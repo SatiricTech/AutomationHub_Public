@@ -1,5 +1,5 @@
 # Inputs
-$AccountKey = "{ACCT KEY FROM HUTNRESS HERE}"
+$AccountKey = "ACCT KEY FROM HUTNRESS HERE"
 $DirectoryPath = "C:\Temp\Huntress"
 $OrganizationKey = "ORG KEY FROM HUNTRESS HERE"
 if (-not (Test-Path -Path $directoryPath -PathType Container)) {
