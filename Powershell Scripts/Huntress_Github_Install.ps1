@@ -1,7 +1,7 @@
 # Inputs
 $AccountKey = "{ACCT KEY FROM HUTNRESS HERE}"
 $DirectoryPath = "C:\Temp\Huntress"
-$OrganizationKey = "cmg"
+$OrganizationKey = "ORG KEY FROM HUNTRESS HERE"
 if (-not (Test-Path -Path $directoryPath -PathType Container)) {
     New-Item -Path $directoryPath -ItemType Directory
     Write-Host "Directory '$directoryPath' created."
