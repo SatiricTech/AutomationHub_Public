@@ -1,3 +1,5 @@
+### NEEDS UPDATED WITH UNINSTALL PREVENTION AVOIDANCE ###
+
 # Function to find NinjaRMM uninstall string
 function Get-NinjaUninstallString {
     $uninstallString = Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" | 
