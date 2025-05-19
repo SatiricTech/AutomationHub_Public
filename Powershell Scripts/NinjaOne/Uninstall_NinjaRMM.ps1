@@ -1,6 +1,10 @@
 ### NEEDS UPDATED WITH UNINSTALL PREVENTION AVOIDANCE ###
 
 # Function to find NinjaRMM uninstall string
+# To run from ScreenConnect hosts page uncomment the below leaving the hash preceding the !
+### #!PS
+### #maxlength=50000
+### #Timeout=90000
 function Get-NinjaUninstallString {
     $uninstallString = Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" | 
         Where-Object { $_.DisplayName -like "*Ninja*" } |
