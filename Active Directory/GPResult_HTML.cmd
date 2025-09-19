@@ -1,0 +1,1 @@
+gpresult /h report.html /f && report.html
