@@ -1,6 +1,7 @@
 # Computer Renaming Script
 # Format: ID-(First letter of manufacturer)(Device type)-(Last part of serial)
-# Example: BRR-HD-L52648M4
+# Example: ABC-HD-L52648M4
+# ABC Client - HP Desktop - L52648M4 (partial serial)
 
 # Check if running as administrator
 if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {

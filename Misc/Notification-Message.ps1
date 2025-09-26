@@ -2,9 +2,9 @@
 # Usage: Set the variables and run the script
 
 param(
-    [string]$MessageContent = "This is a sample notification message from Sentinel Cyber. You can include <b>bold text</b>, <i>italic text</i>, and other formatting.",
-    [string]$FormTitle = "Sentinel Cyber",
-    [string]$HeaderText = "Message from Sentinel Cyber"
+    [string]$MessageContent = "This is a sample notification message from {Company}. You can include <b>bold text</b>, <i>italic text</i>, and other formatting.",
+    [string]$FormTitle = "{Company}",
+    [string]$HeaderText = "Message from {Company}"
 )
 
 Add-Type -AssemblyName System.Windows.Forms
