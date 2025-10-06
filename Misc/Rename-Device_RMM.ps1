@@ -67,8 +67,12 @@ elseif ($model -match "All.*in.*One|AIO|OptiPlex.*AIO|EliteOne|IdeaCentre.*AIO|I
 elseif ($model -match "Tablet|Surface.*Pro|Surface.*Go|ThinkPad.*Tablet") {
     $deviceType = "T"
 }
+# Check for server indicators
+elseif ($model -match "Server|PowerEdge|ProLiant|ThinkServer|System.*x|BladeCenter|Rack|Tower.*Server") {
+    $deviceType = "S"
+}
 
-Write-Host "Detected device type: $deviceType (D=Desktop, L=Laptop, A=All-in-One, T=Tablet)" -ForegroundColor Green
+Write-Host "Detected device type: $deviceType (D=Desktop, L=Laptop, A=All-in-One, T=Tablet, S=Server)" -ForegroundColor Green
 
 # Clean and prepare serial number (remove spaces, special characters)
 $cleanSerial = $serialNumber -replace '[^A-Za-z0-9]', ''

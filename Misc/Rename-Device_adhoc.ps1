@@ -73,10 +73,14 @@ elseif ($model -match "All.*in.*One|AIO|OptiPlex.*AIO|EliteOne|IdeaCentre.*AIO|I
 elseif ($model -match "Tablet|Surface.*Pro|Surface.*Go|ThinkPad.*Tablet") {
     $deviceType = "T"
 }
+# Check for server indicators
+elseif ($model -match "Server|PowerEdge|ProLiant|ThinkServer|System.*x|BladeCenter|Rack|Tower.*Server") {
+    $deviceType = "S"
+}
 
 # Allow manual override of device type
-Write-Host "Detected device type: $deviceType (D=Desktop, L=Laptop, A=All-in-One, T=Tablet)"
-$override = Read-Host "Press Enter to accept, or enter different type (D/L/A/T)"
+Write-Host "Detected device type: $deviceType (D=Desktop, L=Laptop, A=All-in-One, T=Tablet, S=Server)"
+$override = Read-Host "Press Enter to accept, or enter different type (D/L/A/T/S)"
 if (-not [string]::IsNullOrWhiteSpace($override)) {
     $deviceType = $override.ToUpper()
 }
