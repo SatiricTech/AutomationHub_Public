@@ -1,7 +1,9 @@
 # Computer Renaming Script
-# Format: ID-(First letter of manufacturer)(Device type)-(Last part of serial)
-# Example: ABC-HD-L52648M4
-# ABC Client - HP Desktop - L52648M4 (partial serial)
+# Format: ID-(Hypervisor/Manufacturer)(Device type)-(Serial/Custom)
+# Physical Examples: ABC-HD-L52648M4 (ABC Client - HP Desktop - L52648M4 partial serial)
+# VM Examples: ABC-HS-DC01 (ABC Client - Hyper-V Server - DC01 custom name)
+# VM Examples: ABC-VS-FS01 (ABC Client - VMware Server - FS01 custom name)
+# VM Detection: Automatically detects VMs and hypervisor platform
 
 # Check if running as administrator
 if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
@@ -21,6 +23,7 @@ Write-Host "Using Company ID: $CompanyID" -ForegroundColor Green
 try {
     $computerInfo = Get-CimInstance -ClassName Win32_ComputerSystem
     $biosInfo = Get-CimInstance -ClassName Win32_BIOS
+    $baseboardInfo = Get-CimInstance -ClassName Win32_BaseBoard -ErrorAction SilentlyContinue
     
     $manufacturer = $computerInfo.Manufacturer
     $model = $computerInfo.Model
@@ -37,51 +40,117 @@ catch {
     exit 1
 }
 
-# Determine manufacturer code
-$manufacturerCode = switch -Wildcard ($manufacturer) {
-    "*Dell*" { "D" }
-    "*HP*" { "H" }
-    "*Hewlett*" { "H" }
-    "*Lenovo*" { "L" }
-    "*Microsoft*" { "M" }
-    "*ASUS*" { "A" }
-    "*Acer*" { "C" }
-    default { 
-        Write-Warning "Unknown manufacturer: $manufacturer - defaulting to 'U' for Unknown"
-        "U"
+# Detect if this is a Virtual Machine
+$isVirtualMachine = $false
+$vmPlatform = ""
+
+# Manufacturer-based VM indicator
+if ($manufacturer -match "Microsoft Corporation|VMware|VirtualBox|QEMU|Xen|Parallels|Oracle") {
+    $isVirtualMachine = $true
+    $vmPlatform = switch -Wildcard ($manufacturer) {
+        "*Microsoft*" { "Hyper-V" }
+        "*VMware*" { "VMware" }
+        "*VirtualBox*" { "VirtualBox" }
+        "*QEMU*" { "QEMU" }
+        "*Xen*" { "Xen" }
+        "*Parallels*" { "Parallels" }
+        "*Oracle*" { "VirtualBox" }
+        default { "Unknown VM" }
     }
 }
 
-# Determine device type based on model and form factor
-$deviceType = "D"  # Default to Desktop
-
-# Check for laptop indicators
-if ($model -match "Laptop|Book|Pavilion.*Book|EliteBook|ProBook|ThinkPad|IdeaPad|Inspiron.*Book|Latitude|XPS.*Book|Surface.*Laptop") {
-    $deviceType = "L"
-}
-# Check for All-in-One indicators  
-elseif ($model -match "All.*in.*One|AIO|OptiPlex.*AIO|EliteOne|IdeaCentre.*AIO|Inspiron.*AIO") {
-    $deviceType = "A"
-}
-# Check for tablet indicators
-elseif ($model -match "Tablet|Surface.*Pro|Surface.*Go|ThinkPad.*Tablet") {
-    $deviceType = "T"
-}
-# Check for server indicators
-elseif ($model -match "Server|PowerEdge|ProLiant|ThinkServer|System.*x|BladeCenter|Rack|Tower.*Server") {
-    $deviceType = "S"
+# Service-based VM detection
+if (-not $isVirtualMachine) {
+    $vmServices = Get-Service -Name "*vm*", "*vbox*", "*vmware*", "*hyper-v*" -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' }
+    if ($vmServices) {
+        $isVirtualMachine = $true
+        $vmPlatform = "Service-based detection"
+    }
 }
 
-Write-Host "Detected device type: $deviceType (D=Desktop, L=Laptop, A=All-in-One, T=Tablet, S=Server)" -ForegroundColor Green
+# Registry-based VM detection
+if (-not $isVirtualMachine) {
+    try {
+        $vmRegKeys = @(
+            "HKLM:\\SOFTWARE\\VMware, Inc.\\VMware Tools",
+            "HKLM:\\SOFTWARE\\Oracle\\VirtualBox Guest Additions",
+            "HKLM:\\SOFTWARE\\Microsoft\\Virtual Machine\\Guest\\Parameters"
+        )
+        foreach ($regKey in $vmRegKeys) {
+            if (Test-Path $regKey) {
+                $isVirtualMachine = $true
+                $vmPlatform = switch ($regKey) {
+                    { $_ -like "*VMware*" } { "VMware"; break }
+                    { $_ -like "*VirtualBox*" } { "VirtualBox"; break }
+                    { $_ -like "*Microsoft*" } { "Hyper-V"; break }
+                }
+            }
+        }
+    }
+    catch { }
+}
 
-# Clean and prepare serial number (remove spaces, special characters)
-$cleanSerial = $serialNumber -replace '[^A-Za-z0-9]', ''
+# Determine manufacturer/hypervisor code
+if ($isVirtualMachine) {
+    $manufacturerCode = switch -Wildcard ($vmPlatform) {
+        "*Hyper-V*" { "H" }
+        "*VMware*" { "V" }
+        "*VirtualBox*" { "B" }
+        "*QEMU*" { "Q" }
+        "*Xen*" { "X" }
+        "*Parallels*" { "P" }
+        default { "U" }
+    }
+} else {
+    $manufacturerCode = switch -Wildcard ($manufacturer) {
+        "*Dell*" { "D" }
+        "*HP*" { "H" }
+        "*Hewlett*" { "H" }
+        "*Lenovo*" { "L" }
+        "*Microsoft*" { "M" }
+        "*ASUS*" { "A" }
+        "*Acer*" { "C" }
+        default { "U" }
+    }
+}
 
-# Build the base name without serial
+# Determine device type (no prompts in RMM)
+if ($isVirtualMachine) {
+    $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem
+    $isServerOS = $osInfo.Caption -match "Server"
+    $hasServerRoles = $false
+    try {
+        $serverRoles = Get-WindowsFeature -ErrorAction SilentlyContinue | Where-Object { $_.FeatureType -eq 'Role' -and $_.InstallState -eq 'Installed' }
+        if ($serverRoles) { $hasServerRoles = $true }
+    }
+    catch {
+        $serverServices = Get-Service -Name "*AD*", "*DNS*", "*DHCP*", "*IIS*", "*SQL*" -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' }
+        if ($serverServices) { $hasServerRoles = $true }
+    }
+    $deviceType = if ($isServerOS -or $hasServerRoles) { "S" } else { "D" }
+} else {
+    $deviceType = "D"  # Default to Desktop
+    if ($model -match "Laptop|Book|Pavilion.*Book|EliteBook|ProBook|ThinkPad|IdeaPad|Inspiron.*Book|Latitude|XPS.*Book|Surface.*Laptop") {
+        $deviceType = "L"
+    }
+    elseif ($model -match "All.*in.*One|AIO|OptiPlex.*AIO|EliteOne|IdeaCentre.*AIO|Inspiron.*AIO") {
+        $deviceType = "A"
+    }
+    elseif ($model -match "Tablet|Surface.*Pro|Surface.*Go|ThinkPad.*Tablet") {
+        $deviceType = "T"
+    }
+    elseif ($model -match "Server|PowerEdge|ProLiant|ThinkServer|System.*x|BladeCenter|Rack|Tower.*Server") {
+        $deviceType = "S"
+    }
+}
+
+Write-Host "Detected: $(if ($isVirtualMachine) { "VM ($vmPlatform)" } else { "Physical" }) - Type: $deviceType" -ForegroundColor Green
+
+# Build the base name without identifier
 $baseName = "$CompanyID-$manufacturerCode$deviceType-"
 $baseLength = $baseName.Length
 
-# Calculate how much space we have for serial (15 total - base length)
+# Calculate how much space we have for identifier (15 total - base length)
 $maxSerialLength = 15 - $baseLength
 
 if ($maxSerialLength -le 0) {
@@ -89,15 +158,26 @@ if ($maxSerialLength -le 0) {
     exit 1
 }
 
-# Get the last part of serial number that fits
-$serialPart = if ($cleanSerial.Length -gt $maxSerialLength) {
-    $cleanSerial.Substring($cleanSerial.Length - $maxSerialLength)
+# Determine identifier
+# If $CustomIdentifier is provided (e.g., DC01/FS01), use it; otherwise fallback to serial
+if (-not [string]::IsNullOrWhiteSpace($CustomIdentifier)) {
+    $identifierPart = ($CustomIdentifier.ToUpper() -replace '[^A-Za-z0-9]', '')
 } else {
-    $cleanSerial
+    $cleanSerial = $serialNumber -replace '[^A-Za-z0-9]', ''
+    $identifierPart = if ($cleanSerial.Length -gt $maxSerialLength) {
+        $cleanSerial.Substring($cleanSerial.Length - $maxSerialLength)
+    } else {
+        $cleanSerial
+    }
+}
+
+# Truncate identifier if needed
+if ($identifierPart.Length -gt $maxSerialLength) {
+    $identifierPart = $identifierPart.Substring(0, $maxSerialLength)
 }
 
 # Build final computer name
-$newComputerName = "$baseName$serialPart"
+$newComputerName = "$baseName$identifierPart"
 
 # Display the proposed name
 Write-Host ""
