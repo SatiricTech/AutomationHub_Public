@@ -1,3 +1,5 @@
+#### NOT PRODUCTION READY!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
 #Requires -RunAsAdministrator
 
 <#
@@ -6,13 +8,25 @@
 
 .DESCRIPTION
     This script checks if LastPass is installed on the system and in supported browsers (Edge, Chrome, Firefox).
-    If not found, it downloads and installs the LastPass desktop application and provides instructions for browser extensions.
+    If not found, it downloads and installs the LastPass Universal MSI installer with silent deployment.
+    The MSI installer includes the desktop app and browser extensions for detected browsers.
+
+.PARAMETER EnableLogging
+    Enable verbose logging during MSI installation for troubleshooting.
 
 .NOTES
     File Name      : Install-LastPass.ps1
     Author         : Ramon
     Prerequisite   : PowerShell 5.1 or higher, Administrator privileges
-    Version        : 1.0
+    Version        : 2.0
+    
+.EXAMPLE
+    .\Install-LastPass.ps1
+    
+    Runs the script interactively with prompts for installation options.
+
+.LINK
+    https://support.lastpass.com/help/install-lastpass-software-using-the-admin-console-lp010069
 #>
 
 # Set error action preference
@@ -156,53 +170,142 @@ function Test-AllBrowsers {
     }
 }
 
-# Function to download and install LastPass
+# Function to download and install LastPass using MSI
 function Install-LastPassUniversal {
     param(
-        [switch]$UniversalInstaller
+        [switch]$IncludeAllBrowsers,
+        [switch]$EnableLogging
     )
     
-    Write-ColorOutput "`n[*] Downloading LastPass installer..." "Cyan"
+    Write-ColorOutput "`n[*] Downloading LastPass Universal MSI installer..." "Cyan"
     
-    if ($UniversalInstaller) {
-        Write-ColorOutput "[*] Using Universal Windows Installer (includes desktop app + browser extensions)" "Cyan"
-        $downloadUrl = "https://download.cloud.lastpass.com/windows_installer/LastPassInstaller.exe"
-        $installerName = "LastPassInstaller.exe"
-    } else {
-        Write-ColorOutput "[*] Using standard installer" "Cyan"
-        $downloadUrl = "https://download.cloud.lastpass.com/windows_installer/LastPassInstaller.exe"
-        $installerName = "LastPassInstaller.exe"
-    }
+    $downloadUrl = "https://download.cloud.lastpass.com/windows_installer/LastPassInstaller.msi"
+    $installerPath = Join-Path $env:TEMP "LastPassInstaller.msi"
+    $logPath = Join-Path $env:TEMP "LastPassInstall.log"
     
-    $installerPath = Join-Path $env:TEMP $installerName
+    <#
+    Available MSI Features (ADDLOCAL parameter):
+    - ChromeExtension: Chrome browser extension
+    - EdgeExtension: Microsoft Edge browser extension  
+    - FirefoxExtension: Firefox browser extension (Note: Firefox disabled sideloading)
+    - ExplorerExtension: Internet Explorer extension
+    - GenericShortcuts: Start menu shortcuts
+    - DesktopShortcut: Desktop shortcut
+    
+    Additional MSI Properties:
+    - DISABLEPRINT=1: Disable print functionality in LastPass
+    - DISABLEEXPORT=1: Disable export functionality
+    - NODISABLEIEPWMGR=0: Disable IE password manager (default: 1 = don't disable)
+    - NODISABLECHROMEPWMGR=0: Disable Chrome password manager (default: 1 = don't disable)
+    - ALLUSERS=1: Install for all users (requires admin)
+    
+    Example advanced deployment:
+    msiexec /i LastPassInstaller.msi /quiet /norestart ALLUSERS=1 
+           ADDLOCAL=ChromeExtension,EdgeExtension,GenericShortcuts,DesktopShortcut 
+           DISABLEPRINT=1 DISABLEEXPORT=1 /l*v install.log
+    #>
     
     try {
-        # Download the installer
+        # Download the MSI installer
         Write-ColorOutput "[*] Downloading from: $downloadUrl" "White"
         Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -UseBasicParsing
         
         Write-ColorOutput "[+] Download complete! ($([math]::Round((Get-Item $installerPath).Length / 1MB, 2)) MB)" "Green"
         Write-ColorOutput "[*] Starting installation..." "Cyan"
         
-        # Run the installer (silent mode)
-        $process = Start-Process -FilePath $installerPath -ArgumentList "/silent" -Wait -PassThru
+        # Build msiexec arguments for silent install
+        $msiArgs = @(
+            "/i"
+            "`"$installerPath`""
+            "/quiet"
+            "/norestart"
+            "ALLUSERS=1"
+        )
         
+        # Determine which browser extensions to install
+        $features = @()
+        
+        if (Test-BrowserInstalled -BrowserName "Chrome") {
+            $features += "ChromeExtension"
+            Write-ColorOutput "[*] Chrome detected - will install extension" "Cyan"
+        }
+        
+        if (Test-BrowserInstalled -BrowserName "Edge") {
+            $features += "EdgeExtension"
+            Write-ColorOutput "[*] Edge detected - will install extension" "Cyan"
+        }
+        
+        if (Test-BrowserInstalled -BrowserName "Firefox") {
+            $features += "FirefoxExtension"
+            Write-ColorOutput "[*] Firefox detected - will install extension" "Cyan"
+        }
+        
+        # Always include desktop shortcuts and app
+        $features += "GenericShortcuts"
+        $features += "DesktopShortcut"
+        
+        # Add ADDLOCAL parameter with features
+        if ($features.Count -gt 0) {
+            $msiArgs += "ADDLOCAL=$($features -join ',')"
+        }
+        
+        # Optional: Disable browser password managers to avoid conflicts
+        # Uncomment these if you want to disable built-in password managers
+        # $msiArgs += "NODISABLEIEPWMGR=0"
+        # $msiArgs += "NODISABLECHROMEPWMGR=0"
+        
+        # Enable logging if requested
+        if ($EnableLogging) {
+            $msiArgs += "/l*v"
+            $msiArgs += "`"$logPath`""
+            Write-ColorOutput "[*] Logging enabled: $logPath" "Cyan"
+        }
+        
+        # Display the command being run
+        Write-ColorOutput "[*] Running: msiexec $($msiArgs -join ' ')" "DarkGray"
+        
+        # Run the MSI installer
+        $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+        
+        # Check exit code
         if ($process.ExitCode -eq 0) {
             Write-ColorOutput "[+] LastPass installed successfully!" "Green"
-            if ($UniversalInstaller) {
-                Write-ColorOutput "[+] Desktop app and browser extensions have been installed" "Green"
-            }
+            Write-ColorOutput "[+] Desktop app and detected browser extensions have been installed" "Green"
+            $success = $true
+        } elseif ($process.ExitCode -eq 3010) {
+            Write-ColorOutput "[+] LastPass installed successfully!" "Green"
+            Write-ColorOutput "[!] A reboot is required to complete the installation" "Yellow"
             $success = $true
         } else {
             Write-ColorOutput "[!] Installer exited with code: $($process.ExitCode)" "Yellow"
-            Write-ColorOutput "[*] Installation may have completed - please check manually" "Yellow"
-            $success = $true
+            
+            if ($EnableLogging -and (Test-Path $logPath)) {
+                Write-ColorOutput "[*] Check installation log for details: $logPath" "Yellow"
+            } else {
+                Write-ColorOutput "[*] Run script with -EnableLogging to get detailed error information" "Yellow"
+            }
+            
+            # Common exit codes
+            switch ($process.ExitCode) {
+                1602 { Write-ColorOutput "[!] User cancelled installation" "Red" }
+                1603 { Write-ColorOutput "[!] Fatal error during installation" "Red" }
+                1619 { Write-ColorOutput "[!] Installation package could not be opened" "Red" }
+                1625 { Write-ColorOutput "[!] Installation forbidden by system policy" "Red" }
+                1638 { Write-ColorOutput "[!] Another version is already installed" "Yellow" }
+                default { Write-ColorOutput "[!] Unknown error occurred" "Red" }
+            }
+            
+            $success = $false
         }
         
-        # Clean up
+        # Clean up installer (keep log if logging was enabled)
         Start-Sleep -Seconds 2
         if (Test-Path $installerPath) {
             Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+        }
+        
+        if (-not $EnableLogging -and (Test-Path $logPath)) {
+            Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue
         }
         
         return $success
@@ -213,6 +316,9 @@ function Install-LastPassUniversal {
         # Clean up on error
         if (Test-Path $installerPath) {
             Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+        }
+        if (-not $EnableLogging -and (Test-Path $logPath)) {
+            Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue
         }
         
         return $false
@@ -230,8 +336,9 @@ function Show-ExtensionInstructions {
     Write-ColorOutput "========================================" "Magenta"
     
     if ($UniversalInstallerUsed) {
-        Write-ColorOutput "`n[*] The Universal Installer should have installed browser extensions automatically." "Green"
+        Write-ColorOutput "`n[*] The MSI installer should have installed browser extensions automatically." "Green"
         Write-ColorOutput "[*] If extensions don't appear, restart your browsers or install manually below." "White"
+        Write-ColorOutput "`n[!] Note: Firefox disabled extension sideloading - you must install from Firefox Add-ons manually." "Yellow"
     } else {
         Write-ColorOutput "`n[!] Browser extensions can be installed manually from the browser stores." "Yellow"
     }
@@ -244,7 +351,7 @@ function Show-ExtensionInstructions {
     Write-ColorOutput "`nMicrosoft Edge Add-ons:" "Cyan"
     Write-ColorOutput "https://microsoftedge.microsoft.com/addons/detail/lastpass-password-mana/bbcinlkgjjkejfdpemiealijmmooekmp" "White"
     
-    Write-ColorOutput "`nFirefox Add-ons:" "Cyan"
+    Write-ColorOutput "`nFirefox Add-ons (REQUIRED for Firefox users):" "Cyan"
     Write-ColorOutput "https://addons.mozilla.org/en-US/firefox/addon/lastpass-password-manager/" "White"
     
     Write-ColorOutput "`n[*] Or search for 'LastPass' in your browser's extension store." "White"
@@ -314,14 +421,19 @@ function Main {
         Write-ColorOutput "`n========================================" "Magenta"
         Write-ColorOutput "Installation Options" "Magenta"
         Write-ColorOutput "========================================" "Magenta"
-        Write-ColorOutput "`nThe Universal Windows Installer includes:" "White"
+        Write-ColorOutput "`nThe LastPass Universal MSI Installer will install:" "White"
         Write-ColorOutput "  • LastPass Desktop Application" "White"
-        Write-ColorOutput "  • Browser extensions for Edge, Chrome, Firefox, and Opera" "White"
+        Write-ColorOutput "  • Browser extensions for detected browsers (Edge, Chrome, Firefox)" "White"
+        Write-ColorOutput "  • Desktop shortcuts" "White"
         Write-ColorOutput "`n[?] Would you like to install LastPass? (Y/N)" "Yellow"
         $response = Read-Host
         
         if ($response -eq "Y" -or $response -eq "y") {
-            $installed = Install-LastPassUniversal -UniversalInstaller
+            Write-ColorOutput "`n[?] Enable installation logging for troubleshooting? (Y/N)" "Yellow"
+            $logResponse = Read-Host
+            $enableLog = ($logResponse -eq "Y" -or $logResponse -eq "y")
+            
+            $installed = Install-LastPassUniversal -EnableLogging:$enableLog
             
             if ($installed) {
                 Write-ColorOutput "`n[+] LastPass has been installed!" "Green"
