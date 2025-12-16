@@ -1,4 +1,5 @@
 ### NinjaRMM Uninstaller with Uninstall Prevention Handling ###
+### Uncomment the 3 lines below to run from ScreenConnect's Access page
 ### #!PS
 ### #maxlength=50000
 ### #Timeout=90000
@@ -13,6 +14,7 @@ if (!($CurrentUser.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrat
 }
 
 # Set MSP Name (placeholder for public repo)
+### Enter your MSP name below to name the logging folder your MSP's name
 $MSPName = "YourMSPName"
 
 # Define log directory
