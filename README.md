@@ -28,7 +28,7 @@ A curated collection of IT automation scripts for MSPs, MSSPs, and IT profession
 | [`OfficeApps/`](Microsoft365/OfficeApps/) | `Install-Microsoft365Apps.ps1` | Deploy M365 Business Standard apps via ODT |
 | | `Get-LatestODTInstaller.ps1` | Download the latest Office Deployment Tool |
 | | `Microsoft365-BusinessStandard.xml` | ODT configuration for Business Standard (non-shared) |
-| [`AVD/`](Microsoft365/AVD/) | `FSLogix-Redirections.xml` | FSLogix profile redirection config for AVD + Hybrid Entra |
+| [`AVD/`](Microsoft365/AVD/) | `Redirections.xml` | FSLogix profile redirection config for AVD + Hybrid Entra |
 
 ### [`Vendors/`](Vendors/) - Third-Party Product Deployment & Removal
 | Folder | Scripts | Description |
