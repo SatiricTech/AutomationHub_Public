@@ -30,39 +30,31 @@ A curated collection of IT automation scripts for MSPs, MSSPs, and IT profession
 | | `Microsoft365-BusinessStandard.xml` | ODT configuration for Business Standard (non-shared) |
 | [`AVD/`](Microsoft365/AVD/) | `FSLogix-Redirections.xml` | FSLogix profile redirection config for AVD + Hybrid Entra |
 
-### [`Security/`](Security/) - Endpoint Security & Identity
+### [`Vendors/`](Vendors/) - Third-Party Product Deployment & Removal
 | Folder | Scripts | Description |
 |--------|---------|-------------|
-| [`BlackpointCyber/`](Security/BlackpointCyber/) | `Install-BlackpointAgent.ps1` | Install Blackpoint ZTAC/Snap agent via NinjaOne |
+| [`BlackpointCyber/`](Vendors/BlackpointCyber/) | `Install-BlackpointAgent.ps1` | Install Blackpoint ZTAC/Snap agent via NinjaOne |
 | | `Uninstall-BlackpointAgent.ps1` | Full removal including registry and services |
-| [`DUO/`](Security/DUO/) | `Set-DUOBypass.ps1` | Add localhost redirect for DUO (fail-open config) |
-| [`Huntress/`](Security/Huntress/) | `Install-HuntressAgent.ps1` | Install Huntress agent from GitHub |
-| [`LastPass/`](Security/LastPass/) | `Install-LastPass.ps1` | Deploy LastPass with browser extension detection |
+| [`DUO/`](Vendors/DUO/) | `Set-DUOBypass.ps1` | Add localhost redirect for DUO (fail-open config) |
+| [`Egnyte/`](Vendors/Egnyte/) | `Add-EgnyteTrustedSites.ps1` | Add Egnyte to IE Trusted Sites for all user profiles |
+| | `Enable-EgnyteOfficeCoEdit.ps1` | Enable Egnyte co-editing in Office apps |
+| [`Huntress/`](Vendors/Huntress/) | `Install-HuntressAgent.ps1` | Install Huntress agent from GitHub |
+| [`LastPass/`](Vendors/LastPass/) | `Install-LastPass.ps1` | Deploy LastPass with browser extension detection |
 | | `Remove-LastPassBrowserExtension.ps1` | Remove LastPass extensions from Chrome/Edge |
-| [`SentinelOne/`](Security/SentinelOne/) | `Install-SentinelOneAgent.ps1` | Install or clean SentinelOne agent (v2.1) |
-| [`ThreatLocker/`](Security/ThreatLocker/) | `Install-ThreatLocker.ps1` | Deploy ThreatLocker via NinjaOne custom fields |
-
-### [`Networking/`](Networking/) - Network & Connectivity
-| Folder | Scripts | Description |
-|--------|---------|-------------|
-| [`Timus/`](Networking/Timus/) | `Install-TimusConnect.ps1` | Install or update Timus Connect client |
+| [`NinjaOne/`](Vendors/NinjaOne/) | `Uninstall-NinjaRMMAgent.ps1` | Complete Ninja agent removal (services, registry, drivers) |
+| [`ScreenConnect/`](Vendors/ScreenConnect/) | `Uninstall-ScreenConnectAll.ps1` | Remove all ScreenConnect/ConnectWise Control instances |
+| | `Uninstall-ScreenConnectSelective.ps1` | Remove ScreenConnect except protected fingerprints |
+| [`SentinelOne/`](Vendors/SentinelOne/) | `Install-SentinelOneAgent.ps1` | Install or clean SentinelOne agent (v2.1) |
+| [`ThreatLocker/`](Vendors/ThreatLocker/) | `Install-ThreatLocker.ps1` | Deploy ThreatLocker via NinjaOne custom fields |
+| [`Timus/`](Vendors/Timus/) | `Install-TimusConnect.ps1` | Install or update Timus Connect client |
 | | `New-TimusEntraSSOApp.ps1` | Create Entra ID enterprise app for Timus SSO/Sync |
 | | `Uninstall-TimusConnect.ps1` | Full removal of Timus Connect |
-| | `Get-NetworkAdapterInfo.ps1` | List network adapters with status, MAC, speed |
-| | `Get-PublicIP.bat` | Continuous public IP monitor (5-second refresh) |
 
-### [`RMM/`](RMM/) - Remote Management
-| Folder | Scripts | Description |
-|--------|---------|-------------|
-| [`NinjaOne/`](RMM/NinjaOne/) | `Uninstall-NinjaRMMAgent.ps1` | Complete Ninja agent removal (services, registry, drivers) |
-| [`ScreenConnect/`](RMM/ScreenConnect/) | `Uninstall-ScreenConnectAll.ps1` | Remove all ScreenConnect/ConnectWise Control instances |
-| | `Uninstall-ScreenConnectSelective.ps1` | Remove ScreenConnect except protected fingerprints |
-
-### [`CloudStorage/`](CloudStorage/) - Cloud File Sync
-| Folder | Scripts | Description |
-|--------|---------|-------------|
-| [`Egnyte/`](CloudStorage/Egnyte/) | `Add-EgnyteTrustedSites.ps1` | Add Egnyte to IE Trusted Sites for all user profiles |
-| | `Enable-EgnyteOfficeCoEdit.ps1` | Enable Egnyte co-editing in Office apps |
+### [`Networking/`](Networking/) - Network Tools
+| Scripts | Description |
+|---------|-------------|
+| `Get-NetworkAdapterInfo.ps1` | List network adapters with status, MAC, speed |
+| `Get-PublicIP.bat` | Continuous public IP monitor (5-second refresh) |
 
 ### [`Monitoring/`](Monitoring/) - Auditing & Discovery
 | Scripts | Description |
@@ -73,9 +65,16 @@ A curated collection of IT automation scripts for MSPs, MSSPs, and IT profession
 | `Find-Hypervisors.py` | Network scan for Hyper-V, Proxmox, and VMware hosts |
 
 ### [`macOS/`](macOS/) - Apple Device Management
-| Scripts | Description |
-|---------|-------------|
-| `Rename-MacDevice.sh` | Rename Mac ComputerName, LocalHostName, and HostName |
+Mirrors the top-level structure for cross-platform parity. Add Mac scripts in the matching subfolder.
+
+| Folder | Scripts | Description |
+|--------|---------|-------------|
+| [`DeviceManagement/`](macOS/DeviceManagement/) | `Rename-MacDevice.sh` | Rename Mac ComputerName, LocalHostName, and HostName |
+| [`Microsoft365/`](macOS/Microsoft365/) | | *Ready for future Mac M365 scripts* |
+| [`Vendors/`](macOS/Vendors/) | | *Ready for future Mac vendor scripts* |
+| [`Networking/`](macOS/Networking/) | | *Ready for future Mac networking scripts* |
+| [`Monitoring/`](macOS/Monitoring/) | | *Ready for future Mac monitoring scripts* |
+| [`Utilities/`](macOS/Utilities/) | | *Ready for future Mac utility scripts* |
 
 ### [`Utilities/`](Utilities/) - General Tools
 | Scripts | Description |
@@ -123,4 +122,4 @@ Scripts with `-RMM` suffix are designed for automated/silent deployment via RMM 
 
 ## Contributing
 
-Contributions are welcome! Please follow the `Verb-Noun` naming convention and place scripts in the appropriate category folder.
+Contributions are welcome! Please follow the `Verb-Noun` naming convention and place scripts in the appropriate category folder. For vendor-specific scripts, create a subfolder under `Vendors/` (or `macOS/Vendors/` for Mac).
