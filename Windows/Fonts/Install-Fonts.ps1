@@ -8,12 +8,19 @@
 
 <#
 .SYNOPSIS
-    Installs every font found in one or more source directories system-wide on Windows.
+    Installs every font found in one or more source directories (recursively)
+    system-wide on Windows.
 
 .DESCRIPTION
     Copies .ttf / .otf / .ttc / .fon files to %windir%\Fonts and registers each font in
     HKLM so it is available to all users (avoids the Windows 10 1809+ per-user
     install behaviour that Shell.Application.CopyHere introduced).
+
+    $FontSourcePath accepts a single path or an array of paths. Each root is
+    walked recursively with no depth limit, so deeply-nested foundry/vendor
+    trees (4+ levels deep) are all covered. When pulling over SFTP, the
+    remote tree is also walked recursively and mirrored into the local
+    staging folder before the install pass runs.
 
     The script supports multiple delivery methods for the source font files:
 
@@ -50,18 +57,24 @@
 # MSP name used for the ProgramData log folder
 if (-not $MSPName) { $MSPName = "YourMSPName" }
 
-# Local staging directory the fonts live in (or will be downloaded to)
-if (-not $FontSourcePath) { $FontSourcePath = "$env:ProgramData\$MSPName\Fonts" }
+# Local staging directory (or directories) the fonts live in / download to.
+# Pass a single path or an array: @("C:\Fonts\Brand", "C:\Fonts\Vendor").
+# Each root is scanned recursively (arbitrary depth) for .ttf/.otf/.ttc/.fon.
+if (-not $FontSourcePath) { $FontSourcePath = @("$env:ProgramData\$MSPName\Fonts") }
+$FontSourcePath = @($FontSourcePath)   # normalise to array
 
 # Set to $true to pull fonts over SFTP before installing
 if ($null -eq $UseSFTP) { $UseSFTP = $false }
 
-# SFTP settings - point at an Azure Blob storage account with SFTP enabled
+# SFTP settings - point at an Azure Blob storage account with SFTP enabled.
+# $SFTPRemotePath can be a single path or an array of remote roots; each is
+# walked recursively and mirrored into the first entry of $FontSourcePath.
 if (-not $SFTPHost)       { $SFTPHost       = "<storageaccount>.blob.core.windows.net" }
 if (-not $SFTPPort)       { $SFTPPort       = 22 }
 if (-not $SFTPUsername)   { $SFTPUsername   = "<storageaccount>.<container>.<localuser>" }
 if (-not $SFTPPassword)   { $SFTPPassword   = "" }   # prefer RMM secret/custom-field injection
-if (-not $SFTPRemotePath) { $SFTPRemotePath = "/fonts" }
+if (-not $SFTPRemotePath) { $SFTPRemotePath = @("/fonts") }
+$SFTPRemotePath = @($SFTPRemotePath)
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -79,38 +92,77 @@ $LogPath = Join-Path $LogDirectory "Install-Fonts_$Now.log"
 Start-Transcript -Path $LogPath -Force | Out-Null
 
 Write-Output "===== Install-Fonts started $(Get-Date -Format s) ====="
-Write-Output "Source path : $FontSourcePath"
-Write-Output "Use SFTP    : $UseSFTP"
-Write-Output "Log file    : $LogPath"
+Write-Output "Source path(s) : $($FontSourcePath -join '; ')"
+Write-Output "Use SFTP       : $UseSFTP"
+Write-Output "Log file       : $LogPath"
 
 # ---------------------------------------------------------------------------
-# Helper: ensure staging directory exists
+# Helper: ensure each staging directory exists
 # ---------------------------------------------------------------------------
-if (-not (Test-Path -Path $FontSourcePath)) {
-    try {
-        New-Item -Path $FontSourcePath -ItemType Directory -Force | Out-Null
-        Write-Output "Created staging directory: $FontSourcePath"
-    } catch {
-        Write-Error "Failed to create staging directory '$FontSourcePath': $_"
-        Stop-Transcript | Out-Null
-        exit 1
+foreach ($root in $FontSourcePath) {
+    if (-not (Test-Path -Path $root)) {
+        try {
+            New-Item -Path $root -ItemType Directory -Force | Out-Null
+            Write-Output "Created staging directory: $root"
+        } catch {
+            Write-Error "Failed to create staging directory '$root': $_"
+            Stop-Transcript | Out-Null
+            exit 1
+        }
     }
 }
 
 # ---------------------------------------------------------------------------
 # Optional: pull fonts from Azure Blob over SFTP using Posh-SSH
 # ---------------------------------------------------------------------------
-function Invoke-FontSFTPSync {
+# Recursively walks a remote SFTP tree, mirrors the directory structure
+# locally, and downloads any font files it finds. Depth-safe for the 4-levels
+# case the user mentioned (and beyond - the recursion has no hard limit).
+function Copy-SFTPFontsRecursive {
     param(
-        [Parameter(Mandatory)] [string] $SFTPHost,
-        [Parameter(Mandatory)] [int]    $SFTPPort,
-        [Parameter(Mandatory)] [string] $SFTPUsername,
-        [Parameter(Mandatory)] [string] $SFTPPassword,
-        [Parameter(Mandatory)] [string] $SFTPRemotePath,
+        [Parameter(Mandatory)] [int]    $SessionId,
+        [Parameter(Mandatory)] [string] $RemotePath,
         [Parameter(Mandatory)] [string] $LocalPath
     )
 
-    Write-Output "Preparing SFTP sync from $SFTPHost$SFTPRemotePath -> $LocalPath"
+    if (-not (Test-Path $LocalPath)) {
+        New-Item -Path $LocalPath -ItemType Directory -Force | Out-Null
+    }
+
+    $downloaded = 0
+    $children = Get-SFTPChildItem -SessionId $SessionId -Path $RemotePath -ErrorAction Stop |
+        Where-Object { $_.Name -ne '.' -and $_.Name -ne '..' }
+
+    foreach ($child in $children) {
+        if ($child.IsDirectory) {
+            $subLocal = Join-Path $LocalPath $child.Name
+            $downloaded += Copy-SFTPFontsRecursive -SessionId $SessionId `
+                -RemotePath $child.FullName -LocalPath $subLocal
+        }
+        elseif ($child.Name -match '\.(ttf|otf|ttc|fon)$') {
+            $dest = Join-Path $LocalPath $child.Name
+            Write-Output "  Downloading $($child.FullName) ($([math]::Round($child.Size/1KB,1)) KB)"
+            Get-SFTPItem -SessionId $SessionId -Path $child.FullName `
+                -Destination $LocalPath -Force -ErrorAction Stop | Out-Null
+            if (Test-Path $dest) { $downloaded++ }
+        }
+    }
+
+    return $downloaded
+}
+
+function Invoke-FontSFTPSync {
+    param(
+        [Parameter(Mandatory)] [string]   $SFTPHost,
+        [Parameter(Mandatory)] [int]      $SFTPPort,
+        [Parameter(Mandatory)] [string]   $SFTPUsername,
+        [Parameter(Mandatory)] [string]   $SFTPPassword,
+        [Parameter(Mandatory)] [string[]] $SFTPRemotePath,
+        [Parameter(Mandatory)] [string]   $LocalPath
+    )
+
+    Write-Output "Preparing SFTP sync from $SFTPHost -> $LocalPath"
+    Write-Output "Remote roots : $($SFTPRemotePath -join '; ')"
 
     if (-not (Get-Module -ListAvailable -Name Posh-SSH)) {
         Write-Output "Posh-SSH module not found. Installing from PSGallery..."
@@ -131,23 +183,19 @@ function Invoke-FontSFTPSync {
 
     $session = New-SFTPSession -ComputerName $SFTPHost -Port $SFTPPort -Credential $credential -AcceptKey -ErrorAction Stop
     try {
-        $remoteItems = Get-SFTPChildItem -SessionId $session.SessionId -Path $SFTPRemotePath -ErrorAction Stop |
-            Where-Object { -not $_.IsDirectory -and $_.Name -match '\.(ttf|otf|ttc|fon)$' }
-
-        if (-not $remoteItems) {
-            Write-Output "No font files found under $SFTPRemotePath."
-            return 0
+        $total = 0
+        foreach ($remoteRoot in $SFTPRemotePath) {
+            # Mirror each remote root as a subfolder of $LocalPath so trees from
+            # different roots never collide with each other.
+            $rootLeaf  = Split-Path -Leaf ($remoteRoot.TrimEnd('/'))
+            if ([string]::IsNullOrWhiteSpace($rootLeaf)) { $rootLeaf = 'root' }
+            $rootLocal = Join-Path $LocalPath $rootLeaf
+            Write-Output "Walking $remoteRoot -> $rootLocal"
+            $total += Copy-SFTPFontsRecursive -SessionId $session.SessionId `
+                -RemotePath $remoteRoot -LocalPath $rootLocal
         }
-
-        $count = 0
-        foreach ($item in $remoteItems) {
-            $dest = Join-Path $LocalPath $item.Name
-            Write-Output "  Downloading $($item.Name) ($([math]::Round($item.Size/1KB,1)) KB)"
-            Get-SFTPItem -SessionId $session.SessionId -Path $item.FullName -Destination $LocalPath -Force -ErrorAction Stop | Out-Null
-            if (Test-Path $dest) { $count++ }
-        }
-        Write-Output "SFTP sync complete. $count file(s) downloaded."
-        return $count
+        Write-Output "SFTP sync complete. $total font file(s) downloaded."
+        return $total
     }
     finally {
         Remove-SFTPSession -SessionId $session.SessionId | Out-Null
@@ -158,7 +206,7 @@ if ($UseSFTP) {
     try {
         Invoke-FontSFTPSync -SFTPHost $SFTPHost -SFTPPort $SFTPPort `
             -SFTPUsername $SFTPUsername -SFTPPassword $SFTPPassword `
-            -SFTPRemotePath $SFTPRemotePath -LocalPath $FontSourcePath | Out-Null
+            -SFTPRemotePath $SFTPRemotePath -LocalPath $FontSourcePath[0] | Out-Null
     } catch {
         Write-Error "SFTP sync failed: $_"
         Stop-Transcript | Out-Null
@@ -218,14 +266,28 @@ if (-not ([System.Management.Automation.PSTypeName]'FontInstaller.Native').Type)
 $HWND_BROADCAST = 0xFFFF
 $WM_FONTCHANGE  = 0x001D
 
-$fontFiles = Get-ChildItem -Path $FontSourcePath -Include $FontExtensions -File -Recurse -ErrorAction SilentlyContinue
+$fontFiles = @()
+foreach ($root in $FontSourcePath) {
+    $found = Get-ChildItem -Path $root -Include $FontExtensions -File -Recurse -ErrorAction SilentlyContinue
+    if ($found) {
+        Write-Output "Scanned $root -> $($found.Count) font file(s)"
+        $fontFiles += $found
+    } else {
+        Write-Output "Scanned $root -> 0 font files"
+    }
+}
+
+# De-dupe by filename - same font reached via two paths shouldn't install twice
+$fontFiles = $fontFiles | Sort-Object FullName -Unique |
+    Group-Object Name | ForEach-Object { $_.Group | Select-Object -First 1 }
+
 if (-not $fontFiles) {
-    Write-Output "No font files found in $FontSourcePath. Nothing to install."
+    Write-Output "No font files found under any source path. Nothing to install."
     Stop-Transcript | Out-Null
     exit 0
 }
 
-Write-Output "Found $($fontFiles.Count) font file(s) to process."
+Write-Output "Total unique font file(s) to process: $($fontFiles.Count)"
 
 $installed = 0
 $skipped   = 0
