@@ -39,6 +39,8 @@ A curated collection of IT automation scripts for MSPs, MSSPs, and IT profession
 | [`Egnyte/`](Vendors/Egnyte/) | `Add-EgnyteTrustedSites.ps1` | Add Egnyte to IE Trusted Sites for all user profiles |
 | | `Enable-EgnyteOfficeCoEdit.ps1` | Enable Egnyte co-editing in Office apps |
 | [`Huntress/`](Vendors/Huntress/) | `Install-HuntressAgent.ps1` | Install Huntress agent from GitHub |
+| | `Set-HuntressAuditPolicy.ps1` | Ad-hoc: enforce Huntress SIEM audit policy baseline (interactive) |
+| | `Invoke-HuntressAuditPolicyRemediation.ps1` | RMM detect & remediate for Huntress SIEM audit policy baseline |
 | [`LastPass/`](Vendors/LastPass/) | `Install-LastPass.ps1` | Deploy LastPass with browser extension detection |
 | | `Remove-LastPassBrowserExtension.ps1` | Remove LastPass extensions from Chrome/Edge |
 | [`NinjaOne/`](Vendors/NinjaOne/) | `Uninstall-NinjaRMMAgent.ps1` | Complete Ninja agent removal (services, registry, drivers) |
