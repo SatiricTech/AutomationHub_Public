@@ -20,10 +20,16 @@
 #              Built for unattended RMM/automation deployment.
 #
 #              Parameters:
-#                -Mode Detect      : report drift only, no changes
-#                -Mode Remediate   : detect + apply changes (default)
-#                -NoHuntressEDR    : set Process Creation to Success (default
-#                                    is No Auditing, since EDR covers it)
+#                -Mode Detect       : report drift only, no changes
+#                -Mode Remediate    : detect + apply changes (default)
+#                -NoHuntressEDR     : set Process Creation to Success
+#                                     (default is No Auditing, since EDR
+#                                     covers it)
+#                -KeepLocalGPOAudit : skip local GPO audit.csv removal
+#                                     (default is to back up + remove so
+#                                     auditpol settings stick across reboot;
+#                                     this is the "Alternative" path from
+#                                     the Huntress article)
 #
 #              Exit codes:
 #                0 = compliant (no drift, no action taken)
@@ -45,7 +51,8 @@ param(
     [ValidateSet('Detect','Remediate')]
     [string]$Mode = 'Remediate',
 
-    [switch]$NoHuntressEDR
+    [switch]$NoHuntressEDR,
+    [switch]$KeepLocalGPOAudit
 )
 
 #############################
@@ -54,7 +61,14 @@ param(
 $OrgFolder = 'SentinelCyber'
 $LogDir    = "C:\ProgramData\$OrgFolder\Logs"
 $LogFile   = Join-Path $LogDir 'Invoke-HuntressAuditPolicyRemediation.log'
+$BackupRoot = "C:\ProgramData\$OrgFolder\Backups"
 $SecurityLogMaxKB = 512000
+
+# Local GPO audit.csv locations (article: "Common Issues" / "Alternative")
+$LocalGPOAuditCsvFiles = @(
+    'C:\Windows\security\audit\audit.csv'
+    'C:\Windows\System32\GroupPolicy\Machine\Microsoft\WindowsNT\Audit\audit.csv'
+)
 
 #############################
 # Huntress Advanced Audit Policy baseline (subcategory -> Success/Failure)
@@ -269,6 +283,30 @@ function Set-SecurityLogBaseline {
     }
 }
 
+function Remove-LocalGPOAuditCsv {
+    $present = $LocalGPOAuditCsvFiles | Where-Object { Test-Path -LiteralPath $_ }
+    if (-not $present) {
+        Write-Log "No local GPO audit.csv files present; nothing to remove." 'INFO'
+        return $true
+    }
+    $backupDir = Join-Path $BackupRoot ("audit-csv-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    try {
+        New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+        foreach ($file in $present) {
+            $safeName = ($file -replace '[:\\\/]', '_').TrimStart('_')
+            Copy-Item -LiteralPath $file -Destination (Join-Path $backupDir $safeName) -Force
+            Rename-Item -LiteralPath $file -NewName ((Split-Path $file -Leaf) + '.bak') -Force
+            Write-Log "audit.csv removed: $file -> $file.bak (backup: $backupDir)" 'FIX'
+        }
+        & gpupdate.exe /force /target:computer 2>&1 | Out-Null
+        Write-Log "gpupdate /force completed after audit.csv removal" 'FIX'
+        return $true
+    } catch {
+        Write-Log "audit.csv removal FAIL :: $_" 'ERROR'
+        return $false
+    }
+}
+
 #############################
 # Main
 #############################
@@ -303,6 +341,13 @@ if ($Mode -eq 'Detect') {
 
 $failed = 0
 $fixed  = 0
+
+if (-not $KeepLocalGPOAudit) {
+    if (Remove-LocalGPOAuditCsv) { $fixed++ } else { $failed++ }
+} else {
+    Write-Log "KeepLocalGPOAudit specified; leaving audit.csv files in place." 'INFO'
+}
+
 foreach ($d in $auditDrift) {
     if (Set-AuditSubcategory -Item $d.Ref) { $fixed++ } else { $failed++ }
 }

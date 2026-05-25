@@ -30,10 +30,16 @@
 #              - "Process Creation" defaults to No Auditing (Huntress EDR
 #                covers process telemetry). Pass -NoHuntressEDR to set it
 #                to Success instead.
+#              - By default, this script removes local Group Policy
+#                audit.csv files (backed up first) so the auditpol baseline
+#                isn't overwritten on the next GP refresh / reboot. This is
+#                the "Alternative" path from the Huntress article. Pass
+#                -KeepLocalGPOAudit to skip the removal if you actively
+#                manage audit policy via Local Group Policy Editor.
 #              - Reboot is NOT required; auditpol changes apply immediately.
-#              - This script does NOT touch GPO. If a domain GPO is pushing
-#                different audit settings, those will reapply at next refresh
-#                (see "Common Issues" in the Huntress article).
+#              - This script does NOT touch domain GPO. If a domain GPO is
+#                pushing different audit settings, those will reapply at
+#                next refresh.
 #############################
 
 #############################
@@ -47,7 +53,8 @@
 param(
     [switch]$Force,
     [switch]$ShowOnly,
-    [switch]$NoHuntressEDR
+    [switch]$NoHuntressEDR,
+    [switch]$KeepLocalGPOAudit
 )
 
 #############################
@@ -56,6 +63,13 @@ param(
 $OrgFolder = 'SentinelCyber'
 $LogDir    = "C:\ProgramData\$OrgFolder\Logs"
 $LogFile   = Join-Path $LogDir 'Set-HuntressAuditPolicy.log'
+$BackupRoot = "C:\ProgramData\$OrgFolder\Backups"
+
+# Local GPO audit.csv locations (article: "Common Issues" / "Alternative")
+$LocalGPOAuditCsvFiles = @(
+    'C:\Windows\security\audit\audit.csv'
+    'C:\Windows\System32\GroupPolicy\Machine\Microsoft\WindowsNT\Audit\audit.csv'
+)
 
 # Recommended Security log size from the article (512 MB)
 $SecurityLogMaxKB = 512000
@@ -299,6 +313,30 @@ function Set-SecurityLogBaseline {
     }
 }
 
+function Remove-LocalGPOAuditCsv {
+    $present = $LocalGPOAuditCsvFiles | Where-Object { Test-Path -LiteralPath $_ }
+    if (-not $present) {
+        Write-Log "No local GPO audit.csv files present; nothing to remove." 'INFO'
+        return $true
+    }
+    $backupDir = Join-Path $BackupRoot ("audit-csv-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    try {
+        New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+        foreach ($file in $present) {
+            $safeName = ($file -replace '[:\\\/]', '_').TrimStart('_')
+            Copy-Item -LiteralPath $file -Destination (Join-Path $backupDir $safeName) -Force
+            Rename-Item -LiteralPath $file -NewName ((Split-Path $file -Leaf) + '.bak') -Force
+            Write-Log "Backed up + renamed local GPO audit file: $file (backup: $backupDir)" 'OK'
+        }
+        & gpupdate.exe /force /target:computer 2>&1 | Out-Null
+        Write-Log "gpupdate /force completed after audit.csv removal" 'OK'
+        return $true
+    } catch {
+        Write-Log "Failed to remove local GPO audit.csv: $_" 'ERROR'
+        return $false
+    }
+}
+
 #############################
 # Main
 #############################
@@ -342,6 +380,15 @@ if (-not $Force) {
 }
 
 $failed = 0
+
+if (-not $KeepLocalGPOAudit) {
+    if ($PSCmdlet.ShouldProcess('local GPO audit.csv', 'remove + backup')) {
+        if (-not (Remove-LocalGPOAuditCsv)) { $failed++ }
+    }
+} else {
+    Write-Log "KeepLocalGPOAudit specified; leaving audit.csv files in place." 'INFO'
+}
+
 foreach ($d in $auditDrift) {
     if ($PSCmdlet.ShouldProcess($d.Item, 'auditpol set')) {
         if (-not (Set-AuditSubcategory -Item $d.Ref)) { $failed++ }
