@@ -18,6 +18,7 @@ A curated collection of IT automation scripts for MSPs, MSSPs, and IT profession
 | | `Export-GPResultReport.cmd` | Generate Group Policy results as HTML |
 | [`DeviceManagement/`](Windows/DeviceManagement/) | `Rename-Device-RMM.ps1` | Automated device naming for RMM deployment |
 | | `Rename-Device-AdHoc.ps1` | Interactive device renaming with prompts |
+| [`Fonts/`](Windows/Fonts/) | `Install-Fonts.ps1` | System-wide font install from local folder or SFTP (Azure Blob) |
 | [`ServerRoles/`](Windows/ServerRoles/) | `Get-WindowsServerRoles.ps1` | Detect installed server roles (AD DS, DNS, DHCP, Hyper-V, etc.) |
 
 ### [`Microsoft365/`](Microsoft365/) - Cloud & Office
