@@ -46,10 +46,21 @@
 ##############################################################################
 
 # Your Huntress Account Key (32-char hex from the portal's "Add Agent" page).
-# Leave as-is to require it be passed by NinjaOne (env var or -a flag).
-defaultAccountKey="__ACCOUNT_KEY__"
+# This is supplied at RUNTIME as a NinjaOne Script Variable, which NinjaOne
+# exposes to the script as an environment variable -- so there is nothing to
+# "GET" and nothing to hardcode here. Set accountKeyVariable to the exact name
+# you give that Script Variable in NinjaOne's script editor; the script reads
+# the matching env var. (The -a flag and HUNTRESS_ACCOUNT_KEY still override it.)
+accountKeyVariable="accountKey"
 
-# Organization Key. NinjaOne can override this per-org. A placeholder is fine.
+# Organization Key. Pulled at RUNTIME from a NinjaOne Custom Field (via
+# ninjarmm-cli) so it can be set per-organization in NinjaOne instead of being
+# hardcoded here. Set orgKeyCustomField to the scripting/machine name of the
+# custom field that holds the org key. If the field is empty or the CLI isn't
+# available, the script falls back to defaultOrgKey below.
+orgKeyCustomField="huntressOrgKey"
+
+# Fallback Org Key, used only if the custom field is empty/unreadable.
 defaultOrgKey="Mac Agents"
 
 # Shows up in Huntress support tooling so they know which RMM deployed the agent.
@@ -88,20 +99,68 @@ logger() {
 }
 
 # ---------------------------------------------------------------------------
-# Resolve config: precedence is CLI flag > NinjaOne env var > hardcoded default.
-# NinjaOne exposes script variables as env vars; we accept a few common names.
+# NinjaOne CLI helpers (macOS). Used to read Custom Fields at runtime.
 # ---------------------------------------------------------------------------
+# Locate the NinjaOne agent CLI. Echoes the path on success, returns non-zero
+# if it can't be found.
+findNinjaCli() {
+    local candidates=(
+        "/Applications/NinjaRMMAgent/programdata/ninjarmm-cli"
+        "/Applications/NinjaRMMAgent/programdata/ninjarmm-cli.app/Contents/MacOS/ninjarmm-cli"
+        "/opt/NinjaRMMAgent/programdata/ninjarmm-cli"
+    )
+    local c
+    for c in "${candidates[@]}"; do
+        [ -x "$c" ] && { echo "$c"; return 0; }
+    done
+    command -v ninjarmm-cli 2>/dev/null && return 0
+    return 1
+}
+
+# Read a NinjaOne Custom Field by name. Echoes the trimmed value (empty on any
+# failure -- missing CLI, missing field, etc).
+ninjaGet() {
+    local field="$1" cli val
+    [ -n "$field" ] || return 1
+    cli=$(findNinjaCli) || return 1
+    val=$("$cli" get "$field" 2>/dev/null) || return 1
+    # ninjarmm-cli prints nothing for an empty field; trim whitespace.
+    echo "$val" | xargs
+}
+
+# ---------------------------------------------------------------------------
+# Resolve config.
+#   Account Key: CLI flag > NinjaOne Script Variable (env var) > HUNTRESS_*.
+#   Org Key:     CLI flag > NinjaOne env var > NinjaOne Custom Field > default.
+# NinjaOne exposes Script Variables as env vars; we read the one named in
+# accountKeyVariable, plus a couple of common aliases.
+# ---------------------------------------------------------------------------
+# Capture the NinjaOne Script Variable's value FIRST, via indirect expansion.
+# This must happen before we initialize our own $accountKey, because the Script
+# Variable is itself exposed as an env var and may share that exact name --
+# zeroing accountKey first would wipe the value we're trying to read.
+accountKeyFromVar=""
+if [ -n "$accountKeyVariable" ]; then
+    accountKeyFromVar="${!accountKeyVariable:-}"
+fi
+
 accountKey=""
 organizationKey=""
 tags=""
 
-# NinjaOne / environment overrides
-[ -n "$accountKey_env" ]      && accountKey="$accountKey_env"
+# Account Key from the NinjaOne Script Variable captured above.
+[ -n "$accountKeyFromVar" ] && accountKey="$accountKeyFromVar"
+# Common env-var aliases (later wins).
+[ -n "$accountKey_env" ]       && accountKey="$accountKey_env"
 [ -n "$HUNTRESS_ACCOUNT_KEY" ] && accountKey="$HUNTRESS_ACCOUNT_KEY"
+
+# Org Key from env-var overrides (if any).
 [ -n "$organizationKey_env" ] && organizationKey="$organizationKey_env"
-[ -n "$HUNTRESS_ORG_KEY" ]     && organizationKey="$HUNTRESS_ORG_KEY"
-[ -n "$tags_env" ]            && tags="$tags_env"
-[ -n "$HUNTRESS_TAGS" ]        && tags="$HUNTRESS_TAGS"
+[ -n "$HUNTRESS_ORG_KEY" ]    && organizationKey="$HUNTRESS_ORG_KEY"
+
+# Tags from env-var overrides (if any).
+[ -n "$tags_env" ]     && tags="$tags_env"
+[ -n "$HUNTRESS_TAGS" ] && tags="$HUNTRESS_TAGS"
 
 # CLI flags (override env). -a account, -o org, -t tags.
 while getopts "a:o:t:h" opt; do
@@ -110,17 +169,16 @@ while getopts "a:o:t:h" opt; do
         o) organizationKey="${OPTARG#=}" ;;
         t) tags="${OPTARG#=}" ;;
         h)
-            echo "Usage: $0 -a <account_key> [-o <org_key>] [-t <tags>]"
+            echo "Usage: $0 [-a <account_key>] [-o <org_key>] [-t <tags>]"
             exit 0
             ;;
         *) ;;
     esac
 done
 
-# Fall back to hardcoded defaults.
-[ -z "$accountKey" ]      && accountKey="$defaultAccountKey"
-[ -z "$organizationKey" ] && organizationKey="$defaultOrgKey"
-[ -z "$tags" ]            && tags="$defaultTags"
+# Tags fall back to the hardcoded default. (Org Key is resolved after the
+# banner below so its source is captured in the log file.)
+[ -z "$tags" ] && tags="$defaultTags"
 
 # ---------------------------------------------------------------------------
 # Pre-flight
@@ -136,11 +194,23 @@ chmod 755 "$workDir"
 logger "=========== Huntress macOS deploy wrapper v${scriptVersion} (${rmm}) ==========="
 logger "macOS version: $(sw_vers -productVersion)"
 
+# Org Key: if not already supplied via flag/env, read it from the NinjaOne
+# Custom Field, then fall back to the hardcoded default.
+if [ -z "$organizationKey" ]; then
+    organizationKey=$(ninjaGet "$orgKeyCustomField")
+    if [ -n "$organizationKey" ]; then
+        logger "Org Key sourced from NinjaOne custom field '${orgKeyCustomField}'."
+    else
+        logger "Custom field '${orgKeyCustomField}' empty/unavailable; using fallback Org Key '${defaultOrgKey}'."
+    fi
+fi
+[ -z "$organizationKey" ] && organizationKey="$defaultOrgKey"
+
 # Validate the account key now so we fail fast with a useful message.
 accountKey=$(echo "$accountKey" | tr -d '[:space:]')
 if ! [[ "$accountKey" =~ $keyPattern ]]; then
     logger "ERROR: A valid 32-char hex Account Key is required."
-    logger "       Provide it via NinjaOne (HUNTRESS_ACCOUNT_KEY), the -a flag, or defaultAccountKey."
+    logger "       Provide it via the NinjaOne Script Variable named '${accountKeyVariable}', the -a flag, or HUNTRESS_ACCOUNT_KEY."
     exit 1
 fi
 organizationKey=$(echo "$organizationKey" | tr -dc '[:alnum:]- ' | tr ' ' '-' | xargs)
