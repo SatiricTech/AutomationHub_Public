@@ -16,6 +16,7 @@ A curated collection of IT automation scripts for MSPs, MSSPs, and IT profession
 | [`ActiveDirectory/`](Windows/ActiveDirectory/) | `New-DomainAdmin.ps1` | Create a new Domain Admin account |
 | | `Get-FSMORoles.ps1` | Display all 5 FSMO role holders |
 | | `Export-GPResultReport.cmd` | Generate Group Policy results as HTML |
+| [`AzureBlob/`](Windows/AzureBlob/) | `Get-AzureBlobData.ps1` | Pull files from Azure Blob (SAS token or SFTP) into ProgramData category folders |
 | [`DeviceManagement/`](Windows/DeviceManagement/) | `Rename-Device-RMM.ps1` | Automated device naming for RMM deployment |
 | | `Rename-Device-AdHoc.ps1` | Interactive device renaming with prompts |
 | [`Fonts/`](Windows/Fonts/) | `Install-Fonts.ps1` | System-wide font install from local folder or SFTP (Azure Blob) |
