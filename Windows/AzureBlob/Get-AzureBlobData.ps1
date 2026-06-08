@@ -44,20 +44,71 @@
     Prerequisite   : PowerShell 5.1+ (SAS method needs nothing else)
     Logs           : %ProgramData%\<MSPName>\Logs\Get-AzureBlobData_<timestamp>.log
 
-    Every input below can be overridden by setting it as an environment / RMM
-    variable BEFORE the script runs, so secrets never have to live in the file.
+    Designed to be edited in place: set the values in the CONFIGURATION block
+    below, save, and deploy the file as-is from your RMM - no command-line
+    arguments required. Anything you fill in always wins.
+
+    Optionally ($AllowEnvOverride = $true), any value you LEAVE BLANK can still
+    be injected as an environment / RMM variable of the same name, so secrets
+    (SAS token, SFTP password) never have to live in the file if you'd rather
+    push them separately.
 #>
 
 # ===========================================================================
-#  CONFIGURATION  -  edit the defaults here, or inject as env/RMM variables.
+#  CONFIGURATION  -  EDIT THIS BLOCK, SAVE, AND DEPLOY.
+#
+#  Everything you need to change lives between here and "END CONFIGURATION".
+#  Set the values directly below - no command-line arguments needed, so this
+#  is safe to push out as-is from an RMM. Whatever you type here wins.
 # ===========================================================================
 
-# --- Who we are (drives the %ProgramData%\<MSPName> root) ------------------
-if (-not $MSPName) { $MSPName = "YourMSPName" }
+# --- (1) WHICH AUTH METHOD -------------------------------------------------
+#   "SAS"  -> HTTPS Blob REST API with a Shared Access Signature token
+#   "SFTP" -> Posh-SSH against the storage account's SFTP endpoint
+$Method = "SAS"
 
-# --- Where it lands --------------------------------------------------------
-# Pick a category folder under %ProgramData%\<MSPName>\. Add/trim the map to
-# taste, but keep it tight - these are the buckets we actually use.
+# --- (2) WHAT WE PULL & WHERE IT LANDS -------------------------------------
+# Your MSP name - drives the %ProgramData%\<MSPName> root folder.
+$MSPName = "YourMSPName"
+
+# Which category bucket to drop the download into.
+# Must be one of the keys in $CategoryMap near the bottom of this block
+# (AppInstalls, Tools, Scripts, Data, Logs).
+$DestinationCategory = "AppInstalls"
+
+# Optional extra subfolder under the category, e.g. "AcmeCorp\AgentV2".
+# Leave blank to land straight in the category folder.
+$DestinationSubPath = ""
+
+# Wipe the destination subfolder before downloading? ($false = merge/refresh)
+$CleanDestination = $false
+
+# --- (3a) SAS (HTTPS) SETTINGS  -  used when $Method = "SAS" ----------------
+$StorageAccount = "<storageaccount>"    # name only, no suffix
+$Container      = "<container>"
+$SasToken       = ""                    # "sv=...&sig=..." (leading '?' optional)
+# Only pull blobs under this virtual path. "" = whole container.
+# e.g. "agents/sentinelone/" or a single blob name "tools/7zip.msi".
+$BlobPrefix     = ""
+# Storage endpoint suffix - change only for sovereign/gov clouds.
+$EndpointSuffix = "core.windows.net"
+
+# --- (3b) SFTP SETTINGS  -  used when $Method = "SFTP" ----------------------
+# Leave $SftpHost / $SftpUsername blank to auto-build them from the SAS
+# settings above; fill them in only if you need something non-standard.
+$SftpHost       = ""                    # blank => "<account>.blob.<suffix>"
+$SftpPort       = 22
+$SftpUsername   = ""                    # blank => "<account>.<container>.<localuser>"
+$SftpPassword   = ""                    # prefer RMM secret injection
+$SftpRemotePath = "/"                   # remote root to mirror
+
+# --- (4) FILTERING / BEHAVIOUR ---------------------------------------------
+# Only download files matching these extensions. Empty array = everything.
+$IncludeExtensions = @()                # e.g. @(".exe",".msi",".zip")
+$MaxRetries        = 4
+
+# --- (5) CATEGORY BUCKETS  -  folders under %ProgramData%\<MSPName>\ --------
+# Add/trim to taste, but keep it tight - these are the buckets we actually use.
 $CategoryMap = @{
     AppInstalls = "AppInstalls"   # installers / MSI / EXE staged for deployment
     Tools       = "Tools"         # portable utilities, sysadmin tooling
@@ -66,46 +117,46 @@ $CategoryMap = @{
     Logs        = "Logs"          # log bundles, exported reports
 }
 
-# Which bucket to drop the download into (must be a key in $CategoryMap above).
-if (-not $DestinationCategory) { $DestinationCategory = "AppInstalls" }
-
-# Optional extra subfolder under the category, e.g. "AcmeCorp\AgentV2".
-# Leave blank to land straight in the category folder.
-if (-not $DestinationSubPath)  { $DestinationSubPath = "" }
-
-# Wipe the destination subfolder before downloading? ($false = merge/refresh)
-if ($null -eq $CleanDestination) { $CleanDestination = $false }
-
-# --- How we authenticate ---------------------------------------------------
-# "SAS"  -> HTTPS Blob REST API with a Shared Access Signature token
-# "SFTP" -> Posh-SSH against the storage account's SFTP endpoint
-if (-not $Method) { $Method = "SAS" }
-
-# --- SAS (HTTPS) settings --------------------------------------------------
-if (-not $StorageAccount) { $StorageAccount = "<storageaccount>" }   # name only, no suffix
-if (-not $Container)      { $Container      = "<container>" }
-if (-not $SasToken)       { $SasToken       = "" }   # "sv=...&sig=..." (leading '?' optional)
-# Only pull blobs under this virtual path. "" = whole container.
-# e.g. "agents/sentinelone/" or a single blob name "tools/7zip.msi".
-if (-not $BlobPrefix)     { $BlobPrefix     = "" }
-# Storage endpoint suffix - change only for sovereign/gov clouds.
-if (-not $EndpointSuffix) { $EndpointSuffix = "core.windows.net" }
-
-# --- SFTP settings ---------------------------------------------------------
-if (-not $SftpHost)       { $SftpHost       = "<storageaccount>.blob.$EndpointSuffix" }
-if (-not $SftpPort)       { $SftpPort       = 22 }
-if (-not $SftpUsername)   { $SftpUsername   = "<storageaccount>.<container>.<localuser>" }
-if (-not $SftpPassword)   { $SftpPassword   = "" }   # prefer RMM secret injection
-if (-not $SftpRemotePath) { $SftpRemotePath = "/" }  # remote root to mirror
-
-# --- Behaviour -------------------------------------------------------------
-# Only download files matching these extensions. Empty array = everything.
-if (-not $IncludeExtensions) { $IncludeExtensions = @() }   # e.g. @(".exe",".msi",".zip")
-if (-not $MaxRetries)        { $MaxRetries = 4 }
+# --- (6) OPTIONAL: env/RMM override for values left blank -------------------
+# $true  => any setting above that you LEFT BLANK can be supplied as an
+#           environment / RMM variable of the same name (handy for secrets
+#           like SasToken / SftpPassword). Values you filled in always win.
+# $false => ignore the environment entirely; use ONLY what's in this file.
+$AllowEnvOverride = $true
 
 # ===========================================================================
 #  END CONFIGURATION
 # ===========================================================================
+
+# Pull blank settings from matching env/RMM variables (inline values win).
+if ($AllowEnvOverride) {
+    $envBackedNames = @(
+        'Method','MSPName','DestinationCategory','DestinationSubPath',
+        'StorageAccount','Container','SasToken','BlobPrefix','EndpointSuffix',
+        'SftpHost','SftpPort','SftpUsername','SftpPassword','SftpRemotePath'
+    )
+    foreach ($name in $envBackedNames) {
+        $current = Get-Variable -Name $name -ValueOnly -ErrorAction SilentlyContinue
+        # "Blank" = null, empty/whitespace, or an unedited <placeholder>.
+        $isBlank = ($null -eq $current) -or
+                   ($current -is [string] -and
+                    ([string]::IsNullOrWhiteSpace([string]$current) -or
+                     [string]$current -match '^\s*<.*>\s*$'))
+        if (-not $isBlank) { continue }
+        $envValue = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrWhiteSpace($envValue)) {
+            Set-Variable -Name $name -Value $envValue
+        }
+    }
+}
+
+# Auto-build the SFTP host/username from the SAS settings if left blank.
+if ([string]::IsNullOrWhiteSpace($SftpHost)) {
+    $SftpHost = "{0}.blob.{1}" -f $StorageAccount, $EndpointSuffix
+}
+if ([string]::IsNullOrWhiteSpace($SftpUsername)) {
+    $SftpUsername = "{0}.{1}.<localuser>" -f $StorageAccount, $Container
+}
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
