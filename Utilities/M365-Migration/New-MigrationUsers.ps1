@@ -33,7 +33,7 @@
 
 .PARAMETER OutputPath
     Directory where the results CSV (including any generated passwords) is
-    written. If omitted, defaults to "<AppData>\Migration-Automations" after
+    written. If omitted, defaults to "<LocalAppData>\Migration-Automations" after
     confirming with you.
 
 .PARAMETER DefaultUsageLocation
@@ -42,6 +42,14 @@
 
 .PARAMETER ForceChangePassword
     Require the user to change their password at next sign-in. Default $true.
+
+.PARAMETER DryRun
+    Preview only - make no changes. Equivalent to -WhatIf: every row is
+    evaluated and reported (Would create / already exists / etc.) but no user
+    is created.
+
+.EXAMPLE
+    .\New-MigrationUsers.ps1 -CsvPath .\NewUsers.csv -DryRun
 
 .EXAMPLE
     .\New-MigrationUsers.ps1 -CsvPath .\NewUsers.csv -WhatIf
@@ -68,10 +76,18 @@ param(
     [string]$DefaultUsageLocation = 'US',
 
     [Parameter(Mandatory = $false)]
-    [bool]$ForceChangePassword = $true
+    [bool]$ForceChangePassword = $true,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -DryRun makes no changes - read-only checks still run, mutating calls are skipped.
+if ($DryRun) {
+    Write-Host 'DRY RUN enabled - read-only checks run, but no changes will be made.' -ForegroundColor Magenta
+}
 
 #region Shared helpers ---------------------------------------------------------
 
@@ -83,9 +99,9 @@ function Resolve-MigrationOutputDirectory {
         $resolved = $Path
     }
     else {
-        $appData = $env:APPDATA
+        $appData = $env:LOCALAPPDATA
         if ([string]::IsNullOrWhiteSpace($appData)) {
-            $appData = [Environment]::GetFolderPath('ApplicationData')
+            $appData = [Environment]::GetFolderPath('LocalApplicationData')
         }
         if ([string]::IsNullOrWhiteSpace($appData)) {
             $appData = Join-Path -Path $HOME -ChildPath '.local/share'
@@ -281,7 +297,7 @@ foreach ($row in $rows) {
             $state = Get-CsvValue -Record $row -Column $col.State;    if ($state) { $params['State'] = $state }
             $country = Get-CsvValue -Record $row -Column $col.Country; if ($country) { $params['Country'] = $country }
 
-            if ($PSCmdlet.ShouldProcess($upn, 'Create Microsoft 365 user')) {
+            if (-not $DryRun -and $PSCmdlet.ShouldProcess($upn, 'Create Microsoft 365 user')) {
                 New-MgUser @params | Out-Null
                 $detail = 'User created.'
             }

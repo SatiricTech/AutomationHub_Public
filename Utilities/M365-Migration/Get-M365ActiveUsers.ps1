@@ -28,8 +28,14 @@
 
 .PARAMETER OutputPath
     Directory where the CSV is written. If omitted, the script defaults to
-    "<AppData>\Migration-Automations", prints that path, and asks you to
+    "<LocalAppData>\Migration-Automations", prints that path, and asks you to
     confirm it or supply a different directory.
+
+.PARAMETER Prefix
+    Text prepended to the output file name (e.g. 'Contoso' ->
+    'Contoso_M365-ActiveUsers_...'). If omitted, you are asked whether you want
+    a custom prefix; if not, you are asked whether this is the Source or
+    Destination tenant and that label is used instead.
 
 .PARAMETER IncludeGuests
     Also include guest (external) user accounts. By default only member
@@ -42,6 +48,11 @@
 .PARAMETER SkipMailboxStats
     Skip the per-user Exchange Online mailbox size lookup. Use this for a much
     faster run when mailbox sizing is not needed.
+
+.PARAMETER DryRun
+    Preview only - resolve the prefix and output location and print the planned
+    output file, then exit without connecting to Microsoft 365 or writing any
+    file.
 
 .EXAMPLE
     .\Get-M365ActiveUsers.ps1
@@ -66,13 +77,19 @@ param(
     [string]$OutputPath,
 
     [Parameter(Mandatory = $false)]
+    [string]$Prefix,
+
+    [Parameter(Mandatory = $false)]
     [switch]$IncludeGuests,
 
     [Parameter(Mandatory = $false)]
     [switch]$IncludeDisabled,
 
     [Parameter(Mandatory = $false)]
-    [switch]$SkipMailboxStats
+    [switch]$SkipMailboxStats,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,7 +99,7 @@ $ErrorActionPreference = 'Stop'
 function Resolve-MigrationOutputDirectory {
     <#
         Returns a usable output directory. If -Path is supplied it is used as-is.
-        Otherwise the user is shown the default (<AppData>\Migration-Automations)
+        Otherwise the user is shown the default (<LocalAppData>\Migration-Automations)
         and asked to accept it or provide another. The directory is created if
         it does not exist.
     #>
@@ -95,9 +112,9 @@ function Resolve-MigrationOutputDirectory {
         $resolved = $Path
     }
     else {
-        $appData = $env:APPDATA
+        $appData = $env:LOCALAPPDATA
         if ([string]::IsNullOrWhiteSpace($appData)) {
-            $appData = [Environment]::GetFolderPath('ApplicationData')
+            $appData = [Environment]::GetFolderPath('LocalApplicationData')
         }
         if ([string]::IsNullOrWhiteSpace($appData)) {
             $appData = Join-Path -Path $HOME -ChildPath '.local/share'
@@ -163,6 +180,52 @@ function Initialize-RequiredModule {
     Install-Module -Name $Name -Scope CurrentUser -Force -AllowClobber
 }
 
+function Format-FilePrefix {
+    <# Strips characters that are unsafe in file names and trims separators. #>
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return ($Value -replace '[^A-Za-z0-9._-]', '').Trim('_', '.', '-', ' ')
+}
+
+function Resolve-FilePrefix {
+    <#
+        Determines the file-name prefix. If -Value is supplied it is sanitised
+        and used. Otherwise the user is asked whether to use a custom prefix; if
+        not, whether this is the Source or Destination tenant - that label
+        becomes the prefix so file names are self-describing.
+    #>
+    [CmdletBinding()]
+    param([string]$Value)
+
+    if (-not [string]::IsNullOrWhiteSpace($Value)) {
+        $clean = Format-FilePrefix -Value $Value
+        if ($clean) { return $clean }
+        Write-Host "Provided prefix '$Value' was empty after cleanup; falling back to a prompt." -ForegroundColor Yellow
+    }
+
+    Write-Host ''
+    while ($true) {
+        $answer = ((Read-Host 'Add a custom file-name prefix? [Y] Yes  [N] No (label as Source/Destination)') ?? '').Trim()
+        if ($answer -match '^(y|yes)$') {
+            $custom = ((Read-Host 'Enter the prefix to use') ?? '').Trim()
+            $clean = Format-FilePrefix -Value $custom
+            if ($clean) { return $clean }
+            Write-Host 'Prefix was empty after cleanup - please try again.' -ForegroundColor Red
+        }
+        elseif ($answer -match '^(n|no)$') {
+            while ($true) {
+                $sd = ((Read-Host 'Is this the [S]ource or [D]estination tenant?') ?? '').Trim()
+                if ($sd -match '^(s|source)$') { return 'Source' }
+                if ($sd -match '^(d|destination)$') { return 'Destination' }
+                Write-Host 'Please enter S or D.' -ForegroundColor Red
+            }
+        }
+        else {
+            Write-Host 'Please answer Y or N.' -ForegroundColor Red
+        }
+    }
+}
+
 #endregion ---------------------------------------------------------------------
 
 # Common SKU friendly names. Anything not listed falls back to its SkuPartNumber.
@@ -204,9 +267,18 @@ function Get-FriendlySkuName {
 
 Write-Host '=== Microsoft 365 Active User Export ===' -ForegroundColor Cyan
 
+$filePrefix = Resolve-FilePrefix -Value $Prefix
 $outputDir = Resolve-MigrationOutputDirectory -Path $OutputPath
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$csvPath = Join-Path -Path $outputDir -ChildPath "M365-ActiveUsers_$timestamp.csv"
+$csvPath = Join-Path -Path $outputDir -ChildPath "${filePrefix}_M365-ActiveUsers_$timestamp.csv"
+
+if ($DryRun) {
+    Write-Host ''
+    Write-Host 'DRY RUN - no connection or file write will occur.' -ForegroundColor Magenta
+    Write-Host 'Would connect to Microsoft Graph + Exchange Online and export active users.' -ForegroundColor Magenta
+    Write-Host "Planned output file: $csvPath" -ForegroundColor Magenta
+    return
+}
 
 Initialize-RequiredModule -Name 'Microsoft.Graph.Users'
 Initialize-RequiredModule -Name 'Microsoft.Graph.Identity.DirectoryManagement'

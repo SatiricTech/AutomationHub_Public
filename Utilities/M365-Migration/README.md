@@ -20,9 +20,10 @@ tools (and into each other).
 |--------|--------|
 | **PowerShell** | Requires PowerShell 7. |
 | **Authentication** | Interactive sign-in via `Connect-MgGraph` / `Connect-ExchangeOnline`. You are prompted at runtime. |
-| **Output location** | Every script takes `-OutputPath`. If omitted, it defaults to `%AppData%\Migration-Automations`, prints that path, and asks you to confirm it or supply another directory. |
+| **Output location** | Every script takes `-OutputPath`. If omitted, it defaults to `%LocalAppData%\Migration-Automations` (always writable by the current user, no roaming), prints that path, and asks you to confirm it or supply another directory. |
+| **File naming (Get scripts)** | `Get-M365ActiveUsers` and `Get-ExchangeMailboxes` take `-Prefix`. If omitted, they ask whether you want a custom prefix; if not, whether the pull is the **Source** or **Destination** tenant. The chosen label is prepended to every output file (e.g. `Source_M365-ActiveUsers_...csv`, `Destination_Exchange-Mailboxes-Full_...csv`) so files are self-describing. |
 | **Modules** | Required modules (`Microsoft.Graph.*`, `ExchangeOnlineManagement`) are auto-installed for the current user if missing. |
-| **Safety** | Scripts that change the tenant support `-WhatIf` / `-Confirm`. Run with `-WhatIf` first. |
+| **Safety / dry run** | Every script takes `-DryRun`. On the tenant-changing scripts it forces WhatIf mode (each row is evaluated and reported, nothing is changed) and is equivalent to `-WhatIf`/`-Confirm`, which are also supported. On the read-only export/compare scripts it resolves the plan (prefix, output path, row counts) and prints the would-be output files without connecting or writing. Always dry-run first. |
 | **Column detection** | CSV-driven scripts auto-detect common headers (UPN/UserPrincipalName, Email/PrimaryEmail, FirstName/GivenName, LastName/Surname, DisplayName), so exports from this toolkit or most migration tools work directly. |
 
 ---
@@ -36,7 +37,7 @@ OneDrive used/total, directory roles, groups, phone numbers, job title,
 department, office and account metadata. All storage in **GB**.
 
 ```powershell
-.\Get-M365ActiveUsers.ps1 -OutputPath C:\Migrations\Contoso
+.\Get-M365ActiveUsers.ps1 -OutputPath C:\Migrations\Contoso -Prefix Source
 ```
 
 ### 2. `Get-ExchangeMailboxes.ps1`
@@ -45,7 +46,7 @@ Exports every Exchange Online mailbox. Produces a **full** CSV (all
 migration mapping. Sizes in GB.
 
 ```powershell
-.\Get-ExchangeMailboxes.ps1 -RecipientTypeDetails SharedMailbox
+.\Get-ExchangeMailboxes.ps1 -Prefix Destination -RecipientTypeDetails SharedMailbox
 ```
 
 ### 3. `Compare-MigrationUserData.ps1`
@@ -64,7 +65,7 @@ row has none, records every result, and writes generated passwords to a results
 CSV. Existing UPNs are skipped.
 
 ```powershell
-.\New-MigrationUsers.ps1 -CsvPath .\NewUsers.csv -WhatIf
+.\New-MigrationUsers.ps1 -CsvPath .\NewUsers.csv -DryRun
 ```
 
 ### 5. `New-MigrationSharedMailboxes.ps1`
@@ -72,7 +73,7 @@ Bulk-creates Exchange Online shared mailboxes from a CSV, optionally adding
 alias addresses and Full Access / Send As permissions.
 
 ```powershell
-.\New-MigrationSharedMailboxes.ps1 -CsvPath .\Shared.csv -WhatIf
+.\New-MigrationSharedMailboxes.ps1 -CsvPath .\Shared.csv -DryRun
 ```
 
 ### 6. `Set-MigrationUserPrincipalNames.ps1`
@@ -82,7 +83,7 @@ account by email/UPN, and rewrites the UPN. Prompts for the scheme if `-Scheme`
 is omitted.
 
 ```powershell
-.\Set-MigrationUserPrincipalNames.ps1 -CsvPath .\Users.csv -Scheme FLast -WhatIf
+.\Set-MigrationUserPrincipalNames.ps1 -CsvPath .\Users.csv -Scheme FLast -DryRun
 ```
 
 ### 7. `Set-MailboxPrimaryAddress.ps1`
@@ -91,7 +92,7 @@ pairing UPN with the desired primary email. Keeps the old address as an alias
 by default.
 
 ```powershell
-.\Set-MailboxPrimaryAddress.ps1 -CsvPath .\PrimaryMap.csv -WhatIf
+.\Set-MailboxPrimaryAddress.ps1 -CsvPath .\PrimaryMap.csv -DryRun
 ```
 
 ---
@@ -122,5 +123,5 @@ required.
 6. **Fix addressing**: `Set-MailboxPrimaryAddress` where the primary email must
    differ from the UPN.
 
-> Always dry-run tenant-changing scripts with `-WhatIf` first, and store any
+> Always dry-run tenant-changing scripts with `-DryRun` (or `-WhatIf`) first, and store any
 > results CSV containing generated passwords securely.

@@ -40,7 +40,14 @@
 
 .PARAMETER OutputPath
     Directory where the results CSV is written. If omitted, defaults to
-    "<AppData>\Migration-Automations" after confirming with you.
+    "<LocalAppData>\Migration-Automations" after confirming with you.
+
+.PARAMETER DryRun
+    Preview only - make no changes. Equivalent to -WhatIf: every row is
+    evaluated and the computed new UPN reported, but no account is modified.
+
+.EXAMPLE
+    .\Set-MigrationUserPrincipalNames.ps1 -CsvPath .\Users.csv -Scheme FLast -DryRun
 
 .EXAMPLE
     .\Set-MigrationUserPrincipalNames.ps1 -CsvPath .\Users.csv -Scheme FLast -WhatIf
@@ -67,10 +74,18 @@ param(
     [string]$DomainSuffix,
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -DryRun makes no changes - read-only checks still run, mutating calls are skipped.
+if ($DryRun) {
+    Write-Host 'DRY RUN enabled - read-only checks run, but no changes will be made.' -ForegroundColor Magenta
+}
 
 #region Shared helpers ---------------------------------------------------------
 
@@ -82,9 +97,9 @@ function Resolve-MigrationOutputDirectory {
         $resolved = $Path
     }
     else {
-        $appData = $env:APPDATA
+        $appData = $env:LOCALAPPDATA
         if ([string]::IsNullOrWhiteSpace($appData)) {
-            $appData = [Environment]::GetFolderPath('ApplicationData')
+            $appData = [Environment]::GetFolderPath('LocalApplicationData')
         }
         if ([string]::IsNullOrWhiteSpace($appData)) {
             $appData = Join-Path -Path $HOME -ChildPath '.local/share'
@@ -286,7 +301,7 @@ foreach ($row in $rows) {
             $status = 'Skipped'
             $detail = 'UPN already matches the target scheme.'
         }
-        elseif ($PSCmdlet.ShouldProcess($account.UserPrincipalName, "Update UPN to $newUpn")) {
+        elseif (-not $DryRun -and $PSCmdlet.ShouldProcess($account.UserPrincipalName, "Update UPN to $newUpn")) {
             Update-MgUser -UserId $account.Id -UserPrincipalName $newUpn
             $detail = 'UPN updated.'
         }
