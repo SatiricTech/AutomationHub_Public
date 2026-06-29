@@ -43,6 +43,14 @@
 .PARAMETER ForceChangePassword
     Require the user to change their password at next sign-in. Default $true.
 
+.PARAMETER DryRun
+    Preview only - make no changes. Equivalent to -WhatIf: every row is
+    evaluated and reported (Would create / already exists / etc.) but no user
+    is created.
+
+.EXAMPLE
+    .\New-MigrationUsers.ps1 -CsvPath .\NewUsers.csv -DryRun
+
 .EXAMPLE
     .\New-MigrationUsers.ps1 -CsvPath .\NewUsers.csv -WhatIf
 
@@ -68,10 +76,18 @@ param(
     [string]$DefaultUsageLocation = 'US',
 
     [Parameter(Mandatory = $false)]
-    [bool]$ForceChangePassword = $true
+    [bool]$ForceChangePassword = $true,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -DryRun makes no changes - read-only checks still run, mutating calls are skipped.
+if ($DryRun) {
+    Write-Host 'DRY RUN enabled - read-only checks run, but no changes will be made.' -ForegroundColor Magenta
+}
 
 #region Shared helpers ---------------------------------------------------------
 
@@ -281,7 +297,7 @@ foreach ($row in $rows) {
             $state = Get-CsvValue -Record $row -Column $col.State;    if ($state) { $params['State'] = $state }
             $country = Get-CsvValue -Record $row -Column $col.Country; if ($country) { $params['Country'] = $country }
 
-            if ($PSCmdlet.ShouldProcess($upn, 'Create Microsoft 365 user')) {
+            if (-not $DryRun -and $PSCmdlet.ShouldProcess($upn, 'Create Microsoft 365 user')) {
                 New-MgUser @params | Out-Null
                 $detail = 'User created.'
             }

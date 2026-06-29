@@ -42,6 +42,10 @@
     Display-name similarity (0.0 - 1.0) at/above which two non-identical names
     are treated as a "SimilarName" partial match. Default 0.85.
 
+.PARAMETER DryRun
+    Preview only - load both CSVs, report the detected columns, row counts and
+    planned output file, then exit without writing the comparison CSV.
+
 .PARAMETER UpnColumn
 .PARAMETER EmailColumn
 .PARAMETER FirstNameColumn
@@ -76,6 +80,9 @@ param(
     [Parameter(Mandatory = $false)]
     [ValidateRange(0.0, 1.0)]
     [double]$SimilarityThreshold = 0.85,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun,
 
     [Parameter(Mandatory = $false)]
     [string]$UpnColumn,
@@ -246,6 +253,14 @@ $cols = @{
 Write-Host 'Detected columns:' -ForegroundColor Cyan
 Write-Host ("  Reference -> UPN:{0} Email:{1} First:{2} Last:{3} Name:{4}" -f $cols.RefUpn, $cols.RefEmail, $cols.RefFirst, $cols.RefLast, $cols.RefName)
 Write-Host ("  Difference-> UPN:{0} Email:{1} First:{2} Last:{3} Name:{4}" -f $cols.DifUpn, $cols.DifEmail, $cols.DifFirst, $cols.DifLast, $cols.DifName)
+
+if ($DryRun) {
+    Write-Host ''
+    Write-Host 'DRY RUN - no comparison CSV will be written.' -ForegroundColor Magenta
+    Write-Host "Would compare $($reference.Count) reference row(s) against $($difference.Count) target row(s)." -ForegroundColor Magenta
+    Write-Host "Planned output file: $csvPath" -ForegroundColor Magenta
+    return
+}
 
 # Pre-normalize the difference set once.
 $difIndex = foreach ($d in $difference) {

@@ -42,6 +42,13 @@
     Directory where the results CSV is written. If omitted, defaults to
     "<LocalAppData>\Migration-Automations" after confirming with you.
 
+.PARAMETER DryRun
+    Preview only - make no changes. Equivalent to -WhatIf: every row is
+    evaluated and the computed new UPN reported, but no account is modified.
+
+.EXAMPLE
+    .\Set-MigrationUserPrincipalNames.ps1 -CsvPath .\Users.csv -Scheme FLast -DryRun
+
 .EXAMPLE
     .\Set-MigrationUserPrincipalNames.ps1 -CsvPath .\Users.csv -Scheme FLast -WhatIf
 
@@ -67,10 +74,18 @@ param(
     [string]$DomainSuffix,
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -DryRun makes no changes - read-only checks still run, mutating calls are skipped.
+if ($DryRun) {
+    Write-Host 'DRY RUN enabled - read-only checks run, but no changes will be made.' -ForegroundColor Magenta
+}
 
 #region Shared helpers ---------------------------------------------------------
 
@@ -286,7 +301,7 @@ foreach ($row in $rows) {
             $status = 'Skipped'
             $detail = 'UPN already matches the target scheme.'
         }
-        elseif ($PSCmdlet.ShouldProcess($account.UserPrincipalName, "Update UPN to $newUpn")) {
+        elseif (-not $DryRun -and $PSCmdlet.ShouldProcess($account.UserPrincipalName, "Update UPN to $newUpn")) {
             Update-MgUser -UserId $account.Id -UserPrincipalName $newUpn
             $detail = 'UPN updated.'
         }

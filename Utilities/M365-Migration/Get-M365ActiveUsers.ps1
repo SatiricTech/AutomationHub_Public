@@ -49,6 +49,11 @@
     Skip the per-user Exchange Online mailbox size lookup. Use this for a much
     faster run when mailbox sizing is not needed.
 
+.PARAMETER DryRun
+    Preview only - resolve the prefix and output location and print the planned
+    output file, then exit without connecting to Microsoft 365 or writing any
+    file.
+
 .EXAMPLE
     .\Get-M365ActiveUsers.ps1
 
@@ -81,7 +86,10 @@ param(
     [switch]$IncludeDisabled,
 
     [Parameter(Mandatory = $false)]
-    [switch]$SkipMailboxStats
+    [switch]$SkipMailboxStats,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -263,6 +271,14 @@ $filePrefix = Resolve-FilePrefix -Value $Prefix
 $outputDir = Resolve-MigrationOutputDirectory -Path $OutputPath
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $csvPath = Join-Path -Path $outputDir -ChildPath "${filePrefix}_M365-ActiveUsers_$timestamp.csv"
+
+if ($DryRun) {
+    Write-Host ''
+    Write-Host 'DRY RUN - no connection or file write will occur.' -ForegroundColor Magenta
+    Write-Host 'Would connect to Microsoft Graph + Exchange Online and export active users.' -ForegroundColor Magenta
+    Write-Host "Planned output file: $csvPath" -ForegroundColor Magenta
+    return
+}
 
 Initialize-RequiredModule -Name 'Microsoft.Graph.Users'
 Initialize-RequiredModule -Name 'Microsoft.Graph.Identity.DirectoryManagement'

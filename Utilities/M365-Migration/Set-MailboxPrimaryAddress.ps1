@@ -38,6 +38,14 @@
     Turn off the Email Address Policy on each mailbox before changing the
     address, so the new primary is not reverted by policy.
 
+.PARAMETER DryRun
+    Preview only - make no changes. Equivalent to -WhatIf: every row is
+    evaluated and the planned primary-address change reported, but no mailbox
+    is modified.
+
+.EXAMPLE
+    .\Set-MailboxPrimaryAddress.ps1 -CsvPath .\PrimaryMap.csv -DryRun
+
 .EXAMPLE
     .\Set-MailboxPrimaryAddress.ps1 -CsvPath .\PrimaryMap.csv -WhatIf
 
@@ -63,10 +71,18 @@ param(
     [switch]$RemoveOldPrimaryAlias,
 
     [Parameter(Mandatory = $false)]
-    [switch]$DisableEmailAddressPolicy
+    [switch]$DisableEmailAddressPolicy,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -DryRun makes no changes - read-only checks still run, mutating calls are skipped.
+if ($DryRun) {
+    Write-Host 'DRY RUN enabled - read-only checks run, but no changes will be made.' -ForegroundColor Magenta
+}
 
 #region Shared helpers ---------------------------------------------------------
 
@@ -207,7 +223,7 @@ foreach ($row in $rows) {
             $status = 'Skipped'
             $detail = 'Primary address already set.'
         }
-        elseif ($PSCmdlet.ShouldProcess($upn, "Set primary SMTP to $newPrimary")) {
+        elseif (-not $DryRun -and $PSCmdlet.ShouldProcess($upn, "Set primary SMTP to $newPrimary")) {
             if ($DisableEmailAddressPolicy -and $mailbox.EmailAddressPolicyEnabled) {
                 Set-Mailbox -Identity $upn -EmailAddressPolicyEnabled $false -ErrorAction Stop
                 $detail += 'Disabled email address policy. '

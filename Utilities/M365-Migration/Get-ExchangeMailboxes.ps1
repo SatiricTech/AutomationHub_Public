@@ -39,6 +39,11 @@
 .PARAMETER SkipStatistics
     Skip the per-mailbox Get-MailboxStatistics lookup for a faster run.
 
+.PARAMETER DryRun
+    Preview only - resolve the prefix and output location and print the planned
+    output files, then exit without connecting to Exchange Online or writing any
+    file.
+
 .EXAMPLE
     .\Get-ExchangeMailboxes.ps1
 
@@ -64,7 +69,10 @@ param(
     [string[]]$RecipientTypeDetails = @('UserMailbox', 'SharedMailbox', 'RoomMailbox', 'EquipmentMailbox'),
 
     [Parameter(Mandatory = $false)]
-    [switch]$SkipStatistics
+    [switch]$SkipStatistics,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -199,6 +207,16 @@ $outputDir = Resolve-MigrationOutputDirectory -Path $OutputPath
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $fullCsv = Join-Path -Path $outputDir -ChildPath "${filePrefix}_Exchange-Mailboxes-Full_$timestamp.csv"
 $summaryCsv = Join-Path -Path $outputDir -ChildPath "${filePrefix}_Exchange-Mailboxes-Summary_$timestamp.csv"
+
+if ($DryRun) {
+    Write-Host ''
+    Write-Host 'DRY RUN - no connection or file write will occur.' -ForegroundColor Magenta
+    Write-Host 'Would connect to Exchange Online and export all mailboxes.' -ForegroundColor Magenta
+    Write-Host "Planned output files:" -ForegroundColor Magenta
+    Write-Host "  Full    : $fullCsv" -ForegroundColor Magenta
+    Write-Host "  Summary : $summaryCsv" -ForegroundColor Magenta
+    return
+}
 
 Initialize-RequiredModule -Name 'ExchangeOnlineManagement'
 

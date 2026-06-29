@@ -35,6 +35,13 @@
     Directory where the results CSV is written. If omitted, defaults to
     "<LocalAppData>\Migration-Automations" after confirming with you.
 
+.PARAMETER DryRun
+    Preview only - make no changes. Equivalent to -WhatIf: every row is
+    evaluated and reported but no mailbox, alias or permission is created.
+
+.EXAMPLE
+    .\New-MigrationSharedMailboxes.ps1 -CsvPath .\Shared.csv -DryRun
+
 .EXAMPLE
     .\New-MigrationSharedMailboxes.ps1 -CsvPath .\Shared.csv -WhatIf
 
@@ -54,10 +61,18 @@ param(
     [string]$CsvPath,
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -DryRun makes no changes - read-only checks still run, mutating calls are skipped.
+if ($DryRun) {
+    Write-Host 'DRY RUN enabled - read-only checks run, but no changes will be made.' -ForegroundColor Magenta
+}
 
 #region Shared helpers ---------------------------------------------------------
 
@@ -208,7 +223,7 @@ foreach ($row in $rows) {
             $status = 'Exists'
             $detail.Add('Mailbox already exists.')
         }
-        elseif ($PSCmdlet.ShouldProcess($smtp, 'Create shared mailbox')) {
+        elseif (-not $DryRun -and $PSCmdlet.ShouldProcess($smtp, 'Create shared mailbox')) {
             New-Mailbox -Shared -Name $displayName -DisplayName $displayName `
                 -PrimarySmtpAddress $smtp -Alias $alias | Out-Null
             $detail.Add('Shared mailbox created.')
@@ -218,8 +233,11 @@ foreach ($row in $rows) {
             $detail.Add('Would create shared mailbox.')
         }
 
-        # Apply aliases / hidden flag / permissions for real (non-WhatIf) runs.
-        if ($status -in @('Created', 'Exists')) {
+        # Apply aliases / hidden flag / permissions for real (non-dry) runs.
+        if ($DryRun -and $status -in @('Created', 'Exists')) {
+            $detail.Add('Dry run: alias/permission changes skipped.')
+        }
+        elseif ($status -in @('Created', 'Exists')) {
             $aliasAddresses = Split-List -Value (Get-CsvValue -Record $row -Column $col.Aliases)
             if ($aliasAddresses.Count -gt 0) {
                 Set-Mailbox -Identity $smtp -EmailAddresses @{ Add = $aliasAddresses } -ErrorAction Stop
