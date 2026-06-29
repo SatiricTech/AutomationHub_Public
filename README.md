@@ -81,11 +81,18 @@ Mirrors the top-level structure for cross-platform parity. Add Mac scripts in th
 | [`Utilities/`](macOS/Utilities/) | | *Ready for future Mac utility scripts* |
 
 ### [`Utilities/`](Utilities/) - General Tools
-| Scripts | Description |
-|---------|-------------|
-| `Mount-SysInternals.bat` | Map network drive to live Sysinternals tools |
-| `Remove-SysInternals.bat` | Unmount Sysinternals network drive |
-| `Send-UserNotification.ps1` | Display a notification message to the user |
+| Folder | Scripts | Description |
+|--------|---------|-------------|
+| | `Mount-SysInternals.bat` | Map network drive to live Sysinternals tools |
+| | `Remove-SysInternals.bat` | Unmount Sysinternals network drive |
+| | `Send-UserNotification.ps1` | Display a notification message to the user |
+| [`M365-Migration/`](Utilities/M365-Migration/) | `Get-M365ActiveUsers.ps1` | Export all active M365 users (licenses, devices, mailbox/OneDrive size in GB, roles, groups) to CSV |
+| | `Get-ExchangeMailboxes.ps1` | Export all Exchange Online mailboxes (full + summary CSVs) |
+| | `Compare-MigrationUserData.ps1` | Compare two user CSVs and flag Exact/Partial matches with what matched |
+| | `New-MigrationUsers.ps1` | Bulk-create Entra ID users from a CSV (generates passwords) |
+| | `New-MigrationSharedMailboxes.ps1` | Bulk-create shared mailboxes from a CSV (aliases + permissions) |
+| | `Set-MigrationUserPrincipalNames.ps1` | Standardise UPNs to First.Last / FLast / FirstLast / F.Last from a CSV |
+| | `Set-MailboxPrimaryAddress.ps1` | Set mailbox primary SMTP independent of UPN from a CSV |
 
 ---
 
