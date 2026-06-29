@@ -29,7 +29,7 @@
 
 .PARAMETER OutputPath
     Directory where the results CSV is written. If omitted, defaults to
-    "<AppData>\Migration-Automations" after confirming with you.
+    "<LocalAppData>\Migration-Automations" after confirming with you.
 
 .PARAMETER RemoveOldPrimaryAlias
     Remove the former primary address instead of keeping it as an alias.
@@ -78,9 +78,9 @@ function Resolve-MigrationOutputDirectory {
         $resolved = $Path
     }
     else {
-        $appData = $env:APPDATA
+        $appData = $env:LOCALAPPDATA
         if ([string]::IsNullOrWhiteSpace($appData)) {
-            $appData = [Environment]::GetFolderPath('ApplicationData')
+            $appData = [Environment]::GetFolderPath('LocalApplicationData')
         }
         if ([string]::IsNullOrWhiteSpace($appData)) {
             $appData = Join-Path -Path $HOME -ChildPath '.local/share'

@@ -33,7 +33,7 @@
 
 .PARAMETER OutputPath
     Directory where the results CSV (including any generated passwords) is
-    written. If omitted, defaults to "<AppData>\Migration-Automations" after
+    written. If omitted, defaults to "<LocalAppData>\Migration-Automations" after
     confirming with you.
 
 .PARAMETER DefaultUsageLocation
@@ -83,9 +83,9 @@ function Resolve-MigrationOutputDirectory {
         $resolved = $Path
     }
     else {
-        $appData = $env:APPDATA
+        $appData = $env:LOCALAPPDATA
         if ([string]::IsNullOrWhiteSpace($appData)) {
-            $appData = [Environment]::GetFolderPath('ApplicationData')
+            $appData = [Environment]::GetFolderPath('LocalApplicationData')
         }
         if ([string]::IsNullOrWhiteSpace($appData)) {
             $appData = Join-Path -Path $HOME -ChildPath '.local/share'

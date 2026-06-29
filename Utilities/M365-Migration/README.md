@@ -20,7 +20,8 @@ tools (and into each other).
 |--------|--------|
 | **PowerShell** | Requires PowerShell 7. |
 | **Authentication** | Interactive sign-in via `Connect-MgGraph` / `Connect-ExchangeOnline`. You are prompted at runtime. |
-| **Output location** | Every script takes `-OutputPath`. If omitted, it defaults to `%AppData%\Migration-Automations`, prints that path, and asks you to confirm it or supply another directory. |
+| **Output location** | Every script takes `-OutputPath`. If omitted, it defaults to `%LocalAppData%\Migration-Automations` (always writable by the current user, no roaming), prints that path, and asks you to confirm it or supply another directory. |
+| **File naming (Get scripts)** | `Get-M365ActiveUsers` and `Get-ExchangeMailboxes` take `-Prefix`. If omitted, they ask whether you want a custom prefix; if not, whether the pull is the **Source** or **Destination** tenant. The chosen label is prepended to every output file (e.g. `Source_M365-ActiveUsers_...csv`, `Destination_Exchange-Mailboxes-Full_...csv`) so files are self-describing. |
 | **Modules** | Required modules (`Microsoft.Graph.*`, `ExchangeOnlineManagement`) are auto-installed for the current user if missing. |
 | **Safety** | Scripts that change the tenant support `-WhatIf` / `-Confirm`. Run with `-WhatIf` first. |
 | **Column detection** | CSV-driven scripts auto-detect common headers (UPN/UserPrincipalName, Email/PrimaryEmail, FirstName/GivenName, LastName/Surname, DisplayName), so exports from this toolkit or most migration tools work directly. |
@@ -36,7 +37,7 @@ OneDrive used/total, directory roles, groups, phone numbers, job title,
 department, office and account metadata. All storage in **GB**.
 
 ```powershell
-.\Get-M365ActiveUsers.ps1 -OutputPath C:\Migrations\Contoso
+.\Get-M365ActiveUsers.ps1 -OutputPath C:\Migrations\Contoso -Prefix Source
 ```
 
 ### 2. `Get-ExchangeMailboxes.ps1`
@@ -45,7 +46,7 @@ Exports every Exchange Online mailbox. Produces a **full** CSV (all
 migration mapping. Sizes in GB.
 
 ```powershell
-.\Get-ExchangeMailboxes.ps1 -RecipientTypeDetails SharedMailbox
+.\Get-ExchangeMailboxes.ps1 -Prefix Destination -RecipientTypeDetails SharedMailbox
 ```
 
 ### 3. `Compare-MigrationUserData.ps1`
