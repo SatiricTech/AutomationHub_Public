@@ -86,8 +86,7 @@ Mirrors the top-level structure for cross-platform parity. Add Mac scripts in th
 | | `Mount-SysInternals.bat` | Map network drive to live Sysinternals tools |
 | | `Remove-SysInternals.bat` | Unmount Sysinternals network drive |
 | | `Send-UserNotification.ps1` | Display a notification message to the user |
-| [`M365-Migration/`](Utilities/M365-Migration/) | `Get-M365ActiveUsers.ps1` | Export all active M365 users (licenses, devices, mailbox/OneDrive size in GB, roles, groups) to CSV |
-| | `Get-ExchangeMailboxes.ps1` | Export all Exchange Online mailboxes (full + summary CSVs) |
+| [`M365-Migration/`](Utilities/M365-Migration/) | `Get-MigrationInventory.ps1` | Pull one tenant into a single Excel workbook + per-tab CSVs: User Mailboxes, Shared Mailboxes, M365 Users, Summary, Teams & Groups |
 | | `Compare-MigrationUserData.ps1` | Compare two user CSVs and flag Exact/Partial matches with what matched |
 | | `New-MigrationUsers.ps1` | Bulk-create Entra ID users from a CSV (generates passwords) |
 | | `New-MigrationSharedMailboxes.ps1` | Bulk-create shared mailboxes from a CSV (aliases + permissions) |

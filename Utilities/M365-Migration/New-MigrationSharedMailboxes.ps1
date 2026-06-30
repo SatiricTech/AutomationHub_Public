@@ -9,8 +9,8 @@
 .DESCRIPTION
     Connects to Exchange Online (interactive sign-in) and creates one shared
     mailbox per CSV row. Column headers are auto-detected so exports from this
-    toolkit (e.g. the shared-mailbox rows of Get-ExchangeMailboxes) or most
-    migration tools work directly.
+    toolkit (e.g. the Shared Mailboxes tab/CSV from Get-MigrationInventory) or
+    most migration tools work directly.
 
     Recognised columns (first match wins, case-insensitive):
       - PrimarySmtpAddress / Email / PrimaryEmail     (required)
