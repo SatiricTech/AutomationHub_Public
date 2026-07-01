@@ -3,6 +3,21 @@
 A curated collection of IT automation scripts for MSPs, MSSPs, and IT professionals. Designed for real-world deployment across managed environments.
 
 > **License:** GNU GPLv3 - Free to use, modify, and distribute with attribution.
+>
+> # ⚠️ Disclaimer & Terms of Use
+
+> **TL;DR:** All scripts, configurations, and tools in this repository are provided **"as-is"** without any warranty of any kind. **Use at your own risk.**
+
+---
+
+### Please Read Before Running Anything Here:
+
+* **Production vs. Testing:** While I make every effort to keep work-in-progress or experimental scripts out of this main repository until they are relatively production-ready, mistakes can happen. 
+* **Edge Cases & Scope:** Some tools here were built specifically to solve an immediate, highly specific need of mine. They may not account for environmental edge cases, specific user permissions, or unique infrastructure configurations that differ from my own. It *will* break something if run blindly.
+* **Maintenance & Support:** This repository is maintained on a "best-effort" basis. I do not actively monitor, update, or maintain these scripts unless I personally encounter an issue or a bug that affects my own daily workflows. 
+
+### Liability
+By downloading, copying, or executing any code found within this repository, you acknowledge and agree that **I am not responsible for any damage, data loss, downtime, or security incidents** that may occur in your environment. Always review, test, and vet scripts in a isolated sandbox environment before running them anywhere near production.
 
 ---
 
