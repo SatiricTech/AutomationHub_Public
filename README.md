@@ -2,7 +2,8 @@
 
 A curated collection of IT automation scripts for MSPs, MSSPs, and IT professionals. Designed for real-world deployment across managed environments.
 
-> **License:** GNU GPLv3 - Free to use, modify, and distribute with attribution.
+**License:** GNU GPLv3 - Free to use, modify, and distribute with attribution.
+
 >
 > # ⚠️ Disclaimer & Terms of Use
 
