@@ -99,6 +99,28 @@ by default.
 .\Set-MailboxPrimaryAddress.ps1 -CsvPath .\PrimaryMap.csv -DryRun
 ```
 
+### 7. `Reset-MigrationCutoverPasswords.ps1`
+Cutover password reset. Targets users either from a **CSV** or from an **Entra
+security group** (by object ID or display name — *not* the group's email), and
+resets each to a freshly generated **passphrase** (at least 3 words, one word
+capitalised, one number, one special character — e.g. `Silver-Copper-lantern74!`).
+Every reset account is set to **change password at next sign-in**, and every
+changed credential (username + passphrase) is logged to a CSV in the current
+directory. Each user gets a unique passphrase. `-TestUser` rehearses the flow
+against a single account; `-DryRun` reports who would be affected without
+changing anything or emitting a credential.
+
+```powershell
+# Preview from a CSV - no changes
+.\Reset-MigrationCutoverPasswords.ps1 -CsvPath .\CutoverUsers.csv -DryRun
+
+# Reset every user member of a security group (by name or object ID)
+.\Reset-MigrationCutoverPasswords.ps1 -Group "Migration Wave 1"
+
+# Rehearse against one user
+.\Reset-MigrationCutoverPasswords.ps1 -TestUser john.smith@contoso.com
+```
+
 ---
 
 ## Expected CSV columns
@@ -113,6 +135,7 @@ required.
 | `New-MigrationSharedMailboxes` | **PrimarySmtpAddress** *(Email)*, **DisplayName**, Alias, AliasAddresses, FullAccess, SendAs, HiddenFromAddressLists |
 | `Set-MigrationUserPrincipalNames` | **UPN** *(current, also matches Email)*, **FirstName**, **LastName** |
 | `Set-MailboxPrimaryAddress` | **UPN** *(UserPrincipalName)*, **PrimaryEmail** *(Email/PrimarySmtpAddress)* |
+| `Reset-MigrationCutoverPasswords` | **UPN** *(UserPrincipalName/UPN/Email/PrimaryEmail/Mail/UserName)* — only when using `-CsvPath`; `-Group`/`-TestUser` need no CSV |
 
 ---
 
