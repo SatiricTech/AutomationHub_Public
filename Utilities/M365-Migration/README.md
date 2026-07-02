@@ -121,6 +121,12 @@ changing anything or emitting a credential.
 .\Reset-MigrationCutoverPasswords.ps1 -TestUser john.smith@contoso.com
 ```
 
+> **Permissions** – resetting a password writes `user.passwordProfile`, which
+> needs the dedicated `User-PasswordProfile.ReadWrite.All` scope (consented at
+> sign-in) *plus* an admin role that can reset the targets — `User Administrator`
+> for members, `Privileged Authentication Administrator` to reset other admins.
+> `User.ReadWrite.All` on its own returns `403 Authorization_RequestDenied`.
+
 ---
 
 ## Expected CSV columns
