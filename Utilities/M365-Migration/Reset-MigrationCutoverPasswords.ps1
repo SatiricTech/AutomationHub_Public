@@ -88,9 +88,15 @@
 .NOTES
     Author      : AutomationHub
     Requires    : PowerShell 7, Microsoft.Graph
-    Permissions : User.ReadWrite.All, Directory.ReadWrite.All, Group.Read.All
-                  (the signed-in admin must be allowed to reset the target
-                  users' passwords).
+    Permissions : User.ReadWrite.All, User-PasswordProfile.ReadWrite.All,
+                  Directory.ReadWrite.All, Group.Read.All.
+                  Resetting a password writes user.passwordProfile, which
+                  requires the dedicated User-PasswordProfile.ReadWrite.All
+                  scope - User.ReadWrite.All alone returns 403
+                  Authorization_RequestDenied. The signed-in account also needs
+                  an admin role that can reset the target users (e.g. User
+                  Administrator; Privileged Authentication Administrator is
+                  required to reset other administrators).
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Csv')]
@@ -273,7 +279,28 @@ Initialize-RequiredModule -Name 'Microsoft.Graph.Users'
 Initialize-RequiredModule -Name 'Microsoft.Graph.Groups'
 
 Write-Host 'Connecting to Microsoft Graph...' -ForegroundColor Cyan
-Connect-MgGraph -Scopes 'User.ReadWrite.All', 'Directory.ReadWrite.All', 'Group.Read.All' -NoWelcome
+# Resetting a password writes user.passwordProfile, which is gated behind the
+# dedicated User-PasswordProfile.ReadWrite.All permission - User.ReadWrite.All
+# alone returns 403 Authorization_RequestDenied. Group.Read.All covers the
+# group-member lookup. You must consent to these scopes at sign-in.
+Connect-MgGraph -Scopes @(
+    'User.ReadWrite.All',
+    'User-PasswordProfile.ReadWrite.All',
+    'Directory.ReadWrite.All',
+    'Group.Read.All'
+) -NoWelcome
+
+# Warn early if the granted token is missing the password-reset scope, so the
+# failure is explained up front rather than as a 403 per user.
+$grantedScopes = @((Get-MgContext).Scopes)
+if ($grantedScopes -notcontains 'User-PasswordProfile.ReadWrite.All') {
+    Write-Host ''
+    Write-Host 'WARNING: the signed-in session was not granted User-PasswordProfile.ReadWrite.All.' -ForegroundColor Yellow
+    Write-Host 'Password resets will fail with 403 Authorization_RequestDenied until an admin' -ForegroundColor Yellow
+    Write-Host 'consents to that permission. Note also that the signed-in account needs a role' -ForegroundColor Yellow
+    Write-Host 'that can reset the target users (e.g. User Administrator; Privileged' -ForegroundColor Yellow
+    Write-Host 'Authentication Administrator is required to reset other administrators).' -ForegroundColor Yellow
+}
 
 #region Build the target list --------------------------------------------------
 
@@ -373,7 +400,11 @@ foreach ($user in $targets) {
         }
 
         if (-not $DryRun -and $PSCmdlet.ShouldProcess($upn, 'Reset password to a new passphrase')) {
-            Update-MgUser -UserId $user.Id -PasswordProfile $passwordProfile
+            # -ErrorAction Stop makes the Graph call terminating so a failed reset
+            # (e.g. 403 Authorization_RequestDenied) lands in catch and is recorded
+            # as Failed - never reported as a success with a credential that was
+            # never actually set.
+            Update-MgUser -UserId $user.Id -PasswordProfile $passwordProfile -ErrorAction Stop
             $detail = 'Password reset; change required at next sign-in.'
         }
         else {
@@ -384,8 +415,16 @@ foreach ($user in $targets) {
     }
     catch {
         $status = 'Failed'
-        $detail = $_.Exception.Message
-        $passphrase = ''
+        $passphrase = ''       # the reset did not take - do not log a credential
+        $message = $_.Exception.Message
+        if ($message -match 'Authorization_RequestDenied|Insufficient privileges') {
+            $detail = 'Access denied - the signed-in account lacks rights to reset this user ' +
+                      '(needs User-PasswordProfile.ReadWrite.All and a suitable admin role; ' +
+                      'resetting an administrator requires Privileged Authentication Administrator).'
+        }
+        else {
+            $detail = $message
+        }
     }
 
     $color = switch ($status) {
