@@ -281,25 +281,35 @@ Initialize-RequiredModule -Name 'Microsoft.Graph.Groups'
 Write-Host 'Connecting to Microsoft Graph...' -ForegroundColor Cyan
 # Resetting a password writes user.passwordProfile, which is gated behind the
 # dedicated User-PasswordProfile.ReadWrite.All permission - User.ReadWrite.All
-# alone returns 403 Authorization_RequestDenied. Group.Read.All covers the
-# group-member lookup. You must consent to these scopes at sign-in.
-Connect-MgGraph -Scopes @(
+# alone returns 403 Authorization_RequestDenied regardless of the signed-in
+# admin's role. Group.Read.All covers the group-member lookup.
+$requiredScopes = @(
     'User.ReadWrite.All',
     'User-PasswordProfile.ReadWrite.All',
     'Directory.ReadWrite.All',
     'Group.Read.All'
-) -NoWelcome
+)
+$passwordScope = 'User-PasswordProfile.ReadWrite.All'
 
-# Warn early if the granted token is missing the password-reset scope, so the
-# failure is explained up front rather than as a 403 per user.
+# A cached session from an earlier run may lack the password-reset scope and
+# would be reused without re-prompting. Drop it so consent is requested afresh.
+$existingContext = Get-MgContext
+if ($existingContext -and (@($existingContext.Scopes) -notcontains $passwordScope)) {
+    Write-Host 'Existing Graph session is missing the password-reset scope - reconnecting for consent...' -ForegroundColor Yellow
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+}
+
+Connect-MgGraph -Scopes $requiredScopes -NoWelcome
+
+# Stop up front (rather than failing every user with a 403) if the granted
+# session still lacks the password-reset scope - it means consent was declined
+# or is pending admin approval.
 $grantedScopes = @((Get-MgContext).Scopes)
-if ($grantedScopes -notcontains 'User-PasswordProfile.ReadWrite.All') {
-    Write-Host ''
-    Write-Host 'WARNING: the signed-in session was not granted User-PasswordProfile.ReadWrite.All.' -ForegroundColor Yellow
-    Write-Host 'Password resets will fail with 403 Authorization_RequestDenied until an admin' -ForegroundColor Yellow
-    Write-Host 'consents to that permission. Note also that the signed-in account needs a role' -ForegroundColor Yellow
-    Write-Host 'that can reset the target users (e.g. User Administrator; Privileged' -ForegroundColor Yellow
-    Write-Host 'Authentication Administrator is required to reset other administrators).' -ForegroundColor Yellow
+if ($grantedScopes -notcontains $passwordScope) {
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    throw ("The signed-in session was not granted '$passwordScope', which is required to reset passwords. " +
+        'A Global Administrator can approve it at the consent prompt - re-run and accept the request. ' +
+        'Until it is consented, every reset fails with 403 Authorization_RequestDenied.')
 }
 
 #region Build the target list --------------------------------------------------
