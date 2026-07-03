@@ -27,6 +27,13 @@
 .PARAMETER CsvPath
     CSV pairing each UPN with its desired primary email address.
 
+.PARAMETER DelegatedOrganization
+    The customer tenant to operate against, e.g. 'contoso.onmicrosoft.com'.
+    Required when you manage the tenant as a partner (GDAP/CSP): without it,
+    Connect-ExchangeOnline signs in to YOUR OWN tenant and every mailbox lookup
+    fails with "No mailbox found". Omit only when the mailboxes live in the same
+    tenant as the account you sign in with.
+
 .PARAMETER OutputPath
     Directory where the results CSV is written. If omitted, defaults to
     "<LocalAppData>\Migration-Automations" after confirming with you.
@@ -52,6 +59,10 @@
 .EXAMPLE
     .\Set-MailboxPrimaryAddress.ps1 -CsvPath .\PrimaryMap.csv -OutputPath C:\Migrations -DisableEmailAddressPolicy
 
+.EXAMPLE
+    # Partner/GDAP: run against a customer tenant you manage
+    .\Set-MailboxPrimaryAddress.ps1 -CsvPath .\PrimaryMap.csv -DelegatedOrganization contoso.onmicrosoft.com -DryRun
+
 .NOTES
     Author      : AutomationHub
     Requires    : PowerShell 7, ExchangeOnlineManagement
@@ -63,6 +74,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$CsvPath,
+
+    [Parameter(Mandatory = $false)]
+    [Alias('Tenant')]
+    [string]$DelegatedOrganization,
 
     [Parameter(Mandatory = $false)]
     [string]$OutputPath,
@@ -188,7 +203,25 @@ if (-not $col.Email) { throw "Could not find a primary email column in '$CsvPath
 Initialize-RequiredModule -Name 'ExchangeOnlineManagement'
 
 Write-Host 'Connecting to Exchange Online...' -ForegroundColor Cyan
-Connect-ExchangeOnline -ShowBanner:$false
+$connectParams = @{ ShowBanner = $false }
+if ($DelegatedOrganization) {
+    # Partner/GDAP: target the customer tenant. Without this you connect to your
+    # own tenant and every mailbox lookup fails with "No mailbox found".
+    $connectParams['DelegatedOrganization'] = $DelegatedOrganization
+    Write-Host "Delegated organization: $DelegatedOrganization" -ForegroundColor Cyan
+}
+Connect-ExchangeOnline @connectParams
+
+# Show which tenant we actually landed in - a wrong-tenant session is the usual
+# cause of every row reporting "No mailbox found".
+$conn = Get-ConnectionInformation -ErrorAction SilentlyContinue | Select-Object -Last 1
+if ($conn) {
+    Write-Host "Connected to tenant: $($conn.Organization)" -ForegroundColor Green
+    if (-not $DelegatedOrganization) {
+        Write-Host 'No -DelegatedOrganization was given. If these mailboxes live in a customer' -ForegroundColor Yellow
+        Write-Host 'tenant you manage as a partner, re-run with -DelegatedOrganization <tenant>.onmicrosoft.com.' -ForegroundColor Yellow
+    }
+}
 
 $results = [System.Collections.Generic.List[object]]::new()
 $index = 0

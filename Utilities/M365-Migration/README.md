@@ -99,6 +99,12 @@ by default.
 .\Set-MailboxPrimaryAddress.ps1 -CsvPath .\PrimaryMap.csv -DryRun
 ```
 
+> **Partner / GDAP:** if you manage the tenant as an MSP, pass
+> `-DelegatedOrganization <customer>.onmicrosoft.com` so Exchange Online connects
+> to the *customer* tenant. Without it you connect to your own tenant and every
+> mailbox lookup fails with "No mailbox found". The script prints the tenant it
+> actually connected to so you can confirm before running.
+
 ### 7. `Reset-MigrationCutoverPasswords.ps1`
 Cutover password reset. Targets users either from a **CSV** or from an **Entra
 security group** (by object ID or display name — *not* the group's email), and
