@@ -134,15 +134,17 @@ changing anything or emitting a credential.
 > `User.ReadWrite.All` on its own returns `403 Authorization_RequestDenied`.
 
 ### 8. `Get-MigrationTeamsPhoneAssignments.ps1`
-The Teams Phone pull. Connects to Microsoft Teams and exports every user's
-currently assigned phone number to a CSV — UPN, display name, number (E.164),
-extension, number type (`CallingPlan` / `OperatorConnect` / `DirectRouting`),
-enterprise-voice status, voice routing policy, dial plan, calling policy and
-emergency location. The number inventory is pulled once and joined locally, so
-users are not queried one at a time. Read-only. Takes the same `-Prefix`
-prompting as the inventory script. `-IncludeUsersWithoutNumbers` widens the
-export to voice-capable users with no number; `-IncludeUnassignedNumbers`
-writes a second CSV of every number in the tenant not assigned to anyone.
+The Teams Phone pull. Connects to Microsoft Teams and exports **every user**
+to a CSV — UPN, display name, number (E.164), extension, number type
+(`CallingPlan` / `OperatorConnect` / `DirectRouting`), enterprise-voice
+status, voice routing policy, dial plan, calling policy and emergency
+location. Users without a phone number are included with blank phone columns,
+so the export doubles as the list of who still needs a number;
+`-OnlyUsersWithNumbers` narrows it to assigned users. The number inventory is
+pulled once and joined locally, so users are not queried one at a time.
+Read-only. Takes the same `-Prefix` prompting as the inventory script.
+`-IncludeUnassignedNumbers` writes a second CSV of every number in the tenant
+not assigned to anyone.
 
 ```powershell
 .\Get-MigrationTeamsPhoneAssignments.ps1 -OutputPath C:\Migrations\Contoso -Prefix Source -IncludeUnassignedNumbers

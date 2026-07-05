@@ -20,6 +20,11 @@
     EnterpriseVoiceEnabled, OnlineVoiceRoutingPolicy, TenantDialPlan,
     TeamsCallingPolicy, LocationId, UsageLocation and AccountEnabled.
 
+    EVERY user is exported, whether or not they have a phone number - users
+    without one simply have blank phone columns, so the CSV is also your list
+    of who still needs a number. Use -OnlyUsersWithNumbers to narrow the
+    export to users that currently have an assignment.
+
     The number inventory is pulled once (paged) and joined to the user list
     locally, so users are not queried one number at a time. The script is
     read-only against the tenant.
@@ -39,9 +44,10 @@
     Tenant ID (GUID) to sign in to. Useful for MSP / multi-tenant admins so the
     interactive sign-in lands in the intended tenant.
 
-.PARAMETER IncludeUsersWithoutNumbers
-    Also include enterprise-voice-capable users that have NO phone number
-    assigned. By default only users with an assigned number are exported.
+.PARAMETER OnlyUsersWithNumbers
+    Narrow the export to users that currently have a phone number assigned.
+    By default every user is exported, with blank phone columns for users
+    that have no number.
 
 .PARAMETER IncludeUnassignedNumbers
     Also write a second CSV listing every telephone number in the tenant
@@ -63,7 +69,7 @@
     .\Get-MigrationTeamsPhoneAssignments.ps1 -OutputPath 'C:\Migrations\Contoso' -Prefix Source -IncludeUnassignedNumbers
 
 .EXAMPLE
-    .\Get-MigrationTeamsPhoneAssignments.ps1 -Prefix Destination -IncludeUsersWithoutNumbers
+    .\Get-MigrationTeamsPhoneAssignments.ps1 -Prefix Destination -OnlyUsersWithNumbers
 
 .NOTES
     Author      : AutomationHub
@@ -84,7 +90,7 @@ param(
     [string]$TenantId,
 
     [Parameter(Mandatory = $false)]
-    [switch]$IncludeUsersWithoutNumbers,
+    [switch]$OnlyUsersWithNumbers,
 
     [Parameter(Mandatory = $false)]
     [switch]$IncludeUnassignedNumbers,
@@ -303,7 +309,7 @@ foreach ($num in $allNumbers) {
 
 Write-Host 'Retrieving Teams users (this can take a while on large tenants)...' -ForegroundColor Cyan
 $users = $null
-if (-not $IncludeUsersWithoutNumbers) {
+if ($OnlyUsersWithNumbers) {
     # Server-side filter keeps the pull small; fall back to a full pull if the
     # connected module version rejects the filter syntax.
     try {
@@ -316,11 +322,12 @@ if (-not $IncludeUsersWithoutNumbers) {
 }
 if ($null -eq $users) {
     $users = @(Get-CsOnlineUser)
-    if (-not $IncludeUsersWithoutNumbers) {
+    if ($OnlyUsersWithNumbers) {
         $users = @($users | Where-Object { -not [string]::IsNullOrWhiteSpace($_.LineUri) })
     }
 }
-Write-Host "  Users to export: $($users.Count)" -ForegroundColor Cyan
+$withNumber = @($users | Where-Object { -not [string]::IsNullOrWhiteSpace($_.LineUri) }).Count
+Write-Host "  Users to export: $($users.Count) ($withNumber with a phone number, $($users.Count - $withNumber) without)" -ForegroundColor Cyan
 
 #endregion ---------------------------------------------------------------------
 
