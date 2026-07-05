@@ -133,6 +133,74 @@ changing anything or emitting a credential.
 > for members, `Privileged Authentication Administrator` to reset other admins.
 > `User.ReadWrite.All` on its own returns `403 Authorization_RequestDenied`.
 
+### 8. `Get-MigrationTeamsPhoneAssignments.ps1`
+The Teams Phone pull. Connects to Microsoft Teams and exports every user's
+currently assigned phone number to a CSV — UPN, display name, number (E.164),
+extension, number type (`CallingPlan` / `OperatorConnect` / `DirectRouting`),
+enterprise-voice status, voice routing policy, dial plan, calling policy and
+emergency location. The number inventory is pulled once and joined locally, so
+users are not queried one at a time. Read-only. Takes the same `-Prefix`
+prompting as the inventory script. `-IncludeUsersWithoutNumbers` widens the
+export to voice-capable users with no number; `-IncludeUnassignedNumbers`
+writes a second CSV of every number in the tenant not assigned to anyone.
+
+```powershell
+.\Get-MigrationTeamsPhoneAssignments.ps1 -OutputPath C:\Migrations\Contoso -Prefix Source -IncludeUnassignedNumbers
+```
+
+### 9. `Remove-MigrationTeamsPhoneAssignments.ps1`
+Bulk-unassigns Teams phone numbers in the **source** tenant. Targets either a
+single user (`-User`), users from a CSV by UPN (`-CsvPath` — the export from
+script 8 works directly), or every user with a number (`-All`). Each user's
+number, type and voice routing policy are captured *before* removal and logged
+to a results CSV whose columns match what script 10 reads, so the log doubles
+as your rollback / reassignment input. Policies are left in place; only the
+number assignment is removed. Hybrid numbers synced from on-prem AD
+(`OnPremLineURI`) can't be removed here and are reported as `Failed`.
+
+```powershell
+# Preview what -All would remove - no changes
+.\Remove-MigrationTeamsPhoneAssignments.ps1 -All -DryRun
+
+# Unassign the users in a CSV
+.\Remove-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments.csv
+
+# Rehearse against one user
+.\Remove-MigrationTeamsPhoneAssignments.ps1 -User john.smith@contoso.com
+```
+
+### 10. `Set-MigrationTeamsPhoneAssignments.ps1`
+The destination-side opposite: bulk-assigns Teams phone numbers, either to a
+single user (`-User` + `-PhoneNumber`) or to users from a CSV by UPN
+(`-CsvPath` — every row is processed, so "all users" is simply the full export
+from script 8 or the removal log from script 9). Numbers are normalised
+automatically (`tel:`, spaces, dashes stripped; missing `+` added; `;ext=`
+preserved) and the number type is auto-detected from the tenant inventory when
+the CSV doesn't provide one (numbers not in the inventory are treated as
+Direct Routing). A number already assigned to a *different* user fails rather
+than being stolen. An `OnlineVoiceRoutingPolicy` column (or
+`-VoiceRoutingPolicy`) is granted after assignment — Direct Routing numbers
+need one. `-ListUnassigned` is a read-only mode that lists **every available
+(unassigned) phone number** in the tenant and exports it to a CSV.
+
+```powershell
+# What numbers are free in the destination tenant?
+.\Set-MigrationTeamsPhoneAssignments.ps1 -ListUnassigned
+
+# Preview a bulk assignment from the source export
+.\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments.csv -DryRun
+
+# Assign one number to one user
+.\Set-MigrationTeamsPhoneAssignments.ps1 -User john.smith@contoso.com -PhoneNumber +15551234567
+```
+
+> **Teams Phone notes** – all three scripts use the `MicrosoftTeams` module
+> (auto-installed) and need a Teams Administrator / Teams Communications
+> Administrator role. Assigning a number requires the user to already hold a
+> Teams Phone license. For MSP / multi-tenant admins, pass `-TenantId` so the
+> sign-in lands in the intended tenant — each script prints the tenant it
+> actually connected to.
+
 ---
 
 ## Expected CSV columns
@@ -148,6 +216,8 @@ required.
 | `Set-MigrationUserPrincipalNames` | **UPN** *(current, also matches Email)*, **FirstName**, **LastName** |
 | `Set-MailboxPrimaryAddress` | **UPN** *(UserPrincipalName)*, **PrimaryEmail** *(Email/PrimarySmtpAddress)* |
 | `Reset-MigrationCutoverPasswords` | **UPN** *(UserPrincipalName/UPN/Email/PrimaryEmail/Mail/UserName)* — only when using `-CsvPath`; `-Group`/`-TestUser` need no CSV |
+| `Remove-MigrationTeamsPhoneAssignments` | **UPN** *(UserPrincipalName/UPN/Email/PrimaryEmail/Mail/UserName)* — only when using `-CsvPath`; `-User`/`-All` need no CSV |
+| `Set-MigrationTeamsPhoneAssignments` | **UPN** *(UserPrincipalName/UPN/Email/...)*, **PhoneNumber** *(TelephoneNumber/Phone/Number/LineUri)*, PhoneNumberType *(NumberType/Type)*, Extension, LocationId, OnlineVoiceRoutingPolicy *(VoiceRoutingPolicy)* |
 
 ---
 
@@ -162,6 +232,12 @@ required.
 5. **Standardise** identities: `Set-MigrationUserPrincipalNames`.
 6. **Fix addressing**: `Set-MailboxPrimaryAddress` where the primary email must
    differ from the UPN.
+7. **Teams Phone**: export source assignments with
+   `Get-MigrationTeamsPhoneAssignments`, release them with
+   `Remove-MigrationTeamsPhoneAssignments`, then (after the numbers land in the
+   destination tenant) reassign from the same CSV with
+   `Set-MigrationTeamsPhoneAssignments` — check what's available first with
+   `-ListUnassigned`.
 
 > Always dry-run tenant-changing scripts with `-DryRun` (or `-WhatIf`) first, and store any
 > results CSV containing generated passwords securely.
