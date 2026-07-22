@@ -25,8 +25,8 @@ conventions](https://learn.microsoft.com/en-us/dotnet/standard/design-guidelines
 - **No underscores**, ever.
 - No client names, dates, version numbers, author initials, or ticket numbers.
 
-> The global `powershell-naming` skill specifies lowercase `verb-scope-target.ps1`.
-> **That does not apply here** — this repo follows the .NET conventions above.
+> The `powershell-naming` skill encodes these rules in full, including the approved
+> scope-token registry and verb selection guide. Defer to it when naming a new script.
 
 ## The RMM / AdHoc variant pattern
 
