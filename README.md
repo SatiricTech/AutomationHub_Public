@@ -30,10 +30,10 @@ By downloading, copying, or executing any code found within this repository, you
 | [`Activation/`](Windows/Activation/) | `Invoke-WindowsHomeToProUpgrade.ps1` | Upgrade Windows Home to Pro (interactive + RMM) |
 | | `Invoke-WindowsProActivation.ps1` | Activate Windows Pro with product key (interactive + RMM) |
 | [`ActiveDirectory/`](Windows/ActiveDirectory/) | `New-DomainAdmin.ps1` | Create a new Domain Admin account |
-| | `Get-FSMORoles.ps1` | Display all 5 FSMO role holders |
+| | `Get-FsmoRoles.ps1` | Display all 5 FSMO role holders |
 | | `Export-GPResultReport.cmd` | Generate Group Policy results as HTML |
 | [`AzureBlob/`](Windows/AzureBlob/) | `Get-AzureBlobData.ps1` | Pull files from Azure Blob (SAS token or SFTP) into ProgramData category folders |
-| [`DeviceManagement/`](Windows/DeviceManagement/) | `Rename-Device-RMM.ps1` | Automated device naming for RMM deployment |
+| [`DeviceManagement/`](Windows/DeviceManagement/) | `Rename-Device-Rmm.ps1` | Automated device naming for RMM deployment |
 | | `Rename-Device-AdHoc.ps1` | Interactive device renaming with prompts |
 | [`Fonts/`](Windows/Fonts/) | `Install-Fonts.ps1` | System-wide font install from local folder or SFTP (Azure Blob) |
 | [`ServerRoles/`](Windows/ServerRoles/) | `Get-WindowsServerRoles.ps1` | Detect installed server roles (AD DS, DNS, DHCP, Hyper-V, etc.) |
@@ -44,7 +44,7 @@ By downloading, copying, or executing any code found within this repository, you
 | [`EntraID/`](Microsoft365/EntraID/) | `Start-EntraIDSyncCycle.bat` | Trigger a delta Entra ID (Azure AD) sync |
 | | `Update-M365UserPrincipalNames.ps1` | Bulk rename M365 UPNs to FirstInitial+LastName format |
 | [`OfficeApps/`](Microsoft365/OfficeApps/) | `Install-Microsoft365Apps.ps1` | Deploy M365 Business Standard apps via ODT |
-| | `Get-LatestODTInstaller.ps1` | Download the latest Office Deployment Tool |
+| | `Get-LatestOdtInstaller.ps1` | Download the latest Office Deployment Tool |
 | | `Microsoft365-BusinessStandard.xml` | ODT configuration for Business Standard (non-shared) |
 | [`AVD/`](Microsoft365/AVD/) | `Redirections.xml` | FSLogix profile redirection config for AVD + Hybrid Entra |
 
@@ -53,7 +53,7 @@ By downloading, copying, or executing any code found within this repository, you
 |--------|---------|-------------|
 | [`BlackpointCyber/`](Vendors/BlackpointCyber/) | `Install-BlackpointAgent.ps1` | Install Blackpoint ZTAC/Snap agent via NinjaOne |
 | | `Uninstall-BlackpointAgent.ps1` | Full removal including registry and services |
-| [`DUO/`](Vendors/DUO/) | `Set-DUOBypass.ps1` | Add localhost redirect for DUO (fail-open config) |
+| [`DUO/`](Vendors/DUO/) | `Set-DuoBypass.ps1` | Add localhost redirect for DUO (fail-open config) |
 | [`Egnyte/`](Vendors/Egnyte/) | `Add-EgnyteTrustedSites.ps1` | Add Egnyte to IE Trusted Sites for all user profiles |
 | | `Enable-EgnyteOfficeCoEdit.ps1` | Enable Egnyte co-editing in Office apps |
 | [`Huntress/`](Vendors/Huntress/) | `Install-HuntressAgent.ps1` | Install Huntress agent from GitHub |
@@ -61,13 +61,13 @@ By downloading, copying, or executing any code found within this repository, you
 | | `Invoke-HuntressAuditPolicyRemediation.ps1` | RMM detect & remediate for Huntress SIEM audit policy baseline |
 | [`LastPass/`](Vendors/LastPass/) | `Install-LastPass.ps1` | Deploy LastPass with browser extension detection |
 | | `Remove-LastPassBrowserExtension.ps1` | Remove LastPass extensions from Chrome/Edge |
-| [`NinjaOne/`](Vendors/NinjaOne/) | `Uninstall-NinjaRMMAgent.ps1` | Complete Ninja agent removal (services, registry, drivers) |
+| [`NinjaOne/`](Vendors/NinjaOne/) | `Uninstall-NinjaRmmAgent.ps1` | Complete Ninja agent removal (services, registry, drivers) |
 | [`ScreenConnect/`](Vendors/ScreenConnect/) | `Uninstall-ScreenConnectAll.ps1` | Remove all ScreenConnect/ConnectWise Control instances |
 | | `Uninstall-ScreenConnectSelective.ps1` | Remove ScreenConnect except protected fingerprints |
 | [`SentinelOne/`](Vendors/SentinelOne/) | `Install-SentinelOneAgent.ps1` | Install or clean SentinelOne agent (v2.1) |
 | [`ThreatLocker/`](Vendors/ThreatLocker/) | `Install-ThreatLocker.ps1` | Deploy ThreatLocker via NinjaOne custom fields |
 | [`Timus/`](Vendors/Timus/) | `Install-TimusConnect.ps1` | Install or update Timus Connect client |
-| | `New-TimusEntraSSOApp.ps1` | Create Entra ID enterprise app for Timus SSO/Sync |
+| | `New-TimusEntraSsoApp.ps1` | Create Entra ID enterprise app for Timus SSO/Sync |
 | | `Uninstall-TimusConnect.ps1` | Full removal of Timus Connect |
 
 ### [`Networking/`](Networking/) - Network Tools
@@ -118,9 +118,9 @@ All scripts follow the **PowerShell `Verb-Noun`** naming standard for consistenc
 | Verb | Meaning | Example |
 |------|---------|---------|
 | `Install-` | Deploy an application | `Install-HuntressAgent.ps1` |
-| `Uninstall-` | Remove an application | `Uninstall-NinjaRMMAgent.ps1` |
-| `Get-` | Retrieve information | `Get-FSMORoles.ps1` |
-| `Set-` | Configure a setting | `Set-DUOBypass.ps1` |
+| `Uninstall-` | Remove an application | `Uninstall-NinjaRmmAgent.ps1` |
+| `Get-` | Retrieve information | `Get-FsmoRoles.ps1` |
+| `Set-` | Configure a setting | `Set-DuoBypass.ps1` |
 | `New-` | Create a resource | `New-DomainAdmin.ps1` |
 | `Remove-` | Delete a component | `Remove-LastPassBrowserExtension.ps1` |
 | `Invoke-` | Run a multi-step process | `Invoke-WindowsHomeToProUpgrade.ps1` |
