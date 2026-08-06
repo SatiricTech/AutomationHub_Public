@@ -45,6 +45,12 @@
     want a custom prefix; if not, whether this is the Source or Destination
     tenant and that label is used instead.
 
+.PARAMETER DomainFilter
+    Only include accounts whose UserPrincipalName is on this domain (accepts
+    'contoso.com' or '@contoso.com'). Applies to the User Mailboxes, Shared
+    Mailboxes, M365 Users and Summary tabs; the Teams & Groups tab is not
+    filtered. If omitted, every domain in the tenant is included.
+
 .PARAMETER IncludeGuests
     Also include guest (external) user accounts on the user tabs. By default only
     member accounts are exported.
@@ -76,6 +82,11 @@
 .EXAMPLE
     .\Get-MigrationInventory.ps1 -OutputPath 'C:\Migrations\Contoso' -Prefix Source -IncludeOneDrive
 
+.EXAMPLE
+    .\Get-MigrationInventory.ps1 -Prefix Source -DomainFilter contoso.com
+
+    Inventories only mailboxes and users whose UPN ends in '@contoso.com'.
+
 .NOTES
     Author      : AutomationHub
     Requires    : PowerShell 7, Microsoft.Graph, ExchangeOnlineManagement, ImportExcel
@@ -90,6 +101,10 @@ param(
 
     [Parameter(Mandatory = $false)]
     [string]$Prefix,
+
+    [Parameter(Mandatory = $false)]
+    [ValidatePattern('^@?[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$')]
+    [string]$DomainFilter,
 
     [Parameter(Mandatory = $false)]
     [switch]$IncludeGuests,
@@ -317,6 +332,21 @@ function Get-GroupKind {
 
 Write-Host '=== Microsoft 365 Migration Inventory ===' -ForegroundColor Cyan
 
+# Normalise the optional UPN domain filter (accept 'contoso.com' or '@contoso.com').
+$upnDomainFilter = $null
+if ($DomainFilter) {
+    $upnDomainFilter = $DomainFilter.TrimStart('@').Trim().ToLowerInvariant()
+    Write-Host "Domain filter: only UPNs ending in '@$upnDomainFilter' will be included." -ForegroundColor Cyan
+}
+
+function Test-UpnDomainMatch {
+    <# True when the UPN belongs to the filtered domain, or when no filter is set. #>
+    param([string]$UserPrincipalName)
+    if (-not $script:upnDomainFilter) { return $true }
+    if ([string]::IsNullOrWhiteSpace($UserPrincipalName)) { return $false }
+    return ($UserPrincipalName -split '@')[-1].ToLowerInvariant() -eq $script:upnDomainFilter
+}
+
 $filePrefix = Resolve-FilePrefix -Value $Prefix
 $outputDir = Resolve-MigrationOutputDirectory -Path $OutputPath
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -372,6 +402,12 @@ Write-Host 'Retrieving Exchange Online mailboxes...' -ForegroundColor Cyan
 $allMailboxes = Get-Mailbox -ResultSize Unlimited `
     -RecipientTypeDetails @('UserMailbox', 'SharedMailbox', 'RoomMailbox', 'EquipmentMailbox')
 Write-Host "Found $($allMailboxes.Count) mailbox(es)." -ForegroundColor Green
+
+# Filter before the statistics pass so excluded mailboxes cost no EXO calls.
+if ($upnDomainFilter) {
+    $allMailboxes = @($allMailboxes | Where-Object { Test-UpnDomainMatch -UserPrincipalName $_.UserPrincipalName })
+    Write-Host "After '@$upnDomainFilter' filter: $($allMailboxes.Count) mailbox(es)." -ForegroundColor Green
+}
 
 # Statistics keyed by ExchangeGuid (one pass, optional).
 $statsByGuid = @{}
@@ -483,6 +519,11 @@ $users = Get-MgUser @getUserParams
 
 if (-not $IncludeGuests) {
     $users = $users | Where-Object { $_.UserType -ne 'Guest' }
+}
+
+if ($upnDomainFilter) {
+    $users = @($users | Where-Object { Test-UpnDomainMatch -UserPrincipalName $_.UserPrincipalName })
+    Write-Host "After '@$upnDomainFilter' filter: $($users.Count) user(s)." -ForegroundColor Green
 }
 
 Write-Host "Processing $($users.Count) user(s)..." -ForegroundColor Green

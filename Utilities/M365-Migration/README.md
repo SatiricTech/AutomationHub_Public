@@ -47,7 +47,8 @@ users are not queried one mailbox at a time. Tabs:
 Storage figures are in **GB**. `-IncludeOneDrive` adds OneDrive used/total
 columns to the M365 Users tab (one extra Graph call per user). `-IncludeGuests`
 / `-IncludeDisabled` widen the user set; `-SkipMailboxStats` skips sizing for a
-faster run.
+faster run. `-DomainFilter contoso.com` narrows the mailbox and user tabs to
+accounts whose UPN is on that domain (Teams & Groups is not filtered).
 
 ```powershell
 .\Get-MigrationInventory.ps1 -OutputPath C:\Migrations\Contoso -Prefix Source
