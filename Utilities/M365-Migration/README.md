@@ -67,21 +67,48 @@ DisplayName, FirstName+LastName, EmailLocalPart, SimilarName).
 ### 3. `New-MigrationUsers.ps1`
 Bulk-creates Entra ID users from a CSV. Generates a complex password where a
 row has none, records every result, and writes generated passwords to a results
-CSV. Existing UPNs are skipped.
+CSV. Existing UPNs are skipped. Because a source-tenant export carries source
+domains, the script lists the **target tenant's verified domains** after
+sign-in and asks which one new UPNs should use — or pass
+`-TargetDomain newco.com` to skip the prompt, `-KeepCsvDomains` to use the CSV
+values unchanged.
 
 ```powershell
 .\New-MigrationUsers.ps1 -CsvPath .\NewUsers.csv -DryRun
+.\New-MigrationUsers.ps1 -CsvPath .\Source_M365Users.csv -TargetDomain newco.com -DryRun
 ```
 
-### 4. `New-MigrationSharedMailboxes.ps1`
+### 4. `New-MigrationUserMapping.ps1`
+Builds a migration-tool **user mapping file** (source address → target
+address) from one or **more** user CSVs — pass the M365Users and
+SharedMailboxes exports together and users + shared mailboxes land in one
+upload. No tenant connection, pure file transform. The source address prefers
+primary SMTP over UPN (shared mailbox UPNs are often onmicrosoft noise);
+target addresses come from a `Target*` column in the CSV when present,
+otherwise `localpart@TargetDomain`. Formats live in a single registry inside
+the script; **AvePoint** ships today — an `.xlsx` reproducing AvePoint's own
+`Fly_User_Mapping` template (sheet `Migration mappings`, columns
+`Source user/group` / `Destination user/group`) — and adding BitTitan /
+ShareGate / etc. is one registry entry.
+
+```powershell
+.\New-MigrationUserMapping.ps1 -CsvPath .\Source_M365Users.csv, .\Source_SharedMailboxes.csv -TargetDomain newco.com -DryRun
+```
+
+### 5. `New-MigrationSharedMailboxes.ps1`
 Bulk-creates Exchange Online shared mailboxes from a CSV, optionally adding
-alias addresses and Full Access / Send As permissions.
+alias addresses and Full Access / Send As permissions. Like the user script,
+it lists the **target tenant's accepted domains** (from Exchange) after
+sign-in and asks which one new addresses should use — applied to the primary
+SMTP, every alias, and the FullAccess/SendAs grantees. `-TargetDomain` skips
+the prompt; `-KeepCsvDomains` uses the CSV values unchanged.
 
 ```powershell
 .\New-MigrationSharedMailboxes.ps1 -CsvPath .\Shared.csv -DryRun
+.\New-MigrationSharedMailboxes.ps1 -CsvPath .\Source_SharedMailboxes.csv -TargetDomain newco.com -DryRun
 ```
 
-### 5. `Set-MigrationUserPrincipalNames.ps1`
+### 6. `Set-MigrationUserPrincipalNames.ps1`
 Standardises UPNs to a chosen scheme — `First.Last`, `FLast`, `FirstLast` or
 `F.Last`. Takes a CSV with current UPN + first + last name, matches the live
 account by email/UPN, and rewrites the UPN. Prompts for the scheme if `-Scheme`
@@ -91,7 +118,7 @@ is omitted.
 .\Set-MigrationUserPrincipalNames.ps1 -CsvPath .\Users.csv -Scheme FLast -DryRun
 ```
 
-### 6. `Set-MailboxPrimaryAddress.ps1`
+### 7. `Set-MailboxPrimaryAddress.ps1`
 Sets each mailbox's primary SMTP address independently of the UPN, from a CSV
 pairing UPN with the desired primary email. Keeps the old address as an alias
 by default.
@@ -106,7 +133,7 @@ by default.
 > mailbox lookup fails with "No mailbox found". The script prints the tenant it
 > actually connected to so you can confirm before running.
 
-### 7. `Reset-MigrationCutoverPasswords.ps1`
+### 8. `Reset-MigrationCutoverPasswords.ps1`
 Cutover password reset. Targets users either from a **CSV** or from an **Entra
 security group** (by object ID or display name — *not* the group's email), and
 resets each to a freshly generated **passphrase** (at least 3 words, one word
@@ -134,7 +161,7 @@ changing anything or emitting a credential.
 > for members, `Privileged Authentication Administrator` to reset other admins.
 > `User.ReadWrite.All` on its own returns `403 Authorization_RequestDenied`.
 
-### 8. `Get-MigrationTeamsPhoneAssignments.ps1`
+### 9. `Get-MigrationTeamsPhoneAssignments.ps1`
 The Teams Phone pull. Connects to Microsoft Teams and exports **every user**
 to a CSV — UPN, display name, number (E.164), extension, number type
 (`CallingPlan` / `OperatorConnect` / `DirectRouting`), enterprise-voice
@@ -151,7 +178,7 @@ not assigned to anyone.
 .\Get-MigrationTeamsPhoneAssignments.ps1 -OutputPath C:\Migrations\Contoso -Prefix Source -IncludeUnassignedNumbers
 ```
 
-### 9. `Remove-MigrationTeamsPhoneAssignments.ps1`
+### 10. `Remove-MigrationTeamsPhoneAssignments.ps1`
 Bulk-unassigns Teams phone numbers in the **source** tenant. Targets either a
 single user (`-User`), users from a CSV by UPN (`-CsvPath` — the export from
 script 8 works directly), or every user with a number (`-All`). Each user's
@@ -172,7 +199,7 @@ number assignment is removed. Hybrid numbers synced from on-prem AD
 .\Remove-MigrationTeamsPhoneAssignments.ps1 -User john.smith@contoso.com
 ```
 
-### 10. `Set-MigrationTeamsPhoneAssignments.ps1`
+### 11. `Set-MigrationTeamsPhoneAssignments.ps1`
 The destination-side opposite: bulk-assigns Teams phone numbers, either to a
 single user (`-User` + `-PhoneNumber`) or to users from a CSV by UPN
 (`-CsvPath` — every row is processed, so "all users" is simply the full export
@@ -215,6 +242,7 @@ required.
 |--------|---------|
 | `Compare-MigrationUserData` | UPN *(UserPrincipalName)*, Email *(PrimaryEmail/Mail)*, FirstName *(GivenName)*, LastName *(Surname)*, DisplayName |
 | `New-MigrationUsers` | **UPN** *(UserPrincipalName)*, **DisplayName** *(or First+Last)*, FirstName, LastName, MailNickname *(Alias)*, Password, UsageLocation, JobTitle, Department, Office, MobilePhone, City, State, Country |
+| `New-MigrationUserMapping` | **UPN/Email** *(UserPrincipalName/UPN/PrimaryEmail/Email/Mail/PrimarySmtpAddress)*, Target *(TargetUserPrincipalName/TargetUPN/TargetEmail — optional per-row override)* |
 | `New-MigrationSharedMailboxes` | **PrimarySmtpAddress** *(Email)*, **DisplayName**, Alias, AliasAddresses, FullAccess, SendAs, HiddenFromAddressLists |
 | `Set-MigrationUserPrincipalNames` | **UPN** *(current, also matches Email)*, **FirstName**, **LastName** |
 | `Set-MailboxPrimaryAddress` | **UPN** *(UserPrincipalName)*, **PrimaryEmail** *(Email/PrimarySmtpAddress)* |
@@ -230,12 +258,15 @@ required.
 2. **Export** destination tenant the same way (if it has existing users).
 3. **Compare** the two with `Compare-MigrationUserData` (point it at the
    `Summary` or `M365Users` CSVs) to find overlaps.
-4. **Provision** the destination: `New-MigrationUsers`, then
-   `New-MigrationSharedMailboxes`.
-5. **Standardise** identities: `Set-MigrationUserPrincipalNames`.
-6. **Fix addressing**: `Set-MailboxPrimaryAddress` where the primary email must
+4. **Provision** the destination: `New-MigrationUsers` (pick the target domain
+   when prompted), then `New-MigrationSharedMailboxes`.
+5. **Map** users for your migration tool: `New-MigrationUserMapping` turns the
+   source exports (users + shared mailboxes) into one mapping file (AvePoint
+   today; other tools are one registry entry).
+6. **Standardise** identities: `Set-MigrationUserPrincipalNames`.
+7. **Fix addressing**: `Set-MailboxPrimaryAddress` where the primary email must
    differ from the UPN.
-7. **Teams Phone**: export source assignments with
+8. **Teams Phone**: export source assignments with
    `Get-MigrationTeamsPhoneAssignments`, release them with
    `Remove-MigrationTeamsPhoneAssignments`, then (after the numbers land in the
    destination tenant) reassign from the same CSV with

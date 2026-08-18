@@ -22,6 +22,13 @@
       - JobTitle, Department, Office/OfficeLocation,
         MobilePhone, City, State, Country
 
+    Because the CSV usually comes from the SOURCE tenant, its UPN domains may
+    not exist in the tenant you are creating users in. After sign-in the script
+    queries the target tenant's verified domains and asks which one new UPNs
+    should use (or pass -TargetDomain to skip the prompt, -KeepCsvDomains to
+    use the CSV values unchanged). Only the domain part is rewritten - the
+    local part (everything before '@') is kept.
+
     For each row a result is recorded (Created / Skipped / Failed) and, where a
     password was generated, it is written to a results CSV so you can distribute
     initial credentials. Existing users (same UPN) are skipped, not modified.
@@ -30,6 +37,16 @@
 
 .PARAMETER CsvPath
     Path to the CSV describing the users to create.
+
+.PARAMETER TargetDomain
+    Domain to place new UserPrincipalNames on (accepts 'contoso.com' or
+    '@contoso.com'). Must be verified in the target tenant. If omitted (and
+    -KeepCsvDomains is not set), the tenant's verified domains are listed for
+    selection after sign-in.
+
+.PARAMETER KeepCsvDomains
+    Use each UPN exactly as it appears in the CSV - no domain prompt, no
+    rewrite. Creation fails for any domain not verified in the tenant.
 
 .PARAMETER OutputPath
     Directory where the results CSV (including any generated passwords) is
@@ -57,6 +74,12 @@
 .EXAMPLE
     .\New-MigrationUsers.ps1 -CsvPath .\NewUsers.csv -OutputPath C:\Migrations -DefaultUsageLocation GB
 
+.EXAMPLE
+    .\New-MigrationUsers.ps1 -CsvPath .\Source_M365Users.csv -TargetDomain newcompany.com -DryRun
+
+    Previews creating the source-tenant users with their UPNs re-homed on
+    '@newcompany.com'.
+
 .NOTES
     Author      : AutomationHub
     Requires    : PowerShell 7, Microsoft.Graph
@@ -67,6 +90,13 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$CsvPath,
+
+    [Parameter(Mandatory = $false)]
+    [ValidatePattern('^@?[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$')]
+    [string]$TargetDomain,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$KeepCsvDomains,
 
     [Parameter(Mandatory = $false)]
     [string]$OutputPath,
@@ -167,6 +197,55 @@ function Get-CsvValue {
     return $text
 }
 
+function Resolve-TargetDomain {
+    <#
+        Returns the verified tenant domain new UPNs should be placed on, or
+        $null to keep the CSV's domains. The connected tenant is queried so only
+        a domain that actually exists there can be chosen - New-MgUser rejects
+        unverified domains anyway, so catching a typo here saves a failed run.
+    #>
+    [CmdletBinding()]
+    param([string]$Requested)
+
+    $verified = @()
+    try {
+        $verified = @(Get-MgDomain -All | Where-Object { $_.IsVerified } |
+            ForEach-Object { $_.Id.ToLowerInvariant() } | Sort-Object)
+    }
+    catch {
+        Write-Host "Could not list tenant domains: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    if ($Requested) {
+        $clean = $Requested.TrimStart('@').Trim().ToLowerInvariant()
+        if ($verified -and $verified -notcontains $clean) {
+            throw "Domain '$clean' is not verified in this tenant. Verified domains: $($verified -join ', ')"
+        }
+        return $clean
+    }
+
+    if (-not $verified) {
+        Write-Host 'No domain list available - keeping the UPN domains from the CSV.' -ForegroundColor Yellow
+        return $null
+    }
+
+    Write-Host ''
+    Write-Host 'Select the domain for new UserPrincipalNames:' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $verified.Count; $i++) {
+        Write-Host ("  [{0}] {1}" -f ($i + 1), $verified[$i])
+    }
+    Write-Host '  [K] Keep the UPN domains exactly as they appear in the CSV'
+
+    while ($true) {
+        $answer = ((Read-Host 'Choice') ?? '').Trim()
+        if ($answer -match '^(k|keep)$') { return $null }
+        if ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le $verified.Count) {
+            return $verified[[int]$answer - 1]
+        }
+        Write-Host "Please enter 1-$($verified.Count) or K." -ForegroundColor Red
+    }
+}
+
 function New-RandomPassword {
     <# Generates a 16-char password meeting M365 complexity requirements. #>
     param([int]$Length = 16)
@@ -228,9 +307,20 @@ if (-not $col.Upn) {
 }
 
 Initialize-RequiredModule -Name 'Microsoft.Graph.Users'
+Initialize-RequiredModule -Name 'Microsoft.Graph.Identity.DirectoryManagement'
 
 Write-Host 'Connecting to Microsoft Graph...' -ForegroundColor Cyan
 Connect-MgGraph -Scopes 'User.ReadWrite.All', 'Directory.ReadWrite.All' -NoWelcome
+
+# The CSV usually carries the SOURCE tenant's domains, which may not be verified
+# here - so unless told otherwise, re-home every UPN on a domain this tenant owns.
+$targetUpnDomain = $null
+if (-not $KeepCsvDomains) {
+    $targetUpnDomain = Resolve-TargetDomain -Requested $TargetDomain
+}
+if ($targetUpnDomain) {
+    Write-Host "New UPNs will be created on '@$targetUpnDomain'." -ForegroundColor Cyan
+}
 
 $results = [System.Collections.Generic.List[object]]::new()
 $index = 0
@@ -238,6 +328,9 @@ $index = 0
 foreach ($row in $rows) {
     $index++
     $upn = Get-CsvValue -Record $row -Column $col.Upn
+    if ($targetUpnDomain -and $upn) {
+        $upn = '{0}@{1}' -f ($upn -split '@')[0], $targetUpnDomain
+    }
     Write-Progress -Activity 'Creating users' `
         -Status "$index of $($rows.Count): $upn" `
         -PercentComplete (($index / [math]::Max($rows.Count, 1)) * 100)

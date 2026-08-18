@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash -n macOS/Vendors/Huntress/Install-HuntressAgent.sh)",
+      "Bash(command -v shellcheck)",
+      "Bash(shellcheck macOS/Vendors/Huntress/Install-HuntressAgent.sh)",
+      "Bash(git push *)",
+      "Bash(gh auth *)"
+    ]
+  }
+}

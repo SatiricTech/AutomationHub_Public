@@ -104,8 +104,9 @@ Mirrors the top-level structure for cross-platform parity. Add Mac scripts in th
 | | `Send-UserNotification.ps1` | Display a notification message to the user |
 | [`M365-Migration/`](Utilities/M365-Migration/) | `Get-MigrationInventory.ps1` | Pull one tenant into a single Excel workbook + per-tab CSVs: User Mailboxes, Shared Mailboxes, M365 Users, Summary, Teams & Groups |
 | | `Compare-MigrationUserData.ps1` | Compare two user CSVs and flag Exact/Partial matches with what matched |
-| | `New-MigrationUsers.ps1` | Bulk-create Entra ID users from a CSV (generates passwords) |
-| | `New-MigrationSharedMailboxes.ps1` | Bulk-create shared mailboxes from a CSV (aliases + permissions) |
+| | `New-MigrationUsers.ps1` | Bulk-create Entra ID users from a CSV (generates passwords, prompts for the target UPN domain) |
+| | `New-MigrationUserMapping.ps1` | Build a migration-tool user mapping file (AvePoint; extensible registry) from a user CSV |
+| | `New-MigrationSharedMailboxes.ps1` | Bulk-create shared mailboxes from a CSV (aliases + permissions, prompts for the target domain) |
 | | `Set-MigrationUserPrincipalNames.ps1` | Standardise UPNs to First.Last / FLast / FirstLast / F.Last from a CSV |
 | | `Set-MailboxPrimaryAddress.ps1` | Set mailbox primary SMTP independent of UPN from a CSV |
 

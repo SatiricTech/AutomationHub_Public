@@ -24,12 +24,30 @@
                                                         grant Send As)
       - HiddenFromAddressLists                        (true/false)
 
+    Because the CSV usually comes from the SOURCE tenant, its addresses may be
+    on domains this tenant does not own. After sign-in the script queries the
+    target tenant's accepted domains and asks which one new addresses should
+    use (or pass -TargetDomain to skip the prompt, -KeepCsvDomains to use the
+    CSV values unchanged). The chosen domain is applied to the primary SMTP
+    address, every alias, and the FullAccess / SendAs grantees - local parts
+    are kept, only the domain is rewritten.
+
     Existing mailboxes (same primary address) are not recreated; the script
     still applies any aliases/permissions specified for them. Supports
     -WhatIf / -Confirm.
 
 .PARAMETER CsvPath
     Path to the CSV describing the shared mailboxes to create.
+
+.PARAMETER TargetDomain
+    Domain to place new addresses on (accepts 'contoso.com' or
+    '@contoso.com'). Must be an accepted domain of the target tenant. If
+    omitted (and -KeepCsvDomains is not set), the tenant's accepted domains
+    are listed for selection after sign-in.
+
+.PARAMETER KeepCsvDomains
+    Use every address exactly as it appears in the CSV - no domain prompt, no
+    rewrite. Creation fails for any domain the tenant does not accept.
 
 .PARAMETER OutputPath
     Directory where the results CSV is written. If omitted, defaults to
@@ -48,6 +66,12 @@
 .EXAMPLE
     .\New-MigrationSharedMailboxes.ps1 -CsvPath .\Shared.csv -OutputPath C:\Migrations
 
+.EXAMPLE
+    .\New-MigrationSharedMailboxes.ps1 -CsvPath .\Source_SharedMailboxes.csv -TargetDomain newcompany.com -DryRun
+
+    Previews creating the source tenant's shared mailboxes with all addresses
+    re-homed on '@newcompany.com'.
+
 .NOTES
     Author      : AutomationHub
     Requires    : PowerShell 7, ExchangeOnlineManagement
@@ -59,6 +83,13 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$CsvPath,
+
+    [Parameter(Mandatory = $false)]
+    [ValidatePattern('^@?[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$')]
+    [string]$TargetDomain,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$KeepCsvDomains,
 
     [Parameter(Mandatory = $false)]
     [string]$OutputPath,
@@ -159,6 +190,66 @@ function Split-List {
     return $Value -split '[;,]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 }
 
+function Resolve-TargetDomain {
+    <#
+        Returns the accepted domain new addresses should be placed on, or $null
+        to keep the CSV's domains. The connected tenant is queried so only a
+        domain it actually accepts can be chosen - New-Mailbox rejects foreign
+        domains anyway, so catching a typo here saves a failed run.
+    #>
+    [CmdletBinding()]
+    param([string]$Requested)
+
+    $accepted = @()
+    try {
+        $accepted = @(Get-AcceptedDomain |
+            ForEach-Object { $_.DomainName.ToString().ToLowerInvariant() } | Sort-Object)
+    }
+    catch {
+        Write-Host "Could not list accepted domains: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    if ($Requested) {
+        $clean = $Requested.TrimStart('@').Trim().ToLowerInvariant()
+        if ($accepted -and $accepted -notcontains $clean) {
+            throw "Domain '$clean' is not an accepted domain of this tenant. Accepted domains: $($accepted -join ', ')"
+        }
+        return $clean
+    }
+
+    if (-not $accepted) {
+        Write-Host 'No domain list available - keeping the addresses from the CSV.' -ForegroundColor Yellow
+        return $null
+    }
+
+    Write-Host ''
+    Write-Host 'Select the domain for new mailbox addresses:' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $accepted.Count; $i++) {
+        Write-Host ("  [{0}] {1}" -f ($i + 1), $accepted[$i])
+    }
+    Write-Host '  [K] Keep the addresses exactly as they appear in the CSV'
+
+    while ($true) {
+        $answer = ((Read-Host 'Choice') ?? '').Trim()
+        if ($answer -match '^(k|keep)$') { return $null }
+        if ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le $accepted.Count) {
+            return $accepted[[int]$answer - 1]
+        }
+        Write-Host "Please enter 1-$($accepted.Count) or K." -ForegroundColor Red
+    }
+}
+
+function ConvertTo-TargetAddress {
+    <#
+        Re-homes an SMTP address on the chosen domain, keeping the local part.
+        Values that are not addresses (display names, empty strings) and calls
+        with no domain selected pass through untouched.
+    #>
+    param([string]$Address, [string]$Domain)
+    if (-not $Domain -or -not $Address -or $Address -notmatch '@') { return $Address }
+    return '{0}@{1}' -f ($Address -split '@')[0], $Domain
+}
+
 #endregion ---------------------------------------------------------------------
 
 Write-Host '=== Bulk Shared Mailbox Creation ===' -ForegroundColor Cyan
@@ -197,12 +288,22 @@ Initialize-RequiredModule -Name 'ExchangeOnlineManagement'
 Write-Host 'Connecting to Exchange Online...' -ForegroundColor Cyan
 Connect-ExchangeOnline -ShowBanner:$false
 
+# The CSV usually carries the SOURCE tenant's domains, which this tenant may
+# not accept - so unless told otherwise, re-home every address on one it does.
+$targetAddressDomain = $null
+if (-not $KeepCsvDomains) {
+    $targetAddressDomain = Resolve-TargetDomain -Requested $TargetDomain
+}
+if ($targetAddressDomain) {
+    Write-Host "New addresses will be created on '@$targetAddressDomain'." -ForegroundColor Cyan
+}
+
 $results = [System.Collections.Generic.List[object]]::new()
 $index = 0
 
 foreach ($row in $rows) {
     $index++
-    $smtp = Get-CsvValue -Record $row -Column $col.Smtp
+    $smtp = ConvertTo-TargetAddress -Address (Get-CsvValue -Record $row -Column $col.Smtp) -Domain $targetAddressDomain
     $displayName = Get-CsvValue -Record $row -Column $col.Name
     Write-Progress -Activity 'Creating shared mailboxes' `
         -Status "$index of $($rows.Count): $smtp" `
@@ -238,7 +339,12 @@ foreach ($row in $rows) {
             $detail.Add('Dry run: alias/permission changes skipped.')
         }
         elseif ($status -in @('Created', 'Exists')) {
-            $aliasAddresses = Split-List -Value (Get-CsvValue -Record $row -Column $col.Aliases)
+            # Re-homing aliases on one domain can collapse duplicates or collide
+            # with the primary - dedupe and drop those instead of failing.
+            $aliasAddresses = @(Split-List -Value (Get-CsvValue -Record $row -Column $col.Aliases) |
+                ForEach-Object { ConvertTo-TargetAddress -Address $_ -Domain $targetAddressDomain } |
+                Sort-Object -Unique |
+                Where-Object { $_ -ne $smtp })
             if ($aliasAddresses.Count -gt 0) {
                 Set-Mailbox -Identity $smtp -EmailAddresses @{ Add = $aliasAddresses } -ErrorAction Stop
                 $detail.Add("Added $($aliasAddresses.Count) alias(es).")
@@ -251,7 +357,10 @@ foreach ($row in $rows) {
                 $detail.Add("HiddenFromAddressLists=$hidden.")
             }
 
-            foreach ($member in (Split-List -Value (Get-CsvValue -Record $row -Column $col.FullAccess))) {
+            # Grantees exported from the source tenant carry source-domain
+            # addresses; the accounts here were created on the target domain.
+            foreach ($member in (Split-List -Value (Get-CsvValue -Record $row -Column $col.FullAccess) |
+                    ForEach-Object { ConvertTo-TargetAddress -Address $_ -Domain $targetAddressDomain })) {
                 try {
                     Add-MailboxPermission -Identity $smtp -User $member -AccessRights FullAccess `
                         -AutoMapping $true -ErrorAction Stop | Out-Null
@@ -262,7 +371,8 @@ foreach ($row in $rows) {
                 }
             }
 
-            foreach ($member in (Split-List -Value (Get-CsvValue -Record $row -Column $col.SendAs))) {
+            foreach ($member in (Split-List -Value (Get-CsvValue -Record $row -Column $col.SendAs) |
+                    ForEach-Object { ConvertTo-TargetAddress -Address $_ -Domain $targetAddressDomain })) {
                 try {
                     Add-RecipientPermission -Identity $smtp -Trustee $member -AccessRights SendAs `
                         -Confirm:$false -ErrorAction Stop | Out-Null
