@@ -62,6 +62,7 @@ By downloading, copying, or executing any code found within this repository, you
 | [`LastPass/`](Vendors/LastPass/) | `Install-LastPass.ps1` | Deploy LastPass with browser extension detection |
 | | `Remove-LastPassBrowserExtension.ps1` | Remove LastPass extensions from Chrome/Edge |
 | [`NinjaOne/`](Vendors/NinjaOne/) | `Uninstall-NinjaRmmAgent.ps1` | Complete Ninja agent removal (services, registry, drivers) |
+| [`Proofpoint/`](Vendors/Proofpoint/) | `Uninstall-ProofpointOutlookPlugin.ps1` | Detect-first silent removal of the Proofpoint Outlook encryption plug-in (closes Outlook only if installed) |
 | [`ScreenConnect/`](Vendors/ScreenConnect/) | `Uninstall-ScreenConnectAll.ps1` | Remove all ScreenConnect/ConnectWise Control instances |
 | | `Uninstall-ScreenConnectSelective.ps1` | Remove ScreenConnect except protected fingerprints |
 | [`SentinelOne/`](Vendors/SentinelOne/) | `Install-SentinelOneAgent.ps1` | Install or clean SentinelOne agent (v2.1) |
