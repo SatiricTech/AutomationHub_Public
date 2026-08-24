@@ -43,6 +43,7 @@ By downloading, copying, or executing any code found within this repository, you
 |--------|---------|-------------|
 | [`EntraID/`](Microsoft365/EntraID/) | `Start-EntraIDSyncCycle.bat` | Trigger a delta Entra ID (Azure AD) sync |
 | | `Update-M365UserPrincipalNames.ps1` | Bulk rename M365 UPNs to FirstInitial+LastName format |
+| [`EntraID/PerUserMfaAudit/`](Microsoft365/EntraID/PerUserMfaAudit/) | `Get-EntraPerUserMfaAudit.ps1` | Read-only audit of legacy per-user MFA state (Enabled/Enforced) tenant-wide, per group, or per user — CSV report + CI exit codes |
 | [`OfficeApps/`](Microsoft365/OfficeApps/) | `Install-Microsoft365Apps.ps1` | Deploy M365 Business Standard apps via ODT |
 | | `Get-LatestOdtInstaller.ps1` | Download the latest Office Deployment Tool |
 | | `Microsoft365-BusinessStandard.xml` | ODT configuration for Business Standard (non-shared) |
