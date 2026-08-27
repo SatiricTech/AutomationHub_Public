@@ -181,9 +181,10 @@ not assigned to anyone.
 ### 10. `Remove-MigrationTeamsPhoneAssignments.ps1`
 Bulk-unassigns Teams phone numbers in the **source** tenant. Targets either a
 single user (`-User`), users from a CSV by UPN (`-CsvPath` — the export from
-script 8 works directly), or every user with a number (`-All`). Each user's
-number, type and voice routing policy are captured *before* removal and logged
-to a results CSV whose columns match what script 10 reads, so the log doubles
+`Get-MigrationTeamsPhoneAssignments` works directly), or every user with a
+number (`-All`). Each user's number, type and voice routing policy are
+captured *before* removal and logged to a results CSV whose columns match what
+`Set-MigrationTeamsPhoneAssignments` reads, so the log doubles
 as your rollback / reassignment input. Policies are left in place; only the
 number assignment is removed. Hybrid numbers synced from on-prem AD
 (`OnPremLineURI`) can't be removed here and are reported as `Failed`.
@@ -203,7 +204,8 @@ number assignment is removed. Hybrid numbers synced from on-prem AD
 The destination-side opposite: bulk-assigns Teams phone numbers, either to a
 single user (`-User` + `-PhoneNumber`) or to users from a CSV by UPN
 (`-CsvPath` — every row is processed, so "all users" is simply the full export
-from script 8 or the removal log from script 9). Numbers are normalised
+from `Get-MigrationTeamsPhoneAssignments` or the removal log from
+`Remove-MigrationTeamsPhoneAssignments`). Numbers are normalised
 automatically (`tel:`, spaces, dashes stripped; missing `+` added; `;ext=`
 preserved) and the number type is auto-detected from the tenant inventory when
 the CSV doesn't provide one (numbers not in the inventory are treated as
@@ -231,6 +233,77 @@ need one. `-ListUnassigned` is a read-only mode that lists **every available
 > sign-in lands in the intended tenant — each script prints the tenant it
 > actually connected to.
 
+### 12. `Get-MigrationVivaLearningHistory.ps1`
+The Viva Learning pull. Exports every user's **learner history** — course
+assignments and self-initiated courses from the Graph employee learning API —
+to a CSV (one row per activity) plus a raw-JSON fidelity backup. The API has
+no tenant-wide endpoint, so users are read one at a time; where the tenant has
+API-registered learning providers, each row is enriched with the course
+metadata (title, URL, duration, skill tags…) the import script needs. Rows
+pointing at content of built-in providers (LinkedIn Learning, Microsoft
+Learn…) export with blank `Course*` columns — fill in at least `CourseTitle`
+and `CourseWebUrl` before importing those. `-User` narrows the pull for a
+rehearsal; `-IncludeGuests` widens it; `-SkipCourseMetadata` skips the catalog
+read (and its extra scopes).
+
+```powershell
+.\Get-MigrationVivaLearningHistory.ps1 -OutputPath C:\Migrations\Contoso -Prefix Source
+.\Get-MigrationVivaLearningHistory.ps1 -User john.smith@contoso.com -Prefix Test
+```
+
+> **Read-permission quirks** — listing course activities only works with
+> *delegated* sign-in, and Microsoft's docs contradict themselves on the exact
+> delegated scope names, so the script tries both documented sets. Whether a
+> delegated admin token can read *other* users' activities is undocumented; if
+> every cross-user read comes back 403, the script says so and points at the
+> fallback (each user runs the script themselves with `-User`, or the Viva
+> Learning admin tab's "Download learner completion records" export).
+
+### 13. `Import-MigrationVivaLearningHistory.ps1`
+The destination-side opposite: replays the exported CSV into the target tenant
+under a **custom learning provider** — records cannot be written into built-in
+providers. Three steps in one run: register or reuse the provider (with
+course-activity sync enabled), upsert one catalog item per distinct course,
+then create one activity per row against the mapped target user. Re-runs are
+idempotent — rows whose activity already exists under the provider (matched by
+external activity ID) are skipped, not duplicated. User mapping follows the
+toolkit convention: a `TargetUserPrincipalName` column wins, otherwise
+`localpart@TargetDomain` (prompted once if omitted), or `-KeepCsvDomains`.
+Every row's outcome is appended to a results CSV as it happens (so the audit
+trail survives an interrupted run); like the cutover password log, it defaults
+to the **current directory** rather than the shared output location.
+
+The employee learning API forces a **split auth model**, so the script signs in
+twice: provider registration is delegated-only (interactive, needs a
+Viva-licensed **Knowledge Administrator**), while content + activity writes are
+application-only (an app registration with a secret or certificate). Pass
+`-LearningProviderId` for an already-registered provider and the interactive
+step is skipped entirely — with `-Confirm:$false` added the run is then fully
+unattended (without it, each change still raises a confirmation prompt).
+
+```powershell
+# Preview - resolves provider, users and rows, changes nothing
+.\Import-MigrationVivaLearningHistory.ps1 -CsvPath .\Source_VivaLearningHistory.csv `
+    -TenantId <target-tenant-guid> -ClientId <app-id> -ClientSecret (Read-Host -AsSecureString 'Secret') `
+    -TargetDomain newco.com -DryRun
+
+# Unattended re-run under an existing provider registration
+.\Import-MigrationVivaLearningHistory.ps1 -CsvPath .\Source_VivaLearningHistory.csv `
+    -TenantId <target-tenant-guid> -ClientId <app-id> -CertificateThumbprint <thumbprint> `
+    -LearningProviderId <registration-guid> -TargetDomain newco.com -Confirm:$false
+```
+
+> **Viva Learning notes** – the app registration needs admin-consented
+> *application* permissions `LearningContent.ReadWrite.All`,
+> `LearningAssignedCourse.ReadWrite.All`,
+> `LearningSelfInitiatedCourse.ReadWrite.All` and `User.Read.All`. Registering
+> a provider requires publicly reachable logo image URLs (one `-LogoUrl` covers
+> all four slots). Each target learner must hold a Viva Learning premium
+> license — rows for unlicensed users fail with a licensing 403 and are
+> recorded in the results CSV. Imported records appear on My Learning;
+> catalog content can take up to 24 hours to show in search/browse. The
+> employee learning API exists in the Global cloud only (no GCC High/DoD/21Vianet).
+
 ---
 
 ## Expected CSV columns
@@ -249,6 +322,7 @@ required.
 | `Reset-MigrationCutoverPasswords` | **UPN** *(UserPrincipalName/UPN/Email/PrimaryEmail/Mail/UserName)* — only when using `-CsvPath`; `-Group`/`-TestUser` need no CSV |
 | `Remove-MigrationTeamsPhoneAssignments` | **UPN** *(UserPrincipalName/UPN/Email/PrimaryEmail/Mail/UserName)* — only when using `-CsvPath`; `-User`/`-All` need no CSV |
 | `Set-MigrationTeamsPhoneAssignments` | **UPN** *(UserPrincipalName/UPN/Email/...)*, **PhoneNumber** *(TelephoneNumber/Phone/Number/LineUri)*, PhoneNumberType *(NumberType/Type)*, Extension, LocationId, OnlineVoiceRoutingPolicy *(VoiceRoutingPolicy)* |
+| `Import-MigrationVivaLearningHistory` | **UserPrincipalName** *(UPN/Email)*, **ActivityType** *(Assignment/SelfInitiated)*, **Status** *(notStarted/inProgress/completed)*, **CourseTitle**, **CourseWebUrl**, plus the rest of the export's columns (CompletionPercentage, CompletedDateTime, AssignmentType, DueDateTime, CourseExternalId…) and an optional TargetUserPrincipalName override — the CSV from `Get-MigrationVivaLearningHistory` works directly |
 
 ---
 
@@ -272,6 +346,11 @@ required.
    destination tenant) reassign from the same CSV with
    `Set-MigrationTeamsPhoneAssignments` — check what's available first with
    `-ListUnassigned`.
+9. **Viva Learning**: export learner history from the source with
+   `Get-MigrationVivaLearningHistory`, fill in any blank
+   `CourseTitle`/`CourseWebUrl` cells, then replay it into the destination with
+   `Import-MigrationVivaLearningHistory` (dry-run first — it validates the
+   user mapping and course catalog without writing).
 
 > Always dry-run tenant-changing scripts with `-DryRun` (or `-WhatIf`) first, and store any
 > results CSV containing generated passwords securely.

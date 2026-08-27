@@ -111,6 +111,12 @@ Mirrors the top-level structure for cross-platform parity. Add Mac scripts in th
 | | `New-MigrationSharedMailboxes.ps1` | Bulk-create shared mailboxes from a CSV (aliases + permissions, prompts for the target domain) |
 | | `Set-MigrationUserPrincipalNames.ps1` | Standardise UPNs to First.Last / FLast / FirstLast / F.Last from a CSV |
 | | `Set-MailboxPrimaryAddress.ps1` | Set mailbox primary SMTP independent of UPN from a CSV |
+| | `Reset-MigrationCutoverPasswords.ps1` | Cutover password reset to unique passphrases (CSV, group or single user), change-at-next-sign-in, credential log |
+| | `Get-MigrationTeamsPhoneAssignments.ps1` | Export every user's Teams phone number, type and voice policies to a CSV (optionally the unassigned number inventory too) |
+| | `Remove-MigrationTeamsPhoneAssignments.ps1` | Bulk-unassign Teams phone numbers in the source tenant, logging each removal as a reassignment-ready CSV |
+| | `Set-MigrationTeamsPhoneAssignments.ps1` | Bulk-assign Teams phone numbers in the destination tenant from a CSV (auto-detects number type, grants voice routing policy) |
+| | `Get-MigrationVivaLearningHistory.ps1` | Export every user's Viva Learning learner history (assignments + self-initiated courses) with course metadata to CSV + JSON |
+| | `Import-MigrationVivaLearningHistory.ps1` | Replay exported Viva Learning learner history into the destination tenant under a custom provider (idempotent re-runs) |
 
 ---
 
