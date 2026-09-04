@@ -383,7 +383,8 @@ Heartbeat: when `now - LastHeartbeatUtc >= HeartbeatHours`, or `-SendHeartbeat`,
   and `FlapCount` are integers, 0 when not applicable. Every other field is required and
   non-null. Timestamps use the 4.4 format.
 - The endpoint truncates `LastError` to 1000 characters, `Summary` to 512, and
-  `DisplayName` to 256, appending ` [truncated]`, before sending.
+  `DisplayName` to 256 before sending; the ` [truncated]` marker it appends counts toward
+  the limit, so the sent value never exceeds it.
 - `test` events carry an empty `Services` array and a summary line. `heartbeat` events
   carry the full service list with `Notify = false` everywhere. Both use a fresh `EventId`.
 - The endpoint never adds fields beyond this schema; the function rejects unknown
@@ -834,6 +835,9 @@ prevents purging the vault).
   zero-row digest notice.
 - `run.ps1` files are tested by dot-sourcing with mocked `Push-OutputBinding` and a fake
   `$Request`.
+- `Tests/ServiceWatchdogContract.Tests.ps1` drives the worker's real payload path for
+  every event type and passes the result through the module's `Test-WatchdogPayload`, and
+  asserts the endpoint truncation limits agree with the module limits.
 - Windows PowerShell 5.1 compatibility: `Tests/Test-WindowsPowerShellCompat.ps1` parses
   the endpoint scripts with the PowerShell AST and fails on any 7-only construct listed in
   4.1. Real execution on a Windows Server is the operator's acceptance test, documented in

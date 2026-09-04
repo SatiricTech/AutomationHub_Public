@@ -1321,10 +1321,25 @@ Describe 'Invoke-WinServiceWatchdog' {
                 Attempts = 1; FirstFailedUtc = $null; LastError = ('e' * 1500); FlapCount = 0; Notify = $true
             }
             $payload = New-TestPayload -EventType 'alert' -Items @($item) -Summary ('s' * 600)
-            $payload.Services[0].LastError.Length | Should -Be 1012
-            $payload.Services[0].LastError | Should -Match ' \[truncated\]$'
-            $payload.Summary.Length | Should -Be 524
-            $payload.Services[0].DisplayName.Length | Should -Be 268
+            # The marker counts toward the limit so the function (DESIGN.md 6.3) never rejects
+            # a value the endpoint already truncated.
+            $payload.Services[0].LastError.Length | Should -Be 1000
+            $payload.Services[0].LastError | Should -Match '^e+ \[truncated\]$'
+            $payload.Summary.Length | Should -Be 512
+            $payload.Summary | Should -Match '^s+ \[truncated\]$'
+            $payload.Services[0].DisplayName.Length | Should -Be 256
+            $payload.Services[0].DisplayName | Should -Match '^d+ \[truncated\]$'
+        }
+
+        It 'sends values exactly at the limits untouched' {
+            $item = @{
+                Name = 'Spooler'; DisplayName = ('d' * 256); PayloadStatus = 'Failed'; StartType = 'Automatic'
+                Attempts = 1; FirstFailedUtc = $null; LastError = ('e' * 1000); FlapCount = 0; Notify = $true
+            }
+            $payload = New-TestPayload -EventType 'alert' -Items @($item) -Summary ('s' * 512)
+            $payload.Services[0].LastError | Should -Be ('e' * 1000)
+            $payload.Summary | Should -Be ('s' * 512)
+            $payload.Services[0].DisplayName | Should -Be ('d' * 256)
         }
 
         It 'keeps nullable fields null for a Missing service' {
@@ -1873,6 +1888,24 @@ Describe 'Invoke-WinServiceWatchdog' {
             Should -Invoke Write-WatchdogEvent -ParameterFilter { $EventId -eq 1001 } -Times 1 -Exactly
             $state = Get-WatchdogState -Path $script:StateFile
             $state.Services.Spooler.LastRemediatedUtc | Should -Be (Get-TestTimestamp)
+        }
+
+        It 'posts a remediated event and exits 0 when NotifyOnRemediation is on' {
+            # Regression: a remediated-only plan has an empty pending list, which must not
+            # be unrolled to $null on its way to Get-WatchdogEventId (exit 1, event 1099).
+            $cfg = New-TestConfigFile -Overrides @{ Alerting = @{ NotifyOnRemediation = $true } }
+            $script:StatusMap.Spooler.Status = 'Stopped'
+            Mock Start-WatchdogService { $script:StatusMap.Spooler.Status = 'Running' }
+            $code = Invoke-WatchdogMain -ConfigPath $cfg -LogPath $script:LogPath
+            $code | Should -Be 0
+            Should -Invoke Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
+                ([System.Text.Encoding]::UTF8.GetString($Body)) -match '"EventType":\s*"remediated"'
+            }
+            Should -Invoke Write-WatchdogEvent -ParameterFilter { $EventId -eq 1099 } -Times 0
+            $state = Get-WatchdogState -Path (Join-Path (Split-Path -Parent $cfg) 'ServiceWatchdog.state.json')
+            $state.PendingNotification | Should -BeFalse
+            $state.Services.Spooler.Status | Should -Be 'Healthy'
+            $state.Services.Spooler.LastNotifiedUtc | Should -Be (Get-TestTimestamp)
         }
 
         It 'exits 10 when the notification is pending and no service is failed' {

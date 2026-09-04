@@ -428,7 +428,10 @@ function Limit-WatchdogString {
     if ($text.Length -le $MaxLength) {
         return $text
     }
-    return $text.Substring(0, $MaxLength) + ' [truncated]'
+    # The marker counts toward the limit: the function (DESIGN.md 6.3) rejects any value
+    # longer than MaxLength, so the truncated text plus marker must fit inside it.
+    $marker = ' [truncated]'
+    return $text.Substring(0, $MaxLength - $marker.Length) + $marker
 }
 
 function Initialize-WatchdogTransportSecurity {
@@ -2047,7 +2050,9 @@ function Invoke-WatchdogMain {
         $delivered = $null
         $eventId = $null
         if ($plan.EventType) {
-            $pendingNames = Get-WatchdogPendingServiceList -Plan $plan
+            # @() keeps an empty result (a remediated-only run) as an empty array; the pipeline
+            # would otherwise unroll it to $null, which Get-WatchdogEventId rejects.
+            $pendingNames = @(Get-WatchdogPendingServiceList -Plan $plan)
             $eventId = Get-WatchdogEventId -State $state -EventType $plan.EventType -ServiceNames $pendingNames
             $summary = Get-WatchdogSummary -EventType $plan.EventType -Items $plan.Items -HostName $identity.HostName
             $payload = New-WatchdogPayload -EventType $plan.EventType -EventId $eventId -Config $config `
