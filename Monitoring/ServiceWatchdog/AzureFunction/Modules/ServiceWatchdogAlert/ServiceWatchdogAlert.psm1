@@ -75,6 +75,10 @@ $script:TableApiVersion = '2020-12-06'
 $script:TableTimeoutSeconds = 10
 $script:HostsTable = 'WatchdogHosts'
 $script:SentEventsTable = 'WatchdogSentEvents'
+# Hourly counter rows for the global email cap live in WatchdogSentEvents under a partition
+# no host can produce: sanitized host keys always start with a letter or digit.
+$script:RateLimitPartitionKey = '_RateLimit'
+$script:RateLimitMaxAttempts = 3
 $script:StorageResource = 'https://storage.azure.com/'
 $script:TokenRefreshMarginMinutes = 5
 $script:Smtp2GoRetryDelays = @(2, 5)
@@ -733,7 +737,11 @@ function Invoke-WatchdogTableRequest {
         [string]$RowKey,
 
         [AllowNull()]
-        [string]$Body
+        [string]$Body,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$IfMatch
     )
 
     $token = Get-WatchdogStorageToken
@@ -746,6 +754,10 @@ function Invoke-WatchdogTableRequest {
         'Accept'                = 'application/json;odata=nometadata'
         'DataServiceVersion'    = '3.0;NetFx'
         'MaxDataServiceVersion' = '3.0;NetFx'
+    }
+    if (-not [string]::IsNullOrEmpty($IfMatch)) {
+        # Update Entity: the write succeeds only when the ETag still matches (412 otherwise).
+        $headers['If-Match'] = $IfMatch
     }
     $request = @{
         Method             = $Method
@@ -760,9 +772,19 @@ function Invoke-WatchdogTableRequest {
         $request['ContentType'] = 'application/json'
     }
     $response = Invoke-WebRequest @request
+    $etag = $null
+    try {
+        if ($null -ne $response.Headers -and $response.Headers['ETag']) {
+            $etag = [string](@($response.Headers['ETag'])[0])
+        }
+    }
+    catch {
+        $etag = $null
+    }
     return @{
         StatusCode = [int]$response.StatusCode
         Content    = [string]$response.Content
+        ETag       = $etag
     }
 }
 
@@ -884,7 +906,8 @@ function Get-WatchdogConfig {
     $readNames = @(
         'WATCHDOG_MAIL_PROVIDER', 'WATCHDOG_MAIL_FROM', 'WATCHDOG_MAIL_TO', 'WATCHDOG_MAIL_SUBJECT_PREFIX',
         'WATCHDOG_MAIL_TIMEOUT_SECONDS', 'WATCHDOG_TABLE_ENDPOINT', 'WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR',
-        'WATCHDOG_ALLOWED_SITES', 'WATCHDOG_STALE_HOURS', 'WATCHDOG_DIGEST_ALWAYS_SEND'
+        'WATCHDOG_MAX_EMAILS_PER_HOUR', 'WATCHDOG_ALLOWED_SITES', 'WATCHDOG_STALE_HOURS',
+        'WATCHDOG_DIGEST_ALWAYS_SEND'
     )
     if ($provider -eq 'Smtp2GoApi') {
         $readNames += 'WATCHDOG_SMTP2GO_API_URL', 'WATCHDOG_SMTP2GO_API_KEY'
@@ -911,6 +934,7 @@ function Get-WatchdogConfig {
         WATCHDOG_SMTP_PORT                    = '587'
         WATCHDOG_SMTP_USE_STARTTLS            = 'true'
         WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR = '6'
+        WATCHDOG_MAX_EMAILS_PER_HOUR          = '60'
         WATCHDOG_STALE_HOURS                  = '26'
         WATCHDOG_DIGEST_ALWAYS_SEND           = 'false'
     }
@@ -945,6 +969,8 @@ function Get-WatchdogConfig {
         TableEndpoint           = $tableEndpoint
         MaxAlertsPerHostPerHour = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR' `
             -Value $setting['WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR']
+        MaxEmailsPerHour        = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_MAX_EMAILS_PER_HOUR' `
+            -Value $setting['WATCHDOG_MAX_EMAILS_PER_HOUR']
         AllowedSites            = ConvertTo-WatchdogSettingList -Value $setting['WATCHDOG_ALLOWED_SITES']
         StaleHours              = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_STALE_HOURS' `
             -Value $setting['WATCHDOG_STALE_HOURS']
@@ -1440,6 +1466,121 @@ function Test-WatchdogRateLimit {
     return $true
 }
 
+function Test-WatchdogGlobalRateLimit {
+    <#
+    .SYNOPSIS
+        Fixed-window cap on emails per UTC clock hour, shared by every worker instance.
+
+    .DESCRIPTION
+        The per-host limiter lives in one worker's memory and keys on the caller-supplied
+        host name, so a leaked function key defeats it with fresh host names or scale-out.
+        This cap counts every email the app sends in the current UTC hour in one
+        WatchdogSentEvents row (PartitionKey '_RateLimit', RowKey 'yyyyMMddHH', Count) and
+        increments it with an ETag-conditioned update, so concurrent instances never lose
+        each other's count. Returns $true when another email is allowed and records it.
+
+        Best effort in the same sense as every other table call: a transport error or an
+        unexpected status is logged as a Warning and the email is allowed, so a storage
+        outage never silences alerts. Persistent ETag conflicts (three attempts) are the one
+        exception: that only happens under a write rate no legitimate fleet produces, so the
+        email is refused.
+
+    .PARAMETER Config
+        The object returned by Get-WatchdogConfig.
+
+    .PARAMETER Limit
+        Maximum emails per UTC hour across all hosts.
+
+    .PARAMETER NowUtc
+        Injected clock for tests. Defaults to [datetime]::UtcNow.
+
+    .EXAMPLE
+        if (-not (Test-WatchdogGlobalRateLimit -Config $config -Limit $config.MaxEmailsPerHour)) { ... }
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param (
+        [Parameter(Mandatory)]
+        [object]$Config,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$Limit,
+
+        [datetime]$NowUtc = [datetime]::UtcNow
+    )
+
+    $rowKey = $NowUtc.ToUniversalTime().ToString('yyyyMMddHH', [System.Globalization.CultureInfo]::InvariantCulture)
+    for ($attempt = 1; $attempt -le $script:RateLimitMaxAttempts; $attempt++) {
+        try {
+            $current = Invoke-WatchdogTableRequest -Config $Config -Method Get -Table $script:SentEventsTable `
+                -PartitionKey $script:RateLimitPartitionKey -RowKey $rowKey
+        }
+        catch {
+            Write-WatchdogLog -Level Warning -Message ("Global rate limit read failed: $($_.Exception.Message); " +
+                'allowing the email')
+            return $true
+        }
+
+        $count = 0
+        $etag = $null
+        switch ($current.StatusCode) {
+            200 {
+                try {
+                    $row = $current.Content | ConvertFrom-Json -AsHashtable
+                    $count = [int]$row['Count']
+                }
+                catch {
+                    $count = 0
+                }
+                $etag = $current.ETag
+            }
+            404 {
+                $count = 0
+            }
+            default {
+                Write-WatchdogLog -Level Warning -Message ("Global rate limit read returned HTTP " +
+                    "$($current.StatusCode); allowing the email")
+                return $true
+            }
+        }
+
+        if ($count -ge $Limit) {
+            return $false
+        }
+
+        $entity = [ordered]@{
+            PartitionKey = $script:RateLimitPartitionKey
+            RowKey       = $rowKey
+            Count        = $count + 1
+            UpdatedUtc   = ConvertTo-WatchdogTimestamp -Value $NowUtc
+        }
+        try {
+            $write = Invoke-WatchdogTableRequest -Config $Config -Method Put -Table $script:SentEventsTable `
+                -PartitionKey $script:RateLimitPartitionKey -RowKey $rowKey -Body ($entity | ConvertTo-Json -Compress) `
+                -IfMatch $etag
+        }
+        catch {
+            Write-WatchdogLog -Level Warning -Message ("Global rate limit write failed: $($_.Exception.Message); " +
+                'allowing the email')
+            return $true
+        }
+        if ($write.StatusCode -eq 204) {
+            return $true
+        }
+        if ($write.StatusCode -ne 412) {
+            Write-WatchdogLog -Level Warning -Message ("Global rate limit write returned HTTP $($write.StatusCode); " +
+                'allowing the email')
+            return $true
+        }
+        # 412: another instance updated the counter first; re-read and try again.
+    }
+
+    Write-WatchdogLog -Level Warning -Message ("Global rate limit counter for $rowKey could not be updated after " +
+        "$($script:RateLimitMaxAttempts) conflicting attempts; refusing the email")
+    return $false
+}
+
 function Get-WatchdogStorageToken {
     <#
     .SYNOPSIS
@@ -1543,7 +1684,9 @@ function ConvertTo-WatchdogHostEntity {
     .DESCRIPTION
         LastSeenUtc is always the function's own receipt time (NowUtc), never the payload's
         TimestampUtc, so staleness never depends on the server's clock. ProblemServiceCount
-        counts services whose status is Failed, Missing or Disabled; a test event stores 0/0.
+        counts services whose status is Failed, Missing or Disabled. Test events never reach
+        this function: SendServiceWatchdogAlert skips the host row for them, because a test
+        event proves nothing about a watchdog being installed on that host.
 
     .PARAMETER Payload
         A validated payload.
@@ -1800,8 +1943,12 @@ function Get-WatchdogStaleHosts {
         }
         $lastSeen = ConvertFrom-WatchdogTimestamp -Value (Get-WatchdogField -Object $row -Name 'LastSeenUtc')
         $ageHours = $null
+        $rawHours = $null
         if ($null -ne $lastSeen) {
-            $ageHours = [math]::Round(($NowUtc.ToUniversalTime() - $lastSeen).TotalHours, 1)
+            # The comparison uses the exact age; rounding is for display only, so a host
+            # 26h02m old is stale against a 26-hour threshold rather than rounded to fresh.
+            $rawHours = ($NowUtc.ToUniversalTime() - $lastSeen).TotalHours
+            $ageHours = [math]::Round($rawHours, 1)
         }
         $item = [pscustomobject]@{
             HostName              = [string](Get-WatchdogField -Object $row -Name 'RowKey')
@@ -1813,7 +1960,7 @@ function Get-WatchdogStaleHosts {
             MonitoredServiceCount = Get-WatchdogField -Object $row -Name 'MonitoredServiceCount'
             ProblemServiceCount   = Get-WatchdogField -Object $row -Name 'ProblemServiceCount'
         }
-        if ($null -eq $ageHours -or $ageHours -gt $StaleHours) {
+        if ($null -eq $rawHours -or $rawHours -gt $StaleHours) {
             $stale.Add($item)
         }
         else {
@@ -1836,6 +1983,7 @@ Export-ModuleMember -Function @(
     'ConvertTo-WatchdogEmail',
     'Send-WatchdogMail',
     'Test-WatchdogRateLimit',
+    'Test-WatchdogGlobalRateLimit',
     'Get-WatchdogStorageToken',
     'Set-WatchdogHostEntity',
     'Test-WatchdogSentEvent',

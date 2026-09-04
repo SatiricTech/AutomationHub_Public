@@ -71,6 +71,12 @@ param (
 $ErrorActionPreference = 'Stop'
 $script:DigestFunctionName = 'SendServiceWatchdogDigest'
 $script:DigestTimestampFormat = 'yyyy-MM-ddTHH:mm:ssZ'
+# Bounds on what one digest renders. WatchdogHosts rows are created by any caller holding
+# the function key, so a leaked key can grow the table without limit; the email lists at
+# most DigestMaxListedHosts stale hosts and says how many more there are, and a row count
+# above DigestSuspiciousRowCount is logged as a Warning so poisoning is visible.
+$script:DigestMaxListedHosts = 200
+$script:DigestSuspiciousRowCount = 1000
 
 #endregion
 
@@ -188,7 +194,8 @@ function ConvertTo-DigestEmail {
                     '<th align="left">' + $_ + '</th>'
                 })
             [void]$html.AppendLine('<tr>' + ($headerCells -join '') + '</tr>')
-            foreach ($item in $Stale) {
+            $listed = @($Stale | Select-Object -First $script:DigestMaxListedHosts)
+            foreach ($item in $listed) {
                 $age = Format-DigestAge -AgeHours $item.AgeHours
                 $lastSeen = if ($null -eq $item.LastSeenUtc) { 'never' } else { [string]$item.LastSeenUtc }
                 [void]$text.AppendLine("  $($item.HostName) ($($item.SiteName)): last seen $lastSeen, $age; " +
@@ -199,6 +206,12 @@ function ConvertTo-DigestEmail {
                 [void]$html.AppendLine('<tr>' + ($cells -join '') + '</tr>')
             }
             [void]$html.AppendLine('</table>')
+            if ($Stale.Count -gt $listed.Count) {
+                $omitted = "... and $($Stale.Count - $listed.Count) more stale hosts not listed (only the first " +
+                "$($listed.Count) are shown); review the WatchdogHosts table."
+                [void]$text.AppendLine("  $omitted")
+                [void]$html.AppendLine('<p>' + (ConvertTo-DigestHtml -Value $omitted) + '</p>')
+            }
             $freshLine = "$($Fresh.Count) fresh $freshWord reported within the threshold."
             [void]$text.AppendLine('')
             [void]$text.AppendLine($freshLine)
@@ -269,6 +282,11 @@ function Invoke-WatchdogDigestFlow {
     $config = Get-WatchdogConfig
 
     $rows = ConvertTo-DigestRowArray -Hosts $Hosts
+    if ($rows.Count -gt $script:DigestSuspiciousRowCount) {
+        Write-WatchdogLog -Level Warning -RunId $RunId -Message ("WatchdogHosts holds $($rows.Count) rows, more than " +
+            "$($script:DigestSuspiciousRowCount): a leaked function key may be creating host rows; rotate the key " +
+            'and clean the table (README, Recovering from a leaked function key)')
+    }
     $email = $null
     $staleCount = 0
     $freshCount = 0

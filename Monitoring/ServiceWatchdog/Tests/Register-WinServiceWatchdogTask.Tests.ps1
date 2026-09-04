@@ -192,6 +192,13 @@ Describe 'Register-WinServiceWatchdogTask' {
         Mock Invoke-WatchdogWorker { return 0 }
         Mock Test-WatchdogEventSource { return $true }
         Mock icacls { $global:LASTEXITCODE = 0 }
+        Mock Get-WatchdogPathOwnerSid { 'S-1-5-32-544' }
+        Mock Get-WatchdogPathAccessRule {
+            @(
+                @{ Sid = 'S-1-5-18'; IsInherited = $false; Type = 'Allow' }
+                @{ Sid = 'S-1-5-32-544'; IsInherited = $false; Type = 'Allow' }
+            )
+        }
         Mock sc.exe { $global:LASTEXITCODE = 0 }
         Mock Add-WatchdogEventSource { }
         Mock Register-ScheduledTask { }
@@ -298,6 +305,41 @@ Describe 'Register-WinServiceWatchdogTask' {
             Should -Invoke Register-ScheduledTask -Times 0
         }
 
+        It 'locks the install folder on the first run, before the example config is copied' {
+            $fixture = New-RegisterFixture
+
+            $exitCode = Invoke-WatchdogRegistration @fixture
+
+            $exitCode | Should -Be 2
+            Test-Path -LiteralPath $fixture.ConfigPath | Should -BeTrue
+            Should -Invoke icacls -Times 1 -Exactly -ParameterFilter {
+                $args[0] -eq $fixture.InstallPath -and $args -contains '/inheritance:r'
+            }
+            $log = Get-LogText
+            $log.IndexOf('Restrict') | Should -BeLessThan $log.IndexOf('Copy example config')
+        }
+
+        It 'refuses an existing install folder owned by another account with exit 2 and touches nothing' {
+            $fixture = New-RegisterFixture -WithConfig
+            Mock Get-WatchdogPathOwnerSid { 'S-1-5-21-1000000000-2000000000-3000000000-1001' }
+
+            $exitCode = Invoke-WatchdogRegistration @fixture
+
+            $exitCode | Should -Be 2
+            Get-LogText | Should -Match 'S-1-5-21-1000000000-2000000000-3000000000-1001'
+            Test-Path -LiteralPath (Join-Path $fixture.InstallPath $script:WorkerFileName) | Should -BeFalse
+            Should -Invoke icacls -Times 0
+            Should -Invoke Invoke-WatchdogWorker -Times 0
+            Should -Invoke Register-ScheduledTask -Times 0
+        }
+
+        It 'accepts an existing install folder owned by SYSTEM' {
+            $fixture = New-RegisterFixture -WithConfig
+            Mock Get-WatchdogPathOwnerSid { 'S-1-5-18' }
+
+            Invoke-WatchdogRegistration @fixture | Should -Be 0
+        }
+
         It 'creates the install folder when it does not exist and the config has a custom name inside it' {
             $fixture = New-RegisterFixture
             New-Item -Path $fixture.InstallPath -ItemType Directory -Force | Out-Null
@@ -366,7 +408,7 @@ Describe 'Register-WinServiceWatchdogTask' {
 
             Invoke-WatchdogRegistration @fixture | Should -Be 0
 
-            Should -Invoke icacls -Times 1 -Exactly -ParameterFilter { $args[0] -eq $fixture.InstallPath }
+            Should -Invoke icacls -Times 3 -Exactly -ParameterFilter { $args[0] -eq $fixture.InstallPath }
         }
 
         It 'exits 2 when neither a config nor the example config exists' {
@@ -378,6 +420,69 @@ Describe 'Register-WinServiceWatchdogTask' {
             $exitCode | Should -Be 2
             Test-Path -LiteralPath $fixture.ConfigPath | Should -BeFalse
             Get-LogText | Should -Match ([regex]::Escape($script:ExampleConfigFileName))
+        }
+    }
+
+    Context 'Step 1: path canonicalization' {
+        It 'bakes absolute paths into the task action and the ACL call when InstallPath is relative' {
+            $fixture = New-RegisterFixture -WithConfig
+            $absoluteInstall = $fixture.InstallPath
+            $fixture.InstallPath = Split-Path -Path $absoluteInstall -Leaf
+            $fixture.ConfigPath = Join-Path $fixture.InstallPath 'ServiceWatchdog.json'
+            $script:TaskAction = $null
+            Mock Register-ScheduledTask { $script:TaskAction = $Action }
+
+            Push-Location -LiteralPath $script:TestRoot
+            try {
+                $exitCode = Invoke-WatchdogRegistration @fixture
+            }
+            finally {
+                Pop-Location
+            }
+
+            $exitCode | Should -Be 0
+            $script:TaskAction.Argument | Should -BeLike "*-File `"$absoluteInstall*Invoke-WinServiceWatchdog.ps1`"*"
+            $script:TaskAction.Argument | Should -Not -BeLike "*-File `"$($fixture.InstallPath)*"
+            Should -Invoke icacls -Times 3 -Exactly -ParameterFilter { $args[0] -eq $absoluteInstall }
+            Should -Invoke Invoke-WatchdogWorker -Times 1 -Exactly -ParameterFilter {
+                $Arguments -contains (Join-Path $absoluteInstall 'ServiceWatchdog.json')
+            }
+        }
+
+        It 'collapses .. segments before the containment check, the ACL call and the task action' {
+            $fixture = New-RegisterFixture -WithConfig
+            $absoluteInstall = $fixture.InstallPath
+            $fixture.InstallPath = Join-Path (Join-Path $absoluteInstall 'sub') '..'
+            $script:TaskAction = $null
+            Mock Register-ScheduledTask { $script:TaskAction = $Action }
+
+            Invoke-WatchdogRegistration @fixture | Should -Be 0
+
+            $script:TaskAction.Argument | Should -Not -Match '\.\.'
+            $script:TaskAction.Argument | Should -BeLike "*-File `"$absoluteInstall*"
+            Should -Invoke icacls -Times 3 -Exactly -ParameterFilter { $args[0] -eq $absoluteInstall }
+        }
+
+        It 'refuses an InstallPath that resolves to ProgramData through .. with exit 2 and no icacls call' {
+            $fixture = New-RegisterFixture -WithConfig
+            $fixture.InstallPath = Join-Path (Join-Path $env:ProgramData 'ServiceWatchdog') '..'
+            $fixture.ConfigPath = Join-Path $env:ProgramData 'ServiceWatchdog.json'
+
+            $exitCode = Invoke-WatchdogRegistration @fixture
+
+            $exitCode | Should -Be 2
+            Get-LogText | Should -Match 'filesystem root or a Windows system folder'
+            Should -Invoke icacls -Times 0
+            Should -Invoke Register-ScheduledTask -Times 0
+        }
+
+        It 'refuses a filesystem root as InstallPath' {
+            $fixture = New-RegisterFixture -WithConfig
+            $fixture.InstallPath = [System.IO.Path]::GetPathRoot($fixture.InstallPath)
+            $fixture.ConfigPath = Join-Path $fixture.InstallPath 'ServiceWatchdog.json'
+
+            Invoke-WatchdogRegistration @fixture | Should -Be 2
+            Should -Invoke icacls -Times 0
         }
     }
 
@@ -395,6 +500,54 @@ Describe 'Register-WinServiceWatchdogTask' {
                 $args -contains '*S-1-5-18:(OI)(CI)F' -and
                 $args -contains '*S-1-5-32-544:(OI)(CI)F'
             }
+        }
+
+        It 'resets explicit entries first and takes ownership of the whole tree afterwards' {
+            $script:IcaclsCalls = [System.Collections.Generic.List[string]]::new()
+            Mock icacls { $script:IcaclsCalls.Add(($args -join ' ')); $global:LASTEXITCODE = 0 }
+            $fixture = New-RegisterFixture -WithConfig
+
+            Invoke-WatchdogRegistration @fixture | Should -Be 0
+
+            $script:IcaclsCalls.Count | Should -Be 3
+            $script:IcaclsCalls[0] | Should -Be "$($fixture.InstallPath) /reset /T"
+            $script:IcaclsCalls[1] | Should -Match '/inheritance:r /grant:r'
+            $script:IcaclsCalls[2] | Should -Be "$($fixture.InstallPath) /setowner *S-1-5-32-544 /T"
+            Should -Invoke Get-WatchdogPathAccessRule -Times 1 -Exactly -ParameterFilter {
+                $Path -eq $fixture.InstallPath
+            }
+        }
+
+        It 'fails the run with exit 1 when the ACL read back still carries a foreign entry' {
+            $fixture = New-RegisterFixture -WithConfig
+            Mock Get-WatchdogPathAccessRule {
+                @(
+                    @{ Sid = 'S-1-5-18'; IsInherited = $false; Type = 'Allow' }
+                    @{ Sid = 'S-1-5-32-544'; IsInherited = $false; Type = 'Allow' }
+                    @{ Sid = 'S-1-5-21-1000000000-2000000000-3000000000-1001'; IsInherited = $false; Type = 'Allow' }
+                )
+            }
+
+            $exitCode = Invoke-WatchdogRegistration @fixture
+
+            $exitCode | Should -Be 1
+            Get-LogText | Should -Match 'S-1-5-21-1000000000-2000000000-3000000000-1001'
+            Should -Invoke Register-ScheduledTask -Times 0
+        }
+
+        It 'fails the run when the read back is missing one of the expected entries or one is inherited' {
+            $fixture = New-RegisterFixture -WithConfig
+            Mock Get-WatchdogPathAccessRule { @(@{ Sid = 'S-1-5-18'; IsInherited = $false; Type = 'Allow' }) }
+            Invoke-WatchdogRegistration @fixture | Should -Be 1
+            Get-LogText | Should -Match 'missing the entry for SID S-1-5-32-544'
+
+            Mock Get-WatchdogPathAccessRule {
+                @(
+                    @{ Sid = 'S-1-5-18'; IsInherited = $false; Type = 'Allow' }
+                    @{ Sid = 'S-1-5-32-544'; IsInherited = $true; Type = 'Allow' }
+                )
+            }
+            Invoke-WatchdogRegistration @fixture -Force | Should -Be 1
         }
 
         It 'fails the run with exit 1 and no task when icacls returns non-zero' {
@@ -415,6 +568,14 @@ Describe 'Register-WinServiceWatchdogTask' {
     }
 
     Context 'Step 3: config validation' {
+        It 'does not pass -DryRun to the worker on a real run' {
+            $fixture = New-RegisterFixture -WithConfig
+            Invoke-WatchdogRegistration @fixture | Should -Be 0
+            Should -Invoke Invoke-WatchdogWorker -Times 1 -Exactly -ParameterFilter {
+                $Arguments -contains '-ValidateConfig' -and $Arguments -notcontains '-DryRun'
+            }
+        }
+
         It 'validates through the worker with -ValidateConfig and the config path' {
             $fixture = New-RegisterFixture -WithConfig
 
@@ -746,7 +907,7 @@ Describe 'Register-WinServiceWatchdogTask' {
             Should -Invoke Start-ScheduledTask -Times 0
             Should -Invoke Invoke-WatchdogWorker -Times 0 -ParameterFilter { $Arguments -contains '-TestAlert' }
             Should -Invoke Invoke-WatchdogWorker -Times 1 -Exactly -ParameterFilter {
-                $Arguments -contains '-ValidateConfig'
+                $Arguments -contains '-ValidateConfig' -and $Arguments -contains '-DryRun'
             }
             Get-LogText | Should -Match '\[DRYRUN\]'
         }

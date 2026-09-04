@@ -266,6 +266,54 @@ Describe 'Unregister-WinServiceWatchdogTask' {
             Should -Invoke Unregister-ScheduledTask -Times 0
             Test-Path -LiteralPath $env:ProgramData | Should -BeTrue
         }
+
+        It 'refuses an InstallPath that resolves to a protected folder through a .. segment' {
+            # C:\ProgramData\ServiceWatchdog\.. is C:\ProgramData: -LiteralPath does not stop
+            # the file system from resolving '..', so the guard must resolve it first.
+            $fixture = New-UnregisterFixture
+            $sentinel = Join-Path $env:ProgramData 'ServiceWatchdog'
+            New-Item -Path $sentinel -ItemType Directory -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $env:ProgramData 'other-app.txt') -Value 'keep'
+
+            $programDataLeaf = Split-Path -Path $env:ProgramData -Leaf
+            foreach ($traversal in @(
+                    (Join-Path $sentinel '..'),
+                    (Join-Path $sentinel (Join-Path '..' (Join-Path '..' $programDataLeaf))))) {
+                $fixture.InstallPath = $traversal
+                Invoke-WatchdogUnregistration @fixture -RemoveFiles -Force | Should -Be 2
+            }
+
+            Should -Invoke Unregister-ScheduledTask -Times 0
+            Test-Path -LiteralPath $env:ProgramData | Should -BeTrue
+            Test-Path -LiteralPath $sentinel | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $env:ProgramData 'other-app.txt') | Should -BeTrue
+            Test-Path -LiteralPath $script:TestRoot | Should -BeTrue
+        }
+
+        It 'resolves a relative InstallPath before removing it' {
+            $fixture = New-UnregisterFixture
+            $absolute = $fixture.InstallPath
+            $fixture.InstallPath = Split-Path -Path $absolute -Leaf
+
+            Push-Location -LiteralPath $script:TestRoot
+            try {
+                $exitCode = Invoke-WatchdogUnregistration @fixture -RemoveFiles -Force
+            }
+            finally {
+                Pop-Location
+            }
+
+            $exitCode | Should -Be 0
+            Test-Path -LiteralPath $absolute | Should -BeFalse
+            Get-LogText | Should -Match ([regex]::Escape("Resolved InstallPath=$absolute"))
+        }
+
+        It 'Test-WatchdogProtectedPath resolves .. and relative segments before comparing' {
+            Test-WatchdogProtectedPath -Path (Join-Path (Join-Path $env:ProgramData 'ServiceWatchdog') '..') |
+                Should -BeTrue
+            Test-WatchdogProtectedPath -Path (Join-Path $env:ProgramData 'ServiceWatchdog') | Should -BeFalse
+            Test-WatchdogProtectedPath -Path ([System.IO.Path]::GetPathRoot($script:TestRoot)) | Should -BeTrue
+        }
     }
 
     Context 'Console verbosity' {

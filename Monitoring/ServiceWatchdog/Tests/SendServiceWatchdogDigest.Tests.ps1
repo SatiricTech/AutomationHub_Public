@@ -161,6 +161,27 @@ Describe 'SendServiceWatchdogDigest run.ps1' {
             }
         }
 
+        It 'lists at most 200 stale hosts and says how many more there are' {
+            $rows = @(1..205 | ForEach-Object { New-HostRow -HostName ('SRV-STALE-{0:000}' -f $_) -AgeHours 50 })
+            Invoke-DigestFunction -Hosts $rows
+            Should -Invoke Send-WatchdogMail -Times 1 -Exactly -ParameterFilter {
+                $Subject -like '*205 stale hosts*' -and
+                $TextBody -like '*SRV-STALE-200*' -and
+                $TextBody -notlike '*SRV-STALE-201*' -and
+                $TextBody -like '*and 5 more stale hosts not listed*' -and
+                $HtmlBody -like '*and 5 more stale hosts not listed*'
+            }
+        }
+
+        It 'warns when the table holds more rows than any fleet should produce' {
+            $rows = @(1..1001 | ForEach-Object { New-HostRow -HostName ('SRV-{0:0000}' -f $_) -AgeHours 1 })
+            Invoke-DigestFunction -Hosts $rows
+            Should -Invoke Write-WatchdogLog -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'Warning' -and $Message -like '*1001 rows*' -and $Message -like '*leaked function key*'
+            }
+            Should -Invoke Send-WatchdogMail -Times 0 -Exactly
+        }
+
         It 'accepts a single row that arrives as one hashtable rather than an array' {
             $row = New-HostRow -HostName 'SRV-STALE-01' -AgeHours 50
             $timer = @{ IsPastDue = $false }

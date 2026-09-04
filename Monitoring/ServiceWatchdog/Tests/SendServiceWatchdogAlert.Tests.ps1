@@ -179,6 +179,7 @@ Describe 'SendServiceWatchdogAlert run.ps1' {
         Mock Set-WatchdogHostEntity { }
         Mock Test-WatchdogSentEvent { $false }
         Mock Test-WatchdogRateLimit { $true }
+        Mock Test-WatchdogGlobalRateLimit { $true }
         Mock Send-WatchdogMail { @{ Sent = $true; ProviderMessageId = 'email-123'; Error = $null; StatusCode = 200 } }
         Mock Set-WatchdogSentEvent { }
     }
@@ -310,6 +311,22 @@ Describe 'SendServiceWatchdogAlert run.ps1' {
             Should -Invoke Test-WatchdogSentEvent -Times 0 -Exactly
             Should -Invoke Send-WatchdogMail -Times 1 -Exactly
         }
+
+        It 'never records a host row for a test event' {
+            Invoke-AlertFunction -Request (New-TestRequest -Body (New-TestPayload -EventType 'test'))
+            (Get-PushedResponse).StatusCode | Should -Be 200
+            Should -Invoke Set-WatchdogHostEntity -Times 0 -Exactly
+            Should -Invoke Write-WatchdogLog -ParameterFilter { $Message -like '*host row not recorded*' }
+        }
+
+        It 'records a host row for every non-test event type' -ForEach @(
+            @{ EventType = 'alert' }
+            @{ EventType = 'recovered' }
+            @{ EventType = 'heartbeat' }
+        ) {
+            Invoke-AlertFunction -Request (New-TestRequest -Body (New-TestPayload -EventType $EventType))
+            Should -Invoke Set-WatchdogHostEntity -Times 1 -Exactly
+        }
     }
 
     Context 'Rate limiting' {
@@ -327,12 +344,45 @@ Describe 'SendServiceWatchdogAlert run.ps1' {
             Should -Invoke Send-WatchdogMail -Times 0 -Exactly
         }
 
-        It 'lets a recovered event bypass the rate limit' {
+        It 'lets a recovered event bypass the per-host rate limit' {
             Mock Test-WatchdogRateLimit { $false }
             Invoke-AlertFunction -Request (New-TestRequest -Body (New-TestPayload -EventType 'recovered'))
             (Get-PushedResponse).StatusCode | Should -Be 200
             Should -Invoke Test-WatchdogRateLimit -Times 0 -Exactly
             Should -Invoke Send-WatchdogMail -Times 1 -Exactly
+        }
+
+        It 'returns 429 rate_limited from the global cap with the configured limit' {
+            Mock Test-WatchdogGlobalRateLimit { $false }
+            Invoke-AlertFunction -Request (New-TestRequest -Body (New-TestPayload))
+            $response = Get-PushedResponse
+            $response.StatusCode | Should -Be 429
+            $response.Body.error | Should -Be 'rate_limited'
+            $response.Body.errors[0] | Should -BeLike '*60 emails per hour*'
+            $response.Headers['Retry-After'] | Should -Be '600'
+            Should -Invoke Test-WatchdogGlobalRateLimit -Times 1 -Exactly -ParameterFilter { $Limit -eq 60 }
+            Should -Invoke Send-WatchdogMail -Times 0 -Exactly
+        }
+
+        It 'applies the global cap to recovered and test events too' -ForEach @(
+            @{ EventType = 'recovered' }
+            @{ EventType = 'test' }
+        ) {
+            Mock Test-WatchdogGlobalRateLimit { $false }
+            Invoke-AlertFunction -Request (New-TestRequest -Body (New-TestPayload -EventType $EventType))
+            (Get-PushedResponse).StatusCode | Should -Be 429
+            Should -Invoke Send-WatchdogMail -Times 0 -Exactly
+        }
+
+        It 'checks the global cap only after the per-host limit and the dedup check pass' {
+            Mock Test-WatchdogRateLimit { $false }
+            Invoke-AlertFunction -Request (New-TestRequest -Body (New-TestPayload))
+            Should -Invoke Test-WatchdogGlobalRateLimit -Times 0 -Exactly
+
+            Mock Test-WatchdogRateLimit { $true }
+            Mock Test-WatchdogSentEvent { $true }
+            Invoke-AlertFunction -Request (New-TestRequest -Body (New-TestPayload))
+            Should -Invoke Test-WatchdogGlobalRateLimit -Times 0 -Exactly
         }
     }
 
@@ -406,6 +456,7 @@ Describe 'SendServiceWatchdogAlert run.ps1' {
             @{ Name = 'heartbeat' }
             @{ Name = 'duplicate' }
             @{ Name = 'rate limited' }
+            @{ Name = 'globally rate limited' }
             @{ Name = 'provider failure' }
             @{ Name = 'success' }
         ) {
@@ -416,6 +467,7 @@ Describe 'SendServiceWatchdogAlert run.ps1' {
                 'heartbeat' { $body = New-TestPayload -EventType 'heartbeat' }
                 'duplicate' { Mock Test-WatchdogSentEvent { $true } }
                 'rate limited' { Mock Test-WatchdogRateLimit { $false } }
+                'globally rate limited' { Mock Test-WatchdogGlobalRateLimit { $false } }
                 'provider failure' { Mock Send-WatchdogMail { @{ Sent = $false; Error = 'x' } } }
             }
             Invoke-AlertFunction -Request (New-TestRequest -Body $body)
@@ -498,6 +550,41 @@ public class HttpResponseContext
             Should -Invoke Write-WatchdogLog -Times 1 -Exactly -ParameterFilter {
                 $Level -eq 'Warning' -and $Message -like '*HttpResponseContext conversion failed*'
             }
+        }
+    }
+}
+
+Describe 'SendServiceWatchdogAlert run.ps1 cold-start failure' {
+    # Separate Describe: the block above mocks the module functions, which would mask the
+    # case this covers, where the module never loaded and none of them exist.
+
+    BeforeEach {
+        $script:Pushed = [System.Collections.ArrayList]::new()
+        Mock Push-OutputBinding { $null = $script:Pushed.Add(@{ Name = $Name; Value = $Value }) }
+        Mock Write-Error { }
+        Remove-Module -Name $script:ModuleName -Force -ErrorAction SilentlyContinue
+        Mock Import-Module { throw 'The specified module was not loaded because no valid module file was found' }
+    }
+
+    AfterEach {
+        # Invoked through the cmdlet's CommandInfo so the Import-Module mock above (which
+        # also intercepts module-qualified calls) does not swallow the restore.
+        & (Get-Command -Name 'Import-Module' -CommandType Cmdlet) $script:ModulePath -Force
+    }
+
+    It 'still pushes exactly one 500 internal_error JSON response when Import-Module fails' {
+        Get-Module -Name $script:ModuleName | Should -BeNullOrEmpty
+
+        Invoke-AlertFunction -Request (New-TestRequest -Body (New-TestPayload))
+
+        Should -Invoke Push-OutputBinding -Times 1 -Exactly
+        $response = Get-PushedResponse
+        $response.StatusCode | Should -Be 500
+        $response.ContentType | Should -Be 'application/json'
+        $response.Body.accepted | Should -BeFalse
+        $response.Body.error | Should -Be 'internal_error'
+        Should -Invoke Write-Error -Times 1 -Exactly -ParameterFilter {
+            $Message -like '*no valid module file was found*' -and $Message -like '*runId=*'
         }
     }
 }

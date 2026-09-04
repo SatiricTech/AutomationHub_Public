@@ -131,13 +131,16 @@ Do the Azure side first; the servers need its URL and key.
    address must be on that domain.
 2. Create a dedicated **API key** (Settings > API Keys) with only the **Emails**
    permission (`/email/send`) enabled. Give it a name that identifies this deployment.
-3. Set a **per-key rate limit** on that key (for example 60 per hour) as a blast-radius
-   cap; a leaked key can then do limited damage.
+3. Set a **per-key rate limit** on that key (for example 60 per hour). This is a required
+   step, not a suggestion: the function enforces its own global cap
+   (`WATCHDOG_MAX_EMAILS_PER_HOUR`, 60 per hour by default), but the provider-side limit is
+   the one that still holds if the function app itself is misused or bypassed.
 4. Do **not** enable the account-level API IP allowlist: a Consumption Function App has no
    fixed outbound IP and would block itself.
 
-For an SMTP relay instead of the REST API, create an SMTP user at the relay and note the
-host, port and credential; pass `-MailProvider Smtp` below.
+For an SMTP relay instead of the REST API, create an SMTP user at the relay, apply the
+relay's equivalent per-account sending limit, and note the host, port and credential;
+pass `-MailProvider Smtp` below.
 
 ### 2. Deploy the Azure side
 
@@ -155,10 +158,13 @@ cd Monitoring/ServiceWatchdog/Deploy
 The script checks prerequisites, creates the resource group if needed, deploys
 `main.bicep`, seeds the provider secret in Key Vault (retrying while the role assignment
 propagates), zips and publishes the function code, restarts the app so the Key Vault
-references resolve, verifies admin endpoint isolation, waits for the function to appear,
-creates a named function key (`watchdog` by default), and prints the alert URL and key to
-the console **once**. The key is never written to the log file. `-SendTestEmail` posts a
-`test` event and reports the function's verdict.
+references resolve, waits for the function to appear, creates a named function key
+(`watchdog` by default), prints the alert URL and key to the console **once**, and only
+then verifies admin endpoint isolation (a failure there is reported as exit 50 after the
+key was shown, never before). The key is never written to the log file. `-SendTestEmail`
+posts a `test` event and reports the function's verdict; test events never create a
+`WatchdogHosts` row, so the workstation you deploy from does not turn up in the stale-host
+digest.
 
 Re-running the script is safe: every step is idempotent, an existing key of the same name
 is reused rather than regenerated, and a re-run is the way to change recipients or push
@@ -186,8 +192,9 @@ Copy the `Endpoint/` folder to the server and, in an elevated PowerShell:
 ```powershell
 cd C:\Temp\Endpoint
 .\Register-WinServiceWatchdogTask.ps1
-# First run: copies the worker and example config to C:\ProgramData\ServiceWatchdog
-# and exits 2 asking you to edit ServiceWatchdog.json.
+# First run: creates C:\ProgramData\ServiceWatchdog, locks it down to SYSTEM and
+# Administrators, copies the example config into it and exits 2 asking you to edit
+# ServiceWatchdog.json.
 
 notepad C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json
 # Set SiteName, Services, Webhook.Url and Webhook.FunctionKey (the two lines the
@@ -196,11 +203,14 @@ notepad C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json
 .\Register-WinServiceWatchdogTask.ps1 -TestAlert -RunNow
 ```
 
-The second run locks the install folder down to SYSTEM and Administrators (`icacls`),
+The second run re-applies the folder lockdown (`icacls`: explicit entries reset,
+inheritance removed, SYSTEM and Administrators only, ownership taken), copies the worker,
 validates the config by running the worker with `-ValidateConfig`, checks the task's
 execution limit against the config's worst-case run time, registers the event log source,
 registers the `ServiceWatchdog` task (SYSTEM, every 5 minutes, plus 5 minutes after boot),
-starts the task and sends a test alert. Add `-SetServiceRecovery` to also set Service
+starts the task and sends a test alert. If `C:\ProgramData\ServiceWatchdog` already exists
+and is owned by an account other than SYSTEM or Administrators, the installer refuses it
+(exit 2): remove the folder or take ownership as an administrator first. Add `-SetServiceRecovery` to also set Service
 Control Manager failure actions (restart after 1 and 2 minutes) on every listed service.
 
 Check the inbox for the `[TEST]` email, then see [Testing an installation](#testing-an-installation).
@@ -343,7 +353,7 @@ script otherwise and reports exit 1).
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `-InstallPath` | `%ProgramData%\ServiceWatchdog` | Where the worker, config, state and logs live |
+| `-InstallPath` | `%ProgramData%\ServiceWatchdog` | Where the worker, config, state and logs live. Resolved to an absolute path first; a filesystem root or Windows system folder is refused (exit 2), as is an existing folder owned by another account |
 | `-SourcePath` | script folder | Where to copy the worker and example config from |
 | `-ConfigPath` | `<InstallPath>\ServiceWatchdog.json` | Config to validate and use. **Must be inside `InstallPath`** (any file name, subfolders allowed) because that is the only folder the ACL protects; anything else is refused with exit 2 before any change |
 | `-TaskName` | `ServiceWatchdog` | Task name in the root Task Scheduler folder |
@@ -353,12 +363,14 @@ script otherwise and reports exit 1).
 | `-SetServiceRecovery` | off | `sc.exe failure <svc> reset= 86400 actions= restart/60000/restart/120000/none/0` on each listed service |
 | `-RunNow` | off | Start the task after registration |
 | `-TestAlert` | off | Run the worker with `-TestAlert` after registration |
-| `-Force` | off | Overwrite a worker already present in `InstallPath` |
-| `-DryRun`, `-Verbosity`, `-LogPath` | | Standard; the config is still validated under `-DryRun` because that step is read-only |
+| `-Force` | off | Overwrite a worker already present in `InstallPath`; needed on every re-run after the first install |
+| `-DryRun`, `-Verbosity`, `-LogPath` | | Standard; the config is still validated under `-DryRun` (the worker is run with `-ValidateConfig -DryRun`, so nothing is registered) |
 
-Re-runs always use `Register-ScheduledTask -Force`, so changing `-IntervalMinutes` or
-`-ExecutionTimeLimitSeconds` later is just another run (add `-Force` only if the worker
-script itself should be replaced). The task action is
+Re-runs always use `Register-ScheduledTask -Force`, but the script's own `-Force` is
+needed on every run after the first install because the worker is already present
+(the copy is idempotent), so changing `-IntervalMinutes` or `-ExecutionTimeLimitSeconds`
+later is `.\Register-WinServiceWatchdogTask.ps1 -Force -IntervalMinutes 10`. The task
+action is
 `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "<InstallPath>\Invoke-WinServiceWatchdog.ps1"`,
 with `-ConfigPath` appended only when the config has a non-default name; no argument
 carries a secret.
@@ -366,8 +378,8 @@ carries a secret.
 | Code | Meaning |
 |---|---|
 | `0` | Task registered |
-| `1` | Unexpected error (including not elevated) |
-| `2` | Config invalid, config not yet edited, config outside `InstallPath`, worker already present without `-Force`, or execution limit too small |
+| `1` | Unexpected error (including not elevated, and an install-folder ACL that does not read back as SYSTEM and Administrators only) |
+| `2` | Config invalid, config not yet edited, config outside `InstallPath`, `InstallPath` a root or system folder or an existing folder with a foreign owner, worker already present without `-Force`, or execution limit too small |
 | `10` | Task registered but the `-TestAlert` delivery failed |
 | `50` | Task registered but one or more `-SetServiceRecovery` steps failed (the loop continues past a failing service) |
 
@@ -376,8 +388,9 @@ carries a secret.
 Also elevated. `-TaskName` (default `ServiceWatchdog`), `-InstallPath` (default
 `%ProgramData%\ServiceWatchdog`), `-RemoveEventSource`, `-RemoveFiles` (deletes the install
 folder including config, state and logs; prompts unless `-Force` or `-Confirm:$false`),
-`-DryRun`, `-Verbosity`, `-LogPath`. `-WhatIf` behaves like `-DryRun`. A task that is
-already absent is not an error. Service Control Manager failure actions set by
+`-DryRun`, `-Verbosity`, `-LogPath`. `-WhatIf` behaves like `-DryRun`. `-InstallPath` is
+resolved to an absolute path before anything else, so a `..` segment cannot slip past the
+protected-folder check. A task that is already absent is not an error. Service Control Manager failure actions set by
 `-SetServiceRecovery` are left in place. Exit codes: `0` success, `1` unexpected, `2`
 invalid parameters (for example `-RemoveFiles` pointed at a filesystem root or a Windows
 system folder). After decommissioning a server, delete its row from the `WatchdogHosts`
@@ -413,7 +426,8 @@ install script, not only in the portal.
 | `WATCHDOG_SMTP_PASSWORD` | Key Vault secret `SmtpPassword` | |
 | `WATCHDOG_SMTP_USE_STARTTLS` | `true` | Implicit TLS on 465 is not supported |
 | `WATCHDOG_TABLE_ENDPOINT` | from the template | Storage table endpoint, ends with `/` |
-| `WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR` | `6` | `recovered` and `heartbeat` are exempt; held in worker memory, so a backstop rather than a hard global cap |
+| `WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR` | `6` | `recovered` and `heartbeat` are exempt; held in worker memory and keyed on the reported host name, so a backstop rather than a hard cap |
+| `WATCHDOG_MAX_EMAILS_PER_HOUR` | `60` | Global cap per UTC clock hour across all hosts and worker instances, counted in the `WatchdogSentEvents` table; applies to every email including `recovered` and `test` events |
 | `WATCHDOG_ALLOWED_SITES` | empty | Optional semicolon list of accepted `SiteName` values; empty allows any |
 | `WATCHDOG_STALE_HOURS` | `26` | Digest threshold |
 | `WATCHDOG_DIGEST_SCHEDULE` | `0 0 7 * * *` | NCRONTAB, UTC |
@@ -433,7 +447,7 @@ Function-level auth (`x-functions-key` header). Every response is JSON.
 | 200 | | `{ accepted: true, emailSent, duplicate, providerMessageId }`; `emailSent` is false for heartbeats and duplicates |
 | 400 | `invalid_body`, `invalid_payload` | Body not a JSON object, or schema violations listed in `errors` (unknown top-level keys are rejected) |
 | 403 | `site_not_allowed` | `SiteName` not in `WATCHDOG_ALLOWED_SITES` |
-| 429 | `rate_limited` | Per-host limit reached; `Retry-After: 600` |
+| 429 | `rate_limited` | Per-host limit or the global emails-per-hour cap reached (`errors` says which); `Retry-After: 600` |
 | 500 | `config_unresolved`, `internal_error` | Unresolved Key Vault reference, or an unexpected exception |
 | 502 | `provider_failed` | The mail provider did not accept the message |
 
@@ -452,15 +466,18 @@ run id and event id. HTML and plain text are both sent.
 
 `WatchdogHosts` (partition = site, row = host) keeps `LastSeenUtc` (the function's own
 receipt time, never the server clock), `LastEventType`, `WatchdogVersion`,
-`MonitoredServiceCount`, `ProblemServiceCount`. `WatchdogSentEvents` holds one row per
-delivered `EventId` for deduplication. Table writes are best effort and never change the
-HTTP response. Nothing cleans old rows in v1.
+`MonitoredServiceCount`, `ProblemServiceCount`; `test` events never create a row.
+`WatchdogSentEvents` holds one row per delivered `EventId` for deduplication plus one
+counter row per UTC hour (partition `_RateLimit`) for the global cap. Table writes are best
+effort and never change the HTTP response. Nothing cleans old rows in v1.
 
 `SendServiceWatchdogDigest` runs on `WATCHDOG_DIGEST_SCHEDULE` and reads every host row:
 no rows at all produces a "no hosts have ever reported" notice; any host older than
 `WATCHDOG_STALE_HOURS` produces a digest listing each stale host with its last-seen time
 and age plus the count of fresh hosts; otherwise nothing is sent unless
-`WATCHDOG_DIGEST_ALWAYS_SEND` is true. The digest bypasses the rate limit and dedup.
+`WATCHDOG_DIGEST_ALWAYS_SEND` is true. The digest bypasses the rate limits and dedup. It
+lists at most 200 stale hosts and says how many more there are, and logs a warning when the
+table holds more than 1000 rows (see "Recovering from a leaked function key").
 
 ### Install-AzureServiceWatchdogFunction.ps1
 
@@ -476,7 +493,7 @@ and age plus the count of fresh hosts; otherwise nothing is sent unless
 | `-PowerShellVersion 7.4\|7.6` | `7.4` | Functions worker version (see [Runtime version check](#runtime-version-check)) |
 | `-FunctionKeyName` | `watchdog` | Named key created for the servers; an existing key of that name is reused |
 | `-SourcePath` | `../AzureFunction` | Function code folder (`host.json` at its root) |
-| `-SendTestEmail` | | POST a `test` event after deployment (sends a real email). The event carries `SiteName` `ServiceWatchdog deployment`, so it is rejected with 403 (exit 50) if `allowedSites` was set by hand |
+| `-SendTestEmail` | | POST a `test` event after deployment (sends a real email, never creates a `WatchdogHosts` row). The event carries `SiteName` `ServiceWatchdog deployment`, so it is rejected with 403 (exit 50) if `allowedSites` was set by hand |
 | `-DryRun`, `-Verbosity`, `-LogPath` | | Standard |
 
 | Code | Meaning |
@@ -487,9 +504,9 @@ and age plus the count of fresh hosts; otherwise nothing is sent unless
 | `20` | Not signed in, or not authorized on the subscription or resource group |
 | `50` | Template deployed, but a later step failed (the log names the step; fix the cause and re-run) |
 
-Template parameters not exposed by the script (`maxAlertsPerHostPerHour`, `staleHours`,
-`digestSchedule`, `digestAlwaysSend`, `allowedSites`, `mailTimeoutSeconds`,
-`smtp2GoApiUrl`, `tags`) keep their defaults; change them by deploying the template by
+Template parameters not exposed by the script (`maxAlertsPerHostPerHour`,
+`maxEmailsPerHour`, `staleHours`, `digestSchedule`, `digestAlwaysSend`, `allowedSites`,
+`mailTimeoutSeconds`, `smtp2GoApiUrl`, `tags`) keep their defaults; change them by deploying the template by
 hand with a parameters file.
 
 ## Testing an installation
@@ -579,6 +596,32 @@ storage account, not in the package); rotate explicitly.
    proves the new key works end to end).
 5. Revoke the old key in SMTP2GO.
 
+### Recovering from a leaked function key
+
+A leaked function key lets its holder post any payload the schema accepts. Recipients and
+the sender are fixed server-side and the global cap bounds the mail volume, but heartbeats
+send no mail and cannot be told from a real first contact, so the holder can create
+`WatchdogHosts` rows for invented host names until the daily digest is mostly noise (the
+digest warns in Application Insights once the table passes 1000 rows and lists at most 200
+stale hosts). Recovery:
+
+1. Rotate the function key as above and delete the old one; the rows stop growing at once.
+2. Delete the invented rows. In the portal, Storage browser > Tables > `WatchdogHosts`
+   lets you filter and delete; from a workstation with the Azure CLI:
+
+   ```powershell
+   az storage entity query --account-name 'stsvcwatchdogabc123' --table-name 'WatchdogHosts' `
+       --auth-mode login --query "items[].{site:PartitionKey, host:RowKey, seen:LastSeenUtc}" -o table
+   az storage entity delete --account-name 'stsvcwatchdogabc123' --table-name 'WatchdogHosts' `
+       --auth-mode login --partition-key 'Example Org' --row-key 'FAKE-HOST-01'
+   ```
+
+   (Storage Table Data Contributor on the account is required; the deployer does not get
+   it from the template, so assign it for the cleanup and remove it afterwards.) A real
+   server that is deleted by mistake writes its row again on its next heartbeat.
+3. If the digest is not needed for a day, the rows under partition `_RateLimit` in
+   `WatchdogSentEvents` can stay; they are one per hour and harmless.
+
 ## Runtime version check
 
 **Check before 2026-11-10.** The Function App runs PowerShell 7.4, whose support on Azure
@@ -660,7 +703,17 @@ shows which reference failed.
 counts attempts, not successes, and the endpoint re-posts its pending event every 5
 minutes, so a 30-minute provider outage can consume the hourly allowance. Wait it out,
 raise `WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR`, or restart the app (the counter lives in
-worker memory).
+worker memory). The global cap (`WATCHDOG_MAX_EMAILS_PER_HOUR`) counts only emails the
+provider accepted; a 429 whose `errors` names the global limit means the whole fleet sent
+that many emails in the current UTC hour, which is worth a look on its own.
+
+**Install script exits 50 with "functionsRuntimeAdminIsolationEnabled could not be
+confirmed".** The key was already printed; the deployment is usable. The property is
+outside the ARM schema, so check it in the portal (Function App > Configuration > General
+settings, or `az resource show` on the site and look for
+`functionsRuntimeAdminIsolationEnabled`), set it by hand if needed, and re-run the script
+to verify. The log line "Site reports functionsRuntimeAdminIsolationEnabled = ..." shows
+what ARM returned.
 
 **Digest says "no hosts have ever reported".** No server has reached the function yet:
 check the task exists and runs (`Get-ScheduledTaskInfo`), the config, and event 1011/1013
@@ -704,5 +757,4 @@ Not in v1, deliberately: monitoring plain processes; DPAPI protection of the con
 (SYSTEM has no SecretManagement vault, so the key sits in the ACLed folder); HMAC request
 signing; IP restrictions on the function; dead-letter queuing when the mail provider is
 down; a cross-server outage digest; a Flex Consumption template (Linux-only, currently 7.4
-only); Teams or RMM notification channels; cleanup of old rows in `WatchdogSentEvents`;
-a rate limit shared across worker instances in Table storage.
+only); Teams or RMM notification channels; cleanup of old rows in `WatchdogSentEvents`.

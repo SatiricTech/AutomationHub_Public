@@ -188,7 +188,8 @@ Describe 'ServiceWatchdogAlert module' {
         It 'exports exactly the documented public functions' {
             $expected = @(
                 'Get-WatchdogConfig', 'Test-WatchdogPayload', 'ConvertTo-WatchdogEmail', 'Send-WatchdogMail',
-                'Test-WatchdogRateLimit', 'Get-WatchdogStorageToken', 'Set-WatchdogHostEntity',
+                'Test-WatchdogRateLimit', 'Test-WatchdogGlobalRateLimit', 'Get-WatchdogStorageToken',
+                'Set-WatchdogHostEntity',
                 'Test-WatchdogSentEvent', 'Set-WatchdogSentEvent', 'ConvertTo-WatchdogHostEntity',
                 'Get-WatchdogStaleHosts', 'ConvertTo-WatchdogKey', 'Write-WatchdogLog'
             )
@@ -275,6 +276,7 @@ Describe 'ServiceWatchdogAlert module' {
             $config.SmtpPort | Should -Be 587
             $config.SmtpUseStartTls | Should -BeTrue
             $config.MaxAlertsPerHostPerHour | Should -Be 6
+            $config.MaxEmailsPerHour | Should -Be 60
             $config.AllowedSites | Should -BeNullOrEmpty
             $config.StaleHours | Should -Be 26
             $config.DigestAlwaysSend | Should -BeFalse
@@ -291,6 +293,7 @@ Describe 'ServiceWatchdogAlert module' {
             $environment = New-TestEnvironment -Provider 'Smtp' -Overrides @{
                 WATCHDOG_MAIL_TIMEOUT_SECONDS        = '45'
                 WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR = '3'
+                WATCHDOG_MAX_EMAILS_PER_HOUR         = '25'
                 WATCHDOG_STALE_HOURS                 = '48'
                 WATCHDOG_DIGEST_ALWAYS_SEND          = 'true'
                 WATCHDOG_SMTP_PORT                   = '2525'
@@ -299,6 +302,7 @@ Describe 'ServiceWatchdogAlert module' {
             $config = Get-WatchdogConfig -Environment $environment
             $config.MailTimeoutSeconds | Should -Be 45
             $config.MaxAlertsPerHostPerHour | Should -Be 3
+            $config.MaxEmailsPerHour | Should -Be 25
             $config.StaleHours | Should -Be 48
             $config.DigestAlwaysSend | Should -BeTrue
             $config.SmtpPort | Should -Be 2525
@@ -853,6 +857,124 @@ Describe 'ServiceWatchdogAlert module' {
         }
     }
 
+    Context 'Test-WatchdogGlobalRateLimit' {
+
+        BeforeAll {
+            $script:Config = Get-WatchdogConfig -Environment (New-TestEnvironment)
+            $script:Now = [datetime]::new(2026, 9, 4, 18, 40, 0, [DateTimeKind]::Utc)
+        }
+
+        BeforeEach {
+            Mock -ModuleName $script:ModuleName Get-WatchdogStorageToken { 'test-bearer-token' }
+            Mock -ModuleName $script:ModuleName Write-WatchdogLog { }
+        }
+
+        It 'creates the hourly counter row without If-Match when none exists and allows the email' {
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest {
+                if ($Method -eq 'Get') { return (New-TableResponse -StatusCode 404) }
+                return (New-TableResponse -StatusCode 204)
+            }
+            Test-WatchdogGlobalRateLimit -Config $script:Config -Limit 60 -NowUtc $script:Now | Should -BeTrue
+            Should -Invoke -ModuleName $script:ModuleName Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
+                $Method -eq 'Put' -and
+                $Uri -like "*WatchdogSentEvents(PartitionKey='_RateLimit',RowKey='2026090418')" -and
+                -not $Headers.ContainsKey('If-Match') -and
+                ($Body | ConvertFrom-Json).Count -eq 1
+            }
+        }
+
+        It 'increments an existing counter with the ETag as If-Match' {
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest {
+                if ($Method -eq 'Get') {
+                    return [pscustomobject]@{
+                        StatusCode = 200
+                        Headers    = @{ ETag = @('W/"datetime''2026-09-04T18%3A39%3A00Z''"') }
+                        Content    = '{"PartitionKey":"_RateLimit","RowKey":"2026090418","Count":41}'
+                    }
+                }
+                return (New-TableResponse -StatusCode 204)
+            }
+            Test-WatchdogGlobalRateLimit -Config $script:Config -Limit 60 -NowUtc $script:Now | Should -BeTrue
+            Should -Invoke -ModuleName $script:ModuleName Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
+                $Method -eq 'Put' -and
+                $Headers['If-Match'] -eq 'W/"datetime''2026-09-04T18%3A39%3A00Z''"' -and
+                ($Body | ConvertFrom-Json).Count -eq 42
+            }
+        }
+
+        It 'refuses the email without writing once the hourly count has reached the limit' {
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest {
+                if ($Method -eq 'Get') {
+                    return (New-TableResponse -StatusCode 200 -Content '{"Count":60}')
+                }
+                return (New-TableResponse -StatusCode 204)
+            }
+            Test-WatchdogGlobalRateLimit -Config $script:Config -Limit 60 -NowUtc $script:Now | Should -BeFalse
+            Should -Invoke -ModuleName $script:ModuleName Invoke-WebRequest -Times 0 -Exactly -ParameterFilter {
+                $Method -eq 'Put'
+            }
+        }
+
+        It 're-reads after a 412 conflict and refuses after three conflicting attempts' {
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest {
+                if ($Method -eq 'Get') {
+                    return (New-TableResponse -StatusCode 200 -Content '{"Count":5}')
+                }
+                return (New-TableResponse -StatusCode 412)
+            }
+            Test-WatchdogGlobalRateLimit -Config $script:Config -Limit 60 -NowUtc $script:Now | Should -BeFalse
+            Should -Invoke -ModuleName $script:ModuleName Invoke-WebRequest -Times 3 -Exactly -ParameterFilter {
+                $Method -eq 'Put'
+            }
+            Should -Invoke -ModuleName $script:ModuleName Write-WatchdogLog -ParameterFilter {
+                $Level -eq 'Warning' -and $Message -like '*conflicting attempts*'
+            }
+        }
+
+        It 'succeeds on the retry after a single 412 conflict' {
+            $script:PutCalls = 0
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest {
+                if ($Method -eq 'Get') {
+                    return (New-TableResponse -StatusCode 200 -Content '{"Count":5}')
+                }
+                $script:PutCalls++
+                if ($script:PutCalls -eq 1) { return (New-TableResponse -StatusCode 412) }
+                return (New-TableResponse -StatusCode 204)
+            }
+            Test-WatchdogGlobalRateLimit -Config $script:Config -Limit 60 -NowUtc $script:Now | Should -BeTrue
+            $script:PutCalls | Should -Be 2
+        }
+
+        It 'allows the email with a warning when the table is unreachable or answers unexpectedly' {
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest { throw 'connection refused' }
+            Test-WatchdogGlobalRateLimit -Config $script:Config -Limit 60 -NowUtc $script:Now | Should -BeTrue
+
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest { New-TableResponse -StatusCode 503 }
+            Test-WatchdogGlobalRateLimit -Config $script:Config -Limit 60 -NowUtc $script:Now | Should -BeTrue
+
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest {
+                if ($Method -eq 'Get') { return (New-TableResponse -StatusCode 404) }
+                return (New-TableResponse -StatusCode 500)
+            }
+            Test-WatchdogGlobalRateLimit -Config $script:Config -Limit 60 -NowUtc $script:Now | Should -BeTrue
+            Should -Invoke -ModuleName $script:ModuleName Write-WatchdogLog -Times 3 -Exactly -ParameterFilter {
+                $Level -eq 'Warning' -and $Message -like '*allowing the email*'
+            }
+        }
+
+        It 'keys the counter on the UTC clock hour' {
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest {
+                if ($Method -eq 'Get') { return (New-TableResponse -StatusCode 404) }
+                return (New-TableResponse -StatusCode 204)
+            }
+            $local = [datetime]::new(2026, 9, 4, 23, 30, 0, [DateTimeKind]::Utc)
+            Test-WatchdogGlobalRateLimit -Config $script:Config -Limit 60 -NowUtc $local | Should -BeTrue
+            Should -Invoke -ModuleName $script:ModuleName Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
+                $Method -eq 'Get' -and $Uri -like "*RowKey='2026090423')"
+            }
+        }
+    }
+
     Context 'Get-WatchdogStorageToken' {
 
         BeforeEach {
@@ -1060,8 +1182,8 @@ Describe 'ServiceWatchdogAlert module' {
             $entity.ProblemServiceCount | Should -Be 3
         }
 
-        It 'stores 0/0 for a test event' {
-            $payload = New-TestPayload -EventType 'test' -Services @()
+        It 'counts 0/0 for a payload with no services (heartbeat from an empty list)' {
+            $payload = New-TestPayload -EventType 'heartbeat' -Services @()
             $entity = ConvertTo-WatchdogHostEntity -Payload $payload -NowUtc $script:Now
             $entity.MonitoredServiceCount | Should -Be 0
             $entity.ProblemServiceCount | Should -Be 0
@@ -1094,6 +1216,13 @@ Describe 'ServiceWatchdogAlert module' {
             $result.Stale[0].AgeHours | Should -Be 49
             @($result.Fresh).Count | Should -Be 1
             $result.Fresh[0].HostName | Should -Be 'SRV-NEW'
+        }
+
+        It 'compares the exact age, so a host 26h02m old is stale against 26 hours even though it rounds to 26.0' {
+            $rows = @(@{ PartitionKey = 'Example Org'; RowKey = 'SRV-EDGE'; LastSeenUtc = '2026-09-04T04:58:00Z' })
+            $result = Get-WatchdogStaleHosts -Rows $rows -StaleHours 26 -NowUtc $script:Now
+            @($result.Stale).Count | Should -Be 1
+            $result.Stale[0].AgeHours | Should -Be 26
         }
 
         It 'treats a row exactly at the threshold as fresh' {

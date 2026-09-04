@@ -81,6 +81,11 @@ param smtpUseStartTls bool = true
 @maxValue(1000)
 param maxAlertsPerHostPerHour int = 6
 
+@description('Maximum emails per UTC clock hour across all hosts, counted in the WatchdogSentEvents table so it holds across worker instances. Applies to every event type; the bound that remains when a leaked function key sidesteps the per-host limit.')
+@minValue(1)
+@maxValue(100000)
+param maxEmailsPerHour int = 60
+
 @description('Hours without a report after which the daily digest lists a host as stale.')
 @minValue(1)
 @maxValue(8760)
@@ -367,6 +372,10 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
         {
           name: 'WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR'
           value: string(maxAlertsPerHostPerHour)
+        }
+        {
+          name: 'WATCHDOG_MAX_EMAILS_PER_HOUR'
+          value: string(maxEmailsPerHour)
         }
         {
           name: 'WATCHDOG_ALLOWED_SITES'

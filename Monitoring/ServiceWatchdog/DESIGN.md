@@ -218,7 +218,13 @@ Validation rules (exit code 2 with every violation listed, event 1020):
 
 - `Status` is one of `Healthy`, `Failed`, `Missing`, `Disabled`, `Unknown`. `Unknown` is
   written only when the service check itself threw an unexpected exception (not the
-  Missing case) and is treated like `Healthy` for transition purposes.
+  Missing case) and there is no previous entry to carry forward. A check that throws is
+  no observation: the previous `Status`, `FirstFailedUtc`, `LastNotifiedUtc` and flap
+  fields are carried forward unchanged, no transition is counted, nothing is notified, and
+  the run logs a WARNING naming the carried status (review ruling, 2026-09-04: a WMI or
+  RPC hiccup during an outage must neither send a false `recovered` nor restart the outage
+  with a fresh `alert` and a new `EventId`). The payload still shows `Unknown` for that
+  service (4.8), and a carried problem status still counts toward exit code 50.
 - Unreadable or invalid state is treated as empty, logged as WARNING, and reported as
   event 1021. The file is written atomically (write temp file, then move). `-DryRun` never
   writes it.
@@ -242,7 +248,7 @@ in order:
 | `Running` | none | `Healthy` |
 | `StartPending` | `WaitForStatus('Running', min(StartPendingWaitSeconds, remaining))`; never issue a new start; still pending when the budget is gone is `Failed` with `LastError` noting the budget | `Healthy` or `Failed` |
 | `Stopped`, `StopPending`, `Paused`, other | eligible for start rounds | `Failed` unless a round succeeds |
-| Check threw an unexpected exception | none, logged | `Unknown` |
+| Check threw an unexpected exception | none, logged as WARNING | previous status carried forward (`Unknown` when there is none); payload shows `Unknown` (4.4) |
 
 Start rounds:
 
@@ -251,10 +257,14 @@ Start rounds:
    - For each eligible service, `Start-WatchdogService` (a helper that calls
      `(Get-Service <name>).Start()`, which does not block, then
      `WaitForStatus('Running', min(PostStartVerifySeconds, remaining))`) inside
-     `Invoke-Action`. Capture the exception message as `LastError`. The Service Control
-     Manager starts declared dependencies itself; dependency failures surface in that
-     message. `Start-Service` is not used because it blocks until the SCM resolves the
-     start and could consume the whole budget on one stuck service.
+     `Invoke-Action`. Capture the exception as `LastError`: the messages of the whole
+     exception chain joined with ` -> `, skipping PowerShell's `MethodInvocationException`
+     wrapper, so the SCM reason carried by the inner `Win32Exception` (1068 dependency
+     failed, 1053 no response, 1069 logon failure, 1056 already running) is recorded rather
+     than only `Cannot start service X`. The Service Control Manager starts declared
+     dependencies itself; dependency failures surface in that message. `Start-Service` is
+     not used because it blocks until the SCM resolves the start and could consume the
+     whole budget on one stuck service.
    - After the wait, re-read every eligible service. A service that is `Running` leaves the
      eligible set as remediated with `Attempts = round`. A service that started and stopped
      again is still failed with `LastError` set to a flapping message.
@@ -279,6 +289,7 @@ Computed after the rounds, per service, comparing new status with the previous s
 | Failed / Missing / Disabled | different problem (e.g. Missing to Failed) | `alert` | |
 | Failed / Missing / Disabled | Healthy (with or without our action) | `recovered` | clears `FirstFailedUtc` |
 | Healthy / Unknown / none | Healthy after our start succeeded | `remediated` | only if `NotifyOnRemediation` and `now - LastRemediatedUtc >= RemediationCooldownMinutes` |
+| any | Unknown (check threw) | none | previous `Status` carried forward, no transition and no flap update; payload `Status` is `Unknown` (4.4) |
 
 Flapping: every transition between a problem status and `Healthy` (either direction)
 increments `FlapCount` inside a rolling 60-minute window that starts at
@@ -373,7 +384,8 @@ Heartbeat: when `now - LastHeartbeatUtc >= HeartbeatHours`, or `-SendHeartbeat`,
 
 - Payload `Status` per service is derived as: `Recovered` when the 4.6 category for the
   service is `recovered`; `Remediated` when our start succeeded this run (regardless of
-  `NotifyOnRemediation`); otherwise the state `Status` (`Healthy`, `Failed`, `Missing`,
+  `NotifyOnRemediation`); `Unknown` when the check threw this run (the state keeps the
+  previous status, 4.4); otherwise the state `Status` (`Healthy`, `Failed`, `Missing`,
   `Disabled`, `Unknown`). `Notify` is true for every service that has a 4.6 category this run;
   all of them ride in the single POST, and `EventType` is only the highest-priority category.
 - `StartType` is one of `Boot`, `System`, `Automatic`, `AutomaticDelayedStart`, `Manual`,
@@ -402,7 +414,9 @@ Heartbeat: when `now - LastHeartbeatUtc >= HeartbeatHours`, or `-SendHeartbeat`,
   Sensitive values are masked.
 - Event log: source `ServiceWatchdog` in the `Application` log. The worker registers the
   source itself if missing and it is elevated (guarded by `SourceExists`); otherwise it
-  logs a warning and continues with file logging only.
+  logs a warning and continues with file logging only. A registration attempt that throws
+  is decided once per run: one WARNING, then file logging only, rather than a retry and a
+  repeated warning on every event of that run.
 
 | ID | Level | When |
 |---|---|---|
@@ -449,7 +463,7 @@ is enforced by `#Requires`, which stops the script before it runs (the host repo
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `-InstallPath` | `$env:ProgramData\ServiceWatchdog` | Where the worker, config, state, and logs live |
+| `-InstallPath` | `$env:ProgramData\ServiceWatchdog` | Where the worker, config, state, and logs live; resolved to an absolute path, never a filesystem root or Windows system folder |
 | `-SourcePath` | `$PSScriptRoot` | Where to copy `Invoke-WinServiceWatchdog.ps1` and the example config from |
 | `-ConfigPath` | `<InstallPath>\ServiceWatchdog.json` | Config to validate and use |
 | `-TaskName` | `ServiceWatchdog` | Task name in the root Task Scheduler folder |
@@ -459,28 +473,51 @@ is enforced by `#Requires`, which stops the script before it runs (the host repo
 | `-SetServiceRecovery` | off | Also set SCM failure actions on each listed service via `sc.exe failure` |
 | `-RunNow` | off | Start the task immediately after registration |
 | `-TestAlert` | off | Run the worker with `-TestAlert` after registration |
-| `-Force` | off | Overwrite an existing worker script at `InstallPath` |
+| `-Force` | off | Overwrite an existing worker script at `InstallPath`; needed on every re-run after the first install (the copy is idempotent) |
 | `-DryRun`, `-Verbosity`, `-LogPath` | | standard |
 
 Steps, each through `Invoke-Action`:
 
-1. Create `InstallPath`. Copy the worker script; if it already exists and `-Force` is not
-   set, exit 2 with a message to re-run with `-Force`. If no config exists, copy
+1. Resolve `-InstallPath`, `-SourcePath` and `-ConfigPath` to absolute, normalized paths
+   (`GetUnresolvedProviderPathFromPSPath`) before any check or mutation, so a relative
+   path never reaches the task action (Task Scheduler resolves it against System32) and a
+   `..` segment is compared, ACLed and written exactly as the file system resolves it.
+   Refuse an `InstallPath` that is a filesystem root or a Windows system folder
+   (`ProgramData`, `SystemRoot`, `ProgramFiles`, `ProgramFiles(x86)`, `SystemDrive`) with
+   exit 2. Refuse a `-ConfigPath` outside `InstallPath` (subfolders allowed) with exit 2,
+   because the ACL in step 2 only protects that folder. Pre-flight checks that need no
+   mutation (source worker missing, worker present without `-Force`, neither a config nor
+   the example config) also exit 2 here.
+2. Create `InstallPath` if missing and lock it down before anything is written into it,
+   wrapped in a helper `Set-WatchdogInstallAcl` so tests can mock it. Three `icacls` calls,
+   each failing the step on a non-zero exit code: `icacls "<InstallPath>" /reset /T`
+   (strips every explicit entry on the folder and its contents; `/inheritance:r /grant:r`
+   alone leaves a pre-existing entry for another account in place), then
+   `icacls "<InstallPath>" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F"
+   "*S-1-5-32-544:(OI)(CI)F"` (well-known SIDs for SYSTEM and Administrators, so the call
+   is locale-safe), then `icacls "<InstallPath>" /setowner *S-1-5-32-544 /T` (an owner
+   keeps WRITE_DAC whatever the DACL says). The DACL is then read back with `Get-Acl` and
+   must hold exactly the two non-inherited Allow entries. An existing `InstallPath` owned
+   by anything other than SYSTEM, Administrators or TrustedInstaller is refused with exit 2
+   before the ACL is touched: BUILTIN\Users can create folders under ProgramData, and a
+   folder pre-created by a standard user would let that user replace the worker the SYSTEM
+   task runs (threat model SEV1). The lockdown runs on the first run too, so the example
+   config, which will hold the function key, never sits under the inherited ProgramData
+   ACL between the first run and the edit-and-re-run (review ruling, 2026-09-04).
+3. Copy the worker script; if it already exists and `-Force` is not set, exit 2 with a
+   message to re-run with `-Force` (every re-run after the first install therefore carries
+   `-Force`; the copy is idempotent). If no config exists, copy
    `ServiceWatchdog.example.json` to `ConfigPath`, then stop with exit 2 and a message to
    edit it and re-run.
-2. ACL `InstallPath` with `icacls`, wrapped in a helper `Set-WatchdogInstallAcl` so tests
-   can mock it: `icacls "<InstallPath>" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F"
-   "*S-1-5-32-544:(OI)(CI)F"` (well-known SIDs for SYSTEM and Administrators, so the call
-   is locale-safe); a non-zero exit code fails the step.
-3. Refuse a `-ConfigPath` outside `InstallPath` (subfolders allowed) with exit 2 before any
-   mutation, because the ACL in step 2 only protects that folder. Validate the config by
-   running the worker with `-ValidateConfig -ConfigPath <path>`; abort on non-zero. Under
-   `-DryRun` the source copy of the worker is used because the install copy does not exist
-   yet.
+4. Validate the config by running the worker with `-ValidateConfig -ConfigPath <path>`,
+   adding `-DryRun` when the installer itself runs under `-DryRun` (an invalid config makes
+   the worker record event 1020, which would otherwise register the event source: a real
+   mutation); abort on non-zero. Under `-DryRun` the source copy of the worker is used
+   because the install copy does not exist yet.
    Then read `MaxRunSeconds` and `Webhook.TimeoutSeconds` from the config and exit 2 if
    `-ExecutionTimeLimitSeconds` is below `MaxRunSeconds + 2 * (2 * TimeoutSeconds + 5) + 15`.
-4. Register the event source (`SourceExists` guard).
-5. Register the task with `Register-ScheduledTask -Force` (always, regardless of the
+5. Register the event source (`SourceExists` guard).
+6. Register the task with `Register-ScheduledTask -Force` (always, regardless of the
    script's own `-Force`, because re-registration is idempotent and must succeed on reruns
    that only change scheduling parameters):
    - Principal `NT AUTHORITY\SYSTEM`, `RunLevel Highest`.
@@ -498,13 +535,15 @@ Steps, each through `Invoke-Action`:
      `-ConfigPath <path>` appended only when the config is not beside the worker. No
      argument carries a secret.
    - Description names this repository and the version.
-6. Optional `-SetServiceRecovery`: `sc.exe failure <svc> reset= 86400
+7. Optional `-SetServiceRecovery`: `sc.exe failure <svc> reset= 86400
    actions= restart/60000/restart/120000/none/0` per Microsoft's non-critical guidance.
-7. Optional `-RunNow` and `-TestAlert`.
-8. Print a summary: install path, task name, next run time, config path, log path.
+8. Optional `-RunNow` and `-TestAlert`.
+9. Print a summary: install path, task name, next run time, config path, log path.
 
-Exit codes: 0 success, 1 unexpected, 2 config invalid, not yet edited, outside
-`InstallPath`, worker already present without `-Force`, or execution limit too small,
+Exit codes: 0 success, 1 unexpected (including an ACL that does not read back as
+expected), 2 config invalid, not yet edited, outside `InstallPath`, `InstallPath` a root
+or system folder or an existing folder with a foreign owner, worker already present
+without `-Force`, or execution limit too small,
 10 task registered but the `-TestAlert` delivery failed, 50 task registered but one or
 more `-SetServiceRecovery` steps failed (the loop continues past a failing service).
 
@@ -516,9 +555,13 @@ install folder including config, state, and logs), `-Force` (skips the `-RemoveF
 confirmation), `-DryRun`, `-Verbosity`, `-LogPath`. Confirmation uses
 `[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]` with
 `$PSCmdlet.ShouldProcess`, so `-Confirm:$false` and `-Force` both skip it and an
-unattended run never blocks on a prompt. Steps through `Invoke-Action`: unregister the
-task if present, optionally remove the event source, optionally remove files. Does not
-touch SCM failure actions. Exit codes: 0 success (including task already absent),
+unattended run never blocks on a prompt. `-InstallPath` is resolved to an absolute,
+normalized path before the protected-path check, the existence check and the removal:
+`-LiteralPath` only disables wildcards, so `C:\ProgramData\ServiceWatchdog\..` would
+otherwise pass a check on the raw string and `Remove-Item` would delete `C:\ProgramData`
+(review ruling, 2026-09-04). Steps through `Invoke-Action`: unregister the task if
+present, optionally remove the event source, optionally remove files. Does not touch SCM
+failure actions. Exit codes: 0 success (including task already absent),
 1 unexpected, 2 invalid parameters.
 
 ## 6. Azure Function App
@@ -563,7 +606,8 @@ All watchdog settings are prefixed `WATCHDOG_`. Secrets are Key Vault references
 | `WATCHDOG_SMTP_PASSWORD` | KV ref to secret `SmtpPassword` | |
 | `WATCHDOG_SMTP_USE_STARTTLS` | `true` | |
 | `WATCHDOG_TABLE_ENDPOINT` | required | storage account table endpoint, ends with `/` |
-| `WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR` | `6` | `recovered` and `heartbeat` exempt |
+| `WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR` | `6` | per worker instance; `recovered` and `heartbeat` exempt |
+| `WATCHDOG_MAX_EMAILS_PER_HOUR` | `60` | global cap per UTC clock hour across all hosts and instances, counted in Table storage; every event type that sends mail, `recovered` and `test` included |
 | `WATCHDOG_ALLOWED_SITES` | empty | optional semicolon list; empty allows any `SiteName` |
 | `WATCHDOG_STALE_HOURS` | `26` | digest threshold |
 | `WATCHDOG_DIGEST_SCHEDULE` | `0 0 7 * * *` | NCRONTAB, referenced as `%WATCHDOG_DIGEST_SCHEDULE%` |
@@ -592,6 +636,7 @@ Loaded from `Modules/` (on `PSModulePath` automatically) and unit-tested directl
 | `Send-WatchdogMailSmtp2Go` | REST call with `X-Smtp2go-Api-Key`; success when `data.succeeded >= 1`; when `data.failed > 0` alongside success, logs a Warning listing `data.failures` and still returns `Sent = $true`; on 429 or 5xx retries up to 2 more times (2 s, then 5 s, honoring `Retry-After` up to 30 s); no retry on other 4xx |
 | `Send-WatchdogMailSmtp` | `System.Net.Mail.SmtpClient` with `EnableSsl` for STARTTLS via a factory `New-WatchdogSmtpClient` that tests replace; documents that implicit TLS on 465 is unsupported |
 | `Test-WatchdogRateLimit` | Module-scope sliding window per host key; best effort per worker process |
+| `Test-WatchdogGlobalRateLimit` | Fixed-window cap per UTC clock hour across all hosts: one `WatchdogSentEvents` row (`PartitionKey` `_RateLimit`, `RowKey` `yyyyMMddHH`, `Count`) incremented with an ETag-conditioned `PUT` (`If-Match`; 412 re-reads and retries, three attempts). Transport errors and unexpected statuses allow the email with a Warning like every other table call; three consecutive 412s refuse it. The bound that holds when the per-host limiter is sidestepped with fresh host names or spread across scaled-out instances |
 | `Get-WatchdogStorageToken` | Managed-identity bearer token for `https://storage.azure.com/` from `$env:IDENTITY_ENDPOINT` with `X-IDENTITY-HEADER`, cached in module scope until 5 minutes before `expires_on` |
 | `Set-WatchdogHostEntity` | Insert-or-replace the host row via the Table REST API |
 | `Test-WatchdogSentEvent` / `Set-WatchdogSentEvent` | Read and write the dedup row for an `EventId` via the Table REST API |
@@ -603,8 +648,11 @@ Table REST calls: `PUT <WATCHDOG_TABLE_ENDPOINT><Table>(PartitionKey='<pk>',RowK
 with headers `Authorization: Bearer <token>`, `x-ms-version: 2020-12-06`, `x-ms-date`
 (RFC 1123), `Accept: application/json;odata=nometadata`, `DataServiceVersion: 3.0;NetFx`,
 `MaxDataServiceVersion: 3.0;NetFx`, `Content-Type: application/json`, `-TimeoutSec 10`.
-A PUT without `If-Match` is Insert Or Replace (expect 204). `GET` of the same URI returns
-200 or 404. Keys are URL-encoded with single quotes doubled. Every table call is
+A PUT without `If-Match` is Insert Or Replace (expect 204); a PUT with `If-Match: <ETag>`
+is a conditional Update Entity (204, or 412 when the row changed). `GET` of the same URI
+returns 200 or 404 and its `ETag` header is returned to the caller. Keys are URL-encoded
+with single quotes doubled. Sanitized host keys always start with a letter or digit, so
+the `_RateLimit` partition can never collide with a host. Every table call is
 best-effort: failures are logged as Warning with the status code and never change the
 HTTP response or block sending.
 
@@ -626,10 +674,13 @@ Sanitize (for table keys and the rate-limit key): replace every character outsid
   `route "servicewatchdog/alert"`) and `http` output `Response` only. No table bindings:
   the Tables output binding only creates entities, so host rows are written in code.
 - Flow: config guard (500) → body must be a hashtable (400) → `Test-WatchdogPayload`
-  (400) → optional site allowlist (403) → `Set-WatchdogHostEntity` (best effort) →
-  if `heartbeat`, return 200 with `emailSent = false` → if not `test`, `Test-WatchdogSentEvent`
-  for (`HostName`, `EventId`); when found return 200 with `duplicate = true` →
-  rate limit unless `recovered` (429) → `Send-WatchdogMail` → on `Sent`,
+  (400) → optional site allowlist (403) → `Set-WatchdogHostEntity` unless `test` (best
+  effort; a test event is not evidence that a watchdog is installed on that host, and a
+  row for the operator workstation would make the digest report it stale from the next
+  day on) → if `heartbeat`, return 200 with `emailSent = false` → if not `test`,
+  `Test-WatchdogSentEvent` for (`HostName`, `EventId`); when found return 200 with
+  `duplicate = true` → per-host rate limit unless `recovered` (429) → global
+  emails-per-hour cap, every type (429) → `Send-WatchdogMail` → on `Sent`,
   `Set-WatchdogSentEvent` (best effort) and return 200; otherwise 502.
 - Exactly one `Push-OutputBinding` to `Response` per invocation, `Content-Type
   application/json` on every response.
@@ -637,8 +688,12 @@ Sanitize (for table keys and the rate-limit key): replace every character outsid
   providerMessageId: <string or null> }`. Every non-200 is `{ accepted: false, error:
   <code>, errors: [<messages>] }` with `error` one of `config_unresolved` (500),
   `invalid_body` (400), `invalid_payload` (400), `site_not_allowed` (403), `rate_limited`
-  (429 with `Retry-After: 600`), `provider_failed` (502), `internal_error` (500, any
-  unexpected exception, so every branch still returns JSON and exactly one push).
+  (429 with `Retry-After: 600`, from either limit), `provider_failed` (502),
+  `internal_error` (500, any unexpected exception, so every branch still returns JSON and
+  exactly one push). The outer catch and the response conversion log through a fallback
+  in `run.ps1` (`Write-WatchdogLog` when the module is loaded, `Write-Error
+  -ErrorAction Continue` otherwise), so a failed `Import-Module` at cold start still
+  produces the 500 with the import error visible in Application Insights.
 - Every 400 and 403 logs the caller's client IP from `X-Forwarded-For` or
   `X-Azure-ClientIP`.
 
@@ -650,9 +705,11 @@ the HTML.
 
 Table entities: `WatchdogHosts` rows carry `PartitionKey`, `RowKey`, `LastSeenUtc`,
 `LastEventType`, `WatchdogVersion`, `MonitoredServiceCount`, `ProblemServiceCount`
-(services whose status is `Failed`, `Missing`, or `Disabled`; a `test` event stores 0/0).
-`WatchdogSentEvents` rows carry `PartitionKey` (sanitized host key), `RowKey` (`EventId`),
-`SentUtc`, `EventType`, `ProviderMessageId`.
+(services whose status is `Failed`, `Missing`, or `Disabled`); `test` events never write a
+host row. `WatchdogSentEvents` rows carry `PartitionKey` (sanitized host key), `RowKey`
+(`EventId`), `SentUtc`, `EventType`, `ProviderMessageId`, plus one counter row per UTC
+hour under `PartitionKey` `_RateLimit` (`RowKey` `yyyyMMddHH`, `Count`, `UpdatedUtc`) for
+the global cap.
 
 ### 6.5 SendServiceWatchdogDigest (timer)
 
@@ -664,7 +721,10 @@ Table entities: `WatchdogHosts` rows carry `PartitionKey`, `RowKey`, `LastSeenUt
   notice regardless of `WATCHDOG_DIGEST_ALWAYS_SEND` → else `Get-WatchdogStaleHosts` →
   if any stale, email a digest listing stale hosts with last-seen and age, plus a count of
   fresh hosts → else, if `WATCHDOG_DIGEST_ALWAYS_SEND`, email an all-clear summary → log
-  counts either way. A mail failure is logged as Error and does not throw.
+  counts either way. A mail failure is logged as Error and does not throw. The digest
+  lists at most 200 stale hosts and states how many more exist, and more than 1000 rows
+  logs a Warning naming the count: any holder of the function key can create host rows
+  (8), so the email size is bounded and poisoning is visible.
 - The digest is exempt from the per-host rate limit and the dedup check.
 
 ## 7. Azure deployment
@@ -765,10 +825,7 @@ Steps:
    the SCM endpoint means SCM basic auth is disabled by policy; the README documents the
    `basicPublishingCredentialsPolicies` fix.
 6. `Restart-AzWebApp` (Az.Websites; works for function apps) so Key Vault references
-   resolve against the seeded secrets. Verify admin isolation: `Invoke-AzRestMethod -Method
-   GET -Path "<siteResourceId>?api-version=2024-04-01"`; if
-   `properties.functionsRuntimeAdminIsolationEnabled` is not true, PATCH
-   `{"properties":{"functionsRuntimeAdminIsolationEnabled":true}}` and re-check. Then poll
+   resolve against the seeded secrets. Then poll
    `Invoke-AzRestMethod -Method GET -Path "<siteResourceId>/functions?api-version=2024-04-01"`
    every 15 seconds for up to 5 minutes until `SendServiceWatchdogAlert` is listed.
 7. Create the named function key: `Invoke-AzRestMethod -Method PUT -Path
@@ -780,8 +837,17 @@ Steps:
    the property named `<FunctionKeyName>` under `properties`.
 8. Print once, to the console only: alert URL, function key, Key Vault name, and the two
    lines to paste into `ServiceWatchdog.json`. Never write the key to the log file.
-9. Optional `-SendTestEmail`: POST a `test` payload to the alert URL with the key in the
-   `x-functions-key` header and report the result.
+9. Verify admin isolation: `Invoke-AzRestMethod -Method GET -Path
+   "<siteResourceId>?api-version=2024-04-01"`, logging the raw value of
+   `properties.functionsRuntimeAdminIsolationEnabled` (or that it is absent); if it is not
+   true, PATCH `{"properties":{"functionsRuntimeAdminIsolationEnabled":true}}` and
+   re-check. Deliberately after step 8: the property is outside the ARM schema (6.1), so a
+   platform that drops it from the response must never withhold the key from an
+   otherwise finished deployment. A value that still reads false is logged as an ERROR, the
+   remaining steps run, and the script ends with exit 50 (review ruling, 2026-09-04).
+10. Optional `-SendTestEmail`: POST a `test` payload to the alert URL with the key in the
+    `x-functions-key` header and report the result. The function records no host row for
+    it (6.4).
 
 Exit codes: 0, 1 unexpected, 2 prerequisites or parameters, 20 not signed in or not
 authorized, 50 deployed but a post-deployment step failed (message says which).
@@ -803,12 +869,24 @@ prevents purging the vault).
   limits, HTML encoding of every field in the HTML part, plain-text part always present,
   subject lines stripped of line breaks, recipients and sender fixed server-side,
   `EventId` deduplication, per-host rate limit (best effort, held in module-scope memory
-  per instance; on Consumption it is a backstop, not a hard global cap; the primary
-  defenses are the endpoint state machine and fixed recipients), SMTP2GO key scoped to
-  `/email/send` with a provider-side rate limit (documented setup step), secrets in Key
+  per instance and keyed on the caller-supplied host name, so on its own it is a backstop)
+  plus a global emails-per-hour cap counted in Table storage with an ETag-conditioned
+  update, which holds across instances and across invented host names and covers
+  `recovered` and `test` events too (60 per hour by default; the primary defenses remain
+  the endpoint state machine and fixed recipients), SMTP2GO key scoped to `/email/send`
+  with a provider-side rate limit (required setup step; an SMTP relay gets the equivalent
+  account limit), secrets in Key
   Vault with RBAC and purge protection, least-privilege identity (Secrets User and Table
   Data Contributor only), Application Insights without sampling of requests and exceptions,
-  client IP logged on rejected calls.
+  client IP logged on rejected calls. Known residual with a leaked function key: heartbeats
+  send no mail and a first heartbeat from an unknown host cannot be told from a real first
+  contact, so an attacker can create `WatchdogHosts` rows for invented names; the digest
+  bounds what it renders and warns above 1000 rows, and the README runbook (rotate the key,
+  clean the table) covers recovery.
+- Endpoint install: the install folder is created and locked before the config is written,
+  explicit entries are reset and ownership is taken for the whole tree, an existing folder
+  with a foreign owner is refused, paths are canonicalized before any check, and neither
+  script will ACL or delete a filesystem root or a Windows system folder.
 - Repository: `.gitignore` for real config, local settings, and the real Bicep parameter
   file; example values use `example.com`, `SRV-EXAMPLE-01`, `REPLACE_WITH_FUNCTION_KEY`;
   nothing brand- or client-specific in code, comments, examples, or `.NOTES`.
@@ -827,12 +905,18 @@ prevents purging the vault).
   4.6 including pending-delivery retry with `EventId` reuse, previous-status preservation
   on failed delivery, dropped-service handling, state-file reset, time-budget exhaustion
   including StartPending waits, Disabled and Missing handling, flapping detection,
-  suppression and release, heartbeat scheduling, payload validation edge cases including
+  suppression and release, an `Unknown` check carrying the previous status forward,
+  heartbeat scheduling, payload validation edge cases including
   unknown keys and nulls, HTML encoding of hostile strings and subject line-break
   stripping, SMTP2GO 200-with-partial-failures and 429 retry, provider timeouts, dedup hit
   and miss, a simulated 403 from the table write still returning 200, a second heartbeat
-  from the same host returning 200, rate limit exemptions, stale-host computation and the
-  zero-row digest notice.
+  from the same host returning 200, rate limit exemptions, the global cap including its
+  ETag conflict path, a failed `Import-Module` still answering 500 with one push, a test
+  event writing no host row, stale-host computation (exact-age comparison), the
+  zero-row digest notice and the 200-host listing cap; for the installers, path
+  canonicalization (relative and `..`), the protected-path and foreign-owner refusals, the
+  three-step `icacls` sequence with the DACL read-back, the first-run lockdown, and
+  `-DryRun` passing through to the worker's validation.
 - `run.ps1` files are tested by dot-sourcing with mocked `Push-OutputBinding` and a fake
   `$Request`.
 - `Tests/ServiceWatchdogContract.Tests.ps1` drives the worker's real payload path for

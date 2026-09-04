@@ -20,13 +20,19 @@
          propagates.
       5. Packages the AzureFunction folder (host.json at the archive root, local.settings
          files excluded) and publishes it with Publish-AzWebApp.
-      6. Restarts the app so the Key Vault references resolve, verifies that admin endpoint
-         isolation is enabled, and waits for SendServiceWatchdogAlert to be listed.
+      6. Restarts the app so the Key Vault references resolve and waits for
+         SendServiceWatchdogAlert to be listed.
       7. Creates the named function key and reads it back. A key of that name left by an
          earlier run is reused, never regenerated, so servers already configured keep working.
       8. Prints the alert URL, the key and the two lines to paste into ServiceWatchdog.json
          to the console only. The key is never written to the log file.
-      9. Optionally posts a test event to the new endpoint (-SendTestEmail) and reports the
+      9. Verifies that admin endpoint isolation (functionsRuntimeAdminIsolationEnabled) is
+         on, patching it on when the site does not report it. Deliberately after step 8: the
+         property is absent from the ARM schema, so a platform that drops it from the GET
+         response must never withhold the key from an otherwise finished deployment. A
+         value that still reads false is logged with the raw response and ends the run
+         with exit 50 after the remaining steps.
+     10. Optionally posts a test event to the new endpoint (-SendTestEmail) and reports the
          function's verdict, including its error code when the event is rejected.
 
     Every step is idempotent, so the script can be re-run after fixing a failure (or to
@@ -846,7 +852,13 @@ function Get-WatchdogAdminIsolationState {
         throw "Reading the site returned HTTP $($response.StatusCode)."
     }
     $site = ConvertFrom-WatchdogRestContent -Content $response.Content
-    return ($site.properties.functionsRuntimeAdminIsolationEnabled -eq $true)
+    $raw = $null
+    if ($site.properties -and $site.properties.PSObject.Properties['functionsRuntimeAdminIsolationEnabled']) {
+        $raw = $site.properties.functionsRuntimeAdminIsolationEnabled
+    }
+    $shown = if ($null -eq $raw) { '<absent from the response>' } else { [string]$raw }
+    Write-Log "Site reports functionsRuntimeAdminIsolationEnabled = $shown" -Level 'INFO'
+    return ($raw -eq $true)
 }
 
 function Confirm-WatchdogAdminIsolation {
@@ -1220,6 +1232,7 @@ function Invoke-WatchdogDeployment {
     # Steps 4 to 9: everything after the template is a post-deployment step (exit 50).
     $step = 'read the deployment outputs'
     $packagePath = $null
+    $isolationFailure = $null
     try {
         $outputs = Get-WatchdogDeploymentOutput -Deployment $deployment `
             -Name @('functionAppName', 'functionAppHostName', 'alertUrl', 'keyVaultName')
@@ -1250,9 +1263,6 @@ function Invoke-WatchdogDeployment {
                     -ErrorAction Stop | Out-Null
             }
 
-        $step = 'verify admin endpoint isolation'
-        Confirm-WatchdogAdminIsolation -SiteResourceId $siteResourceId
-
         $step = "wait for $script:AlertFunctionName to be listed"
         Wait-WatchdogFunction -SiteResourceId $siteResourceId -FunctionName $script:AlertFunctionName
 
@@ -1262,6 +1272,18 @@ function Invoke-WatchdogDeployment {
 
         Show-WatchdogSummary -FunctionAppName $outputs.functionAppName -AlertUrl $outputs.alertUrl `
             -FunctionKey $functionKey -KeyVaultName $outputs.keyVaultName
+
+        # After the key is shown on purpose (7.2 step 9): the property is outside the ARM
+        # schema, so a response that drops it must not withhold the deployment's one
+        # deliverable. A failure here is reported at the end as exit 50.
+        $step = 'verify admin endpoint isolation'
+        try {
+            Confirm-WatchdogAdminIsolation -SiteResourceId $siteResourceId
+        }
+        catch {
+            $isolationFailure = [string]$_
+            Write-Log "Admin endpoint isolation could not be verified: $isolationFailure" -Level 'ERROR'
+        }
 
         if ($SendTestEmail) {
             $step = 'send the test email'
@@ -1277,6 +1299,13 @@ function Invoke-WatchdogDeployment {
         if ($packagePath -and (Test-Path -LiteralPath $packagePath)) {
             Remove-Item -LiteralPath $packagePath -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    if ($isolationFailure) {
+        Write-Log ('Deployed and the function key was shown above, but functionsRuntimeAdminIsolationEnabled could ' +
+            "not be confirmed: $isolationFailure Check the site in the portal or set the property by hand " +
+            '(README troubleshooting) and re-run to verify (exit 50).') -Level 'ERROR'
+        return 50
     }
 
     $elapsed = (Get-Date) - $started

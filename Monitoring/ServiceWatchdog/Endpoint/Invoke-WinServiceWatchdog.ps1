@@ -434,6 +434,30 @@ function Limit-WatchdogString {
     return $text.Substring(0, $MaxLength - $marker.Length) + $marker
 }
 
+function Get-WatchdogExceptionMessage {
+    # Joins the messages of an exception chain with ' -> ', skipping PowerShell's
+    # MethodInvocationException wrapper (its text only repeats the inner message) and
+    # duplicate texts, so the innermost reason reported by the SCM is kept.
+    param (
+        [Parameter(Mandatory)]
+        [object]$Exception
+    )
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $current = $Exception
+    while ($null -ne $current) {
+        $text = ([string]$current.Message).Trim()
+        if ($current.GetType().Name -ne 'MethodInvocationException' -and $text -and -not $parts.Contains($text)) {
+            $parts.Add($text)
+        }
+        $current = $current.InnerException
+    }
+    if ($parts.Count -eq 0) {
+        return [string]$Exception
+    }
+    return ($parts -join ' -> ')
+}
+
 function Initialize-WatchdogTransportSecurity {
     # Windows PowerShell 5.1 does not enable TLS 1.2 by default; PowerShell 7 already does.
     if ($PSVersionTable.PSVersion.Major -lt 6) {
@@ -524,9 +548,19 @@ function Write-WatchdogEvent {
                 $script:EventSourceReady = $true
             }
             elseif (Test-WatchdogElevation) {
-                Register-WatchdogEventSource -Source $script:EventSourceName -LogName $script:EventLogName
-                Write-Log -Message "Registered event source '$($script:EventSourceName)'." -Level 'INFO'
-                $script:EventSourceReady = $true
+                try {
+                    Register-WatchdogEventSource -Source $script:EventSourceName -LogName $script:EventLogName
+                    Write-Log -Message "Registered event source '$($script:EventSourceName)'." -Level 'INFO'
+                    $script:EventSourceReady = $true
+                }
+                catch {
+                    # Decided once per run: retrying on every event would repeat the same
+                    # failure and warning for every call site.
+                    $script:EventSourceReady = $false
+                    Write-Log -Message ("Could not register event source '$($script:EventSourceName)': $_. " +
+                        'Continuing with file logging only for this run.') -Level 'WARNING'
+                    return
+                }
             }
             else {
                 $script:EventSourceReady = $false
@@ -1035,7 +1069,14 @@ function Start-WatchdogService {
     )
 
     $service = Get-Service -Name ([System.Management.Automation.WildcardPattern]::Escape($Name)) -ErrorAction Stop
-    $service.Start()
+    try {
+        $service.Start()
+    }
+    catch {
+        # The SCM reason (1068 dependency failed, 1053 no response, 1069 logon failure) lives
+        # in the inner Win32Exception; the outer messages say only "Cannot start service".
+        throw (Get-WatchdogExceptionMessage -Exception $_.Exception)
+    }
     try {
         Wait-WatchdogServiceStatus -Service $service -Status 'Running' -TimeoutSeconds $WaitSeconds
     }
@@ -1049,7 +1090,7 @@ function Start-WatchdogService {
             }
             $exception = $exception.InnerException
         }
-        throw
+        throw (Get-WatchdogExceptionMessage -Exception $_.Exception)
     }
 }
 
@@ -1389,6 +1430,35 @@ function Get-WatchdogNotificationPlan {
             FlapCount              = $(if ($previous) { [int]$previous.FlapCount } else { 0 })
             FlapWindowStartUtc     = $(if ($previous) { $previous.FlapWindowStartUtc } else { $null })
             FlapSuppressedUntilUtc = $(if ($previous) { $previous.FlapSuppressedUntilUtc } else { $null })
+        }
+
+        if ($newStatus -eq 'Unknown') {
+            # DESIGN.md 4.4: a check that threw is no observation. The previous Status is
+            # carried forward, no transition is counted and nothing is notified, so a
+            # monitoring-side hiccup can neither send a false all-clear nor reset an outage.
+            # The payload still shows Unknown for this service.
+            $carried = $(if ($previousStatus -eq 'none') { 'Unknown' } else { $previousStatus })
+            $entry.Status = $carried
+            $message = "Service '$($result.Name)': check failed ($($result.LastError)); keeping previous status " +
+            "'$carried', counting no transition and notifying nothing."
+            Write-Log -Message $message -Level 'WARNING'
+            $items.Add(@{
+                    Name           = $result.Name
+                    ResolvedName   = $result.ResolvedName
+                    DisplayName    = $result.DisplayName
+                    StartType      = $result['StartType']
+                    Status         = $carried
+                    PayloadStatus  = 'Unknown'
+                    Category       = $null
+                    Notify         = $false
+                    Attempts       = [int]$result.Attempts
+                    LastError      = $result.LastError
+                    FirstFailedUtc = $entry.FirstFailedUtc
+                    FlapCount      = [int]$entry.FlapCount
+                    Entry          = $entry
+                    Previous       = $previous
+                })
+            continue
         }
 
         $category = $null

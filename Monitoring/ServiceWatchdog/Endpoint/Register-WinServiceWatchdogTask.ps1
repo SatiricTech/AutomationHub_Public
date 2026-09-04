@@ -9,16 +9,21 @@
     Windows-only. Runs elevated on the server being monitored and performs the one-time setup
     for the ServiceWatchdog worker (Invoke-WinServiceWatchdog.ps1):
 
-      1. Creates the install folder and copies the worker there. An existing worker is left
-         alone unless -Force is set (exit 2 otherwise). If no ServiceWatchdog.json exists, the
-         example config is copied into place and the script stops with exit 2 so the
-         operator can edit it and re-run.
-      2. Locks the install folder down with icacls: inheritance removed, SYSTEM and
-         Administrators full control (well-known SIDs, locale-safe). The folder holds the
-         config file with the function key and the state file the worker writes beside it,
-         and Task Scheduler runs whatever is in it as SYSTEM, so nothing else may write
-         there. Because only this folder is protected, -ConfigPath must point inside it; any
-         other folder is refused with exit 2 before anything is created.
+      1. Resolves -InstallPath, -SourcePath and -ConfigPath to absolute paths (a relative
+         path or a '..' segment would otherwise reach the task action, icacls and the file
+         system in different forms), refuses a filesystem root or Windows system folder as
+         InstallPath (exit 2), creates the install folder if missing and locks it down with
+         icacls before anything is written into it: explicit entries reset, inheritance
+         removed, SYSTEM and Administrators full control (well-known SIDs, locale-safe),
+         ownership taken for the whole tree, and the DACL read back to confirm nothing else
+         remains. An existing folder owned by any other account is refused (exit 2): its
+         owner keeps WRITE_DAC whatever the DACL says, and Task Scheduler runs whatever is in
+         the folder as SYSTEM. Because only this folder is protected, -ConfigPath must point
+         inside it; any other folder is refused with exit 2 before anything is created.
+      2. Copies the worker into the folder. An existing worker is left alone unless -Force
+         is set (exit 2 otherwise). If no ServiceWatchdog.json exists, the example config is
+         copied into the locked folder and the script stops with exit 2 so the operator can
+         edit it and re-run.
       3. Validates the config by running the worker with -ValidateConfig in a fresh
          Windows PowerShell process (exit 2 on failure), then checks that
          -ExecutionTimeLimitSeconds covers the worst-case run time
@@ -51,7 +56,7 @@
 
 .PARAMETER ConfigPath
     Config file to validate and use. Defaults to <InstallPath>\ServiceWatchdog.json. It must
-    live inside InstallPath (any file name), because that is the only folder step 2 protects
+    live inside InstallPath (any file name), because that is the only folder step 1 protects
     and the worker writes its state file beside the config; a path outside InstallPath is
     refused with exit 2. When the name differs from the default, the task action passes
     -ConfigPath to the worker so both agree.
@@ -133,7 +138,7 @@
         $env:ProgramData\$MSPName\Logs, because the tool is deployed by end-client IT and
         the project is MSP-name-agnostic throughout.
       - 5.2: no SecretManagement vault. This script never reads the function key; the worker
-        keeps it in the ACLed config file this script protects in step 2.
+        keeps it in the ACLed config file this script protects in step 1.
       - 5.7: ships unsigned in the public repository; adopters sign with their own
         certificate.
       - 6.6: the integration test is the operator acceptance run documented in the README.
@@ -194,6 +199,11 @@ $script:EventLogName = 'Application'
 $script:EventSourceName = 'ServiceWatchdog'
 $script:SystemSid = 'S-1-5-18'
 $script:AdministratorsSid = 'S-1-5-32-544'
+$script:TrustedInstallerSid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+# Owners an existing install folder may already have. Anything else (typically a standard
+# user who pre-created the folder under ProgramData) is refused: the owner keeps WRITE_DAC
+# whatever the DACL says, so the SYSTEM task would run a script that user can replace.
+$script:TrustedOwnerSids = @($script:SystemSid, $script:AdministratorsSid, $script:TrustedInstallerSid)
 $script:RepositoryName = 'AutomationHub_Public (Monitoring/ServiceWatchdog)'
 
 # Spec 4.3 defaults, used for the execution-limit check when the config omits the keys.
@@ -362,6 +372,126 @@ function Test-WatchdogPathInside {
     return $fullPath.StartsWith($prefix, $comparison)
 }
 
+function Resolve-WatchdogPath {
+    # Returns the absolute, normalized form of a path without requiring it to exist:
+    # relative segments and '..' are collapsed so a path is compared, ACLed and written to
+    # the task action exactly as the file system will interpret it.
+    param (
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($full)
+    if ($root -and $full.TrimEnd('\', '/') -eq $root.TrimEnd('\', '/')) {
+        return $full
+    }
+    return $full.TrimEnd('\', '/')
+}
+
+function Test-WatchdogProtectedPath {
+    # True for a filesystem root or a Windows system folder, which the installer must never
+    # lock down to SYSTEM and Administrators even when an operator mistypes -InstallPath.
+    param (
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $resolved = Resolve-WatchdogPath -Path $Path
+    $root = [System.IO.Path]::GetPathRoot($resolved)
+    if ($root -and $resolved.TrimEnd('\', '/') -eq $root.TrimEnd('\', '/')) {
+        return $true
+    }
+
+    $protected = @($env:ProgramData, $env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:SystemDrive)
+    foreach ($candidate in $protected) {
+        if ($candidate -and (Resolve-WatchdogPath -Path $candidate).Equals($resolved,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-WatchdogPathOwnerSid {
+    # Wrapped so tests can mock it: Get-Acl is Windows-only.
+    param (
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $acl = Get-Acl -LiteralPath $Path
+    return $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+}
+
+function Get-WatchdogPathAccessRule {
+    # Wrapped so tests can mock it. Returns one record per DACL entry with the SID resolved,
+    # so the read-back check compares well-known SIDs rather than localized names.
+    param (
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $acl = Get-Acl -LiteralPath $Path
+    $rules = @()
+    foreach ($rule in @($acl.Access)) {
+        $rules += @{
+            Sid         = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            IsInherited = [bool]$rule.IsInherited
+            Type        = [string]$rule.AccessControlType
+        }
+    }
+    return $rules
+}
+
+function Invoke-WatchdogIcaclsStep {
+    # Runs one icacls call, logs its output and throws on a non-zero exit code.
+    param (
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string[]]$ArgumentList,
+
+        [Parameter(Mandatory)]
+        [string]$Purpose
+    )
+
+    $output = & icacls $Path @ArgumentList
+    $exitCode = $LASTEXITCODE
+    foreach ($line in @($output | Where-Object { $null -ne $_ })) {
+        Write-Log "  icacls> $line" -Level 'DEBUG'
+    }
+    if ($exitCode -ne 0) {
+        throw "icacls exited with code $exitCode while $Purpose on '$Path'."
+    }
+}
+
+function Test-WatchdogInstallAcl {
+    # Reads the folder DACL back and throws unless it holds exactly the two expected
+    # non-inherited Allow entries, so a leftover explicit entry never survives silently.
+    param (
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $expected = @($script:SystemSid, $script:AdministratorsSid)
+    $rules = @(Get-WatchdogPathAccessRule -Path $Path)
+    $present = @()
+    foreach ($rule in $rules) {
+        if ($rule.IsInherited -or $rule.Type -ne 'Allow' -or $expected -notcontains $rule.Sid) {
+            throw ("The ACL on '$Path' still carries an unexpected entry for SID $($rule.Sid) " +
+                "(inherited: $($rule.IsInherited), type: $($rule.Type)). Remove it or the folder and re-run.")
+        }
+        $present += $rule.Sid
+    }
+    foreach ($sid in $expected) {
+        if ($present -notcontains $sid) {
+            throw "The ACL on '$Path' is missing the entry for SID $sid after icacls ran."
+        }
+    }
+}
+
 function Set-WatchdogInstallAcl {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSUseShouldProcessForStateChangingFunctions',
@@ -373,17 +503,19 @@ function Set-WatchdogInstallAcl {
         [string]$Path
     )
 
-    # Well-known SIDs for SYSTEM and Administrators keep the call locale-safe.
+    # Well-known SIDs for SYSTEM and Administrators keep the calls locale-safe. Three steps:
+    # /reset strips every explicit entry on the folder and its contents (/inheritance:r and
+    # /grant:r alone leave a pre-existing entry for another account in place), the grant
+    # replaces the DACL with the two expected entries, and /setowner takes ownership of the
+    # whole tree because an owner keeps WRITE_DAC whatever the DACL says.
     $systemGrant = "*$($script:SystemSid):(OI)(CI)F"
     $administratorsGrant = "*$($script:AdministratorsSid):(OI)(CI)F"
-    $output = & icacls $Path /inheritance:r /grant:r $systemGrant $administratorsGrant
-    $exitCode = $LASTEXITCODE
-    foreach ($line in @($output | Where-Object { $null -ne $_ })) {
-        Write-Log "  icacls> $line" -Level 'DEBUG'
-    }
-    if ($exitCode -ne 0) {
-        throw "icacls exited with code $exitCode while setting the ACL on '$Path'."
-    }
+    Invoke-WatchdogIcaclsStep -Path $Path -ArgumentList @('/reset', '/T') -Purpose 'resetting explicit entries'
+    Invoke-WatchdogIcaclsStep -Path $Path -ArgumentList @('/inheritance:r', '/grant:r', $systemGrant, $administratorsGrant) `
+        -Purpose 'setting the ACL'
+    Invoke-WatchdogIcaclsStep -Path $Path -ArgumentList @('/setowner', "*$($script:AdministratorsSid)", '/T') `
+        -Purpose 'taking ownership'
+    Test-WatchdogInstallAcl -Path $Path
 }
 
 function Get-WatchdogConfigValue {
@@ -419,7 +551,7 @@ function Get-WatchdogConfigValue {
 #region Main Functions
 
 function Install-WatchdogContent {
-    # Step 1. Returns 0 to continue or 2 when the operator has to act first.
+    # Steps 1 and 2. Returns 0 to continue or 2 when the operator has to act first.
     [CmdletBinding()]
     param (
         [Parameter(Mandatory)]
@@ -456,9 +588,31 @@ function Install-WatchdogContent {
         return 2
     }
 
+    # The folder is created and locked before anything is written into it, so the config
+    # (which will hold the function key) never sits under the permissive ProgramData ACL,
+    # not even between the first run and the edit-and-re-run.
+    if (Test-Path -LiteralPath $InstallPath -PathType Container) {
+        $owner = Get-WatchdogPathOwnerSid -Path $InstallPath
+        if ($script:TrustedOwnerSids -notcontains $owner) {
+            Write-Log ("Install folder '$InstallPath' already exists and is owned by SID $owner, not SYSTEM or " +
+                'Administrators. A folder pre-created by another account cannot be trusted to hold a script that ' +
+                'runs as SYSTEM: remove the folder (or take ownership as an administrator) and re-run.') -Level 'ERROR'
+            return 2
+        }
+    }
+    else {
+        Invoke-Action -Description "Create install folder '$InstallPath'" -Action {
+            New-Item -Path $InstallPath -ItemType Directory -Force | Out-Null
+        }
+    }
+
+    Invoke-Action -Description "Restrict '$InstallPath' to SYSTEM and Administrators" -Action {
+        Set-WatchdogInstallAcl -Path $InstallPath
+    }
+
     if (-not $configExists) {
         # Nothing else is touched until a real config exists, so a first run leaves only the
-        # example config behind for the operator to edit.
+        # example config behind, inside the locked folder, for the operator to edit.
         Invoke-Action -Description "Copy example config to '$ConfigPath'" -Action {
             $configDir = Split-Path -Path $ConfigPath -Parent
             if ($configDir -and -not (Test-Path -LiteralPath $configDir)) {
@@ -469,12 +623,6 @@ function Install-WatchdogContent {
         Write-Log ("Config file created at '$ConfigPath'. Edit it (Services, Webhook.Url, Webhook.FunctionKey) " +
             'and re-run this script.') -Level 'ERROR'
         return 2
-    }
-
-    if (-not (Test-Path -LiteralPath $InstallPath -PathType Container)) {
-        Invoke-Action -Description "Create install folder '$InstallPath'" -Action {
-            New-Item -Path $InstallPath -ItemType Directory -Force | Out-Null
-        }
     }
 
     Invoke-Action -Description "Copy worker '$sourceWorker' to '$installedWorker'" -Action {
@@ -501,6 +649,11 @@ function Test-WatchdogInstallConfig {
 
     Write-Log "Validating '$ConfigPath' with the worker" -Level 'INFO'
     $validateArguments = @('-ValidateConfig', '-ConfigPath', $ConfigPath)
+    if ($script:DryRun) {
+        # The worker registers the event log source when it records event 1020 for an
+        # invalid config; under -DryRun that mutation is suppressed on its side too.
+        $validateArguments += '-DryRun'
+    }
     $validateExit = Invoke-WatchdogWorker -WorkerPath $WorkerPath -Arguments $validateArguments
     if ($validateExit -ne 0) {
         Write-Log ("Config validation failed (worker exit code $validateExit). " +
@@ -744,7 +897,23 @@ function Invoke-WatchdogRegistration {
             Write-Log '*** DRYRUN MODE - No changes will be made ***' -Level 'WARNING'
         }
 
-        # Only InstallPath receives the step 2 ACL, and the worker writes its state file
+        # Paths are canonicalized once, before any check or mutation: a relative path would
+        # otherwise end up verbatim in the task action (which Task Scheduler resolves against
+        # System32), and a '..' segment would be resolved by icacls and the file system to a
+        # folder the checks below never saw.
+        $InstallPath = Resolve-WatchdogPath -Path $InstallPath
+        $SourcePath = Resolve-WatchdogPath -Path $SourcePath
+        $ConfigPath = Resolve-WatchdogPath -Path $ConfigPath
+        Write-Log "Resolved paths: InstallPath=$InstallPath, SourcePath=$SourcePath, ConfigPath=$ConfigPath" `
+            -Level 'INFO'
+
+        if (Test-WatchdogProtectedPath -Path $InstallPath) {
+            Write-Log ("Refusing -InstallPath '$InstallPath': it is a filesystem root or a Windows system folder, " +
+                'and this script restricts the whole install folder to SYSTEM and Administrators.') -Level 'ERROR'
+            return 2
+        }
+
+        # Only InstallPath receives the step 1 ACL, and the worker writes its state file
         # beside the config, so a config anywhere else would leave the function key under
         # whatever DACL that folder inherits. Refused before anything is created.
         $configFolder = Split-Path -Path $ConfigPath -Parent
@@ -759,10 +928,6 @@ function Invoke-WatchdogRegistration {
             -ConfigPath $ConfigPath -Force:$Force
         if ($fileExit -ne 0) {
             return $fileExit
-        }
-
-        Invoke-Action -Description "Restrict '$InstallPath' to SYSTEM and Administrators" -Action {
-            Set-WatchdogInstallAcl -Path $InstallPath
         }
 
         # Under -DryRun the worker was not copied, so validate with the source copy instead;

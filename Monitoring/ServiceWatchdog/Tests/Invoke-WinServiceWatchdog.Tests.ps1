@@ -806,6 +806,43 @@ Describe 'Invoke-WinServiceWatchdog' {
             Mock Get-Service { $fake }
             { Start-WatchdogService -Name 'Spooler' -WaitSeconds 3 } | Should -Throw '*did not reach Running*'
         }
+
+        It 'surfaces the SCM reason from the inner exception when Start() fails' {
+            $fake = [pscustomobject]@{ Name = 'Spooler'; Status = 'Stopped' }
+            $fake | Add-Member -MemberType ScriptMethod -Name Start -Value {
+                $inner = [System.ComponentModel.Win32Exception]::new(1068,
+                    'The dependency service or group failed to start')
+                throw [System.InvalidOperationException]::new("Cannot start service Spooler on computer '.'.", $inner)
+            }
+            $fake | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value { }
+            Mock Get-Service { $fake }
+            $message = $null
+            try {
+                Start-WatchdogService -Name 'Spooler' -WaitSeconds 3
+            }
+            catch {
+                $message = $_.Exception.Message
+            }
+            $message | Should -Match "Cannot start service Spooler on computer '\.'"
+            $message | Should -Match 'The dependency service or group failed to start'
+            $message | Should -Not -Match 'Exception calling'
+        }
+
+        It 'Get-WatchdogExceptionMessage skips the MethodInvocationException wrapper and joins the chain' {
+            $inner = [System.ComponentModel.Win32Exception]::new(1069, 'The service did not start due to a logon failure')
+            $middle = [System.InvalidOperationException]::new("Cannot start service Spooler on computer '.'.", $inner)
+            $outer = [System.Management.Automation.MethodInvocationException]::new(
+                'Exception calling "Start" with "0" argument(s): "Cannot start service Spooler on computer ''.''."',
+                $middle)
+            $text = Get-WatchdogExceptionMessage -Exception $outer
+            $text | Should -Be ("Cannot start service Spooler on computer '.'. -> " +
+                'The service did not start due to a logon failure')
+        }
+
+        It 'Get-WatchdogExceptionMessage returns a single message unchanged' {
+            $text = Get-WatchdogExceptionMessage -Exception ([System.Exception]::new('plain'))
+            $text | Should -Be 'plain'
+        }
     }
 
     Context 'Start rounds' {
@@ -1095,11 +1132,51 @@ Describe 'Invoke-WinServiceWatchdog' {
             Should -Invoke Write-WatchdogEvent -ParameterFilter { $EventId -eq 1005 } -Times 1 -Exactly
         }
 
-        It 'categorizes Unknown after a problem as recovered' {
-            $state = New-TestState -Services @{ Spooler = New-TestEntry -Status 'Missing' }
-            $plan = Get-WatchdogNotificationPlan -Results @((New-TestResult -Name 'Spooler' -Status 'Unknown')) `
-                -State $state -Config $script:Config -Now $script:Now
-            $plan.EventType | Should -Be 'recovered'
+        It 'carries the previous status forward and notifies nothing when the check is Unknown' {
+            $state = New-TestState -Services @{
+                Spooler = New-TestEntry -Status 'Missing' -FirstFailedUtc (Get-TestTimestamp -30) -FlapCount 2 `
+                    -FlapWindowStartUtc (Get-TestTimestamp -10)
+            }
+            $result = New-TestResult -Name 'Spooler' -Status 'Unknown' -LastError 'Check failed unexpectedly: WMI busy'
+            $plan = Get-WatchdogNotificationPlan -Results @($result) -State $state -Config $script:Config -Now $script:Now
+            $plan.EventType | Should -BeNullOrEmpty
+            $plan.NotifiableNames | Should -BeNullOrEmpty
+            $item = $plan.Items[0]
+            $item.Category | Should -BeNullOrEmpty
+            $item.Notify | Should -BeFalse
+            $item.Status | Should -Be 'Missing'
+            $item.PayloadStatus | Should -Be 'Unknown'
+            $item.Entry.Status | Should -Be 'Missing'
+            $item.Entry.FirstFailedUtc | Should -Be (Get-TestTimestamp -30)
+            $item.Entry.FlapCount | Should -Be 2
+            $item.Entry.FlapWindowStartUtc | Should -Be (Get-TestTimestamp -10)
+            $item.Entry.LastError | Should -Be 'Check failed unexpectedly: WMI busy'
+            Should -Invoke Write-WatchdogEvent -Times 0
+            Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'WARNING' -and $Message -like "*keeping previous status 'Missing'*"
+            }
+        }
+
+        It 'does not alert again after an Unknown run interrupts an outage' {
+            # Failed -> Unknown -> Failed must stay one outage: no recovered, no second alert.
+            $state = New-TestState -Services @{
+                Spooler = New-TestEntry -Status 'Failed' -FirstFailedUtc (Get-TestTimestamp -30) `
+                    -LastNotifiedUtc (Get-TestTimestamp -30)
+            }
+            $plan = Get-TestPlan -Results @((New-TestResult -Name 'Spooler' -Status 'Unknown')) -State $state
+            $state.Services['Spooler'] = $plan.Items[0].Entry
+            $plan = Get-TestPlan -Results @((New-TestResult -Name 'Spooler' -Status 'Failed')) -State $state
+            $plan.EventType | Should -BeNullOrEmpty
+            $plan.Items[0].Entry.FirstFailedUtc | Should -Be (Get-TestTimestamp -30)
+            Should -Invoke Write-WatchdogEvent -Times 0
+        }
+
+        It 'records Unknown with no category when the check fails and there is no previous entry' {
+            $plan = Get-TestPlan -Results @((New-TestResult -Name 'Spooler' -Status 'Unknown')) -State (New-TestState)
+            $plan.EventType | Should -BeNullOrEmpty
+            $plan.Items[0].Status | Should -Be 'Unknown'
+            $plan.Items[0].Entry.Status | Should -Be 'Unknown'
+            $plan.Items[0].PayloadStatus | Should -Be 'Unknown'
         }
 
         It 'sends remediated only when NotifyOnRemediation is on and the cooldown has elapsed' {
@@ -1766,13 +1843,17 @@ Describe 'Invoke-WinServiceWatchdog' {
             Should -Invoke Write-Log -ParameterFilter { $Level -eq 'WARNING' } -Times 1 -Exactly
         }
 
-        It 'only warns when source registration throws' {
+        It 'warns once and degrades to file logging for the run when source registration throws' {
             Mock Test-WatchdogEventSource { $false }
             Mock Test-WatchdogElevation { $true }
             Mock Register-WatchdogEventSource { throw 'access denied' }
             { Write-WatchdogEvent -EventId 1001 -EntryType 'Information' -Message 'x' } | Should -Not -Throw
+            { Write-WatchdogEvent -EventId 1002 -EntryType 'Error' -Message 'y' } | Should -Not -Throw
+            $script:EventSourceReady | Should -BeFalse
+            Should -Invoke Register-WatchdogEventSource -Times 1 -Exactly
             Should -Invoke Write-WatchdogEventLogEntry -Times 0
-            Should -Invoke Write-Log -ParameterFilter { $Level -eq 'WARNING' } -Times 1 -Exactly
+            Should -Invoke Write-Log -ParameterFilter { $Level -eq 'WARNING' -and $Message -like '*access denied*' } `
+                -Times 1 -Exactly
         }
 
         It 'logs the intended entry and writes nothing under -DryRun' {

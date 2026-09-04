@@ -19,6 +19,7 @@
         'ConvertTo-WatchdogEmail',
         'Send-WatchdogMail',
         'Test-WatchdogRateLimit',
+        'Test-WatchdogGlobalRateLimit',
         'Get-WatchdogStorageToken',
         'Set-WatchdogHostEntity',
         'Test-WatchdogSentEvent',

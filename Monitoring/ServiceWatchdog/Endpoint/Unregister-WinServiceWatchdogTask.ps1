@@ -247,23 +247,43 @@ function Remove-WatchdogEventSource {
     [System.Diagnostics.EventLog]::DeleteEventSource($Source)
 }
 
-function Test-WatchdogProtectedPath {
-    # True for a filesystem root or a Windows system folder, which -RemoveFiles must never
-    # delete even when an operator mistypes -InstallPath.
+function Resolve-WatchdogPath {
+    # Returns the absolute, normalized form of a path without requiring it to exist. '..'
+    # segments and relative paths are collapsed here, once, because -LiteralPath only
+    # disables wildcards: Remove-Item still lets the file system resolve '..', so a guard
+    # that compared the raw string would pass 'C:\ProgramData\ServiceWatchdog\..' and the
+    # removal would then delete C:\ProgramData.
     param (
         [Parameter(Mandatory)]
         [string]$Path
     )
 
-    $trimmed = $Path.TrimEnd('\', '/')
-    $root = [System.IO.Path]::GetPathRoot($Path)
-    if ($null -ne $root -and $trimmed -eq $root.TrimEnd('\', '/')) {
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($full)
+    if ($root -and $full.TrimEnd('\', '/') -eq $root.TrimEnd('\', '/')) {
+        return $full
+    }
+    return $full.TrimEnd('\', '/')
+}
+
+function Test-WatchdogProtectedPath {
+    # True for a filesystem root or a Windows system folder, which -RemoveFiles must never
+    # delete even when an operator mistypes -InstallPath. Both sides are resolved first.
+    param (
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $resolved = Resolve-WatchdogPath -Path $Path
+    $root = [System.IO.Path]::GetPathRoot($resolved)
+    if ($root -and $resolved.TrimEnd('\', '/') -eq $root.TrimEnd('\', '/')) {
         return $true
     }
 
     $protected = @($env:ProgramData, $env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:SystemDrive)
     foreach ($candidate in $protected) {
-        if ($candidate -and $trimmed -eq $candidate.TrimEnd('\', '/')) {
+        if ($candidate -and (Resolve-WatchdogPath -Path $candidate).Equals($resolved,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
             return $true
         }
     }
@@ -376,6 +396,11 @@ function Invoke-WatchdogUnregistration {
         if ($script:DryRun) {
             Write-Log '*** DRYRUN MODE - No changes will be made ***' -Level 'WARNING'
         }
+
+        # Resolved once, before any check or mutation, so the protected-path guard, the
+        # existence check and Remove-Item all see the same folder.
+        $InstallPath = Resolve-WatchdogPath -Path $InstallPath
+        Write-Log "Resolved InstallPath=$InstallPath" -Level 'INFO'
 
         if ($RemoveFiles -and (Test-WatchdogProtectedPath -Path $InstallPath)) {
             Write-Log "Refusing to remove '$InstallPath': it is a filesystem root or a Windows system folder" `

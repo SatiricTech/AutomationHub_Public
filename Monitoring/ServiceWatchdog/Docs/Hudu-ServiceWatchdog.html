@@ -125,7 +125,10 @@ outage neither loses nor duplicates an email.</p>
 
 <ol>
   <li>In SMTP2GO: verify the sender domain (three CNAME records), create the scoped API key,
-  set its rate limit (for example 60 per hour).</li>
+  set its rate limit (for example 60 per hour; required, not optional: the function has its
+  own global cap of 60 emails per hour, but the provider-side limit is the one that still
+  holds if the function app is misused). For an SMTP relay, apply the relay's equivalent
+  per-account limit.</li>
   <li>From the repository folder <code>Monitoring/ServiceWatchdog/Deploy</code>:
 <pre><code>Connect-AzAccount
 $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
@@ -135,9 +138,12 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
     -Smtp2GoApiKey $apiKey -SendTestEmail -Verbosity Medium</code></pre>
   The script deploys the Bicep template (Function App, Key Vault, storage tables, Application
   Insights, role assignments), seeds the secret, publishes the function code, restarts the
-  app, creates a named function key (<code>watchdog</code>) and prints the alert URL and
-  key to the console <strong>once</strong>. <code>-SendTestEmail</code> sends a
-  <code>[TEST]</code> email to the recipients.</li>
+  app, creates a named function key (<code>watchdog</code>), prints the alert URL and
+  key to the console <strong>once</strong>, and then verifies admin endpoint isolation (a
+  failure there ends with exit 50 after the key was shown; the deployment is still
+  usable). <code>-SendTestEmail</code> sends a <code>[TEST]</code> email to the
+  recipients; a test event never creates a host row, so the workstation does not appear in
+  the stale-host digest.</li>
   <li>Store the function key in
   <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[PASSWORD VAULT ENTRY]</span>
   and record the alert URL in the table above. The key is never written to the log file.</li>
@@ -163,9 +169,10 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
   <li>Copy the repository's <code>Monitoring/ServiceWatchdog/Endpoint</code> folder to the
   server (for example <code>C:\Temp\Endpoint</code>).</li>
   <li>In an elevated PowerShell, run <code>.\Register-WinServiceWatchdogTask.ps1</code>.
-  The first run copies the worker and an example config to
-  <code>C:\ProgramData\ServiceWatchdog</code> and stops with exit 2 asking for the config to
-  be edited.</li>
+  The first run creates <code>C:\ProgramData\ServiceWatchdog</code>, locks it down to SYSTEM
+  and Administrators, copies an example config into it and stops with exit 2 asking for
+  the config to be edited. If that folder already exists and is owned by another account,
+  the installer refuses it (exit 2): remove the folder or take ownership first.</li>
   <li>Edit <code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code>: set
   <code>SiteName</code> (the customer or site as it should appear in the email),
   <code>Services</code> (service <strong>short names</strong>, for example <code>Spooler</code>
@@ -174,9 +181,9 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
   containing <code>REPLACE</code> fails validation.</li>
   <li>Run <code>.\Register-WinServiceWatchdogTask.ps1 -TestAlert -RunNow</code>
   (add <code>-SetServiceRecovery</code> to also set Service Control Manager failure actions,
-  restart after 1 and 2 minutes, on every listed service). This locks the folder down,
-  validates the config, registers the event source and the task, starts it and sends a test
-  alert.</li>
+  restart after 1 and 2 minutes, on every listed service). This re-applies the folder
+  lockdown, copies the worker, validates the config, registers the event source and the
+  task, starts it and sends a test alert.</li>
   <li>Confirm the <code>[TEST]</code> email arrived, then run the checks under
   <a href="#testing">Testing an installation</a>.</li>
 </ol>
@@ -184,8 +191,10 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
 <div class="callout callout-success">
   <div class="callout-title">Re-running the installer is safe</div>
   <p>Re-run it to change the interval (<code>-IntervalMinutes</code>) or the execution
-  limit; the task is always re-registered with <code>-Force</code>. Add the script's own
-  <code>-Force</code> only when the worker script itself should be replaced (an upgrade).
+  limit; the task is always re-registered. Every re-run after the first install needs the
+  script's own <code>-Force</code>, because the worker is already in place (the copy is
+  idempotent and also serves as the upgrade path):
+  <code>.\Register-WinServiceWatchdogTask.ps1 -Force -IntervalMinutes 10</code>.
   <code>-DryRun</code> shows every step without changing anything.</p>
 </div>
 
@@ -330,6 +339,10 @@ Invoke-AzRestMethod -Method PUT -Payload '{"name":"watchdog-2027q1"}' `
   <code>Invoke-AzRestMethod -Method DELETE -Path "$site/functions/SendServiceWatchdogAlert/keys/watchdog?api-version=2024-04-01"</code>.
   Any server that was missed starts logging event 1013 and exit 10, which is the signal
   to fix it.</li>
+  <li>If the rotation is because the key leaked, also review the <code>WatchdogHosts</code>
+  table (Storage browser in the portal) and delete rows for host names that are not real
+  servers; the README section "Recovering from a leaked function key" has the CLI
+  commands. A real server writes its row again on its next heartbeat.</li>
 </ol>
 
 <h3>SMTP2GO API key (or SMTP password)</h3>
@@ -397,7 +410,7 @@ Invoke-AzRestMethod -Method PUT -Payload '{"name":"watchdog-2027q1"}' `
         <td>Re-run the install script (it seeds the secret) or <code>Restart-AzWebApp</code>. The portal's "Key Vault Application Settings Diagnostics" blade names the failing reference.</td></tr>
     <tr><td>Alerts resume up to an hour late after a mail provider outage</td>
         <td>The per-host rate limit (6 per hour) counts attempts, and the server re-posts its pending event every 5 minutes</td>
-        <td>Wait it out, or restart the Function App (the counter is in memory).</td></tr>
+        <td>Wait it out, or restart the Function App (the counter is in memory). A 429 naming the global limit (60 emails per hour across all servers) means the whole fleet sent that many emails in the hour; look at what is alerting.</td></tr>
     <tr><td>Digest says "no hosts have ever reported"</td>
         <td>No server has reached the function yet</td>
         <td>On the servers: <code>Get-ScheduledTaskInfo -TaskName ServiceWatchdog</code>, the config, and events 1011/1013.</td></tr>

@@ -948,16 +948,46 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             }
         }
 
-        It 'exits 50 when admin isolation is still off after the patch' {
+        It 'exits 50 when admin isolation is still off after the patch, but only after the key was shown' {
             $fixture = Get-DeployFixture
             $script:Azure.AdminIsolation = $false
             $script:Azure.PatchApplies = $false
 
-            $exitCode = Invoke-WatchdogDeployment @fixture
+            $exitCode = Invoke-WatchdogDeployment @fixture -SendTestEmail
 
             $exitCode | Should -Be 50
             Get-LogText | Should -Match 'functionsRuntimeAdminIsolationEnabled'
-            Should -Invoke Invoke-AzRestMethod -Times 0 -ParameterFilter { $Method -eq 'PUT' }
+            Get-LogText | Should -Match 'function key was shown above'
+            Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'PUT' }
+            Should -Invoke Show-WatchdogSummary -Times 1 -Exactly -ParameterFilter {
+                $FunctionKey -eq $script:FunctionKeyValue
+            }
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly
+        }
+
+        It 'treats a response without the property as not enabled and logs that it was absent' {
+            $fixture = Get-DeployFixture
+            $script:Azure.PatchApplies = $false
+            Mock Invoke-AzRestMethod {
+                return (Get-RestResponse -StatusCode 200 -Content '{ "properties": { "state": "Running" } }')
+            } -ParameterFilter { $Method -eq 'GET' -and $Path -match '/sites/[^/?]+\?api-version=' }
+
+            $exitCode = Invoke-WatchdogDeployment @fixture
+
+            $exitCode | Should -Be 50
+            Get-LogText | Should -Match 'absent from the response'
+            Should -Invoke Show-WatchdogSummary -Times 1 -Exactly
+        }
+
+        It 'verifies isolation after the key is created rather than before' {
+            $script:CallOrder = [System.Collections.Generic.List[string]]::new()
+            Mock Show-WatchdogSummary { $script:CallOrder.Add('summary') }
+            Mock Confirm-WatchdogAdminIsolation { $script:CallOrder.Add('isolation') }
+            $fixture = Get-DeployFixture
+
+            Invoke-WatchdogDeployment @fixture | Should -Be 0
+
+            $script:CallOrder | Should -Be @('summary', 'isolation')
         }
     }
 

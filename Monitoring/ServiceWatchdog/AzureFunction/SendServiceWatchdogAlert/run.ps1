@@ -13,12 +13,15 @@
       2. Body must be a JSON object                -> 400 invalid_body
       3. Test-WatchdogPayload                       -> 400 invalid_payload (errors listed)
       4. Optional site allowlist                    -> 403 site_not_allowed
-      5. Set-WatchdogHostEntity (best effort; never changes the response)
+      5. Set-WatchdogHostEntity unless test (best effort; never changes the response)
       6. heartbeat                                  -> 200, emailSent = false
       7. Dedup on (host, EventId) unless test       -> 200, duplicate = true
-      8. Rate limit unless recovered                -> 429 rate_limited, Retry-After: 600
-      9. Send-WatchdogMail                          -> 502 provider_failed on failure
-     10. Set-WatchdogSentEvent (best effort)        -> 200 with providerMessageId
+      8. Per-host rate limit unless recovered       -> 429 rate_limited, Retry-After: 600
+      9. Global emails-per-hour cap (every type)    -> 429 rate_limited, Retry-After: 600
+     10. Send-WatchdogMail                          -> 502 provider_failed on failure
+     11. Set-WatchdogSentEvent (best effort)        -> 200 with providerMessageId
+    The outer catch that turns any other exception into 500 internal_error does not depend
+    on the module having loaded, so a broken deployment package still answers with JSON.
 
     Every 400 and 403 logs the caller's client IP from X-Forwarded-For or X-Azure-ClientIP.
     All responses carry Content-Type application/json. Recipients and sender always come
@@ -151,6 +154,48 @@ function Get-WatchdogClientAddress {
     return 'unknown'
 }
 
+function Write-WatchdogFallbackLog {
+    <#
+    .SYNOPSIS
+        Logs through Write-WatchdogLog when the module is loaded, otherwise natively.
+
+    .DESCRIPTION
+        The outer catch and the response conversion must work even when Import-Module
+        itself failed (module folder missing from the package, manifest error), so they
+        never call the module directly. Write-Error with -ErrorAction Continue is a
+        non-terminating record that Application Insights captures without aborting the
+        invocation; Write-Warning covers the Warning level the same way.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [ValidateSet('Warning', 'Error')]
+        [string]$Level = 'Error',
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$RunId
+    )
+
+    # Get-Module rather than Get-Command: command discovery would try to auto-load the
+    # module, which is the very step that may have just failed.
+    $module = Get-Module -Name 'ServiceWatchdogAlert'
+    if ($module -and $module.ExportedCommands.ContainsKey('Write-WatchdogLog')) {
+        Write-WatchdogLog -Level $Level -RunId $RunId -Message $Message
+        return
+    }
+    $runText = if ([string]::IsNullOrEmpty($RunId)) { '-' } else { $RunId }
+    $line = "[ServiceWatchdog] [$Level] runId=$runText host=- $Message"
+    if ($Level -eq 'Warning') {
+        Write-Warning -Message $line
+    }
+    else {
+        Write-Error -Message $line -ErrorAction Continue
+    }
+}
+
 function ConvertTo-WatchdogRejection {
     <#
     .SYNOPSIS
@@ -271,7 +316,7 @@ function ConvertTo-WatchdogHttpResponse {
         $failure = $_.Exception.Message
     }
     if ($null -eq $converted) {
-        Write-WatchdogLog -Level Warning -RunId $RunId -Message ("HttpResponseContext conversion failed " +
+        Write-WatchdogFallbackLog -Level Warning -RunId $RunId -Message ("HttpResponseContext conversion failed " +
             "($failure); pushing plain hashtable with status $($context.StatusCode)")
         return $context
     }
@@ -333,12 +378,20 @@ function Invoke-WatchdogAlertFlow {
             -Errors @("Site '$siteName' is not allowed"))
     }
 
-    try {
-        Set-WatchdogHostEntity -Config $config -Payload $body
+    if ($eventType -eq 'test') {
+        # A test event (installer -SendTestEmail from a workstation, -TestAlert by hand) is
+        # not evidence that a watchdog is installed on that host; recording it would make
+        # the digest report the host as stale from the next day on.
+        Write-WatchdogLog -RunId $RunId -HostName $hostName -Message 'Test event: host row not recorded'
     }
-    catch {
-        Write-WatchdogLog -Level Warning -RunId $RunId -HostName $hostName -Message ("Host row write failed: " +
-            "$($_.Exception.Message); continuing")
+    else {
+        try {
+            Set-WatchdogHostEntity -Config $config -Payload $body
+        }
+        catch {
+            Write-WatchdogLog -Level Warning -RunId $RunId -HostName $hostName -Message ("Host row write failed: " +
+                "$($_.Exception.Message); continuing")
+        }
     }
 
     if ($eventType -eq 'heartbeat') {
@@ -363,6 +416,17 @@ function Invoke-WatchdogAlertFlow {
                 -Errors @("Rate limit of $($config.MaxAlertsPerHostPerHour) alerts per host per hour reached") `
                 -Headers @{ 'Retry-After' = $script:RateLimitRetryAfterSeconds })
         }
+    }
+
+    # The global cap applies to every email including recovered and test events: it is the
+    # bound that holds when the per-host limiter is sidestepped with fresh host names or
+    # spread across scaled-out instances (DESIGN.md 8).
+    if (-not (Test-WatchdogGlobalRateLimit -Config $config -Limit $config.MaxEmailsPerHour)) {
+        Write-WatchdogLog -Level Warning -RunId $RunId -HostName $hostName -Message ("Global limit of " +
+            "$($config.MaxEmailsPerHour) emails per hour reached; event $eventId ($eventType) not sent")
+        return (ConvertTo-WatchdogRejection -StatusCode 429 -Code 'rate_limited' `
+            -Errors @("Global limit of $($config.MaxEmailsPerHour) emails per hour reached") `
+            -Headers @{ 'Retry-After' = $script:RateLimitRetryAfterSeconds })
     }
 
     $email = ConvertTo-WatchdogEmail -Payload $body -Config $config
@@ -403,8 +467,10 @@ try {
     $response = Invoke-WatchdogAlertFlow -Request $Request -RunId $runId
 }
 catch {
-    Write-WatchdogLog -Level Error -RunId $runId -Message ("Unexpected error in $($script:HostsAlertFunctionName): " +
-        "$($_.Exception.Message) at $($_.ScriptStackTrace)")
+    # Self-sufficient on purpose: when the failure is the Import-Module above, no module
+    # function exists yet, and the caller must still receive exactly one JSON response.
+    Write-WatchdogFallbackLog -Level Error -RunId $runId -Message ("Unexpected error in " +
+        "$($script:HostsAlertFunctionName): $($_.Exception.Message) at $($_.ScriptStackTrace)")
     $response = ConvertTo-WatchdogRejection -StatusCode 500 -Code 'internal_error' `
         -Errors @('Unexpected error; see function logs')
 }
