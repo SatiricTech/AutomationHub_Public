@@ -183,7 +183,11 @@ Validation rules (exit code 2 with every violation listed, event 1020):
 - Unknown keys produce a warning, not a failure, so a newer config works on an older script.
 - Missing optional keys take the defaults above. `Logging.LogRoot` empty means
   `$env:ProgramData\ServiceWatchdog\Logs`.
+- `Services` must be a JSON array; a bare string is a validation error. Placeholder detection
+  (`REPLACE`, case-sensitive) also covers `SiteName`.
 - `-ServiceName` replaces `Services` for that run only and is logged as an override.
+- `-ValidateConfig` performs no log-retention sweep; retention runs only on real runs and
+  `-TestAlert`.
 
 ### 4.4 State file (ServiceWatchdog.state.json, beside the config)
 
@@ -305,9 +309,13 @@ Delivery: on success the new per-service `Status` values are committed to state,
 cleared. On failure (network error, timeout, 5xx, 429, or any 4xx) the state is saved with
 `PendingNotification = true`, `PendingEventId`, `PendingEventType`, and
 `PendingServices` set, and, for every service that was notifiable this run, the previous
-`Status`, `FirstFailedUtc`, and `LastNotifiedUtc` are preserved unchanged (`LastError`,
-`LastRemediatedUtc`, and the flap fields are updated), so the next run computes the same
-transition again and re-sends. Services that were not notifiable commit normally. A
+`Status`, `FirstFailedUtc`, `LastNotifiedUtc`, `FlapCount`, `FlapWindowStartUtc`, and
+`FlapSuppressedUntilUtc` are preserved unchanged (`LastError` and `LastRemediatedUtc` are
+updated), so the next run computes the same transition again and re-sends. The flap fields
+are preserved alongside `Status` so that a transition whose delivery is retried is counted
+toward the flap threshold exactly once, when it is finally committed; otherwise a single
+outage during a webhook outage would be counted on every retry run and become `flapping`
+(review ruling, 2026-09-04). Services that were not notifiable commit normally. A
 `remediated` category whose delivery fails is dropped and logged, because it is
 informational only. Delivery failures write event 1011, 1013, 1014, or 1015 (4.9).
 
@@ -366,8 +374,8 @@ Heartbeat: when `now - LastHeartbeatUtc >= HeartbeatHours`, or `-SendHeartbeat`,
 - Payload `Status` per service is derived as: `Recovered` when the 4.6 category for the
   service is `recovered`; `Remediated` when our start succeeded this run (regardless of
   `NotifyOnRemediation`); otherwise the state `Status` (`Healthy`, `Failed`, `Missing`,
-  `Disabled`, `Unknown`). `Notify` is true only for services whose category is included in
-  this run's event.
+  `Disabled`, `Unknown`). `Notify` is true for every service that has a 4.6 category this run;
+  all of them ride in the single POST, and `EventType` is only the highest-priority category.
 - `StartType` is one of `Boot`, `System`, `Automatic`, `AutomaticDelayedStart`, `Manual`,
   `Disabled`, `Unknown`, mapped from `Win32_Service.StartMode` plus `DelayedAutoStart`
   (`Auto` with `DelayedAutoStart` true = `AutomaticDelayedStart`); null for `Missing`.
@@ -463,7 +471,11 @@ Steps, each through `Invoke-Action`:
    can mock it: `icacls "<InstallPath>" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F"
    "*S-1-5-32-544:(OI)(CI)F"` (well-known SIDs for SYSTEM and Administrators, so the call
    is locale-safe); a non-zero exit code fails the step.
-3. Validate the config by running the worker with `-ValidateConfig`; abort on non-zero.
+3. Refuse a `-ConfigPath` outside `InstallPath` (subfolders allowed) with exit 2 before any
+   mutation, because the ACL in step 2 only protects that folder. Validate the config by
+   running the worker with `-ValidateConfig -ConfigPath <path>`; abort on non-zero. Under
+   `-DryRun` the source copy of the worker is used because the install copy does not exist
+   yet.
    Then read `MaxRunSeconds` and `Webhook.TimeoutSeconds` from the config and exit 2 if
    `-ExecutionTimeLimitSeconds` is below `MaxRunSeconds + 2 * (2 * TimeoutSeconds + 5) + 15`.
 4. Register the event source (`SourceExists` guard).
@@ -481,16 +493,19 @@ Steps, each through `Invoke-Action`:
    - Settings: `MultipleInstances IgnoreNew`, `ExecutionTimeLimit`, `StartWhenAvailable`,
      `AllowStartIfOnBatteries`, `DontStopIfGoingOnBatteries`.
    - Action: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
-     -WindowStyle Hidden -File "<InstallPath>\Invoke-WinServiceWatchdog.ps1"`. The worker
-     finds its config beside itself, so no arguments carry secrets.
+     -WindowStyle Hidden -File "<InstallPath>\Invoke-WinServiceWatchdog.ps1"`, with
+     `-ConfigPath <path>` appended only when the config is not beside the worker. No
+     argument carries a secret.
    - Description names this repository and the version.
 6. Optional `-SetServiceRecovery`: `sc.exe failure <svc> reset= 86400
    actions= restart/60000/restart/120000/none/0` per Microsoft's non-critical guidance.
 7. Optional `-RunNow` and `-TestAlert`.
 8. Print a summary: install path, task name, next run time, config path, log path.
 
-Exit codes: 0 success, 1 unexpected, 2 config invalid, not yet edited, worker already
-present without `-Force`, or execution limit too small.
+Exit codes: 0 success, 1 unexpected, 2 config invalid, not yet edited, outside
+`InstallPath`, worker already present without `-Force`, or execution limit too small,
+10 task registered but the `-TestAlert` delivery failed, 50 task registered but one or
+more `-SetServiceRecovery` steps failed (the loop continues past a failing service).
 
 ### 5.2 Unregister
 
@@ -621,7 +636,8 @@ Sanitize (for table keys and the rate-limit key): replace every character outsid
   providerMessageId: <string or null> }`. Every non-200 is `{ accepted: false, error:
   <code>, errors: [<messages>] }` with `error` one of `config_unresolved` (500),
   `invalid_body` (400), `invalid_payload` (400), `site_not_allowed` (403), `rate_limited`
-  (429 with `Retry-After: 600`), `provider_failed` (502).
+  (429 with `Retry-After: 600`), `provider_failed` (502), `internal_error` (500, any
+  unexpected exception, so every branch still returns JSON and exactly one push).
 - Every 400 and 403 logs the caller's client IP from `X-Forwarded-For` or
   `X-Azure-ClientIP`.
 
@@ -655,7 +671,7 @@ Table entities: `WatchdogHosts` rows carry `PartitionKey`, `RowKey`, `LastSeenUt
 ### 7.1 main.bicep
 
 Parameters: `baseName`, `location` (default resource group location), `powerShellVersion`
-(`7.4`), `mailProvider`, `mailFrom`, `mailTo`, `mailSubjectPrefix`, `smtpHost`,
+(`7.4`, allowed `7.4` or `7.6`), `mailProvider`, `mailTimeoutSeconds` (20), `smtp2GoApiUrl`, `mailFrom`, `mailTo`, `mailSubjectPrefix`, `smtpHost`,
 `smtpPort`, `smtpUsername`, `smtpUseStartTls`, `maxAlertsPerHostPerHour`, `staleHours`,
 `digestSchedule`, `digestAlwaysSend`, `allowedSites`, `deployerObjectId` (gets Key Vault
 Secrets Officer so the install script can seed secrets), `deployerPrincipalType`
@@ -691,7 +707,13 @@ Resources, with verified API versions from the research:
   defaultAction: 'Allow', bypass: 'AzureServices' }` (Consumption apps and the operator
   workstation reach the vault over public endpoints). Secrets are not created by Bicep;
   the install script seeds them.
-- Role assignments with deterministic names `guid(<scope>.id, <principalId>, <roleId>)`:
+- Globally unique names carry a six-character `uniqueString(resourceGroup().id)` suffix:
+  function app `func-<baseName>-<suffix>`, vault `kv-<baseName>-<suffix>`, storage account
+  `st<baseName><suffix>` (lowercase, no hyphens). Plan, workspace, and App Insights are
+  unsuffixed.
+- Role assignments with deterministic names `guid(<scope>.id, functionApp.id, <roleId>)`
+  for the function identity (a principal id cannot appear in a resource name, Bicep BCP120)
+  and `guid(keyVault.id, deployerObjectId, <roleId>)` for the deployer:
   Key Vault Secrets User (`4633458b-17de-408a-b874-0445c86b69e6`) to
   `functionApp.identity.principalId`, `principalType: 'ServicePrincipal'`, vault scope;
   Key Vault Secrets Officer (`b86a8fe4-44ce-4948-aee5-eccb2c155cd7`) to `deployerObjectId`
@@ -709,12 +731,16 @@ BCP037.
 Az.KeyVault` (Az 9.7.1 or later so `Publish-AzWebApp` can fall back to Entra
 authentication), Enterprise tier. Runs from an operator workstation.
 
-Parameters: `-SubscriptionId`, `-ResourceGroupName`, `-Location`, `-BaseName`,
-`-MailProvider`, `-MailFrom`, `-MailTo`, `-MailSubjectPrefix`, `-Smtp2GoApiKey`
-(SecureString), `-SmtpHost`, `-SmtpPort`, `-SmtpCredential` (PSCredential),
-`-SmtpUseStartTls`, `-PowerShellVersion`, `-FunctionKeyName` (default `watchdog`),
-`-SourcePath` (AzureFunction folder, default relative to the script), `-SendTestEmail`,
-`-DryRun`, `-Verbosity`, `-LogPath`.
+Parameters: `-ResourceGroupName`, `-BaseName`, `-MailFrom`, `-MailTo` (mandatory);
+`-SubscriptionId` (optional; the current context subscription when omitted), `-Location`
+(optional; required only when the resource group must be created), `-MailProvider`,
+`-MailSubjectPrefix`, `-Smtp2GoApiKey` (SecureString), `-SmtpHost`, `-SmtpPort`,
+`-SmtpCredential` (PSCredential), `-SmtpUseStartTls` (`[bool]`, default true),
+`-PowerShellVersion`, `-FunctionKeyName` (default `watchdog`; an existing key of that name
+is reused on re-run), `-SourcePath` (AzureFunction folder, default relative to the
+script), `-SendTestEmail`, `-DryRun`, `-Verbosity`, `-LogPath`. Under `-DryRun` with a
+missing resource group the script warns and exits 0 without a what-if, because ARM cannot
+what-if into a group that does not exist.
 
 Steps:
 
