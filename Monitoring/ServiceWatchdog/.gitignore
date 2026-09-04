@@ -1,0 +1,10 @@
+# Real per-server configuration and runtime state never belong in source control.
+ServiceWatchdog.json
+*.state.json
+# Local Azure Functions settings and build artifacts.
+local.settings.json
+*.zip
+# Pester and coverage output.
+TestResults*.xml
+coverage*.xml
+Deploy/main.parameters.json
