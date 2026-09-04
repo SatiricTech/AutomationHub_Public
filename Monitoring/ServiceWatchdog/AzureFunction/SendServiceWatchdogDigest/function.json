@@ -1,0 +1,18 @@
+{
+  "bindings": [
+    {
+      "name": "Timer",
+      "type": "timerTrigger",
+      "direction": "in",
+      "schedule": "%WATCHDOG_DIGEST_SCHEDULE%",
+      "runOnStartup": false
+    },
+    {
+      "name": "Hosts",
+      "type": "table",
+      "direction": "in",
+      "tableName": "WatchdogHosts",
+      "connection": "AzureWebJobsStorage"
+    }
+  ]
+}
