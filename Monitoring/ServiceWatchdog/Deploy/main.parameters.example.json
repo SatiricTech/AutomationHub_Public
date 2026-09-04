@@ -1,0 +1,72 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "baseName": {
+      "value": "svcwatchdog"
+    },
+    "location": {
+      "value": "eastus2"
+    },
+    "powerShellVersion": {
+      "value": "7.4"
+    },
+    "mailProvider": {
+      "value": "Smtp2GoApi"
+    },
+    "mailFrom": {
+      "value": "Service Watchdog <alerts@example.com>"
+    },
+    "mailTo": {
+      "value": "it@example.com;oncall@example.com"
+    },
+    "mailSubjectPrefix": {
+      "value": "[Service Watchdog]"
+    },
+    "mailTimeoutSeconds": {
+      "value": 20
+    },
+    "smtp2GoApiUrl": {
+      "value": "https://api.smtp2go.com/v3/email/send"
+    },
+    "smtpHost": {
+      "value": ""
+    },
+    "smtpPort": {
+      "value": 587
+    },
+    "smtpUsername": {
+      "value": ""
+    },
+    "smtpUseStartTls": {
+      "value": true
+    },
+    "maxAlertsPerHostPerHour": {
+      "value": 6
+    },
+    "staleHours": {
+      "value": 26
+    },
+    "digestSchedule": {
+      "value": "0 0 7 * * *"
+    },
+    "digestAlwaysSend": {
+      "value": false
+    },
+    "allowedSites": {
+      "value": ""
+    },
+    "deployerObjectId": {
+      "value": "00000000-0000-0000-0000-000000000000"
+    },
+    "deployerPrincipalType": {
+      "value": "User"
+    },
+    "tags": {
+      "value": {
+        "workload": "ServiceWatchdog",
+        "environment": "production"
+      }
+    }
+  }
+}
