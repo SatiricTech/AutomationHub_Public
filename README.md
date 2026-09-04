@@ -78,12 +78,16 @@ By downloading, copying, or executing any code found within this repository, you
 | `Get-PublicIP.bat` | Continuous public IP monitor (5-second refresh) |
 
 ### [`Monitoring/`](Monitoring/) - Auditing & Discovery
-| Scripts | Description |
-|---------|-------------|
-| `Get-UserLogonEvents.ps1` | Parse logon events from Security/System logs (last 24hrs) |
-| `Get-BrowserHistory.ps1` | Extract browser history from Chrome/Firefox/Edge with search |
-| `Get-DiskFreeSpace.ps1` | Report disk space usage across all drives |
-| `Find-Hypervisors.py` | Network scan for Hyper-V, Proxmox, and VMware hosts |
+| Folder | Scripts | Description |
+|--------|---------|-------------|
+| | `Get-UserLogonEvents.ps1` | Parse logon events from Security/System logs (last 24hrs) |
+| | `Get-BrowserHistory.ps1` | Extract browser history from Chrome/Firefox/Edge with search |
+| | `Get-DiskFreeSpace.ps1` | Report disk space usage across all drives |
+| | `Find-Hypervisors.py` | Network scan for Hyper-V, Proxmox, and VMware hosts |
+| [`ServiceWatchdog/`](Monitoring/ServiceWatchdog/) | `Endpoint/Invoke-WinServiceWatchdog.ps1` | Scheduled-task worker (SYSTEM, every 5 min) that restarts stopped Windows services inside a time budget and posts state-change alerts, reminders, recoveries and a daily heartbeat to the Azure Function relay |
+| | `Endpoint/Register-WinServiceWatchdogTask.ps1` | Install the worker, lock down its folder, validate `ServiceWatchdog.json`, register the event source and scheduled task (optional SCM recovery actions, test alert) |
+| | `Endpoint/Unregister-WinServiceWatchdogTask.ps1` | Remove the scheduled task and, optionally, the event source and install folder |
+| | `Deploy/Install-AzureServiceWatchdogFunction.ps1` | One-shot Azure deployment of the email relay (Bicep: Function App, Key Vault, storage tables, App Insights), seeds the SMTP2GO/SMTP secret, publishes the function and prints the alert URL and key |
 
 ### [`macOS/`](macOS/) - Apple Device Management
 Mirrors the top-level structure for cross-platform parity. Add Mac scripts in the matching subfolder.
