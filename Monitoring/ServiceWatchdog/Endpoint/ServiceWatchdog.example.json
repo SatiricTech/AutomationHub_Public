@@ -1,0 +1,26 @@
+{
+  "SchemaVersion": 1,
+  "SiteName": "Example Org",
+  "Services": [ "Spooler", "W3SVC", "MSSQLSERVER" ],
+  "MaxStartAttempts": 5,
+  "RetryDelaySeconds": 30,
+  "PostStartVerifySeconds": 10,
+  "StartPendingWaitSeconds": 60,
+  "MaxRunSeconds": 240,
+  "Webhook": {
+    "Url": "https://REPLACE-ME.azurewebsites.net/api/servicewatchdog/alert",
+    "FunctionKey": "REPLACE_WITH_FUNCTION_KEY",
+    "TimeoutSeconds": 30
+  },
+  "Alerting": {
+    "ReminderMinutes": 240,
+    "NotifyOnRemediation": false,
+    "RemediationCooldownMinutes": 60,
+    "HeartbeatHours": 24
+  },
+  "Logging": {
+    "LogRoot": "",
+    "LogRetentionDays": 30,
+    "EventLogHealthyRuns": false
+  }
+}
