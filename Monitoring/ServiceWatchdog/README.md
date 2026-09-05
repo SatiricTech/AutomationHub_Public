@@ -642,6 +642,14 @@ parameter change and nothing else. If a later GA version is not `7.4` or `7.6`, 
 
 ## Troubleshooting
 
+**The portal or `listkeys` does not show a key you just created, or shows one you deleted.**
+The Functions host answers key listings from an in-memory cache that is seeded when the
+instance starts. The install script requests a trigger sync before it looks for an existing
+key so the cache is refreshed; if you manage keys by hand, run
+`Invoke-AzRestMethod -Method POST -Path "$site/syncfunctiontriggers?api-version=2024-04-01"`
+before listing, or restart the app. A key the listing does not show is still honored by the
+function, because authorization re-reads the secret store on a miss.
+
 **`Publish-AzWebApp` fails with 401 (exit 50 at the publish step).** SCM basic
 authentication is disabled on the app or by Azure Policy, and this Az version could not
 fall back to Entra ID authentication. Either update Az to 9.7.1 or later, or allow basic

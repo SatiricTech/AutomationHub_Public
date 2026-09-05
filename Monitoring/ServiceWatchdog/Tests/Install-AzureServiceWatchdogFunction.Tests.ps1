@@ -250,6 +250,8 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             KeyPutStatuses            = [System.Collections.Generic.List[int]]::new()
             KeyExists                 = $false
             KeyPutOmitsValue          = $false
+            SyncStatus                = 204
+            Synced                    = $false
             ListKeysContent           = $null
             DeploymentParameters      = $null
         }
@@ -338,11 +340,19 @@ Describe 'Install-AzureServiceWatchdogFunction' {
                     if (-not $content) {
                         # Like the live service (verified 2026-09-04): a flat name-to-value dictionary
                         # with no properties wrapper, despite what the REST reference implies.
+                        # The host answers listkeys from an in-memory cache seeded at instance start;
+                        # an existing key only shows up once a trigger sync has refreshed it.
                         $keys = @{ default = 'DEFAULTKEY0123456789' }
-                        if ($script:Azure.KeyExists) { $keys.watchdog = $script:FunctionKeyValue }
+                        if ($script:Azure.KeyExists -and $script:Azure.Synced) {
+                            $keys.watchdog = $script:FunctionKeyValue
+                        }
                         $content = $keys | ConvertTo-Json -Depth 3
                     }
                     return (Get-RestResponse -StatusCode 200 -Content $content)
+                }
+                '^POST .*/syncfunctiontriggers\?' {
+                    if ($script:Azure.SyncStatus -in 200, 204) { $script:Azure.Synced = $true }
+                    return (Get-RestResponse -StatusCode $script:Azure.SyncStatus -Content '')
                 }
                 default { return (Get-RestResponse -StatusCode 200) }
             }
@@ -1073,7 +1083,9 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             $exitCode | Should -Be 50
             Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'PUT' }
             # Only the pre-check listkeys ran; nothing is read back after the refused PUT.
-            Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'POST' }
+            Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter {
+                $Method -eq 'POST' -and $Path -like '*/listkeys?api-version=2024-04-01'
+            }
             Should -Invoke Show-WatchdogSummary -Times 0
         }
 
@@ -1135,9 +1147,9 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             Mock Invoke-AzRestMethod {
                 $script:listKeysCalls++
                 if ($script:listKeysCalls -eq 1) { return (Get-RestResponse -StatusCode 503 -Content '') }
-                $content = @{ properties = @{ watchdog = $script:FunctionKeyValue } } | ConvertTo-Json -Depth 3
+                $content = @{ watchdog = $script:FunctionKeyValue } | ConvertTo-Json -Depth 3
                 Get-RestResponse -StatusCode 200 -Content $content
-            } -ParameterFilter { $Method -eq 'POST' }
+            } -ParameterFilter { $Method -eq 'POST' -and $Path -like '*/listkeys?api-version=2024-04-01' }
 
             $exitCode = Invoke-WatchdogDeployment @fixture
 
@@ -1188,6 +1200,30 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             Should -Invoke Show-WatchdogSummary -Times 1 -Exactly -ParameterFilter {
                 $FunctionKey -eq $script:FunctionKeyValue
             }
+        }
+
+        It 'syncs function triggers before the pre-check so a stale host cache cannot hide the key' {
+            $fixture = Get-DeployFixture
+            $script:Azure.KeyExists = $true
+
+            $exitCode = Invoke-WatchdogDeployment @fixture
+
+            $exitCode | Should -Be 0
+            Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter {
+                $Method -eq 'POST' -and $Path -like '*/syncfunctiontriggers?api-version=2024-04-01'
+            }
+            Should -Invoke Invoke-AzRestMethod -Times 0 -ParameterFilter { $Method -eq 'PUT' }
+        }
+
+        It 'continues with a warning when the trigger sync fails' {
+            $fixture = Get-DeployFixture
+            $script:Azure.SyncStatus = 500
+
+            $exitCode = Invoke-WatchdogDeployment @fixture
+
+            $exitCode | Should -Be 0
+            Get-LogText | Should -Match 'syncfunctiontriggers returned HTTP 500'
+            Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'PUT' }
         }
 
         It 'never writes the key to the log even when the test email fails' {

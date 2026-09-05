@@ -995,6 +995,35 @@ function Get-WatchdogFunctionKeyValue {
     return $value
 }
 
+function Sync-WatchdogFunctionTrigger {
+    # Asks the platform to sync function triggers (7.2 step 7). The Functions host answers
+    # listkeys from an in-memory secret cache seeded when the instance started, so without
+    # this an existing key can be invisible to the re-run pre-check and would be regenerated,
+    # breaking every server configured with the old value. The sync makes the host reload
+    # its secrets. A failure is a warning: the pre-check still runs, just with less certainty.
+    param (
+        [Parameter(Mandatory)]
+        [string]$SiteResourceId
+    )
+
+    $syncPath = "$SiteResourceId/syncfunctiontriggers?api-version=$script:WebApiVersion"
+    try {
+        $response = Invoke-AzRestMethod -Method POST -Path $syncPath
+        if ($response.StatusCode -in 200, 204) {
+            Write-Log 'Function trigger sync requested; the host will reload its key cache' -Level 'DEBUG'
+            return $true
+        }
+        $detail = Get-WatchdogRestErrorText -Response $response
+        if ($detail) { $detail = " ($detail)" }
+        Write-Log "syncfunctiontriggers returned HTTP $($response.StatusCode)$detail; listkeys may be stale" `
+            -Level 'WARNING'
+    }
+    catch {
+        Write-Log "syncfunctiontriggers failed: $($_.Exception.Message); listkeys may be stale" -Level 'WARNING'
+    }
+    return $false
+}
+
 function Request-WatchdogFunctionKey {
     # Returns the named key (7.2 step 7). A key that already exists (re-run) is reused as
     # is: a PUT without a value would make the service generate a fresh one and every
@@ -1012,6 +1041,7 @@ function Request-WatchdogFunctionKey {
         [string]$KeyName
     )
 
+    Sync-WatchdogFunctionTrigger -SiteResourceId $SiteResourceId | Out-Null
     $existing = Get-WatchdogFunctionKeyValue -SiteResourceId $SiteResourceId -FunctionName $FunctionName `
         -KeyName $KeyName
     if ($existing) {

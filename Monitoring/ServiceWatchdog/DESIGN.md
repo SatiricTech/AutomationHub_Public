@@ -828,7 +828,12 @@ Steps:
    resolve against the seeded secrets. Then poll
    `Invoke-AzRestMethod -Method GET -Path "<siteResourceId>/functions?api-version=2024-04-01"`
    every 15 seconds for up to 5 minutes until `SendServiceWatchdogAlert` is listed.
-7. Create the named function key: `Invoke-AzRestMethod -Method PUT -Path
+7. First `POST <siteResourceId>/syncfunctiontriggers?api-version=2024-04-01` (204) so the
+   host reloads its secret cache; `listkeys` is answered from an in-memory cache seeded at
+   instance start, and without the sync an existing key can be invisible on a re-run and
+   would be regenerated. A failed sync is a warning. Then check `listkeys` for an existing
+   key of that name and reuse it. Otherwise create the named function key:
+   `Invoke-AzRestMethod -Method PUT -Path
    "<siteResourceId>/functions/SendServiceWatchdogAlert/keys/<FunctionKeyName>?api-version=2024-04-01"
    -Payload (@{ properties = @{ name = <FunctionKeyName> } } | ConvertTo-Json)` (the ARM
    provider requires the `properties` wrapper, verified live; no `value`, so the service
