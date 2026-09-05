@@ -328,7 +328,7 @@ Get-ScheduledTaskInfo -TaskName ServiceWatchdog</code></pre>
   <code>-FunctionKeyName watchdog-2027q1</code> (everything else is reused and the new key
   is printed once), or create it directly:
 <pre><code>$site = (Get-AzWebApp -ResourceGroupName 'rg-servicewatchdog' -Name 'func-svcwatchdog-abc123').Id
-Invoke-AzRestMethod -Method PUT -Payload '{"name":"watchdog-2027q1"}' `
+Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watchdog-2027q1"}}' `
     -Path "$site/functions/SendServiceWatchdogAlert/keys/watchdog-2027q1?api-version=2024-04-01"
 (Invoke-AzRestMethod -Method POST `
     -Path "$site/functions/SendServiceWatchdogAlert/listkeys?api-version=2024-04-01").Content</code></pre></li>

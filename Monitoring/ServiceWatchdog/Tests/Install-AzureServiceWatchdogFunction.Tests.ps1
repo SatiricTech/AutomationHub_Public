@@ -305,6 +305,15 @@ Describe 'Install-AzureServiceWatchdogFunction' {
                     return (Get-RestResponse -StatusCode 200)
                 }
                 '^PUT .*/keys/' {
+                    # Like ARM (verified live 2026-09-04): the key must be wrapped in a properties
+                    # object, or the service answers 400 before looking at anything else.
+                    $bodyObject = $null
+                    if ($Payload) { $bodyObject = $Payload | ConvertFrom-Json }
+                    if (-not ($bodyObject -and $bodyObject.PSObject.Properties['properties'])) {
+                        $content = @{ Code = 'BadRequest'; Message = 'Properties object is not present in the request body.' } |
+                            ConvertTo-Json
+                        return (Get-RestResponse -StatusCode 400 -Content $content)
+                    }
                     $status = 200
                     if ($script:Azure.KeyPutStatuses.Count -gt 0) {
                         $status = $script:Azure.KeyPutStatuses[0]
@@ -1025,7 +1034,7 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             Get-LogText | Should -Match 'SendServiceWatchdogAlert'
         }
 
-        It 'creates the named key with a name-only body and retries the PUT on 404' {
+        It 'creates the named key with a properties-wrapped name-only body and retries the PUT on 404' {
             $fixture = Get-DeployFixture
             $script:Azure.KeyPutStatuses.Add(404)
 
@@ -1035,8 +1044,8 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             Should -Invoke Invoke-AzRestMethod -Times 2 -Exactly -ParameterFilter {
                 $Method -eq 'PUT' -and
                 $Path -like '*/functions/SendServiceWatchdogAlert/keys/watchdog?api-version=2024-04-01' -and
-                ($Payload | ConvertFrom-Json).name -eq 'watchdog' -and
-                -not (($Payload | ConvertFrom-Json).PSObject.Properties.Name -contains 'value')
+                ($Payload | ConvertFrom-Json).properties.name -eq 'watchdog' -and
+                -not (($Payload | ConvertFrom-Json).properties.PSObject.Properties.Name -contains 'value')
             }
         }
 

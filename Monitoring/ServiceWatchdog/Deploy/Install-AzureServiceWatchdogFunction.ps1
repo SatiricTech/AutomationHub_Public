@@ -1014,7 +1014,10 @@ function Request-WatchdogFunctionKey {
     }
 
     $keyPath = "$SiteResourceId/functions/$FunctionName/keys/${KeyName}?api-version=$script:WebApiVersion"
-    $payload = @{ name = $KeyName } | ConvertTo-Json -Compress
+    # ARM wants the KeyInfo wrapped in a properties object (the REST reference shows the
+    # flattened shape, but the service answers 400 "Properties object is not present" without
+    # it). No value is sent, so the service generates the key.
+    $payload = @{ properties = @{ name = $KeyName } } | ConvertTo-Json -Compress -Depth 3
 
     Invoke-Action -Description "Create function key '$KeyName' on $FunctionName" -Action {
         Invoke-WatchdogRetry -Description "function key '$KeyName' to be accepted" `

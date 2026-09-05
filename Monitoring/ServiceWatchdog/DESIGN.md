@@ -830,7 +830,8 @@ Steps:
    every 15 seconds for up to 5 minutes until `SendServiceWatchdogAlert` is listed.
 7. Create the named function key: `Invoke-AzRestMethod -Method PUT -Path
    "<siteResourceId>/functions/SendServiceWatchdogAlert/keys/<FunctionKeyName>?api-version=2024-04-01"
-   -Payload (@{ name = <FunctionKeyName> } | ConvertTo-Json)` (no `value`; the service
+   -Payload (@{ properties = @{ name = <FunctionKeyName> } } | ConvertTo-Json)` (the ARM
+   provider requires the `properties` wrapper, verified live; no `value`, so the service
    generates the key), retrying on 404 or 5xx every 15 seconds for up to 5 minutes. Read it
    back with `Invoke-AzRestMethod -Method POST -Path
    ".../functions/SendServiceWatchdogAlert/listkeys?api-version=2024-04-01"`; the key is
