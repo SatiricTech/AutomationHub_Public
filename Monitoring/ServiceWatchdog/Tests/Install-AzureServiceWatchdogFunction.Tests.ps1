@@ -312,6 +312,12 @@ Describe 'Install-AzureServiceWatchdogFunction' {
                     }
                     # Like the service: the key exists (and listkeys shows it) only once a PUT succeeded.
                     if ($status -in 200, 201) { $script:Azure.KeyExists = $true }
+                    if ($status -ge 400) {
+                        # Like ARM: a failed PUT carries a DefaultErrorResponse body explaining why.
+                        $content = @{ error = @{ code = 'BadRequest'; message = "Simulated ARM error $status" } } |
+                            ConvertTo-Json -Depth 3
+                        return (Get-RestResponse -StatusCode $status -Content $content)
+                    }
                     $content = @{ properties = @{ name = 'watchdog'; value = $script:FunctionKeyValue } } |
                         ConvertTo-Json -Depth 3
                     return (Get-RestResponse -StatusCode $status -Content $content)
@@ -1056,6 +1062,18 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             # Only the pre-check listkeys ran; nothing is read back after the refused PUT.
             Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'POST' }
             Should -Invoke Show-WatchdogSummary -Times 0
+        }
+
+        It 'logs the ARM error code and message when the PUT is rejected' {
+            $fixture = Get-DeployFixture
+            $script:Azure.KeyPutStatuses.Add(400)
+
+            $exitCode = Invoke-WatchdogDeployment @fixture
+
+            $exitCode | Should -Be 50
+            Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'PUT' }
+            Get-LogText | Should -Match 'HTTP 400'
+            Get-LogText | Should -Match 'BadRequest: Simulated ARM error 400'
         }
 
         It 'reads the key back with listkeys and hands it to the console summary only' {

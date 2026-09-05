@@ -462,6 +462,39 @@ function Get-WatchdogBicepVersion {
     return ($output | Select-Object -First 1)
 }
 
+function Get-WatchdogRestErrorText {
+    # Turns a failed Invoke-AzRestMethod response into "code: message" from the ARM
+    # DefaultErrorResponse body, or the trimmed raw body when it is not that shape, so a
+    # non-2xx status is logged with the reason the service gave and not just the number.
+    param (
+        [Parameter(Mandatory)]
+        [object]$Response
+    )
+
+    $content = [string]$Response.Content
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        return ''
+    }
+    try {
+        $parsed = $content | ConvertFrom-Json -Depth 20
+        if ($parsed -and $parsed.error) {
+            $code = [string]$parsed.error.code
+            $message = [string]$parsed.error.message
+            if ($code -or $message) {
+                return (@($code, $message) | Where-Object { $_ }) -join ': '
+            }
+        }
+    }
+    catch {
+        Write-Log "Response body is not JSON: $($_.Exception.Message)" -Level 'DEBUG'
+    }
+    $text = ($content -replace '\s+', ' ').Trim()
+    if ($text.Length -gt 300) {
+        $text = $text.Substring(0, 300) + '...'
+    }
+    return $text
+}
+
 function ConvertFrom-WatchdogRestContent {
     # Parses the JSON body of an Invoke-AzRestMethod response; empty bodies become $null.
     param (
@@ -938,7 +971,9 @@ function Get-WatchdogFunctionKeyValue {
     $listPath = "$SiteResourceId/functions/$FunctionName/listkeys?api-version=$script:WebApiVersion"
     $response = Invoke-AzRestMethod -Method POST -Path $listPath
     if ($response.StatusCode -ne 200) {
-        Write-Log "listkeys on $FunctionName returned HTTP $($response.StatusCode)" -Level 'WARNING'
+        $detail = Get-WatchdogRestErrorText -Response $response
+        if ($detail) { $detail = " ($detail)" }
+        Write-Log "listkeys on $FunctionName returned HTTP $($response.StatusCode)$detail" -Level 'WARNING'
         return $null
     }
     $keys = ConvertFrom-WatchdogRestContent -Content $response.Content
@@ -994,7 +1029,9 @@ function Request-WatchdogFunctionKey {
                         -Level 'WARNING'
                     return $null
                 }
-                throw "Creating function key '$KeyName' returned HTTP $($response.StatusCode)."
+                $detail = Get-WatchdogRestErrorText -Response $response
+                if ($detail) { $detail = " ($detail)" }
+                throw "Creating function key '$KeyName' returned HTTP $($response.StatusCode)$detail."
             } | Out-Null
     }
 
