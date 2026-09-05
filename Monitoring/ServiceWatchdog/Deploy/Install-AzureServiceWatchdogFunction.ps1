@@ -976,10 +976,18 @@ function Get-WatchdogFunctionKeyValue {
         Write-Log "listkeys on $FunctionName returned HTTP $($response.StatusCode)$detail" -Level 'WARNING'
         return $null
     }
+    # The live service returns a flat name-to-value dictionary (verified 2026-09-04); the
+    # REST reference implies a properties wrapper, so both shapes are accepted.
     $keys = ConvertFrom-WatchdogRestContent -Content $response.Content
     $value = $null
-    if ($keys -and $keys.properties) {
-        $value = [string]$keys.properties.$KeyName
+    if ($keys) {
+        $dictionary = $keys
+        if ($keys.PSObject.Properties['properties'] -and $keys.properties) {
+            $dictionary = $keys.properties
+        }
+        if ($dictionary.PSObject.Properties[$KeyName]) {
+            $value = [string]$dictionary.$KeyName
+        }
     }
     if ([string]::IsNullOrEmpty($value)) {
         return $null
@@ -1019,12 +1027,16 @@ function Request-WatchdogFunctionKey {
     # it). No value is sent, so the service generates the key.
     $payload = @{ properties = @{ name = $KeyName } } | ConvertTo-Json -Compress -Depth 3
 
+    # The PUT answers with the generated key (properties.value), which is the authoritative
+    # source; a hashtable carries it out of the retry scriptblock. listkeys is only a fallback.
+    $putResult = @{ Response = $null }
     Invoke-Action -Description "Create function key '$KeyName' on $FunctionName" -Action {
         Invoke-WatchdogRetry -Description "function key '$KeyName' to be accepted" `
             -TimeoutSeconds $script:PropagationTimeoutSeconds -IntervalSeconds $script:PropagationIntervalSeconds `
             -Action {
                 $response = Invoke-AzRestMethod -Method PUT -Path $keyPath -Payload $payload
                 if ($response.StatusCode -in 200, 201) {
+                    $putResult.Response = $response
                     return $true
                 }
                 if ($response.StatusCode -eq 404 -or $response.StatusCode -ge 500) {
@@ -1038,13 +1050,26 @@ function Request-WatchdogFunctionKey {
             } | Out-Null
     }
 
-    $value = Get-WatchdogFunctionKeyValue -SiteResourceId $SiteResourceId -FunctionName $FunctionName `
-        -KeyName $KeyName
-    if (-not $value) {
-        throw "listkeys did not return a key named '$KeyName' after creating it."
+    $value = $null
+    if ($putResult.Response) {
+        $created = ConvertFrom-WatchdogRestContent -Content $putResult.Response.Content
+        if ($created -and $created.PSObject.Properties['properties'] -and $created.properties) {
+            $value = [string]$created.properties.value
+        }
+        elseif ($created -and $created.PSObject.Properties['value']) {
+            $value = [string]$created.value
+        }
+    }
+    if ([string]::IsNullOrEmpty($value)) {
+        Write-Log "The key PUT response carried no value; reading '$KeyName' back with listkeys" -Level 'WARNING'
+        $value = Get-WatchdogFunctionKeyValue -SiteResourceId $SiteResourceId -FunctionName $FunctionName `
+            -KeyName $KeyName
+    }
+    if ([string]::IsNullOrEmpty($value)) {
+        throw "Neither the key PUT response nor listkeys returned a value for '$KeyName'."
     }
     $script:SensitiveValues.Add($value)
-    Write-Log "Function key '$KeyName' created and read back ($($value.Length) characters)" -Level 'INFO'
+    Write-Log "Function key '$KeyName' created ($($value.Length) characters)" -Level 'INFO'
     return $value
 }
 

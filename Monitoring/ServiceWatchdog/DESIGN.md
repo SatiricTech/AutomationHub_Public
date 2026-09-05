@@ -834,8 +834,11 @@ Steps:
    provider requires the `properties` wrapper, verified live; no `value`, so the service
    generates the key), retrying on 404 or 5xx every 15 seconds for up to 5 minutes. Read it
    back with `Invoke-AzRestMethod -Method POST -Path
-   ".../functions/SendServiceWatchdogAlert/listkeys?api-version=2024-04-01"`; the key is
-   the property named `<FunctionKeyName>` under `properties`.
+   ".../functions/SendServiceWatchdogAlert/listkeys?api-version=2024-04-01"`. The PUT
+   response carries the generated value in `properties.value` and is the authoritative
+   source; `listkeys` is used for the re-run pre-check and as a fallback, and returns a
+   flat name-to-value dictionary (verified live), though a `properties` wrapper is also
+   accepted.
 8. Print once, to the console only: alert URL, function key, Key Vault name, and the two
    lines to paste into `ServiceWatchdog.json`. Never write the key to the log file.
 9. Verify admin isolation: `Invoke-AzRestMethod -Method GET -Path

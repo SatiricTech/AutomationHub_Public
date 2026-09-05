@@ -564,10 +564,9 @@ Keys are named, and several can be valid at once, so rotation has no outage wind
 
    ```powershell
    $site = (Get-AzWebApp -ResourceGroupName 'rg-servicewatchdog' -Name 'func-svcwatchdog-abc123').Id
-   Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watchdog-2027q1"}}' `
+   $created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watchdog-2027q1"}}' `
        -Path "$site/functions/SendServiceWatchdogAlert/keys/watchdog-2027q1?api-version=2024-04-01"
-   (Invoke-AzRestMethod -Method POST `
-       -Path "$site/functions/SendServiceWatchdogAlert/listkeys?api-version=2024-04-01").Content
+   ($created.Content | ConvertFrom-Json).properties.value   # the new key; paste it into the vault
    ```
 
    (`az functionapp function keys set ... --key-name watchdog-2027q1` and `keys list` do

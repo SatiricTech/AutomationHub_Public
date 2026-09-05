@@ -328,10 +328,9 @@ Get-ScheduledTaskInfo -TaskName ServiceWatchdog</code></pre>
   <code>-FunctionKeyName watchdog-2027q1</code> (everything else is reused and the new key
   is printed once), or create it directly:
 <pre><code>$site = (Get-AzWebApp -ResourceGroupName 'rg-servicewatchdog' -Name 'func-svcwatchdog-abc123').Id
-Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watchdog-2027q1"}}' `
+$created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watchdog-2027q1"}}' `
     -Path "$site/functions/SendServiceWatchdogAlert/keys/watchdog-2027q1?api-version=2024-04-01"
-(Invoke-AzRestMethod -Method POST `
-    -Path "$site/functions/SendServiceWatchdogAlert/listkeys?api-version=2024-04-01").Content</code></pre></li>
+($created.Content | ConvertFrom-Json).properties.value   # the new key; paste it into the vault</code></pre></li>
   <li>Update <code>Webhook.FunctionKey</code> on every server (RMM script or by hand) and
   verify each with <code>.\Invoke-WinServiceWatchdog.ps1 -TestAlert</code> (exit 0). Update
   <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[PASSWORD VAULT ENTRY]</span>.</li>

@@ -249,6 +249,7 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             FunctionPollsBeforeListed = 0
             KeyPutStatuses            = [System.Collections.Generic.List[int]]::new()
             KeyExists                 = $false
+            KeyPutOmitsValue          = $false
             ListKeysContent           = $null
             DeploymentParameters      = $null
         }
@@ -327,16 +328,19 @@ Describe 'Install-AzureServiceWatchdogFunction' {
                             ConvertTo-Json -Depth 3
                         return (Get-RestResponse -StatusCode $status -Content $content)
                     }
-                    $content = @{ properties = @{ name = 'watchdog'; value = $script:FunctionKeyValue } } |
-                        ConvertTo-Json -Depth 3
+                    $keyProperties = @{ name = 'watchdog'; value = $script:FunctionKeyValue }
+                    if ($script:Azure.KeyPutOmitsValue) { $keyProperties.Remove('value') }
+                    $content = @{ properties = $keyProperties } | ConvertTo-Json -Depth 3
                     return (Get-RestResponse -StatusCode $status -Content $content)
                 }
                 '^POST .*/listkeys\?' {
                     $content = $script:Azure.ListKeysContent
                     if (-not $content) {
-                        $properties = @{ default = 'DEFAULTKEY0123456789' }
-                        if ($script:Azure.KeyExists) { $properties.watchdog = $script:FunctionKeyValue }
-                        $content = @{ properties = $properties } | ConvertTo-Json -Depth 3
+                        # Like the live service (verified 2026-09-04): a flat name-to-value dictionary
+                        # with no properties wrapper, despite what the REST reference implies.
+                        $keys = @{ default = 'DEFAULTKEY0123456789' }
+                        if ($script:Azure.KeyExists) { $keys.watchdog = $script:FunctionKeyValue }
+                        $content = $keys | ConvertTo-Json -Depth 3
                     }
                     return (Get-RestResponse -StatusCode 200 -Content $content)
                 }
@@ -1085,14 +1089,14 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             Get-LogText | Should -Match 'BadRequest: Simulated ARM error 400'
         }
 
-        It 'reads the key back with listkeys and hands it to the console summary only' {
+        It 'takes the key from the PUT response and hands it to the console summary only' {
             $fixture = Get-DeployFixture
 
             $exitCode = Invoke-WatchdogDeployment @fixture
 
             $exitCode | Should -Be 0
-            # listkeys once before the PUT (is it already there?) and once after (read the new value).
-            Should -Invoke Invoke-AzRestMethod -Times 2 -Exactly -ParameterFilter {
+            # listkeys once before the PUT (is it already there?); the value comes from the PUT itself.
+            Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter {
                 $Method -eq 'POST' -and
                 $Path -like '*/functions/SendServiceWatchdogAlert/listkeys?api-version=2024-04-01'
             }
@@ -1142,9 +1146,10 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             Get-LogText | Should -Match 'listkeys on SendServiceWatchdogAlert returned HTTP 503'
         }
 
-        It 'exits 50 when listkeys does not contain the named key' {
+        It 'exits 50 when neither the PUT response nor listkeys yields the key value' {
             $fixture = Get-DeployFixture
-            $script:Azure.ListKeysContent = '{ "properties": { "default": "OTHERKEY" } }'
+            $script:Azure.KeyPutOmitsValue = $true
+            $script:Azure.ListKeysContent = '{ "default": "OTHERKEY" }'
 
             $exitCode = Invoke-WatchdogDeployment @fixture
 
@@ -1153,6 +1158,36 @@ Describe 'Install-AzureServiceWatchdogFunction' {
             Get-LogText | Should -Match 'watchdog'
             Get-LogText | Should -Not -Match 'OTHERKEY'
             Should -Invoke Show-WatchdogSummary -Times 0
+        }
+
+        It 'accepts a listkeys response wrapped in a properties object' {
+            $fixture = Get-DeployFixture
+            $script:Azure.ListKeysContent = ('{ "properties": { "default": "OTHERKEY", "watchdog": "' +
+                $script:FunctionKeyValue + '" } }')
+
+            $exitCode = Invoke-WatchdogDeployment @fixture
+
+            $exitCode | Should -Be 0
+            Should -Invoke Invoke-AzRestMethod -Times 0 -ParameterFilter { $Method -eq 'PUT' }
+            Should -Invoke Show-WatchdogSummary -Times 1 -Exactly -ParameterFilter {
+                $FunctionKey -eq $script:FunctionKeyValue
+            }
+        }
+
+        It 'falls back to a listkeys read-back when the PUT response carries no value' {
+            $fixture = Get-DeployFixture
+            $script:Azure.KeyPutOmitsValue = $true
+
+            $exitCode = Invoke-WatchdogDeployment @fixture
+
+            $exitCode | Should -Be 0
+            Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'PUT' }
+            Should -Invoke Invoke-AzRestMethod -Times 2 -Exactly -ParameterFilter {
+                $Method -eq 'POST' -and $Path -like '*/listkeys?api-version=2024-04-01'
+            }
+            Should -Invoke Show-WatchdogSummary -Times 1 -Exactly -ParameterFilter {
+                $FunctionKey -eq $script:FunctionKeyValue
+            }
         }
 
         It 'never writes the key to the log even when the test email fails' {
