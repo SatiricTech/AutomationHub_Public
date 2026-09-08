@@ -165,6 +165,17 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
 
 <h2>Installing on a server</h2>
 
+<div class="callout callout-warning">
+  <div class="callout-title">The installer does not install where you run it from</div>
+  <p>Wherever you copied the <code>Endpoint</code> folder is only the <em>source</em>. The
+  installer creates and uses <strong><code>C:\ProgramData\ServiceWatchdog</code></strong> for
+  the config file, the state file, the logs and its own copy of the worker script, unless you
+  pass <code>-InstallPath</code> on every run. So after the first run, the file to edit is
+  <strong><code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code></strong>, and it
+  will not appear next to the scripts you ran. The source folder can be deleted once the
+  task is registered.</p>
+</div>
+
 <ol>
   <li>Copy the repository's <code>Monitoring/ServiceWatchdog/Endpoint</code> folder to the
   server (for example <code>C:\Temp\Endpoint</code>).</li>

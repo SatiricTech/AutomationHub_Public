@@ -187,6 +187,13 @@ key. The install script does all of that for you.
 
 ### 3. Install on each server
 
+> **Where the files go.** The folder you copy `Endpoint/` to is only the source. The
+> installer creates and uses **`C:\ProgramData\ServiceWatchdog`** for the config file, the
+> state file, the logs and its own copy of the worker, unless you pass `-InstallPath` on
+> every run. After the first run, the file to edit is
+> **`C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json`**; it does not appear next to
+> the scripts you ran. The source folder can be deleted once the task is registered.
+
 Copy the `Endpoint/` folder to the server and, in an elevated PowerShell:
 
 ```powershell
