@@ -569,6 +569,19 @@ Get-Content "$env:ProgramData\ServiceWatchdog\Logs\ServiceWatchdog-$(Get-Date -F
 Get-ScheduledTaskInfo -TaskName ServiceWatchdog
 ```
 
+### Checkup: has it restarted anything?
+
+A successful restart is silent by default (no email), so this is the quickest way to see
+the watchdog doing its job. Event 1001 is written every time it starts a service:
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'ServiceWatchdog'; Id = 1001 } -MaxEvents 25
+```
+
+Each entry names the service and the attempt it succeeded on. Use `Id = 1002` for failed
+starts instead, or drop the `Id` filter for the last 25 events of any kind. To hear about
+restarts by email, set `Alerting.NotifyOnRemediation` to `true` in the config.
+
 ## Rotation procedures
 
 ### Function key (the value in every server's `ServiceWatchdog.json`)

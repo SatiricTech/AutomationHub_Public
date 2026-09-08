@@ -121,6 +121,13 @@ or sending mail:</p>
 <pre><code>cd C:\ProgramData\ServiceWatchdog
 .\Invoke-WinServiceWatchdog.ps1 -Verbosity High</code></pre>
 
+<h3>Checkup: has it restarted anything?</h3>
+<p>A successful restart is silent by default (no email), so this is the quickest way to see the
+watchdog doing its job. Event 1001 is written every time it starts a service:</p>
+<pre><code>Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'ServiceWatchdog'; Id = 1001 } -MaxEvents 25</code></pre>
+<p>Each entry names the service and the attempt it succeeded on. Use <code>Id = 1002</code> for
+failed starts instead, or drop the <code>Id</code> filter for the last 25 events of any kind.</p>
+
 <h2>Changing the service list later</h2>
 <p>Edit the JSON file, then check it from the install folder. No re-registration is needed;
 the next scheduled run picks the change up.</p>
