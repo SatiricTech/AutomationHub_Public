@@ -1,7 +1,3 @@
-<!-- ServiceWatchdog: server registration guide. Hand-off document for the IT staff who
-     register servers. Fill in the highlighted fields before sharing. Hudu article fragment;
-     uses the shared stylesheet's callout and table classes. -->
-
 <div class="callout callout-info">
   <div class="callout-title">What this page is for</div>
   <p>Follow it to register one Windows server with the service watchdog. Once registered, the
@@ -13,7 +9,7 @@
 <div class="callout callout-accent">
   <div class="callout-title">Source</div>
   <p>The scripts, the deployment template and the full technical documentation are published in
-  the public repository: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog</a>. Always take the <code>Endpoint</code> folder
+  the public repository: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog</a>. Always take the <strong>Endpoint</strong> folder
   from there so servers get the current version.</p>
 </div>
 
@@ -21,11 +17,11 @@
 <table>
   <thead><tr><th>Item</th><th>Value</th><th>Notes</th></tr></thead>
   <tbody>
-    <tr><td>Function URL</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNCTION URL]</span></td><td>Goes in <code>Webhook.Url</code>. Same for every server.</td></tr>
-    <tr><td>Function key</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNCTION KEY OR VAULT ENTRY]</span></td><td>Goes in <code>Webhook.FunctionKey</code>. Treat it like a password: never email it, never paste it into a ticket.</td></tr>
-    <tr><td>Site name</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[SITE NAME]</span></td><td>Goes in <code>SiteName</code>; appears in the subject line of every alert.</td></tr>
-    <tr><td>Install files</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[WHERE THE ENDPOINT FOLDER IS KEPT]</span></td><td>The <code>Endpoint</code> folder: three scripts and an example config.</td></tr>
-    <tr><td>Who to ask</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[CONTACT]</span></td><td>For the values above, or if a step fails.</td></tr>
+    <tr><td>Function URL</td><td><strong>[FUNCTION URL]</strong></td><td>Goes in <code>Webhook.Url</code>. Same for every server.</td></tr>
+    <tr><td>Function key</td><td><strong>[FUNCTION KEY OR VAULT ENTRY]</strong></td><td>Goes in <code>Webhook.FunctionKey</code>. Treat it like a password: never email it, never paste it into a ticket.</td></tr>
+    <tr><td>Site name</td><td><strong>[SITE NAME]</strong></td><td>Goes in <code>SiteName</code>; appears in the subject line of every alert.</td></tr>
+    <tr><td>Install files</td><td><strong>[WHERE THE ENDPOINT FOLDER IS KEPT]</strong></td><td>The <code>Endpoint</code> folder: three scripts and an example config.</td></tr>
+    <tr><td>Who to ask</td><td><strong>[CONTACT]</strong></td><td>For the values above, or if a step fails.</td></tr>
   </tbody>
 </table>
 
@@ -44,9 +40,9 @@
 <div class="callout callout-warning">
   <div class="callout-title">The installer does not install where you run it from</div>
   <p>The folder you copied is only the source. The installer creates and uses
-  <strong><code>C:\ProgramData\ServiceWatchdog</code></strong> for the config file, the state
+  <strong>C:\ProgramData\ServiceWatchdog</strong> for the config file, the state
   file, the logs and its own copy of the worker script. The file you edit in step 3 is
-  <strong><code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code></strong>; it will
+  <strong>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</strong>; it will
   not appear next to the scripts you ran. You can delete the temporary folder after step 5.</p>
 </div>
 
@@ -61,14 +57,14 @@ you to fill in.</p>
 <h2>Step 3: edit the config file</h2>
 <p>Open <code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code> in Notepad (as
 administrator) and set these four values. Leave everything else at its default unless
-<span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[CONTACT]</span> says otherwise.</p>
+<strong>[CONTACT]</strong> says otherwise.</p>
 <pre><code>{
   "SchemaVersion": 1,
-  "SiteName": "<span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[SITE NAME]</span>",
+  "SiteName": "<strong>[SITE NAME]</strong>",
   "Services": [ "Spooler", "W3SVC", "MSSQLSERVER" ],
   "Webhook": {
-    "Url": "<span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNCTION URL]</span>",
-    "FunctionKey": "<span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNCTION KEY]</span>"
+    "Url": "<strong>[FUNCTION URL]</strong>",
+    "FunctionKey": "<strong>[FUNCTION KEY]</strong>"
   }
 }</code></pre>
 
@@ -76,20 +72,24 @@ administrator) and set these four values. Leave everything else at its default u
   <div class="callout-title">Use the service Name, not the Display Name</div>
   <p>Windows services have two names. The watchdog wants the short <strong>Name</strong>, which is
   what the logs, the emails and Windows itself key on. The friendly <strong>Display Name</strong>
-  is what the Services console shows in its first column.</p>
-  <table>
-    <thead><tr><th>Use this (Name)</th><th>Not this (Display Name)</th></tr></thead>
-    <tbody>
-      <tr><td><code>Spooler</code></td><td>Print Spooler</td></tr>
-      <tr><td><code>W3SVC</code></td><td>World Wide Web Publishing Service</td></tr>
-      <tr><td><code>MSSQLSERVER</code></td><td>SQL Server (MSSQLSERVER)</td></tr>
-    </tbody>
-  </table>
-  <p>To look a name up, run <code>Get-Service | Sort-Object DisplayName | Select-Object Name, DisplayName</code>,
-  or for one service <code>(Get-Service -DisplayName 'Print Spooler').Name</code>. In the
-  Services console the Name is on the General tab of a service's properties, labelled
-  "Service name".</p>
+  is what the Services console shows in its first column. The table and commands below show
+  the difference.</p>
 </div>
+
+<table>
+  <thead><tr><th>Use this (Name)</th><th>Not this (Display Name)</th></tr></thead>
+  <tbody>
+    <tr><td><code>Spooler</code></td><td>Print Spooler</td></tr>
+    <tr><td><code>W3SVC</code></td><td>World Wide Web Publishing Service</td></tr>
+    <tr><td><code>MSSQLSERVER</code></td><td>SQL Server (MSSQLSERVER)</td></tr>
+  </tbody>
+</table>
+
+<p>To look a name up, or for one service by its display name:</p>
+<pre><code>Get-Service | Sort-Object DisplayName | Select-Object Name, DisplayName
+(Get-Service -DisplayName 'Print Spooler').Name</code></pre>
+<p>In the Services console the Name is on the General tab of a service's properties, labelled
+"Service name".</p>
 
 <p>Any value still containing <code>REPLACE</code> is rejected. Use straight double quotes and
 a comma between list items, as in the example.</p>
@@ -137,7 +137,7 @@ the next scheduled run picks the change up.</p>
 <h2>Removing the watchdog from a server</h2>
 <pre><code>cd C:\Temp\Endpoint
 .\Unregister-WinServiceWatchdogTask.ps1 -RemoveEventSource -RemoveFiles -Force</code></pre>
-<p>Tell <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[CONTACT]</span> afterwards so the server is removed from the daily check-in report;
+<p>Tell <strong>[CONTACT]</strong> afterwards so the server is removed from the daily check-in report;
 otherwise it is reported as silent.</p>
 
 <h2>If something fails</h2>
@@ -147,7 +147,7 @@ otherwise it is reported as silent.</p>
     <tr><td>Installer stops at once mentioning elevation (exit 1)</td><td>PowerShell is not running as administrator</td><td>Open PowerShell with "Run as administrator" and try again</td></tr>
     <tr><td>Exit 2 naming a config key</td><td>The JSON is invalid or still has a REPLACE value</td><td>Fix the named key; check quotes and commas</td></tr>
     <tr><td>Exit 2 saying the worker already exists</td><td>The installer was already run on this server</td><td>Re-run with <code>-Force</code> added</td></tr>
-    <tr><td>Exit 10, or event 1013 in the Application log</td><td>The function rejected the key</td><td>Check <code>Webhook.FunctionKey</code> for a copy error; ask <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[CONTACT]</span> if it persists</td></tr>
+    <tr><td>Exit 10, or event 1013 in the Application log</td><td>The function rejected the key</td><td>Check <code>Webhook.FunctionKey</code> for a copy error; ask <strong>[CONTACT]</strong> if it persists</td></tr>
     <tr><td>Event 1011</td><td>The server could not reach the function URL</td><td>Check outbound HTTPS and any proxy; the alert is retried automatically</td></tr>
     <tr><td>Event 1003 or 1004 after registration</td><td>A listed service is not installed, or is Disabled</td><td>Fix the name (step 3) or remove it from the list</td></tr>
   </tbody>

@@ -1,11 +1,3 @@
-<!--
-  ServiceWatchdog - global knowledge-base article (draft).
-  Paste the body below into a Hudu article. It relies on the callout and table classes in
-  the shared Hudu stylesheet. Every highlighted [PLACEHOLDER] must be replaced with the
-  real value for our deployment before the article is published; the spans are styled
-  inline so they stay visible until they are edited away.
--->
-
 <h1>ServiceWatchdog: Windows service monitoring with email alerts</h1>
 
 <div class="callout callout-info">
@@ -23,7 +15,7 @@
 <div class="callout callout-accent">
   <div class="callout-title">Source</div>
   <p>The scripts, the deployment template and the full technical documentation are published in
-  the public repository: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog</a>. Always take the <code>Endpoint</code> folder
+  the public repository: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog</a>. Always take the <strong>Endpoint</strong> folder
   from there so servers get the current version.</p>
 </div>
 
@@ -38,21 +30,21 @@ publishing.</p>
   </thead>
   <tbody>
     <tr><td>Alert URL (goes into <code>Webhook.Url</code> on every server)</td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNCTION URL]</span></td></tr>
+        <td><strong>[FUNCTION URL]</strong></td></tr>
     <tr><td>Function key storage (never paste the key into this article)</td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[PASSWORD VAULT ENTRY OR KEY VAULT NAME]</span></td></tr>
+        <td><strong>[PASSWORD VAULT ENTRY OR KEY VAULT NAME]</strong></td></tr>
     <tr><td>Alert recipients (<code>WATCHDOG_MAIL_TO</code>)</td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[RECIPIENT LIST]</span></td></tr>
+        <td><strong>[RECIPIENT LIST]</strong></td></tr>
     <tr><td>Sender address (<code>WATCHDOG_MAIL_FROM</code>, verified in SMTP2GO)</td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[SENDER ADDRESS]</span></td></tr>
+        <td><strong>[SENDER ADDRESS]</strong></td></tr>
     <tr><td>Azure subscription / resource group</td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[SUBSCRIPTION] / [RESOURCE GROUP]</span></td></tr>
+        <td><strong>[SUBSCRIPTION] / [RESOURCE GROUP]</strong></td></tr>
     <tr><td>Function App / Key Vault / storage account</td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNC-NAME] / [KV-NAME] / [ST-NAME]</span></td></tr>
+        <td><strong>[FUNC-NAME] / [KV-NAME] / [ST-NAME]</strong></td></tr>
     <tr><td>SMTP2GO account and API key name</td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[SMTP2GO ACCOUNT] / [API KEY NAME]</span></td></tr>
+        <td><strong>[SMTP2GO ACCOUNT] / [API KEY NAME]</strong></td></tr>
     <tr><td>Stale-host digest schedule (UTC)</td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[07:00 UTC unless changed]</span></td></tr>
+        <td><strong>[07:00 UTC unless changed]</strong></td></tr>
     <tr><td>Source repository and version</td>
         <td><a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">AutomationHub_Public</a>, <code>Monitoring/ServiceWatchdog</code>, version 1.0.0</td></tr>
   </tbody>
@@ -152,7 +144,7 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
   recipients; a test event never creates a host row, so the workstation does not appear in
   the stale-host digest.</li>
   <li>Store the function key in
-  <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[PASSWORD VAULT ENTRY]</span>
+  <strong>[PASSWORD VAULT ENTRY]</strong>
   and record the alert URL in the table above. The key is never written to the log file.</li>
   <li>For an SMTP relay instead of the REST API, pass <code>-MailProvider Smtp -SmtpHost
   ... -SmtpPort 587 -SmtpCredential (Get-Credential)</code>. Port 25 is blocked on most
@@ -162,10 +154,10 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
 <div class="callout callout-danger">
   <div class="callout-title">Secrets</div>
   <p>The function key and the SMTP2GO API key never go into a ticket, chat, this article or
-  the log files. The function key lives only in <code>ServiceWatchdog.json</code> on each
+  the log files. The function key lives only in <strong>ServiceWatchdog.json</strong> on each
   server (a folder restricted to SYSTEM and Administrators) and in
-  <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[PASSWORD VAULT ENTRY]</span>.
-  The SMTP2GO key lives only in Key Vault (secret <code>Smtp2GoApiKey</code>) and in the
+  <strong>[PASSWORD VAULT ENTRY]</strong>.
+  The SMTP2GO key lives only in Key Vault (secret <strong>Smtp2GoApiKey</strong>) and in the
   SMTP2GO console. Recipients are fixed in the Function App settings; nothing a server sends
   can redirect mail.</p>
 </div>
@@ -174,23 +166,23 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
 
 <div class="callout callout-warning">
   <div class="callout-title">The installer does not install where you run it from</div>
-  <p>Wherever you copied the <code>Endpoint</code> folder is only the <em>source</em>. The
-  installer creates and uses <strong><code>C:\ProgramData\ServiceWatchdog</code></strong> for
+  <p>Wherever you copied the <strong>Endpoint</strong> folder is only the <em>source</em>. The
+  installer creates and uses <strong>C:\ProgramData\ServiceWatchdog</strong> for
   the config file, the state file, the logs and its own copy of the worker script, unless you
-  pass <code>-InstallPath</code> on every run. So after the first run, the file to edit is
-  <strong><code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code></strong>, and it
+  pass <strong>-InstallPath</strong> on every run. So after the first run, the file to edit is
+  <strong>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</strong>, and it
   will not appear next to the scripts you ran. The source folder can be deleted once the
   task is registered.</p>
 </div>
 
 <div class="callout callout-danger">
   <div class="callout-title">Use the service Name, not the Display Name</div>
-  <p><code>Services</code> takes the short <strong>Name</strong> that <code>Get-Service</code>
-  shows: <code>Spooler</code>, not <code>Print Spooler</code>; <code>W3SVC</code>, not
-  <code>World Wide Web Publishing Service</code>. Look one up with
-  <code>(Get-Service -DisplayName 'Print Spooler').Name</code>. A display name is resolved as a
-  courtesy, but the short name is what the logs, emails and state file key on.</p>
+  <p>The Services list takes the short <strong>Name</strong> that Get-Service shows:
+  <strong>Spooler</strong>, not Print Spooler; <strong>W3SVC</strong>, not World Wide Web Publishing
+  Service. A display name is resolved as a courtesy, but the short name is what the logs,
+  emails and state file key on. To look one up by its display name:</p>
 </div>
+<pre><code>(Get-Service -DisplayName 'Print Spooler').Name</code></pre>
 
 <div class="callout callout-info">
   <div class="callout-title">Handing registration to another team</div>
@@ -219,18 +211,18 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
   lockdown, copies the worker, validates the config, registers the event source and the
   task, starts it and sends a test alert.</li>
   <li>Confirm the <code>[TEST]</code> email arrived, then run the checks under
-  <a href="#testing">Testing an installation</a>.</li>
+  "Testing an installation" further down this page.</li>
 </ol>
 
 <div class="callout callout-success">
   <div class="callout-title">Re-running the installer is safe</div>
-  <p>Re-run it to change the interval (<code>-IntervalMinutes</code>) or the execution
-  limit; the task is always re-registered. Every re-run after the first install needs the
-  script's own <code>-Force</code>, because the worker is already in place (the copy is
-  idempotent and also serves as the upgrade path):
-  <code>.\Register-WinServiceWatchdogTask.ps1 -Force -IntervalMinutes 10</code>.
-  <code>-DryRun</code> shows every step without changing anything.</p>
+  <p>Re-run it to change the interval or the execution limit; the task is always
+  re-registered. Every re-run after the first install needs the script's own
+  <strong>-Force</strong>, because the worker is already in place (the copy is idempotent and
+  also serves as the upgrade path). <strong>-DryRun</strong> shows every step without changing
+  anything. For example:</p>
 </div>
+<pre><code>.\Register-WinServiceWatchdogTask.ps1 -Force -IntervalMinutes 10</code></pre>
 
 <h3>Editing the service list later</h3>
 
@@ -326,7 +318,7 @@ watchdog doing its job. Event 1001 is written every time it starts a service:</p
 <p>Each entry names the service and the attempt it succeeded on. Use <code>Id = 1002</code> for
 failed starts instead, or drop the <code>Id</code> filter for the last 25 events of any kind.</p>
 
-<h2 id="testing">Testing an installation</h2>
+<h2>Testing an installation</h2>
 
 <p>Run from <code>C:\ProgramData\ServiceWatchdog</code> in an elevated PowerShell.</p>
 
@@ -352,11 +344,12 @@ failed starts instead, or drop the <code>Id</code> filter for the last 25 events
 
 <div class="callout callout-accent">
   <div class="callout-title">Seeing the Azure side</div>
-  <p>In Application Insights on the Function App: <code>requests | where name ==
-  "SendServiceWatchdogAlert"</code> lists every call with its status code, and
-  <code>traces | where message has "ServiceWatchdog"</code> shows the function's own log
-  lines including the run id and host name. Requests and exceptions are never sampled.</p>
+  <p>In Application Insights on the Function App, the first query below lists every call to
+  the alert function with its status code, and the second shows the function's own log lines
+  including the run id and host name. Requests and exceptions are never sampled.</p>
 </div>
+<pre><code>requests | where name == "SendServiceWatchdogAlert"
+traces | where message has "ServiceWatchdog"</code></pre>
 
 <h2>Secrets and rotation</h2>
 
@@ -374,7 +367,7 @@ $created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watc
 ($created.Content | ConvertFrom-Json).properties.value   # the new key; paste it into the vault</code></pre></li>
   <li>Update <code>Webhook.FunctionKey</code> on every server (RMM script or by hand) and
   verify each with <code>.\Invoke-WinServiceWatchdog.ps1 -TestAlert</code> (exit 0). Update
-  <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[PASSWORD VAULT ENTRY]</span>.</li>
+  <strong>[PASSWORD VAULT ENTRY]</strong>.</li>
   <li>Delete the old key:
   <code>Invoke-AzRestMethod -Method DELETE -Path "$site/functions/SendServiceWatchdogAlert/keys/watchdog?api-version=2024-04-01"</code>.
   Any server that was missed starts logging event 1013 and exit 10, which is the signal
@@ -410,12 +403,12 @@ $created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watc
   (Windows plans only) when this was written. Before that date:</p>
   <ol>
     <li>Read the current support table at
-    <code>https://learn.microsoft.com/azure/azure-functions/supported-languages</code>.</li>
+    <strong>https://learn.microsoft.com/azure/azure-functions/supported-languages</strong>.</li>
     <li>When 7.6 is generally available on Windows Consumption, re-run the install script
-    with <code>-PowerShellVersion 7.6</code> (or set the <code>powerShellVersion</code>
+    with <strong>-PowerShellVersion 7.6</strong> (or set the <strong>powerShellVersion</strong>
     template parameter). The function ships no modules, so the bump is a parameter change
     and nothing else.</li>
-    <li>Run the install script with <code>-SendTestEmail</code>, then <code>-TestAlert</code>
+    <li>Run the install script with <strong>-SendTestEmail</strong>, then <strong>-TestAlert</strong>
     from one server, and add a change-log row.</li>
   </ol>
 </div>
@@ -441,7 +434,7 @@ $created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watc
         <td><code>netsh winhttp show proxy</code>; set it with <code>netsh winhttp set proxy proxy-server="proxy.example.com:8080" bypass-list="&lt;local&gt;"</code> or <code>netsh winhttp import proxy source=ie</code>. Confirm outbound 443 to the Function App host name is allowed.</td></tr>
     <tr><td>Event 1013 on every run</td>
         <td>401: wrong or deleted function key. 403 with <code>site_not_allowed</code>: <code>SiteName</code> not in <code>WATCHDOG_ALLOWED_SITES</code></td>
-        <td>Paste the current key from <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[PASSWORD VAULT ENTRY]</span>; or add the site to the allowlist.</td></tr>
+        <td>Paste the current key from <strong>[PASSWORD VAULT ENTRY]</strong>; or add the site to the allowlist.</td></tr>
     <tr><td>Event 1014 on every run</td>
         <td>The function rejected the payload (the log line carries the function's error list); usually a server on a different worker version than the function</td>
         <td>Keep the endpoint scripts and the function on the same version.</td></tr>
@@ -485,8 +478,8 @@ is deleted). Service Control Manager failure actions set with
     <tr><th>Date</th><th>By</th><th>Change</th></tr>
   </thead>
   <tbody>
-    <tr><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[YYYY-MM-DD]</span></td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[NAME]</span></td>
-        <td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[Initial deployment: version 1.0.0, PowerShell 7.4, first servers enrolled]</span></td></tr>
+    <tr><td><strong>[YYYY-MM-DD]</strong></td>
+        <td><strong>[NAME]</strong></td>
+        <td><strong>[Initial deployment: version 1.0.0, PowerShell 7.4, first servers enrolled]</strong></td></tr>
   </tbody>
 </table>
