@@ -176,6 +176,22 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
   task is registered.</p>
 </div>
 
+<div class="callout callout-danger">
+  <div class="callout-title">Use the service Name, not the Display Name</div>
+  <p><code>Services</code> takes the short <strong>Name</strong> that <code>Get-Service</code>
+  shows: <code>Spooler</code>, not <code>Print Spooler</code>; <code>W3SVC</code>, not
+  <code>World Wide Web Publishing Service</code>. Look one up with
+  <code>(Get-Service -DisplayName 'Print Spooler').Name</code>. A display name is resolved as a
+  courtesy, but the short name is what the logs, emails and state file key on.</p>
+</div>
+
+<div class="callout callout-info">
+  <div class="callout-title">Handing registration to another team</div>
+  <p>The separate article <strong>ServiceWatchdog: registering a server</strong> covers only these
+  steps, with fill-in fields for the URL, key and site name, and can be given to the staff
+  who register servers without the rest of this page.</p>
+</div>
+
 <ol>
   <li>Copy the repository's <code>Monitoring/ServiceWatchdog/Endpoint</code> folder to the
   server (for example <code>C:\Temp\Endpoint</code>).</li>

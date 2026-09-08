@@ -77,6 +77,7 @@ Event types sent by the endpoint: `alert`, `flapping`, `reminder`, `recovered`,
 | `Deploy/Install-AzureServiceWatchdogFunction.ps1` | One-shot Azure deployment from an operator workstation |
 | `Deploy/main.parameters.example.json` | Parameter file for deploying the template by hand |
 | `Docs/Hudu-ServiceWatchdog.html` | Knowledge-base article draft (callout and table classes from the house stylesheet) |
+| `Docs/Hudu-ServiceWatchdog-ServerInstall.html` | Server registration hand-off guide for the staff who register servers, with fill-in fields for the URL, key and site name |
 | `Tests/` | Pester suites for every script and the module, the worker-to-function payload contract check, and the Windows PowerShell 5.1 compatibility checker |
 
 `.gitignore` excludes the real `ServiceWatchdog.json`, `*.state.json`,
@@ -193,6 +194,15 @@ key. The install script does all of that for you.
 > every run. After the first run, the file to edit is
 > **`C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json`**; it does not appear next to
 > the scripts you ran. The source folder can be deleted once the task is registered.
+
+> **Service Name, not Display Name.** `Services` takes the short service name, the one
+> `Get-Service` shows as `Name`: `Spooler`, not `Print Spooler`; `W3SVC`, not `World Wide
+> Web Publishing Service`. Look one up with `(Get-Service -DisplayName 'Print Spooler').Name`.
+> A display name is resolved as a courtesy, but the short name is what the logs, emails and
+> state file key on.
+
+For a step-by-step page to hand to the people who register servers, with fill-in fields
+for the URL, key and site name, see `Docs/Hudu-ServiceWatchdog-ServerInstall.html`.
 
 Copy the `Endpoint/` folder to the server and, in an elevated PowerShell:
 

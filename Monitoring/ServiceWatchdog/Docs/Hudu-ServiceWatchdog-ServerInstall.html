@@ -1,0 +1,136 @@
+<!-- ServiceWatchdog: server registration guide. Hand-off document for the IT staff who
+     register servers. Fill in the highlighted fields before sharing. Hudu article fragment;
+     uses the shared stylesheet's callout and table classes. -->
+
+<div class="callout callout-info">
+  <div class="callout-title">What this page is for</div>
+  <p>Follow it to register one Windows server with the service watchdog. Once registered, the
+  server restarts any listed Windows service that stops and emails IT when it cannot. Nothing
+  here touches the Azure side; that is already deployed. Registering another server means
+  repeating these steps on that server.</p>
+</div>
+
+<h2>Values you need before you start</h2>
+<table>
+  <thead><tr><th>Item</th><th>Value</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Function URL</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNCTION URL]</span></td><td>Goes in <code>Webhook.Url</code>. Same for every server.</td></tr>
+    <tr><td>Function key</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNCTION KEY OR VAULT ENTRY]</span></td><td>Goes in <code>Webhook.FunctionKey</code>. Treat it like a password: never email it, never paste it into a ticket.</td></tr>
+    <tr><td>Site name</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[SITE NAME]</span></td><td>Goes in <code>SiteName</code>; appears in the subject line of every alert.</td></tr>
+    <tr><td>Install files</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[WHERE THE ENDPOINT FOLDER IS KEPT]</span></td><td>The <code>Endpoint</code> folder: three scripts and an example config.</td></tr>
+    <tr><td>Who to ask</td><td><span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[CONTACT]</span></td><td>For the values above, or if a step fails.</td></tr>
+  </tbody>
+</table>
+
+<h2>Requirements</h2>
+<ul>
+  <li>Windows Server 2016 or later. Windows PowerShell 5.1, which is built in, is enough.</li>
+  <li>A local Administrator account; every command below runs in an <strong>elevated</strong> PowerShell.</li>
+  <li>Outbound HTTPS (TCP 443) from the server to the function URL.</li>
+  <li>The names of the Windows services to watch (see the service-name rule in step 3).</li>
+</ul>
+
+<h2>Step 1: copy the files</h2>
+<p>Copy the <code>Endpoint</code> folder to any temporary location on the server, for example
+<code>C:\Temp\Endpoint</code>.</p>
+
+<div class="callout callout-warning">
+  <div class="callout-title">The installer does not install where you run it from</div>
+  <p>The folder you copied is only the source. The installer creates and uses
+  <strong><code>C:\ProgramData\ServiceWatchdog</code></strong> for the config file, the state
+  file, the logs and its own copy of the worker script. The file you edit in step 3 is
+  <strong><code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code></strong>; it will
+  not appear next to the scripts you ran. You can delete the temporary folder after step 5.</p>
+</div>
+
+<h2>Step 2: first run of the installer</h2>
+<pre><code>cd C:\Temp\Endpoint
+.\Register-WinServiceWatchdogTask.ps1</code></pre>
+<p>Expected result: one line ending in <em>Edit it (Services, Webhook.Url, Webhook.FunctionKey)
+and re-run this script</em>, and exit code 2. That is success for the first run: the install
+folder now exists, is locked down to SYSTEM and Administrators, and holds a config file for
+you to fill in.</p>
+
+<h2>Step 3: edit the config file</h2>
+<p>Open <code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code> in Notepad (as
+administrator) and set these four values. Leave everything else at its default unless
+<span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[CONTACT]</span> says otherwise.</p>
+<pre><code>{
+  "SchemaVersion": 1,
+  "SiteName": "<span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[SITE NAME]</span>",
+  "Services": [ "Spooler", "W3SVC", "MSSQLSERVER" ],
+  "Webhook": {
+    "Url": "<span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNCTION URL]</span>",
+    "FunctionKey": "<span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[FUNCTION KEY]</span>"
+  }
+}</code></pre>
+
+<div class="callout callout-danger">
+  <div class="callout-title">Use the service Name, not the Display Name</div>
+  <p>Windows services have two names. The watchdog wants the short <strong>Name</strong>, which is
+  what the logs, the emails and Windows itself key on. The friendly <strong>Display Name</strong>
+  is what the Services console shows in its first column.</p>
+  <table>
+    <thead><tr><th>Use this (Name)</th><th>Not this (Display Name)</th></tr></thead>
+    <tbody>
+      <tr><td><code>Spooler</code></td><td>Print Spooler</td></tr>
+      <tr><td><code>W3SVC</code></td><td>World Wide Web Publishing Service</td></tr>
+      <tr><td><code>MSSQLSERVER</code></td><td>SQL Server (MSSQLSERVER)</td></tr>
+    </tbody>
+  </table>
+  <p>To look a name up, run <code>Get-Service | Sort-Object DisplayName | Select-Object Name, DisplayName</code>,
+  or for one service <code>(Get-Service -DisplayName 'Print Spooler').Name</code>. In the
+  Services console the Name is on the General tab of a service's properties, labelled
+  "Service name".</p>
+</div>
+
+<p>Any value still containing <code>REPLACE</code> is rejected. Use straight double quotes and
+a comma between list items, as in the example.</p>
+
+<h2>Step 4: register the task and send a test</h2>
+<pre><code>cd C:\Temp\Endpoint
+.\Register-WinServiceWatchdogTask.ps1 -TestAlert -RunNow</code></pre>
+<p>Expected result: a summary ending with the task name, the next run time and the log path,
+exit code 0, and within a minute an email with <code>[TEST]</code> in the subject in the IT
+mailbox. From now on the server checks its services every 5 minutes and 5 minutes after every
+reboot, as the SYSTEM account.</p>
+<p>Optional: add <code>-SetServiceRecovery</code> to the command to also have Windows restart
+each listed service on its own if it crashes.</p>
+
+<h2>Step 5: confirm it is running</h2>
+<pre><code>Get-ScheduledTask -TaskName ServiceWatchdog | Get-ScheduledTaskInfo
+Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'ServiceWatchdog' } -MaxEvents 5</code></pre>
+<p><code>LastTaskResult</code> of 0 and a recent <code>LastRunTime</code> mean the task ran.
+Event 1030 is the test alert; event 1000 or 1001 means a normal run. The daily log file is in
+<code>C:\ProgramData\ServiceWatchdog\Logs</code>.</p>
+
+<h2>Changing the service list later</h2>
+<p>Edit the JSON file, then check it from the install folder. No re-registration is needed;
+the next scheduled run picks the change up.</p>
+<pre><code>cd C:\ProgramData\ServiceWatchdog
+.\Invoke-WinServiceWatchdog.ps1 -ValidateConfig</code></pre>
+
+<h2>Removing the watchdog from a server</h2>
+<pre><code>cd C:\Temp\Endpoint
+.\Unregister-WinServiceWatchdogTask.ps1 -RemoveEventSource -RemoveFiles -Force</code></pre>
+<p>Tell <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[CONTACT]</span> afterwards so the server is removed from the daily check-in report;
+otherwise it is reported as silent.</p>
+
+<h2>If something fails</h2>
+<table>
+  <thead><tr><th>What you see</th><th>Meaning</th><th>What to do</th></tr></thead>
+  <tbody>
+    <tr><td>Installer stops at once mentioning elevation (exit 1)</td><td>PowerShell is not running as administrator</td><td>Open PowerShell with "Run as administrator" and try again</td></tr>
+    <tr><td>Exit 2 naming a config key</td><td>The JSON is invalid or still has a REPLACE value</td><td>Fix the named key; check quotes and commas</td></tr>
+    <tr><td>Exit 2 saying the worker already exists</td><td>The installer was already run on this server</td><td>Re-run with <code>-Force</code> added</td></tr>
+    <tr><td>Exit 10, or event 1013 in the Application log</td><td>The function rejected the key</td><td>Check <code>Webhook.FunctionKey</code> for a copy error; ask <span class="placeholder" style="background:#fff1cc;border:1px dashed #f59e0b;padding:0 .3em;font-weight:700">[CONTACT]</span> if it persists</td></tr>
+    <tr><td>Event 1011</td><td>The server could not reach the function URL</td><td>Check outbound HTTPS and any proxy; the alert is retried automatically</td></tr>
+    <tr><td>Event 1003 or 1004 after registration</td><td>A listed service is not installed, or is Disabled</td><td>Fix the name (step 3) or remove it from the list</td></tr>
+  </tbody>
+</table>
+
+<div class="callout callout-info">
+  <div class="callout-title">Do not</div>
+  <p>Do not edit the scripts, do not copy the key anywhere else, and do not change the
+  scheduled task by hand. Everything the watchdog needs is in the JSON file.</p>
+</div>
