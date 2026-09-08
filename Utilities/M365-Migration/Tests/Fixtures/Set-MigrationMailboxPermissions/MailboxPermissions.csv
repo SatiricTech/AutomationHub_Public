@@ -1,0 +1,8 @@
+"MailboxPrimarySmtp","MailboxType","Trustee","TrusteeType","Permission","AutoMapping","IsInherited"
+"reception@contoso.com","SharedMailbox","jsmith@contoso.com","UserMailbox","FullAccess","True","False"
+"reception@contoso.com","SharedMailbox","jsmith@contoso.com","UserMailbox","SendAs","","False"
+"reception@contoso.com","SharedMailbox","departed@contoso.com","UserMailbox","FullAccess","True","False"
+"reception@contoso.com","SharedMailbox","jsmith@contoso.com","UserMailbox","FullAccess","True","True"
+"jsmith@contoso.com","UserMailbox","adean@contoso.com","UserMailbox","Calendar:Editor","","False"
+"jsmith@contoso.com","UserMailbox","NT AUTHORITY\SELF","","FullAccess","True","False"
+"jsmith@contoso.com","UserMailbox","bkane@contoso.com","UserMailbox","SendOnBehalf","","False"
