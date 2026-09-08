@@ -104,6 +104,16 @@ Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Servic
 Event 1030 is the test alert; event 1000 or 1001 means a normal run. The daily log file is in
 <code>C:\ProgramData\ServiceWatchdog\Logs</code>.</p>
 
+<h3>Running a check right away</h3>
+<p>You do not have to wait for the next 5-minute run:</p>
+<pre><code>Start-ScheduledTask -TaskName ServiceWatchdog</code></pre>
+<p>That runs the same check the schedule would, as SYSTEM; read the outcome from the event log
+command above or the daily log file. To watch a run on screen instead, run the worker from the
+install folder; add <code>-DryRun</code> to only see what it would do without starting services
+or sending mail:</p>
+<pre><code>cd C:\ProgramData\ServiceWatchdog
+.\Invoke-WinServiceWatchdog.ps1 -Verbosity High</code></pre>
+
 <h2>Changing the service list later</h2>
 <p>Edit the JSON file, then check it from the install folder. No re-registration is needed;
 the next scheduled run picks the change up.</p>
