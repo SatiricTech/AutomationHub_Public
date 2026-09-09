@@ -33,8 +33,8 @@ function New-MigrationPassphrase {
 
     .NOTES
         Author: AutomationHub
-        Private module helper - not exported. Generated values are written only to the
-        results CSV, never to the run log.
+        Written with assistance from Claude (Anthropic).
+        Generated values are written only to the results CSV, never to the run log.
     #>
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',

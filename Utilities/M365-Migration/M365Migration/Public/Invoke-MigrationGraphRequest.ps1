@@ -21,13 +21,21 @@ function Invoke-MigrationGraphRequest {
         the object.
 
     .PARAMETER Method
-        GET, POST, PATCH or DELETE.
+        GET, POST, PUT, PATCH or DELETE.
 
     .PARAMETER Uri
         The Graph URI, absolute or relative (for example '/v1.0/users').
 
     .PARAMETER Body
         The request body. Converted to JSON automatically.
+
+    .PARAMETER Headers
+        Extra request headers, merged into every call the wrapper makes - including each
+        page of a -All walk, because Graph applies the header per request rather than per
+        query. Two headers earn their keep here: 'ConsistencyLevel: eventual' (required
+        by advanced $filter/$count queries) and 'Prefer: include-unknown-enum-members'
+        (without which newer enum values are dropped from the response rather than
+        returned as-is).
 
     .PARAMETER All
         Follows the paging links and returns every page.
@@ -45,6 +53,13 @@ function Invoke-MigrationGraphRequest {
 
         Updates a single user.
 
+    .EXAMPLE
+        Invoke-MigrationGraphRequest -Method GET -All `
+            -Uri '/v1.0/users?$count=true&$filter=endsWith(mail,''@contoso.com'')' `
+            -Headers @{ ConsistencyLevel = 'eventual' }
+
+        Runs an advanced query, which Graph rejects without the ConsistencyLevel header.
+
     .NOTES
         Author: AutomationHub
         Written with assistance from Claude (Anthropic).
@@ -52,10 +67,10 @@ function Invoke-MigrationGraphRequest {
     #>
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
-        Justification = 'Method, Body and MaxRetry are consumed inside the $invokeOnce scriptblock, which the analyzer does not follow. The scriptblock exists so the retry loop can be re-entered for each page.')]
+        Justification = 'Method, Body, Headers and MaxRetry are consumed inside the $invokeOnce scriptblock, which the analyzer does not follow. The scriptblock exists so the retry loop can be re-entered for each page.')]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('GET', 'POST', 'PATCH', 'DELETE')]
+        [ValidateSet('GET', 'POST', 'PUT', 'PATCH', 'DELETE')]
         [string]$Method,
 
         [Parameter(Mandatory)]
@@ -64,6 +79,9 @@ function Invoke-MigrationGraphRequest {
 
         [AllowNull()]
         $Body,
+
+        [AllowNull()]
+        [hashtable]$Headers,
 
         [switch]$All,
 
@@ -79,6 +97,11 @@ function Invoke-MigrationGraphRequest {
             $attempt++
             try {
                 $parameters = @{ Method = $Method; Uri = $RequestUri; OutputType = 'PSObject'; ErrorAction = 'Stop' }
+                if ($null -ne $Headers -and $Headers.Count -gt 0) {
+                    # Cloned per attempt so a retry cannot inherit anything Invoke-MgGraphRequest
+                    # may have added to the hashtable the caller handed us.
+                    $parameters['Headers'] = @{} + $Headers
+                }
                 if ($null -ne $Body) {
                     $parameters['Body'] = ($Body | ConvertTo-Json -Depth 10)
                     $parameters['ContentType'] = 'application/json'

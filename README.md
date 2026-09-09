@@ -42,7 +42,6 @@ By downloading, copying, or executing any code found within this repository, you
 | Folder | Scripts | Description |
 |--------|---------|-------------|
 | [`EntraID/`](Microsoft365/EntraID/) | `Start-EntraIDSyncCycle.bat` | Trigger a delta Entra ID (Azure AD) sync |
-| | `Update-M365UserPrincipalNames.ps1` | Bulk rename M365 UPNs to FirstInitial+LastName format |
 | [`EntraID/PerUserMfaAudit/`](Microsoft365/EntraID/PerUserMfaAudit/) | `Get-EntraPerUserMfaAudit.ps1` | Read-only audit of legacy per-user MFA state (Enabled/Enforced) tenant-wide, per group, or per user — CSV report + CI exit codes |
 | [`OfficeApps/`](Microsoft365/OfficeApps/) | `Install-Microsoft365Apps.ps1` | Deploy M365 Business Standard apps via ODT |
 | | `Get-LatestOdtInstaller.ps1` | Download the latest Office Deployment Tool |
@@ -104,18 +103,23 @@ Mirrors the top-level structure for cross-platform parity. Add Mac scripts in th
 | | `Mount-SysInternals.bat` | Map network drive to live Sysinternals tools |
 | | `Remove-SysInternals.bat` | Unmount Sysinternals network drive |
 | | `Send-UserNotification.ps1` | Display a notification message to the user |
-| [`M365-Migration/`](Utilities/M365-Migration/) | `Get-MigrationInventory.ps1` | Pull one tenant into a single Excel workbook + per-tab CSVs: User Mailboxes, Shared Mailboxes, M365 Users, Summary, Teams & Groups |
-| | `Compare-MigrationUserData.ps1` | Compare two user CSVs and flag Exact/Partial matches with what matched |
-| | `New-MigrationUsers.ps1` | Bulk-create Entra ID users from a CSV (generates passwords, prompts for the target UPN domain) |
-| | `New-MigrationUserMapping.ps1` | Build a migration-tool user mapping file (AvePoint; extensible registry) from a user CSV |
-| | `New-MigrationSharedMailboxes.ps1` | Bulk-create shared mailboxes from a CSV (aliases + permissions, prompts for the target domain) |
-| | `Set-MigrationUserPrincipalNames.ps1` | Standardise UPNs to First.Last / FLast / FirstLast / F.Last from a CSV |
-| | `Set-MailboxPrimaryAddress.ps1` | Set mailbox primary SMTP independent of UPN from a CSV |
-| | `Reset-MigrationCutoverPasswords.ps1` | Cutover password reset to unique passphrases (CSV, group or single user), change-at-next-sign-in, credential log |
+| [`M365-Migration/`](Utilities/M365-Migration/) | `M365Migration/` | Shared module every migration script imports (connections, logging, plan I/O, naming engine, collision resolver) |
+| | `Get-MigrationInventory.ps1` | Read-only tenant pull into nine CSVs + one workbook: Users, UserMailboxes, SharedMailboxes, MailboxPermissions, Groups, Contacts, Domains, Licenses, Summary |
 | | `Get-MigrationTeamsPhoneAssignments.ps1` | Export every user's Teams phone number, type and voice policies to a CSV (optionally the unassigned number inventory too) |
-| | `Remove-MigrationTeamsPhoneAssignments.ps1` | Bulk-unassign Teams phone numbers in the source tenant, logging each removal as a reassignment-ready CSV |
-| | `Set-MigrationTeamsPhoneAssignments.ps1` | Bulk-assign Teams phone numbers in the destination tenant from a CSV (auto-detects number type, grants voice routing policy) |
 | | `Get-MigrationVivaLearningHistory.ps1` | Export every user's Viva Learning learner history (assignments + self-initiated courses) with course metadata to CSV + JSON |
+| | `Compare-MigrationUserData.ps1` | Compare two user CSVs fuzzily, or check a destination inventory against the identity plan |
+| | `New-MigrationIdentityPlan.ps1` | Turn source inventory CSVs into the identity plan: target UPN/SMTP naming, collisions, interim domain, SKU map, waves (offline) |
+| | `Export-MigrationMappingFile.ps1` | Turn the identity plan into a migration tool's source-to-destination mapping file (AvePoint today; extensible registry) |
+| | `Test-MigrationReadiness.ps1` | Pre-flight the destination tenant against the plan at stage Pre, Provisioned or Post; pass/fail per check |
+| | `New-MigrationUsers.ps1` | Create destination Entra accounts from the plan (interim or target UPN, managers, GAL hiding, generated passwords) |
+| | `Set-MigrationLicenses.ps1` | Assign the plan's licences via a SKU map: usage location first, seat pre-check, refuses group-assigned SKUs |
+| | `New-MigrationRecipients.ps1` | Create or patch shared/room/equipment mailboxes, distribution lists, mail-enabled security groups, dynamic DLs and mail contacts |
+| | `Remove-MigrationDomainReferences.ps1` | Release a vanity domain in the source tenant: report every reference and blocker, then move objects off the domain |
+| | `Set-MigrationIdentity.ps1` | Apply the plan's target UPN, primary SMTP, aliases, X500, mail nickname and GAL visibility (also the in-place UPN redesign tool) |
+| | `Set-MigrationMailboxPermissions.ps1` | Re-apply FullAccess, SendAs, SendOnBehalf, calendar permissions and forwarding to the migrated mailboxes |
+| | `Reset-MigrationCutoverPasswords.ps1` | Cutover password reset to unique passphrases (plan, CSV, group or single user), change-at-next-sign-in, credential log |
+| | `Set-MigrationTeamsPhoneAssignments.ps1` | Bulk-assign Teams phone numbers in the destination tenant from a CSV (auto-detects number type, grants voice routing policy) |
+| | `Remove-MigrationTeamsPhoneAssignments.ps1` | Bulk-unassign Teams phone numbers in the source tenant, logging each removal as a reassignment-ready CSV |
 | | `Import-MigrationVivaLearningHistory.ps1` | Replay exported Viva Learning learner history into the destination tenant under a custom provider (idempotent re-runs) |
 
 ---
@@ -134,7 +138,7 @@ All scripts follow the **PowerShell `Verb-Noun`** naming standard for consistenc
 | `Remove-` | Delete a component | `Remove-LastPassBrowserExtension.ps1` |
 | `Invoke-` | Run a multi-step process | `Invoke-WindowsHomeToProUpgrade.ps1` |
 | `Start-` | Begin a service/process | `Start-EntraIDSyncCycle.bat` |
-| `Update-` | Modify existing resources | `Update-M365UserPrincipalNames.ps1` |
+| `Test-` | Validate state or readiness | `Test-MigrationReadiness.ps1` |
 | `Export-` | Output to file | `Export-GPResultReport.cmd` |
 | `Find-` | Search/discover resources | `Find-Hypervisors.py` |
 | `Enable-` | Turn on a feature | `Enable-EgnyteOfficeCoEdit.ps1` |

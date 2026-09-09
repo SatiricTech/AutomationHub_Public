@@ -31,7 +31,19 @@ function Import-MigrationCsv {
           TargetUserPrincipalName TargetUPN, NewUPN, Target
           TargetPrimarySmtp       TargetEmail, NewPrimaryEmail
           Department, Wave        (no aliases)
-          ObjectType              Type, RecipientType
+          ObjectType              RecipientType
+          PhoneNumber             LineUri, Number
+          PhoneNumberType         NumberType
+          LocationId              EmergencyLocationId
+          OnlineVoiceRoutingPolicy VoiceRoutingPolicy
+          Extension               (no aliases)
+
+        A bare 'Type' header is deliberately NOT an ObjectType alias. It collides with the
+        Teams Phone 'PhoneNumberType' and the Viva 'ActivityType' columns, and a header
+        that means three different things is worse than one that means nothing: an
+        unrecognised header passes through under its own name, where a script can ask for
+        it explicitly. Use RecipientType, or the canonical ObjectType, to name a recipient
+        class.
 
     .PARAMETER Path
         The CSV file to read. Read as UTF-8.
@@ -46,9 +58,9 @@ function Import-MigrationCsv {
         Reads the file and guarantees a UserPrincipalName property on every row.
 
     .EXAMPLE
-        $rows = Import-MigrationCsv -Path .\phones.csv -RequiredColumns @('UserPrincipalName', 'MobilePhone')
+        $rows = Import-MigrationCsv -Path .\phones.csv -RequiredColumns @('UserPrincipalName', 'PhoneNumber')
 
-        Fails up front, naming both columns, if either is absent.
+        Reads a Teams Phone assignment file, accepting LineUri or Number as the number column.
 
     .NOTES
         Author: AutomationHub
@@ -87,7 +99,12 @@ function Import-MigrationCsv {
         'TargetUserPrincipalName' = @('TargetUPN', 'NewUPN', 'Target')
         'TargetPrimarySmtp'       = @('TargetEmail', 'NewPrimaryEmail')
         'Wave'                    = @()
-        'ObjectType'              = @('Type', 'RecipientType')
+        'ObjectType'              = @('RecipientType')
+        'PhoneNumber'             = @('LineUri', 'Number')
+        'PhoneNumberType'         = @('NumberType')
+        'LocationId'              = @('EmergencyLocationId')
+        'OnlineVoiceRoutingPolicy' = @('VoiceRoutingPolicy')
+        'Extension'               = @()
     }
 
     try {

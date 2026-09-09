@@ -40,6 +40,108 @@ Describe 'Invoke-MigrationGraphRequest' {
         }
     }
 
+    Context 'Headers' {
+
+        It 'Merges the caller headers into the request' {
+            InModuleScope M365Migration {
+                Mock Invoke-MgGraphRequest { [pscustomobject]@{ value = @() } } -ParameterFilter {
+                    $Headers -is [hashtable] -and $Headers['ConsistencyLevel'] -eq 'eventual'
+                }
+
+                $null = Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/users?$count=true' `
+                    -Headers @{ ConsistencyLevel = 'eventual' }
+                Should -Invoke Invoke-MgGraphRequest -Times 1 -Exactly
+            }
+        }
+
+        It 'Sends multiple headers together' {
+            InModuleScope M365Migration {
+                Mock Invoke-MgGraphRequest { [pscustomobject]@{ value = @() } } -ParameterFilter {
+                    $Headers['ConsistencyLevel'] -eq 'eventual' -and
+                    $Headers['Prefer'] -eq 'include-unknown-enum-members'
+                }
+
+                $null = Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/employeeExperience/learningCourseActivities' `
+                    -Headers @{ ConsistencyLevel = 'eventual'; Prefer = 'include-unknown-enum-members' }
+                Should -Invoke Invoke-MgGraphRequest -Times 1 -Exactly
+            }
+        }
+
+        It 'Sends no Headers argument when none was given' {
+            InModuleScope M365Migration {
+                Mock Invoke-MgGraphRequest { [pscustomobject]@{ value = @() } } -ParameterFilter {
+                    -not $PSBoundParameters.ContainsKey('Headers')
+                }
+
+                $null = Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/users'
+                Should -Invoke Invoke-MgGraphRequest -Times 1 -Exactly
+            }
+        }
+
+        It 'Carries the headers onto every page of a -All walk' {
+            InModuleScope M365Migration {
+                Mock Invoke-MgGraphRequest {
+                    if ($Uri -eq '/v1.0/users') {
+                        [pscustomobject]@{
+                            value             = @([pscustomobject]@{ id = '1' })
+                            '@odata.nextLink' = 'https://graph.microsoft.com/v1.0/users?$skiptoken=page2'
+                        }
+                    }
+                    else {
+                        [pscustomobject]@{ value = @([pscustomobject]@{ id = '2' }) }
+                    }
+                } -ParameterFilter { $Headers['ConsistencyLevel'] -eq 'eventual' }
+
+                $result = Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/users' -All `
+                    -Headers @{ ConsistencyLevel = 'eventual' }
+                @($result.id) | Should -Be @('1', '2')
+                Should -Invoke Invoke-MgGraphRequest -Times 2 -Exactly
+            }
+        }
+
+        It 'Does not hand the caller hashtable itself to the SDK' {
+            InModuleScope M365Migration {
+                Mock Invoke-MgGraphRequest {
+                    $Headers['Injected'] = 'yes'
+                    [pscustomobject]@{ value = @() }
+                }
+
+                $headers = @{ ConsistencyLevel = 'eventual' }
+                $null = Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/users' -Headers $headers
+                $headers.ContainsKey('Injected') | Should -BeFalse
+            }
+        }
+    }
+
+    Context 'Methods' {
+
+        It 'Accepts <Method>' -ForEach @(
+            @{ Method = 'GET' }, @{ Method = 'POST' }, @{ Method = 'PUT' }
+            @{ Method = 'PATCH' }, @{ Method = 'DELETE' }
+        ) {
+            InModuleScope M365Migration -Parameters @{ RequestMethod = $Method } {
+                param($RequestMethod)
+                Mock Invoke-MgGraphRequest { [pscustomobject]@{ ok = $true } }
+
+                (Invoke-MigrationGraphRequest -Method $RequestMethod -Uri '/v1.0/users/1').ok | Should -BeTrue
+                Should -Invoke Invoke-MgGraphRequest -Times 1 -Exactly -ParameterFilter { $Method -eq $RequestMethod }
+            }
+        }
+
+        It 'Passes PUT through to the SDK as PUT' {
+            InModuleScope M365Migration {
+                Mock Invoke-MgGraphRequest { [pscustomobject]@{ ok = $true } } -ParameterFilter { $Method -eq 'PUT' }
+
+                $null = Invoke-MigrationGraphRequest -Method PUT -Uri '/v1.0/users/1/photo/$value' -Body @{ a = 1 }
+                Should -Invoke Invoke-MgGraphRequest -Times 1 -Exactly
+            }
+        }
+
+        It 'Still rejects a method outside the set' {
+            { Invoke-MigrationGraphRequest -Method 'TRACE' -Uri '/v1.0/users' } | Should -Throw
+        }
+    }
+
     Context 'Paging' {
 
         It 'Concatenates every page when -All is given' {

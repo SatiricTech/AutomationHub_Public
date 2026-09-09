@@ -19,7 +19,8 @@ function Resolve-MigrationTeamsUser {
 
     .NOTES
         Author: AutomationHub
-        Private module helper - not exported. Requires an active MicrosoftTeams session.
+        Written with assistance from Claude (Anthropic).
+        Requires an active MicrosoftTeams session; call Connect-MigrationTeams first.
     #>
     [CmdletBinding()]
     param(

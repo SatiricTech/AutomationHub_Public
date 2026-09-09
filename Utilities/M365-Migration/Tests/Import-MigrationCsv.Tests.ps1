@@ -45,6 +45,11 @@ Describe 'Import-MigrationCsv' {
             @{ Alias = 'NewUPN';              Canonical = 'TargetUserPrincipalName' }
             @{ Alias = 'TargetEmail';         Canonical = 'TargetPrimarySmtp' }
             @{ Alias = 'RecipientType';       Canonical = 'ObjectType' }
+            @{ Alias = 'LineUri';             Canonical = 'PhoneNumber' }
+            @{ Alias = 'Number';              Canonical = 'PhoneNumber' }
+            @{ Alias = 'NumberType';          Canonical = 'PhoneNumberType' }
+            @{ Alias = 'EmergencyLocationId'; Canonical = 'LocationId' }
+            @{ Alias = 'VoiceRoutingPolicy';  Canonical = 'OnlineVoiceRoutingPolicy' }
         ) {
             $path = New-TestCsv -Name "alias-$($Alias -replace '\W', '').csv" -Content "$Alias`nvalue"
             $rows = Import-MigrationCsv -Path $path
@@ -68,6 +73,51 @@ Describe 'Import-MigrationCsv' {
             $row = (Import-MigrationCsv -Path $path)[0]
             $row.UserPrincipalName | Should -BeExactly 'john@contoso.com'
             $row.CostCentre | Should -BeExactly '4100'
+        }
+
+        It 'Keeps a bare Type header under its own name instead of mapping it to ObjectType' {
+            # 'Type' collided with the Teams Phone PhoneNumberType and the Viva ActivityType
+            # columns, so it is deliberately not part of the vocabulary any more.
+            $path = New-TestCsv -Name 'bare-type.csv' -Content "UPN,Type`njohn@contoso.com,DirectRouting"
+            $row = (Import-MigrationCsv -Path $path)[0]
+            $row.PSObject.Properties.Name | Should -Not -Contain 'ObjectType'
+            $row.Type | Should -BeExactly 'DirectRouting'
+        }
+
+        It 'Throws when ObjectType is required and only a bare Type header is present' {
+            $path = New-TestCsv -Name 'bare-type-required.csv' -Content "UPN,Type`njohn@contoso.com,User"
+            { Import-MigrationCsv -Path $path -RequiredColumns 'ObjectType' } |
+                Should -Throw -ExpectedMessage '*ObjectType*'
+        }
+
+        It 'Still maps RecipientType to ObjectType' {
+            $path = New-TestCsv -Name 'recipient-type.csv' -Content "UPN,RecipientType`njohn@contoso.com,SharedMailbox"
+            (Import-MigrationCsv -Path $path)[0].ObjectType | Should -BeExactly 'SharedMailbox'
+        }
+
+        It 'Keeps a canonical Extension header' {
+            $path = New-TestCsv -Name 'extension.csv' -Content "UPN,Extension`njohn@contoso.com,4210"
+            (Import-MigrationCsv -Path $path)[0].Extension | Should -BeExactly '4210'
+        }
+
+        It 'Resolves a whole Teams Phone assignment file' {
+            $path = New-TestCsv -Name 'teams-phone.csv' `
+                -Content ("UPN,LineUri,NumberType,EmergencyLocationId,VoiceRoutingPolicy,Extension`n" +
+                    'john@contoso.com,tel:+15551234567,CallingPlan,11111111-1111-1111-1111-111111111111,AU-Routing,123')
+            $row = (Import-MigrationCsv -Path $path -RequiredColumns 'UserPrincipalName', 'PhoneNumber')[0]
+            $row.PhoneNumber | Should -BeExactly 'tel:+15551234567'
+            $row.PhoneNumberType | Should -BeExactly 'CallingPlan'
+            $row.LocationId | Should -BeExactly '11111111-1111-1111-1111-111111111111'
+            $row.OnlineVoiceRoutingPolicy | Should -BeExactly 'AU-Routing'
+            $row.Extension | Should -BeExactly '123'
+        }
+
+        It 'Does not let PhoneNumber aliases evict a canonical PhoneNumber column' {
+            $path = New-TestCsv -Name 'phone-collide.csv' `
+                -Content "PhoneNumber,LineUri`n+15551234567,tel:+15551234567"
+            $row = (Import-MigrationCsv -Path $path)[0]
+            $row.PhoneNumber | Should -BeExactly '+15551234567'
+            $row.LineUri | Should -BeExactly 'tel:+15551234567'
         }
 
         It 'Does not let an alias evict a canonical column of the same meaning' {
