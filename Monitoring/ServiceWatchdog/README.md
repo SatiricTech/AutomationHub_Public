@@ -186,6 +186,30 @@ Key Vault secret (`Smtp2GoApiKey` or `SmtpPassword`), zip the contents of `Azure
 with `host.json` at the archive root, publish it, restart the app, and create a function
 key. The install script does all of that for you.
 
+### Changing who receives the emails
+
+Recipients live in one Function App setting, `WATCHDOG_MAIL_TO`, as a semicolon-separated
+list. Alerts and the daily digest both go to it. Two ways to change it:
+
+1. **Re-run the install script** with the new list in `-MailTo`. Everything else is reused,
+   including the existing function key; it asks for the SMTP2GO key again because it
+   re-seeds the vault secret. Add `-SendTestEmail` to confirm the new list works.
+2. **Edit it in the portal**: Function App, Settings, Environment variables,
+   `WATCHDOG_MAIL_TO`, Save. The app restarts and the next email uses the new list.
+
+```powershell
+./Install-AzureServiceWatchdogFunction.ps1 `
+    -ResourceGroupName 'rg-servicewatchdog' -Location 'eastus2' -BaseName 'svcwatchdog' `
+    -MailFrom 'Service Watchdog <alerts@example.com>' `
+    -MailTo 'it@example.com;helpdesk@example.com' `
+    -Smtp2GoApiKey $apiKey -SendTestEmail
+```
+
+> **A portal edit is wiped by the next install script run.** Every run writes all settings
+> from the template, including the recipient list. If you change recipients in the portal
+> and later run the script with a different `-MailTo`, the portal change is lost. Whenever
+> the script runs, pass the full current list in `-MailTo`.
+
 ### 3. Install on each server
 
 > **Where the files go.** The folder you copy `Endpoint/` to is only the source. The

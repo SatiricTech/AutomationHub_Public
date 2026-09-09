@@ -162,6 +162,36 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
   can redirect mail.</p>
 </div>
 
+<h3>Changing who receives the emails</h3>
+
+<p>Recipients live in one Function App setting, <strong>WATCHDOG_MAIL_TO</strong>, as a
+semicolon-separated list. Alerts and the daily digest both go to it. Two ways to change it:</p>
+
+<ol>
+  <li><strong>Re-run the install script</strong> with the new list in <code>-MailTo</code>.
+  Everything else is reused, including the existing function key; it asks for the SMTP2GO key
+  again because it re-seeds the vault secret. Add <code>-SendTestEmail</code> to confirm the
+  new list works.</li>
+  <li><strong>Edit it in the portal</strong>: Function App <strong>[FUNCTION APP NAME]</strong>,
+  Settings, Environment variables, <code>WATCHDOG_MAIL_TO</code>, then Save. The app restarts
+  and the next email uses the new list.</li>
+</ol>
+
+<pre><code>./Install-AzureServiceWatchdogFunction.ps1 `
+    -ResourceGroupName 'rg-servicewatchdog' -Location 'eastus2' -BaseName 'svcwatchdog' `
+    -MailFrom 'Service Watchdog &lt;alerts@example.com&gt;' `
+    -MailTo 'it@example.com;helpdesk@example.com' `
+    -Smtp2GoApiKey $apiKey -SendTestEmail</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">A portal edit is wiped by the next install script run</div>
+  <p>Every run of the install script writes all settings from the template, including the
+  recipient list. If you change recipients in the portal and later run the script with a
+  different <strong>-MailTo</strong>, the portal change is lost. Whenever the script runs, pass
+  the full current list in <strong>-MailTo</strong>, and keep the list in the deployment table
+  at the top of this page up to date.</p>
+</div>
+
 <h2>Installing on a server</h2>
 
 <div class="callout callout-warning">
