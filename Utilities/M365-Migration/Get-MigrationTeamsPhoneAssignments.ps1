@@ -8,11 +8,9 @@
 .DESCRIPTION
     Connects to Microsoft Teams and reads the tenant's telephone number inventory plus every
     user's Teams voice configuration, then writes a CSV pairing each user (UPN) with their
-    currently assigned phone number. The export is designed to feed the other two Teams Phone
-    scripts in this toolkit:
-
-      Remove-MigrationTeamsPhoneAssignments.ps1  - bulk-unassign in the source
-      Set-MigrationTeamsPhoneAssignments.ps1     - bulk-reassign in the destination
+    currently assigned phone number. The export feeds the other two Teams Phone scripts in
+    this toolkit: Remove-MigrationTeamsPhoneAssignments.ps1 (bulk-unassign in the source) and
+    Set-MigrationTeamsPhoneAssignments.ps1 (bulk-reassign in the destination).
 
     The assignments CSV columns are the round-trip contract between those three scripts and
     are deliberately left exactly as they are: UserPrincipalName, DisplayName, PhoneNumber
@@ -26,11 +24,8 @@
     assignment.
 
     The number inventory is pulled once (paged) and joined to the user list locally, so users
-    are not queried one number at a time. The script is read-only against the tenant.
-
-    Alongside the assignments CSV the run writes the toolkit's standard results file, one row
-    per user in the Identity / Action / Status / Detail shape, so a Teams Phone export
-    summarises the same way every other script in the toolkit does.
+    are not queried one number at a time. The script is read-only against the tenant, and
+    also writes the toolkit's standard Identity / Action / Status / Detail results file.
 
 .PARAMETER OutputPath
     Root directory for the log, the assignments CSV and the results CSV. Defaults to the
@@ -89,9 +84,7 @@
     Permissions : Teams Administrator, or Teams Communications Administrator / Global Reader
                   for this read-only pull. No Graph scopes are used.
     GDAP        : supported through -TenantId, which Connect-MigrationTeams passes to
-                  Connect-MicrosoftTeams. -DelegatedOrganization is an Exchange Online
-                  concept and does not apply - this script never connects to Exchange.
-
+                  Connect-MicrosoftTeams. This script never connects to Exchange.
     Exit codes  : 0 success, 1 fatal error, 2 completed with one or more failed rows.
 
     Written with assistance from Claude (Anthropic).
@@ -122,102 +115,6 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Force -ErrorAction Stop
 
-#region Configuration ----------------------------------------------------------
-
-# Get-CsPhoneNumberAssignment caps a response well below a large tenant's inventory, so the
-# inventory is walked in pages of this size.
-$inventoryPageSize = 1000
-
-#endregion ---------------------------------------------------------------------
-
-#region Functions --------------------------------------------------------------
-
-function Get-MigrationTeamsPolicyName {
-    <#
-        Get-CsOnlineUser returns policy properties inconsistently: a bare string, an object with
-        a Name property, or null for the global policy. Everything collapses to a string here so
-        the CSV round-trip has one shape; null stays null.
-
-        Verbatim copy of the M365Migration module's private helper of the same name;
-        the module does not export it, so this script cannot call it. Delete this copy
-        once the module promotes it to Public/ - the code is identical.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [AllowNull()]
-        $Policy
-    )
-
-    if ($null -eq $Policy) { return $null }
-    if ($Policy.PSObject.Properties['Name']) { return [string]$Policy.Name }
-
-    $text = [string]$Policy
-    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
-    return $text
-}
-
-function Split-MigrationTeamsLineUri {
-    <#
-        Splits a LineUri such as 'tel:+15551234567;ext=123' into Number and Extension. The plan
-        tracks them separately because a ported number keeps its E.164 form while the extension
-        is often re-issued in the destination tenant. Blank input returns both members null.
-
-        Verbatim copy of the M365Migration module's private helper of the same name;
-        the module does not export it, so this script cannot call it. Delete this copy
-        once the module promotes it to Public/ - the code is identical.
-    #>
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$LineUri
-    )
-
-    if ([string]::IsNullOrWhiteSpace($LineUri)) {
-        return [pscustomobject]@{ Number = $null; Extension = $null }
-    }
-
-    $value = $LineUri.Trim() -replace '^(?i)tel:', ''
-    $extension = $null
-    if ($value -match '^(?<num>[^;]+);(?i)ext=(?<ext>.+)$') {
-        $value = $Matches['num']
-        $extension = $Matches['ext'].Trim()
-    }
-
-    return [pscustomobject]@{ Number = $value; Extension = $extension }
-}
-
-function Get-MigrationPhoneNumberInventory {
-    <#
-        Returns the tenant's telephone number inventory, walking -Skip until a short page comes
-        back: Get-CsPhoneNumberAssignment returns a bounded page, so a large tenant silently loses
-        the tail unless the caller pages itself. -Filter splats extra named arguments onto the
-        cmdlet, e.g. @{ PstnAssignmentStatus = 'Unassigned' }.
-
-        Not present in the M365Migration module at all - all three Teams Phone scripts carry an
-        identical copy. Flagged for promotion.
-    #>
-    [CmdletBinding()]
-    [OutputType([object[]])]
-    param(
-        [hashtable]$Filter = @{}
-    )
-
-    $all = [System.Collections.Generic.List[object]]::new()
-    $skip = 0
-    while ($true) {
-        $page = @(Get-CsPhoneNumberAssignment @Filter -Top $inventoryPageSize -Skip $skip -ErrorAction Stop)
-        if ($page.Count -gt 0) { $all.AddRange($page) }
-        if ($page.Count -lt $inventoryPageSize) { break }
-        $skip += $inventoryPageSize
-    }
-    return $all.ToArray()
-}
-
-#endregion ---------------------------------------------------------------------
-
 #region Main -------------------------------------------------------------------
 
 $exitCode = 0
@@ -231,9 +128,25 @@ try {
     $assignmentsCsv = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}TeamsPhoneAssignments_$timestamp.csv"
     $unassignedCsv = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}TeamsPhoneNumbers-Unassigned_$timestamp.csv"
 
-    $null = Connect-MigrationTeams -TenantId $TenantId
+    # These two CSVs are read back by the Set-/Remove- scripts, so they are written here
+    # rather than through Export-MigrationReport: a dry run must not leave a stale export
+    # behind for the next script in the chain to pick up.
+    $writeCsv = {
+        param([object[]]$Rows, [string]$Path, [string]$Label)
+        if ($isDryRun) {
+            Write-MigrationLog -Message "[DRYRUN] Would write $($Rows.Count) $Label row(s) to $Path" -Level WARNING
+            return
+        }
+        try {
+            $Rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding utf8 -ErrorAction Stop
+        }
+        catch {
+            throw "Could not write the $Label CSV '$Path': $($_.Exception.Message)"
+        }
+        Write-MigrationLog -Message "$Label CSV ($($Rows.Count) row(s)): $Path" -Level SUCCESS
+    }
 
-    #region Pull number inventory and users ------------------------------------
+    $null = Connect-MigrationTeams -TenantId $TenantId
 
     Write-MigrationLog -Message 'Retrieving telephone number inventory...' -Level INFO
     $allNumbers = @(Get-MigrationPhoneNumberInventory)
@@ -272,10 +185,6 @@ try {
 
     $withNumber = @($users | Where-Object { -not [string]::IsNullOrWhiteSpace($_.LineUri) }).Count
     Write-MigrationLog -Message "Users to export: $($users.Count) ($withNumber with a phone number, $($users.Count - $withNumber) without)" -Level INFO
-
-    #endregion -----------------------------------------------------------------
-
-    #region Build the export ---------------------------------------------------
 
     # $exportRows carries the round-trip columns exactly as the Set-/Remove- scripts read
     # them; $results is the toolkit's standard summary of the same pass.
@@ -346,24 +255,11 @@ try {
 
     Write-Progress -Activity 'Exporting Teams phone assignments' -Completed
 
-    #endregion -----------------------------------------------------------------
-
-    #region Write the files ----------------------------------------------------
-
     if ($exportRows.Count -eq 0) {
         Write-MigrationLog -Message 'No users matched - nothing to export.' -Level WARNING
     }
-    elseif ($isDryRun) {
-        Write-MigrationLog -Message "[DRYRUN] Would write $($exportRows.Count) assignment row(s) to $assignmentsCsv" -Level WARNING
-    }
     else {
-        try {
-            $exportRows | Export-Csv -LiteralPath $assignmentsCsv -NoTypeInformation -Encoding utf8 -ErrorAction Stop
-        }
-        catch {
-            throw "Could not write the assignments CSV '$assignmentsCsv': $($_.Exception.Message)"
-        }
-        Write-MigrationLog -Message "Assignments CSV ($($exportRows.Count) row(s)): $assignmentsCsv" -Level SUCCESS
+        & $writeCsv $exportRows.ToArray() $assignmentsCsv 'Assignments'
     }
 
     if ($IncludeUnassignedNumbers) {
@@ -371,34 +267,20 @@ try {
         Write-MigrationLog -Message "Unassigned numbers in inventory: $($unassigned.Count)" -Level INFO
 
         if ($unassigned.Count -gt 0) {
-            $unassignedReport = $unassigned | ForEach-Object {
-                [pscustomobject][ordered]@{
-                    PhoneNumber        = $_.TelephoneNumber
-                    PhoneNumberType    = [string]$_.NumberType
-                    AssignmentCategory = [string]$_.AssignmentCategory
-                    Capability         = ($_.Capability -join ';')
-                    IsoCountryCode     = $_.IsoCountryCode
-                    LocationId         = [string]$_.LocationId
-                    ActivationState    = [string]$_.ActivationState
-                }
-            }
-
-            if ($isDryRun) {
-                Write-MigrationLog -Message "[DRYRUN] Would write $($unassigned.Count) unassigned number(s) to $unassignedCsv" -Level WARNING
-            }
-            else {
-                try {
-                    $unassignedReport | Export-Csv -LiteralPath $unassignedCsv -NoTypeInformation -Encoding utf8 -ErrorAction Stop
-                }
-                catch {
-                    throw "Could not write the unassigned-numbers CSV '$unassignedCsv': $($_.Exception.Message)"
-                }
-                Write-MigrationLog -Message "Unassigned numbers CSV: $unassignedCsv" -Level SUCCESS
-            }
+            $unassignedReport = @($unassigned | ForEach-Object {
+                    [pscustomobject][ordered]@{
+                        PhoneNumber        = $_.TelephoneNumber
+                        PhoneNumberType    = [string]$_.NumberType
+                        AssignmentCategory = [string]$_.AssignmentCategory
+                        Capability         = ($_.Capability -join ';')
+                        IsoCountryCode     = $_.IsoCountryCode
+                        LocationId         = [string]$_.LocationId
+                        ActivationState    = [string]$_.ActivationState
+                    }
+                })
+            & $writeCsv $unassignedReport $unassignedCsv 'Unassigned numbers'
         }
     }
-
-    #endregion -----------------------------------------------------------------
 
     $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Get-TeamsPhoneAssignments'
 }

@@ -241,22 +241,6 @@ Describe 'New-MigrationUsers - ConvertTo-FailureDetail' {
     }
 }
 
-Describe 'New-MigrationUsers - Get-GraphPropertyValue' {
-
-    It 'Reads a property from a Graph PSObject' {
-        Get-GraphPropertyValue -InputObject ([pscustomobject]@{ id = 'abc' }) -Name 'id' | Should -BeExactly 'abc'
-    }
-
-    It 'Reads a key from a hashtable response' {
-        Get-GraphPropertyValue -InputObject @{ id = 'abc' } -Name 'id' | Should -BeExactly 'abc'
-    }
-
-    It 'Returns an empty string for a missing property rather than throwing under strict mode' {
-        Get-GraphPropertyValue -InputObject ([pscustomobject]@{ id = 'abc' }) -Name 'mail' | Should -BeExactly ''
-        Get-GraphPropertyValue -InputObject $null -Name 'id' | Should -BeExactly ''
-    }
-}
-
 Describe 'New-MigrationUsers - Invoke-LicenseAssignment' {
 
     BeforeAll {

@@ -14,14 +14,12 @@
 
       1. usageLocation first. assignLicense fails outright when a user has no usage location, and
          the failure surfaces in the admin center as a vague "invalid usage location" issue rather
-         than at the point of assignment. The script PATCHes usageLocation (plan value, else
-         -DefaultUsageLocation) before it ever posts a licence change.
-      2. Group-assigned SKUs are refused. licenseAssignmentStates tells you which SKUs arrived
-         through group-based licensing (assignedByGroup is non-null). assignLicense cannot remove
-         those - the user has to leave the group instead - and re-adding one directly quietly
-         doubles up the assignment. Both directions are skipped and reported.
-      3. Seats are counted before anything is assigned. The script totals the new assignments per
-         SKU, compares them with the seats the tenant actually has spare, prints a table, and stops
+         than at the point of assignment.
+      2. Group-assigned SKUs are refused. assignLicense cannot remove what group-based licensing
+         handed out - the user has to leave the group - and re-adding one directly quietly doubles
+         up the assignment. Both directions are skipped and reported.
+      3. Seats are counted before anything is assigned: the run's new assignments are totalled per
+         SKU, compared with the seats the tenant has spare, printed as a table, and the run stops
          before the first write unless -Force says to press on and let individual rows fail.
       4. Only then does the per-row loop run.
 
@@ -38,13 +36,13 @@
 
 .PARAMETER SkuMapPath
     Optional SkuMap.csv. When supplied the desired SKUs are recomputed from SourceLicenses through
-    the map instead of being read from TargetLicenses, which lets an operator correct the mapping
-    after the plan was generated without regenerating the plan. Source SKUs the map does not mention
-    are carried through unchanged and named in the row Detail.
+    the map instead of read from TargetLicenses, which lets an operator correct the mapping after
+    the plan was generated. Source SKUs the map does not mention are carried through unchanged and
+    named in the row Detail.
 
 .PARAMETER RemoveUnplanned
-    Also remove directly assigned SKUs that the plan does not ask for. Group-inherited SKUs are
-    never removed - they are reported instead.
+    Also remove directly assigned SKUs the plan does not ask for. Group-inherited SKUs are never
+    removed - they are reported instead.
 
 .PARAMETER DefaultUsageLocation
     Two-letter ISO country code used when a plan row has no UsageLocation and the destination user
@@ -76,8 +74,7 @@
     Read, calculate and report without assigning anything. Results are written with Status 'Planned'.
 
 .PARAMETER Verbosity
-    Console detail: Low (errors and successes), Medium (default, adds warnings) or High (everything).
-    The log file always receives every line.
+    Console detail: Low, Medium (default) or High. The log file always receives every line.
 
 .EXAMPLE
     .\Set-MigrationLicenses.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -DryRun -Prefix Fabrikam
@@ -166,16 +163,7 @@ $ErrorActionPreference = 'Stop'
 #region Configuration
 
 # Declared here rather than inline so a reviewer can see the blast radius of the script in one place.
-$requiredGraphScopes = @(
-    'User.ReadWrite.All'
-    'Organization.Read.All'
-    'Directory.Read.All'
-)
-
-# Writers act only on rows the planner marked safe. Collision rows are opt-in because the planned
-# address is, by definition, still contested.
-$eligiblePlanStatus = @('Planned', 'ManualOverride', 'UpnSmtpDiverge')
-if ($IncludeCollisions) { $eligiblePlanStatus += 'Collision' }
+$requiredGraphScopes = @('User.ReadWrite.All', 'Organization.Read.All', 'Directory.Read.All')
 
 # Graph rejects very long $filter strings, so identifiers are looked up in chunks rather than one
 # request per plan row.
@@ -185,64 +173,68 @@ $userLookupBatchSize = 15
 
 #region Functions
 
-function Get-PropertyValue {
+function New-LicenseResult {
     <#
     .SYNOPSIS
-        Reads a property from an arbitrary object without tripping Set-StrictMode.
-
-    .DESCRIPTION
-        Graph responses omit properties that have no value, and strict mode makes a blind read of a
-        missing property fatal. Get-MigrationCsvValue solves the same problem for plan rows but
-        stringifies its result, which destroys arrays such as licenseAssignmentStates - so complex
-        Graph values are read through this instead.
-
-    .PARAMETER InputObject
-        The object to read from. $null is tolerated and yields the default.
-
-    .PARAMETER Name
-        The property name.
-
-    .PARAMETER Default
-        Returned when the object is null, the property is absent, or its value is null.
+        Builds one result row in the toolkit's fixed column order.
+    .PARAMETER Row
+        The plan row the result is about; its target, interim or source UPN becomes the identity.
+    .PARAMETER Status
+        Planned, Succeeded, Skipped or Failed.
+    .PARAMETER Detail
+        Human-readable explanation.
+    .PARAMETER TargetObjectId
+        The destination object id, when one is already known.
+    .EXAMPLE
+        New-LicenseResult -Row $planRow -Status Skipped -Detail $gate.Reason
     #>
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Builds an in-memory result object for the results CSV; it changes no state.')]
+    [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)][AllowNull()]$InputObject,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
-        $Default = $null
+        [Parameter(Mandatory)][AllowNull()]$Row,
+        [Parameter(Mandatory)][ValidateSet('Planned', 'Succeeded', 'Skipped', 'Failed')][string]$Status,
+        [AllowEmptyString()][string]$Detail = '',
+        [AllowEmptyString()][string]$TargetObjectId = ''
     )
 
-    if ($null -eq $InputObject) { return $Default }
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        if (-not $InputObject.Contains($Name)) { return $Default }
-        $raw = $InputObject[$Name]
-        if ($null -eq $raw) { return $Default }
-        return $raw
+    # However the plan spells this row's owner, best first.
+    $identity = ''
+    foreach ($column in @('TargetUserPrincipalName', 'InterimUserPrincipalName', 'SourceUserPrincipalName')) {
+        $identity = Get-MigrationCsvValue -Row $Row -Name $column -Default ''
+        if ($identity) { break }
     }
-    if (-not $InputObject.PSObject.Properties[$Name]) { return $Default }
 
-    $value = $InputObject.PSObject.Properties[$Name].Value
-    if ($null -eq $value) { return $Default }
-    return $value
+    [pscustomobject]@{
+        Identity       = if ($identity) { $identity } else { '(unknown)' }
+        Action         = 'AssignLicense'
+        Status         = $Status
+        Detail         = $Detail
+        TargetObjectId = $TargetObjectId
+        UsageLocation  = ''
+        Added          = ''
+        Removed        = ''
+        GroupAssigned  = ''
+        Unknown        = ''
+    }
 }
 
 function Get-DesiredSku {
     <#
     .SYNOPSIS
         Works out which SKU part numbers a plan row should end up with.
-
     .DESCRIPTION
-        Without a SKU map the answer is simply the plan's TargetLicenses column. With one, the
-        answer is recomputed from SourceLicenses so that a mapping corrected after planning takes
-        effect without regenerating the plan. A source SKU the map does not mention is carried
-        through unchanged and reported, because silently dropping a licence is worse than assigning
-        one the operator can revoke.
-
+        Without a SKU map the answer is the plan's TargetLicenses column. With one it is recomputed
+        from SourceLicenses, so a mapping corrected after planning takes effect without regenerating
+        the plan. An unmapped source SKU is carried through and reported: silently dropping a licence
+        is worse than assigning one the operator can revoke.
     .PARAMETER Row
         The identity plan row.
-
     .PARAMETER SkuMap
         Hashtable from Resolve-MigrationSkuMap, or $null to use TargetLicenses as written.
+    .EXAMPLE
+        Get-DesiredSku -Row $planRow -SkuMap $skuMap
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -258,51 +250,39 @@ function Get-DesiredSku {
         }
     }
 
-    $sourceSku = @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $Row -Name 'SourceLicenses' -Default ''))
     $resolved = [System.Collections.Generic.List[string]]::new()
     $unmapped = [System.Collections.Generic.List[string]]::new()
 
-    foreach ($sku in $sourceSku) {
-        if ($SkuMap.ContainsKey($sku)) {
-            foreach ($target in @($SkuMap[$sku])) {
-                if (-not $resolved.Contains($target)) { $resolved.Add($target) }
-            }
-            continue
+    foreach ($sku in @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $Row -Name 'SourceLicenses' -Default ''))) {
+        $targets = if ($SkuMap.ContainsKey($sku)) { @($SkuMap[$sku]) } else { $unmapped.Add($sku); @($sku) }
+        foreach ($target in $targets) {
+            if (-not $resolved.Contains($target)) { $resolved.Add($target) }
         }
-        $unmapped.Add($sku)
-        if (-not $resolved.Contains($sku)) { $resolved.Add($sku) }
     }
 
-    return [pscustomobject]@{
-        Sku      = $resolved.ToArray()
-        Unmapped = $unmapped.ToArray()
-    }
+    return [pscustomobject]@{ Sku = $resolved.ToArray(); Unmapped = $unmapped.ToArray() }
 }
 
 function Resolve-LicenseChange {
     <#
     .SYNOPSIS
         Turns a desired SKU list plus the user's current assignment states into add/remove sets.
-
     .DESCRIPTION
-        The whole point of this function is that it touches nothing. It takes plain objects, so the
-        rules that matter - group-inherited licences are neither added nor removed, unknown part
-        numbers never reach Graph, already-assigned SKUs are not re-sent - are all testable offline.
-
-        A SKU can appear twice in licenseAssignmentStates, once direct and once via a group. Direct
-        wins for the "already assigned" decision; the group entry still blocks removal.
-
+        This function touches nothing, so the rules that matter - group-inherited licences are
+        neither added nor removed, unknown part numbers never reach Graph, already-assigned SKUs are
+        not re-sent - are all testable offline. A SKU can appear twice in licenseAssignmentStates,
+        once direct and once via a group: direct wins the "already assigned" decision, and the group
+        entry still blocks removal.
     .PARAMETER DesiredSkuPartNumber
         The part numbers the plan wants the user to hold.
-
     .PARAMETER Catalog
         Output of Get-MigrationSkuCatalog (needs SkuId, SkuPartNumber, Available).
-
     .PARAMETER AssignmentState
         The user's licenseAssignmentStates array from Graph.
-
     .PARAMETER RemoveUnplanned
         Also compute removals for directly assigned SKUs the plan does not ask for.
+    .EXAMPLE
+        Resolve-LicenseChange -DesiredSkuPartNumber $desired.Sku -Catalog $catalog -AssignmentState $states
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -316,22 +296,19 @@ function Resolve-LicenseChange {
     $idByPart = @{}
     $partById = @{}
     foreach ($sku in @($Catalog)) {
-        $part = [string](Get-PropertyValue -InputObject $sku -Name 'SkuPartNumber' -Default '')
-        $id = [string](Get-PropertyValue -InputObject $sku -Name 'SkuId' -Default '')
-        if ($part -and $id) {
-            $idByPart[$part] = $id
-            $partById[$id] = $part
-        }
+        $part = [string](Get-MigrationProperty -InputObject $sku -Name 'SkuPartNumber' -Default '')
+        $id = [string](Get-MigrationProperty -InputObject $sku -Name 'SkuId' -Default '')
+        if ($part -and $id) { $idByPart[$part] = $id; $partById[$id] = $part }
     }
 
     $directId = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $groupId = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $desiredId = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($state in @($AssignmentState)) {
-        $skuId = [string](Get-PropertyValue -InputObject $state -Name 'skuId' -Default '')
+        $skuId = [string](Get-MigrationProperty -InputObject $state -Name 'skuId' -Default '')
         if (-not $skuId) { continue }
-        $byGroup = [string](Get-PropertyValue -InputObject $state -Name 'assignedByGroup' -Default '')
-        if ([string]::IsNullOrWhiteSpace($byGroup)) { [void]$directId.Add($skuId) }
-        else { [void]$groupId.Add($skuId) }
+        $byGroup = [string](Get-MigrationProperty -InputObject $state -Name 'assignedByGroup' -Default '')
+        if ([string]::IsNullOrWhiteSpace($byGroup)) { [void]$directId.Add($skuId) } else { [void]$groupId.Add($skuId) }
     }
 
     $addId = [System.Collections.Generic.List[string]]::new()
@@ -339,59 +316,48 @@ function Resolve-LicenseChange {
     $alreadyPart = [System.Collections.Generic.List[string]]::new()
     $groupPart = [System.Collections.Generic.List[string]]::new()
     $unknownPart = [System.Collections.Generic.List[string]]::new()
-    $desiredId = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $addOnce = {
+        param([System.Collections.Generic.List[string]]$List, [string]$Value)
+        if (-not $List.Contains($Value)) { $List.Add($Value) }
+    }
 
     foreach ($part in @($DesiredSkuPartNumber)) {
         if ([string]::IsNullOrWhiteSpace($part)) { continue }
-        if (-not $idByPart.ContainsKey($part)) {
-            if (-not $unknownPart.Contains($part)) { $unknownPart.Add($part) }
-            continue
-        }
+        if (-not $idByPart.ContainsKey($part)) { & $addOnce $unknownPart $part; continue }
 
         $skuId = $idByPart[$part]
         [void]$desiredId.Add($skuId)
 
-        if ($directId.Contains($skuId)) {
-            if (-not $alreadyPart.Contains($part)) { $alreadyPart.Add($part) }
-            continue
-        }
-        if ($groupId.Contains($skuId)) {
-            # Adding it directly on top of the group assignment double-books a seat.
-            if (-not $groupPart.Contains($part)) { $groupPart.Add($part) }
-            continue
-        }
-        if (-not $addId.Contains($skuId)) {
-            $addId.Add($skuId)
-            $addPart.Add($part)
-        }
+        if ($directId.Contains($skuId)) { & $addOnce $alreadyPart $part; continue }
+        # Adding it directly on top of the group assignment double-books a seat.
+        if ($groupId.Contains($skuId)) { & $addOnce $groupPart $part; continue }
+        if (-not $addId.Contains($skuId)) { $addId.Add($skuId); $addPart.Add($part) }
     }
 
     $removeId = [System.Collections.Generic.List[string]]::new()
     $removePart = [System.Collections.Generic.List[string]]::new()
+    $partOf = { param([string]$SkuId) if ($partById.ContainsKey($SkuId)) { $partById[$SkuId] } else { $SkuId } }
 
     if ($RemoveUnplanned) {
         foreach ($skuId in $directId) {
             if ($desiredId.Contains($skuId)) { continue }
             $removeId.Add($skuId)
-            $part = if ($partById.ContainsKey($skuId)) { $partById[$skuId] } else { $skuId }
-            $removePart.Add($part)
+            $removePart.Add((& $partOf $skuId))
         }
         foreach ($skuId in $groupId) {
-            if ($desiredId.Contains($skuId)) { continue }
             # assignLicense cannot take back what a group handed out; say so instead of failing.
-            $part = if ($partById.ContainsKey($skuId)) { $partById[$skuId] } else { $skuId }
-            if (-not $groupPart.Contains($part)) { $groupPart.Add($part) }
+            if (-not $desiredId.Contains($skuId)) { & $addOnce $groupPart (& $partOf $skuId) }
         }
     }
 
     return [pscustomobject]@{
-        AddSkuId          = $addId.ToArray()
-        AddSkuPartNumber  = $addPart.ToArray()
-        RemoveSkuId       = $removeId.ToArray()
+        AddSkuId            = $addId.ToArray()
+        AddSkuPartNumber    = $addPart.ToArray()
+        RemoveSkuId         = $removeId.ToArray()
         RemoveSkuPartNumber = $removePart.ToArray()
-        AlreadyAssigned   = $alreadyPart.ToArray()
-        GroupAssigned     = $groupPart.ToArray()
-        UnknownSku        = $unknownPart.ToArray()
+        AlreadyAssigned     = $alreadyPart.ToArray()
+        GroupAssigned       = $groupPart.ToArray()
+        UnknownSku          = $unknownPart.ToArray()
     }
 }
 
@@ -399,18 +365,17 @@ function Measure-LicenseSeat {
     <#
     .SYNOPSIS
         Totals the seats the run will consume per SKU and compares them with what the tenant has.
-
     .DESCRIPTION
-        Only new assignments consume a seat, so the arithmetic runs over the resolved add sets
-        rather than over the plan's TargetLicenses - a user who already holds the SKU costs nothing.
-        Unknown part numbers are reported with a Status of 'Unknown' so the operator sees a bad SKU
-        map before the first assignment rather than as a wall of per-row failures.
-
+        Only new assignments consume a seat, so the arithmetic runs over the resolved add sets, not
+        the plan's TargetLicenses - a user who already holds the SKU costs nothing. Unknown part
+        numbers get Status 'Unknown', so a bad SKU map shows up before the first assignment rather
+        than as a wall of per-row failures.
     .PARAMETER Change
         The Resolve-LicenseChange results for every row that will be processed.
-
     .PARAMETER Catalog
         Output of Get-MigrationSkuCatalog.
+    .EXAMPLE
+        Measure-LicenseSeat -Change $changes -Catalog $catalog
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -421,48 +386,35 @@ function Measure-LicenseSeat {
 
     $needed = [ordered]@{}
     foreach ($item in @($Change)) {
-        foreach ($part in @(Get-PropertyValue -InputObject $item -Name 'AddSkuPartNumber' -Default @())) {
-            if (-not $needed.Contains($part)) { $needed[$part] = 0 }
-            $needed[$part] = [int]$needed[$part] + 1
-        }
-        foreach ($part in @(Get-PropertyValue -InputObject $item -Name 'UnknownSku' -Default @())) {
-            if (-not $needed.Contains($part)) { $needed[$part] = 0 }
-            $needed[$part] = [int]$needed[$part] + 1
+        foreach ($name in @('AddSkuPartNumber', 'UnknownSku')) {
+            foreach ($part in @(Get-MigrationProperty -InputObject $item -Name $name -Default @())) {
+                if (-not $needed.Contains($part)) { $needed[$part] = 0 }
+                $needed[$part] = [int]$needed[$part] + 1
+            }
         }
     }
 
     $catalogByPart = @{}
     foreach ($sku in @($Catalog)) {
-        $part = [string](Get-PropertyValue -InputObject $sku -Name 'SkuPartNumber' -Default '')
+        $part = [string](Get-MigrationProperty -InputObject $sku -Name 'SkuPartNumber' -Default '')
         if ($part) { $catalogByPart[$part] = $sku }
     }
 
     $rows = [System.Collections.Generic.List[object]]::new()
     foreach ($part in $needed.Keys) {
         $count = [int]$needed[$part]
-        if (-not $catalogByPart.ContainsKey($part)) {
-            $rows.Add([pscustomobject]@{
-                SkuPartNumber = $part
-                SkuId         = ''
-                Needed        = $count
-                Available     = 0
-                Shortfall     = $count
-                Status        = 'Unknown'
-            })
-            continue
-        }
-
-        $sku = $catalogByPart[$part]
-        $available = [int](Get-PropertyValue -InputObject $sku -Name 'Available' -Default 0)
+        $known = $catalogByPart.ContainsKey($part)
+        $available = if ($known) { [int](Get-MigrationProperty -InputObject $catalogByPart[$part] -Name 'Available' -Default 0) } else { 0 }
         $shortfall = [Math]::Max(0, $count - $available)
+
         $rows.Add([pscustomobject]@{
-            SkuPartNumber = $part
-            SkuId         = [string](Get-PropertyValue -InputObject $sku -Name 'SkuId' -Default '')
-            Needed        = $count
-            Available     = $available
-            Shortfall     = $shortfall
-            Status        = if ($shortfall -gt 0) { 'Shortfall' } else { 'Sufficient' }
-        })
+                SkuPartNumber = $part
+                SkuId         = if ($known) { [string](Get-MigrationProperty -InputObject $catalogByPart[$part] -Name 'SkuId' -Default '') } else { '' }
+                Needed        = $count
+                Available     = $available
+                Shortfall     = $shortfall
+                Status        = if (-not $known) { 'Unknown' } elseif ($shortfall -gt 0) { 'Shortfall' } else { 'Sufficient' }
+            })
     }
 
     return $rows.ToArray()
@@ -472,31 +424,26 @@ function Write-SeatTable {
     <#
     .SYNOPSIS
         Prints the seat pre-check as a fixed-width table through the toolkit logger.
-
     .PARAMETER Seat
         Rows from Measure-LicenseSeat.
+    .EXAMPLE
+        Write-SeatTable -Seat $seat
     #>
     [CmdletBinding()]
     [OutputType([void])]
-    param(
-        [AllowNull()][AllowEmptyCollection()][object[]]$Seat
-    )
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Seat)
 
+    $format = '  {0,-28} {1,7} {2,9} {3,9}  {4}'
     Write-MigrationLog -Message '--- Licence seat pre-check ---' -Level SUCCESS
     if (@($Seat).Count -eq 0) {
         Write-MigrationLog -Message '  (no new assignments required)' -Level SUCCESS
         return
     }
 
-    Write-MigrationLog -Message ('  {0,-28} {1,7} {2,9} {3,9}  {4}' -f
-        'SkuPartNumber', 'Needed', 'Available', 'Shortfall', 'Status') -Level SUCCESS
+    Write-MigrationLog -Message ($format -f 'SkuPartNumber', 'Needed', 'Available', 'Shortfall', 'Status') -Level SUCCESS
     foreach ($row in @($Seat) | Sort-Object -Property SkuPartNumber) {
-        $level = switch ($row.Status) {
-            'Sufficient' { 'SUCCESS' }
-            default      { 'ERROR' }
-        }
-        Write-MigrationLog -Message ('  {0,-28} {1,7} {2,9} {3,9}  {4}' -f
-            $row.SkuPartNumber, $row.Needed, $row.Available, $row.Shortfall, $row.Status) -Level $level
+        Write-MigrationLog -Level $(if ($row.Status -eq 'Sufficient') { 'SUCCESS' } else { 'ERROR' }) `
+            -Message ($format -f $row.SkuPartNumber, $row.Needed, $row.Available, $row.Shortfall, $row.Status)
     }
 }
 
@@ -504,21 +451,19 @@ function Get-DestinationUserMap {
     <#
     .SYNOPSIS
         Reads the destination users a plan refers to, in batches rather than one call per row.
-
     .DESCRIPTION
-        A wave of several hundred rows becomes a handful of Graph calls: the identifiers are turned
-        into OData equality clauses and sent -BatchSize at a time. Results are indexed both by object
-        id and by lower-cased UPN so callers can match a row however the plan identifies it.
-
+        A wave of several hundred rows becomes a handful of Graph calls: the identifiers become OData
+        equality clauses, sent -BatchSize at a time. Results are indexed by object id and by
+        lower-cased UPN, so a row matches however the plan identifies it.
     .PARAMETER UserPrincipalName
         UPNs to look up.
-
     .PARAMETER ObjectId
         Directory object ids to look up.
-
     .PARAMETER BatchSize
         Equality clauses per request. Graph tolerates far more, but short filters keep the URL well
         inside proxy limits and make a failure easy to attribute.
+    .EXAMPLE
+        Get-DestinationUserMap -UserPrincipalName $upns -ObjectId $ids -BatchSize 15
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -530,16 +475,12 @@ function Get-DestinationUserMap {
 
     $clause = [System.Collections.Generic.List[string]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-
-    foreach ($id in @($ObjectId)) {
-        if ([string]::IsNullOrWhiteSpace($id)) { continue }
-        $text = "id eq '$(ConvertTo-MigrationODataString -Value $id)'"
-        if ($seen.Add($text)) { $clause.Add($text) }
-    }
-    foreach ($upn in @($UserPrincipalName)) {
-        if ([string]::IsNullOrWhiteSpace($upn)) { continue }
-        $text = "userPrincipalName eq '$(ConvertTo-MigrationODataString -Value $upn)'"
-        if ($seen.Add($text)) { $clause.Add($text) }
+    foreach ($pair in @(@{ Property = 'id'; Value = $ObjectId }, @{ Property = 'userPrincipalName'; Value = $UserPrincipalName })) {
+        foreach ($value in @($pair.Value)) {
+            if ([string]::IsNullOrWhiteSpace($value)) { continue }
+            $text = "$($pair.Property) eq '$(ConvertTo-MigrationODataString -Value $value)'"
+            if ($seen.Add($text)) { $clause.Add($text) }
+        }
     }
 
     $byId = @{}
@@ -550,25 +491,20 @@ function Get-DestinationUserMap {
     for ($offset = 0; $offset -lt $clause.Count; $offset += $BatchSize) {
         $take = [Math]::Min($BatchSize, $clause.Count - $offset)
         $filter = [uri]::EscapeDataString(($clause.GetRange($offset, $take) -join ' or '))
-        $uri = "/v1.0/users?`$select=$select&`$filter=$filter&`$top=999"
 
-        try {
-            $found = @(Invoke-MigrationGraphRequest -Method GET -Uri $uri -All)
-        }
-        catch {
-            throw "Could not read destination users from Graph: $($_.Exception.Message)"
-        }
+        try { $found = @(Invoke-MigrationGraphRequest -Method GET -All -Uri "/v1.0/users?`$select=$select&`$filter=$filter&`$top=999") }
+        catch { throw "Could not read destination users from Graph: $($_.Exception.Message)" }
 
         foreach ($user in $found) {
-            $id = [string](Get-PropertyValue -InputObject $user -Name 'id' -Default '')
+            $id = [string](Get-MigrationProperty -InputObject $user -Name 'id' -Default '')
             if ($id) { $byId[$id] = $user }
-            $upn = [string](Get-PropertyValue -InputObject $user -Name 'userPrincipalName' -Default '')
+            $upn = [string](Get-MigrationProperty -InputObject $user -Name 'userPrincipalName' -Default '')
             if ($upn) { $byUpn[$upn.ToLowerInvariant()] = $user }
         }
     }
 
-    $callCount = [Math]::Ceiling($clause.Count / $BatchSize)
-    Write-MigrationLog -Message "Resolved $($byId.Count) destination user(s) in $callCount Graph call(s)." -Level INFO
+    Write-MigrationLog -Level INFO -Message (
+        "Resolved $($byId.Count) destination user(s) in $([Math]::Ceiling($clause.Count / $BatchSize)) Graph call(s).")
     return @{ ById = $byId; ByUpn = $byUpn }
 }
 
@@ -576,34 +512,27 @@ function Set-PlanRowLicense {
     <#
     .SYNOPSIS
         Applies one plan row's licence change and returns the result row for the CSV.
-
     .DESCRIPTION
-        The whole per-row decision lives here so it can be exercised offline with a fake user
-        object and a mocked Invoke-MigrationGraphRequest. usageLocation is PATCHed before the
-        assignLicense POST, unconditionally and in that order, because Microsoft 365 rejects the
-        assignment otherwise.
-
+        The whole per-row decision lives here so it can be exercised offline with a fake user and a
+        mocked Invoke-MigrationGraphRequest. usageLocation is PATCHed before the assignLicense POST,
+        in that order, because Microsoft 365 rejects the assignment otherwise.
     .PARAMETER Row
         The identity plan row.
-
     .PARAMETER User
         The Graph user object from Get-DestinationUserMap, or $null when the user was not found.
-
     .PARAMETER Catalog
         Output of Get-MigrationSkuCatalog.
-
     .PARAMETER SkuMap
         Optional hashtable from Resolve-MigrationSkuMap.
-
     .PARAMETER DefaultUsageLocation
         Fallback two-letter country code.
-
     .PARAMETER RemoveUnplanned
         Remove directly assigned SKUs the plan does not ask for.
-
     .PARAMETER DryRun
         Report the change as 'Planned' instead of performing it. Invoke-MigrationAction independently
         suppresses the mutation from the run context; this switch only chooses the reported Status.
+    .EXAMPLE
+        Set-PlanRowLicense -Row $planRow -User $user -Catalog $catalog -DefaultUsageLocation US
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -617,35 +546,20 @@ function Set-PlanRowLicense {
         [switch]$DryRun
     )
 
-    $identity = Get-MigrationCsvValue -Row $Row -Name 'TargetUserPrincipalName' -Default ''
-    if (-not $identity) { $identity = Get-MigrationCsvValue -Row $Row -Name 'InterimUserPrincipalName' -Default '' }
-    if (-not $identity) { $identity = Get-MigrationCsvValue -Row $Row -Name 'SourceUserPrincipalName' -Default '(unknown)' }
-
-    $result = [pscustomobject]@{
-        Identity       = $identity
-        Action         = 'AssignLicense'
-        Status         = 'Failed'
-        Detail         = ''
-        TargetObjectId = ''
-        UsageLocation  = ''
-        Added          = ''
-        Removed        = ''
-        GroupAssigned  = ''
-        Unknown        = ''
-    }
+    $result = New-LicenseResult -Row $Row -Status 'Failed'
+    $identity = $result.Identity
 
     if ($null -eq $User) {
-        $result.Status = 'Failed'
         $result.Detail = 'No destination user matched this row - run New-MigrationUsers first.'
         return $result
     }
 
-    $userId = [string](Get-PropertyValue -InputObject $User -Name 'id' -Default '')
+    $userId = [string](Get-MigrationProperty -InputObject $User -Name 'id' -Default '')
     $result.TargetObjectId = $userId
 
     $desired = Get-DesiredSku -Row $Row -SkuMap $SkuMap
     $change = Resolve-LicenseChange -DesiredSkuPartNumber $desired.Sku -Catalog $Catalog `
-        -AssignmentState @(Get-PropertyValue -InputObject $User -Name 'licenseAssignmentStates' -Default @()) `
+        -AssignmentState @(Get-MigrationProperty -InputObject $User -Name 'licenseAssignmentStates' -Default @()) `
         -RemoveUnplanned:$RemoveUnplanned
 
     $result.Added = Join-MigrationList -Values $change.AddSkuPartNumber
@@ -654,33 +568,24 @@ function Set-PlanRowLicense {
     $result.Unknown = Join-MigrationList -Values $change.UnknownSku
 
     $note = [System.Collections.Generic.List[string]]::new()
-    if (@($desired.Unmapped).Count -gt 0) {
-        $note.Add("source SKU not in map, carried through: $(Join-MigrationList -Values $desired.Unmapped)")
-    }
-    if (@($change.UnknownSku).Count -gt 0) {
-        $note.Add("not a SKU in this tenant: $(Join-MigrationList -Values $change.UnknownSku)")
-    }
-    if (@($change.GroupAssigned).Count -gt 0) {
-        $note.Add("group-assigned, left alone: $(Join-MigrationList -Values $change.GroupAssigned)")
-    }
-    if (@($change.AlreadyAssigned).Count -gt 0) {
-        $note.Add("already assigned: $(Join-MigrationList -Values $change.AlreadyAssigned)")
+    foreach ($item in @(
+            @{ Values = $desired.Unmapped; Text = 'source SKU not in map, carried through' }
+            @{ Values = $change.UnknownSku; Text = 'not a SKU in this tenant' }
+            @{ Values = $change.GroupAssigned; Text = 'group-assigned, left alone' }
+            @{ Values = $change.AlreadyAssigned; Text = 'already assigned' })) {
+        if (@($item.Values).Count -gt 0) { $note.Add("$($item.Text): $(Join-MigrationList -Values $item.Values)") }
     }
 
     # usageLocation has to be in place before assignLicense, so it is resolved before anything is sent.
-    $currentLocation = [string](Get-PropertyValue -InputObject $User -Name 'usageLocation' -Default '')
+    $currentLocation = [string](Get-MigrationProperty -InputObject $User -Name 'usageLocation' -Default '')
     $plannedLocation = Get-MigrationCsvValue -Row $Row -Name 'UsageLocation' -Default ''
     $wantedLocation = if ($plannedLocation) { $plannedLocation } elseif ($DefaultUsageLocation) { $DefaultUsageLocation } else { '' }
-    $locationToSet = ''
-    if (-not $currentLocation -or ($wantedLocation -and $wantedLocation -ne $currentLocation)) {
-        $locationToSet = $wantedLocation
-    }
+    $locationToSet = if (-not $currentLocation -or ($wantedLocation -and $wantedLocation -ne $currentLocation)) { $wantedLocation } else { '' }
     $result.UsageLocation = if ($locationToSet) { $locationToSet } else { $currentLocation }
 
     $needsAssign = (@($change.AddSkuId).Count -gt 0) -or (@($change.RemoveSkuId).Count -gt 0)
 
     if (-not $currentLocation -and -not $locationToSet -and $needsAssign) {
-        $result.Status = 'Failed'
         $result.Detail = 'No usage location on the user or in the plan; supply -DefaultUsageLocation.'
         return $result
     }
@@ -688,30 +593,25 @@ function Set-PlanRowLicense {
     if (-not $needsAssign -and -not $locationToSet) {
         $result.Status = 'Skipped'
         $result.Detail = if ($note.Count -gt 0) { "Nothing to do - $($note -join '; ')" }
-            else { 'Nothing to do - licences already match the plan.' }
+        else { 'Nothing to do - licences already match the plan.' }
         return $result
     }
 
     try {
-        if ($locationToSet) {
-            $description = "Set usageLocation '$locationToSet' on $identity"
-            if ($PSCmdlet.ShouldProcess($identity, "Set usageLocation to '$locationToSet'")) {
-                $locationBody = @{ usageLocation = $locationToSet }
-                Invoke-MigrationAction -Description $description -Action {
-                    $null = Invoke-MigrationGraphRequest -Method PATCH -Uri "/v1.0/users/$userId" -Body $locationBody
-                }
+        if ($locationToSet -and $PSCmdlet.ShouldProcess($identity, "Set usageLocation to '$locationToSet'")) {
+            $locationBody = @{ usageLocation = $locationToSet }
+            Invoke-MigrationAction -Description "Set usageLocation '$locationToSet' on $identity" -Action {
+                $null = Invoke-MigrationGraphRequest -Method PATCH -Uri "/v1.0/users/$userId" -Body $locationBody
             }
         }
 
         if ($needsAssign) {
-            $addPayload = @(foreach ($skuId in @($change.AddSkuId)) { @{ skuId = $skuId; disabledPlans = @() } })
             $assignBody = @{
-                addLicenses    = @($addPayload)
+                addLicenses    = @(foreach ($skuId in @($change.AddSkuId)) { @{ skuId = $skuId; disabledPlans = @() } })
                 removeLicenses = @($change.RemoveSkuId)
             }
-            $addText = Join-MigrationList -Values $change.AddSkuPartNumber
-            $removeText = Join-MigrationList -Values $change.RemoveSkuPartNumber
-            $summary = "add [$addText] remove [$removeText]"
+            $summary = "add [$(Join-MigrationList -Values $change.AddSkuPartNumber)] " +
+                "remove [$(Join-MigrationList -Values $change.RemoveSkuPartNumber)]"
             if ($PSCmdlet.ShouldProcess($identity, "Assign licences: $summary")) {
                 Invoke-MigrationAction -Description "Assign licences for $identity ($summary)" -Action {
                     $null = Invoke-MigrationGraphRequest -Method POST -Uri "/v1.0/users/$userId/assignLicense" -Body $assignBody
@@ -720,19 +620,17 @@ function Set-PlanRowLicense {
         }
     }
     catch {
-        $result.Status = 'Failed'
         $result.Detail = $_.Exception.Message
         return $result
     }
 
-    $result.Status = if ($DryRun) { 'Planned' } else { 'Succeeded' }
     $summaryParts = [System.Collections.Generic.List[string]]::new()
     if ($locationToSet) { $summaryParts.Add("usageLocation=$locationToSet") }
     if (@($change.AddSkuPartNumber).Count -gt 0) { $summaryParts.Add("added $(Join-MigrationList -Values $change.AddSkuPartNumber)") }
-    if (@($change.RemoveSkuPartNumber).Count -gt 0) {
-        $summaryParts.Add("removed $(Join-MigrationList -Values $change.RemoveSkuPartNumber)")
-    }
+    if (@($change.RemoveSkuPartNumber).Count -gt 0) { $summaryParts.Add("removed $(Join-MigrationList -Values $change.RemoveSkuPartNumber)") }
     foreach ($item in $note) { $summaryParts.Add($item) }
+
+    $result.Status = if ($DryRun) { 'Planned' } else { 'Succeeded' }
     $result.Detail = ($summaryParts -join '; ')
     return $result
 }
@@ -758,29 +656,21 @@ try {
         Write-MigrationLog -Message 'Target SKUs will be recomputed from SourceLicenses through the supplied map.' -Level WARNING
     }
 
+    # A row's UPN, however the plan spells it: the id is preferred when the row has been provisioned.
+    $rowUpn = {
+        param($Row)
+        $upn = Get-MigrationCsvValue -Row $Row -Name 'TargetUserPrincipalName' -Default ''
+        if (-not $upn) { $upn = Get-MigrationCsvValue -Row $Row -Name 'InterimUserPrincipalName' -Default '' }
+        return [string]$upn
+    }
+
     $eligible = [System.Collections.Generic.List[object]]::new()
     foreach ($row in $planRows) {
-        $status = Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default ''
-        $identity = Get-MigrationCsvValue -Row $row -Name 'TargetUserPrincipalName' -Default ''
-        if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'InterimUserPrincipalName' -Default '' }
-        if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default '(unknown)' }
-
-        if ($eligiblePlanStatus -notcontains $status) {
-            $results.Add([pscustomobject]@{
-                Identity       = $identity
-                Action         = 'AssignLicense'
-                Status         = 'Skipped'
-                Detail         = "PlanStatus is '$status'."
-                TargetObjectId = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
-                UsageLocation  = ''
-                Added          = ''
-                Removed        = ''
-                GroupAssigned  = ''
-                Unknown        = ''
-            })
-            continue
-        }
-        $eligible.Add($row)
+        # -AllowSynced: a licence is a cloud-only attribute, so directory sync does not block it.
+        $gate = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions -AllowSynced
+        if ($gate.Actionable) { $eligible.Add($row); continue }
+        $results.Add((New-LicenseResult -Row $row -Status $gate.Status -Detail $gate.Reason `
+                    -TargetObjectId (Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default '')))
     }
 
     Write-MigrationLog -Message "$($eligible.Count) of $($planRows.Count) plan row(s) are eligible for licensing." -Level INFO
@@ -797,10 +687,8 @@ try {
         $idList = [System.Collections.Generic.List[string]]::new()
         foreach ($row in $eligible) {
             $objectId = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
-            if ($objectId) { $idList.Add($objectId); continue }
-            $upn = Get-MigrationCsvValue -Row $row -Name 'TargetUserPrincipalName' -Default ''
-            if (-not $upn) { $upn = Get-MigrationCsvValue -Row $row -Name 'InterimUserPrincipalName' -Default '' }
-            if ($upn) { $upnList.Add($upn) }
+            if ($objectId) { $idList.Add($objectId) }
+            elseif ((& $rowUpn $row)) { $upnList.Add((& $rowUpn $row)) }
         }
 
         $userMap = Get-DestinationUserMap -UserPrincipalName $upnList.ToArray() -ObjectId $idList.ToArray() `
@@ -810,8 +698,7 @@ try {
         $work = [System.Collections.Generic.List[object]]::new()
         foreach ($row in $eligible) {
             $objectId = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
-            $upn = Get-MigrationCsvValue -Row $row -Name 'TargetUserPrincipalName' -Default ''
-            if (-not $upn) { $upn = Get-MigrationCsvValue -Row $row -Name 'InterimUserPrincipalName' -Default '' }
+            $upn = & $rowUpn $row
 
             $user = $null
             if ($objectId -and $userMap.ById.ContainsKey($objectId)) { $user = $userMap.ById[$objectId] }
@@ -819,10 +706,9 @@ try {
 
             $change = $null
             if ($null -ne $user) {
-                $desired = Get-DesiredSku -Row $row -SkuMap $skuMap
-                $change = Resolve-LicenseChange -DesiredSkuPartNumber $desired.Sku -Catalog $catalog `
-                    -AssignmentState @(Get-PropertyValue -InputObject $user -Name 'licenseAssignmentStates' -Default @()) `
-                    -RemoveUnplanned:$RemoveUnplanned
+                $change = Resolve-LicenseChange -Catalog $catalog -RemoveUnplanned:$RemoveUnplanned `
+                    -DesiredSkuPartNumber (Get-DesiredSku -Row $row -SkuMap $skuMap).Sku `
+                    -AssignmentState @(Get-MigrationProperty -InputObject $user -Name 'licenseAssignmentStates' -Default @())
             }
             $work.Add([pscustomobject]@{ Row = $row; User = $user; Change = $change })
         }
@@ -842,7 +728,7 @@ try {
 
         foreach ($item in $work) {
             $results.Add((Set-PlanRowLicense -Row $item.Row -User $item.User -Catalog $catalog -SkuMap $skuMap `
-                -DefaultUsageLocation $DefaultUsageLocation -RemoveUnplanned:$RemoveUnplanned -DryRun:$DryRun))
+                        -DefaultUsageLocation $DefaultUsageLocation -RemoveUnplanned:$RemoveUnplanned -DryRun:$DryRun))
         }
     }
 }
@@ -856,18 +742,14 @@ catch {
 #region Cleanup
 
 if ($results.Count -gt 0) {
-    try {
-        $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Set-MigrationLicenses'
-    }
+    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Set-MigrationLicenses' }
     catch {
         Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
         $exitCode = 1
     }
 }
 
-if ($exitCode -eq 0 -and @($results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) {
-    $exitCode = 2
-}
+if ($exitCode -eq 0 -and @($results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { $exitCode = 2 }
 
 exit (Complete-MigrationRun -ExitCode $exitCode)
 

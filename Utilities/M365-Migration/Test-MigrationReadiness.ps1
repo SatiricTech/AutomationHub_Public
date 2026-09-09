@@ -9,29 +9,26 @@
     the destination tenant and answers one question per check: is the plan safe to run right now?
     Nothing is written to the tenant at any stage.
 
-    Three stages, each answering a different question:
+      Pre          Before any object exists: are the target and interim domains verified, are there
+                   enough seats for the SKUs the plan asks for, does every licensed row have a usage
+                   location, is the plan clean of NeedsReview/Invalid/Collision rows, and does any
+                   planned UPN, address or mail nickname already belong to a user, group, contact,
+                   mailbox - or to a soft-deleted user, which holds its UPN and returns 409 on
+                   create until it is purged or restored?
 
-      Pre          Before any object exists. Are the target and interim domains verified? Are there
-                   enough seats for the SKUs the plan asks for? Does every licensed row have a usage
-                   location? Does any target UPN, SMTP address, alias or mail nickname already belong
-                   to a user, group, contact or mailbox in the destination - or to a soft-deleted
-                   user, which holds its UPN and will return 409 on create until it is purged or
-                   restored? Is the plan itself clean of NeedsReview, Invalid and Collision rows?
+      Provisioned  After New-MigrationUsers and Set-MigrationLicenses: does the user exist, does the
+                   mailbox exist, is the archive on where the source had one, is litigation hold off
+                   (move tools refuse mailboxes that hold), has OneDrive been provisioned (GET
+                   /users/{id}/drive returns 404 until it has) and is the quota at least the size of
+                   the source mailbox? The only stage that writes anything, and it writes only
+                   MailboxProvisioned and OneDriveProvisioned back to the plan.
 
-      Provisioned  After New-MigrationUsers and Set-MigrationLicenses. Does the user exist? Does the
-                   mailbox exist? Is the archive on where the source had one? Is litigation hold off
-                   (third-party move tools refuse mailboxes that hold)? Has OneDrive been provisioned
-                   - GET /users/{id}/drive returns 404 until it has - and is the destination quota at
-                   least the size of the source mailbox? This is the only stage that writes anything,
-                   and it writes only back to the plan: MailboxProvisioned and OneDriveProvisioned.
+      Post         After cutover: is the UPN the planned one, is the primary SMTP address, is every
+                   planned alias present (X500 included), is the object visible and enabled?
 
-      Post         After cutover. Is the UPN the planned one? Is the primary SMTP address the planned
-                   one? Is every planned alias present, X500 included? Is the object out of hiding and
-                   the account enabled?
-
-    Each check produces one result row. A per-object check that finds nothing wrong reports a single
-    summary row rather than one row per object, so a clean run stays readable; anything wrong is
-    reported per object. The run ends with a pass/fail table and exits 2 if any check failed.
+    A per-object check that finds nothing wrong reports one summary row rather than one row per
+    object, so a clean run stays readable. The run ends with a pass/fail table and exits 2 if any
+    check failed.
 
 .PARAMETER PlanPath
     Path to IdentityPlan.csv.
@@ -43,9 +40,9 @@
     One or more wave labels to check. Omit to check every wave.
 
 .PARAMETER SourceMailboxesCsv
-    Optional inventory of the source mailboxes, used by the Provisioned stage for the archive and
-    mailbox-size checks. Recognised columns: PrimarySmtpAddress (required), TotalItemSizeGB,
-    ArchiveStatus. Without it those two checks report Skipped rather than guessing.
+    Inventory of the source mailboxes, used by the Provisioned stage for the archive and mailbox-size
+    checks. Columns: PrimarySmtpAddress (required), TotalItemSizeGB, ArchiveStatus. Without it those
+    two checks report Skipped rather than guessing.
 
 .PARAMETER TenantId
     Destination tenant id or domain for Connect-MgGraph. Supported under GDAP.
@@ -68,8 +65,7 @@
     Every check still runs and the results file is written with the -DryRun_ marker.
 
 .PARAMETER Verbosity
-    Console detail: Low (errors and successes), Medium (default, adds warnings) or High (everything).
-    The log file always receives every line.
+    Console detail: Low, Medium (default) or High. The log file always receives every line.
 
 .EXAMPLE
     .\Test-MigrationReadiness.ps1 -PlanPath .\IdentityPlan.csv -Prefix Fabrikam
@@ -179,85 +175,70 @@ $exoFilterBatchSize = 20
 
 #region Functions
 
-function Get-PropertyValue {
+function Get-PlanRowIdentity {
     <#
     .SYNOPSIS
-        Reads a property from an arbitrary object without tripping Set-StrictMode.
-
-    .DESCRIPTION
-        Graph and Exchange both omit properties that have no value, and strict mode makes a blind
-        read of a missing property fatal. Get-MigrationCsvValue solves the same problem for plan rows
-        but stringifies its result, which destroys arrays such as EmailAddresses.
-
-    .PARAMETER InputObject
-        The object to read from. $null is tolerated and yields the default.
-
-    .PARAMETER Name
-        The property name.
-
-    .PARAMETER Default
-        Returned when the object is null, the property is absent, or its value is null.
+        Picks the most useful label for a plan row in a result file.
+    .PARAMETER Row
+        The identity plan row.
+    .EXAMPLE
+        Get-PlanRowIdentity -Row $planRow
     #>
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][AllowNull()]$InputObject,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
-        $Default = $null
-    )
+    [OutputType([string])]
+    param([Parameter(Mandatory)][AllowNull()]$Row)
 
-    if ($null -eq $InputObject) { return $Default }
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        if (-not $InputObject.Contains($Name)) { return $Default }
-        $raw = $InputObject[$Name]
-        if ($null -eq $raw) { return $Default }
-        return $raw
+    foreach ($column in @('TargetUserPrincipalName', 'TargetPrimarySmtp', 'InterimUserPrincipalName',
+            'SourceUserPrincipalName', 'SourcePrimarySmtp', 'DisplayName')) {
+        $value = Get-MigrationCsvValue -Row $Row -Name $column -Default ''
+        if ($value) { return $value }
     }
-    if (-not $InputObject.PSObject.Properties[$Name]) { return $Default }
-
-    $value = $InputObject.PSObject.Properties[$Name].Value
-    if ($null -eq $value) { return $Default }
-    return $value
+    return '(unnamed plan row)'
 }
 
 function New-CheckResult {
     <#
     .SYNOPSIS
         Builds one result row in the toolkit's fixed column order.
-
-    .PARAMETER Identity
-        The object or check the row is about.
-
+    .DESCRIPTION
+        Given -Row, the label, wave and object type come off the plan row rather than being spelled
+        out at each call site.
     .PARAMETER Action
         The check name, which is also what the pass/fail table groups on.
-
     .PARAMETER Status
         Succeeded, Failed or Skipped.
-
     .PARAMETER Detail
         Human-readable explanation. Always populated for Failed and Skipped rows.
-
+    .PARAMETER Identity
+        The object or check the row is about. Defaults to -Row's label, or the check name.
     .PARAMETER Stage
         Pre, Provisioned or Post.
-
-    .PARAMETER Wave
-        The plan row's wave, when the row is about a plan object.
-
-    .PARAMETER ObjectType
-        The plan row's object type, when the row is about a plan object.
+    .PARAMETER Row
+        The plan row the check is about, when it is about one.
+    .EXAMPLE
+        New-CheckResult -Row $planRow -Action 'PlanClean' -Status Failed -Detail $why -Stage Pre
     #>
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
         Justification = 'Builds an in-memory result object for the results CSV; it changes no state.')]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Identity,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Action,
         [Parameter(Mandatory)][ValidateSet('Succeeded', 'Failed', 'Skipped')][string]$Status,
         [AllowEmptyString()][string]$Detail = '',
+        [AllowEmptyString()][string]$Identity = '',
         [AllowEmptyString()][string]$Stage = '',
-        [AllowEmptyString()][string]$Wave = '',
-        [AllowEmptyString()][string]$ObjectType = ''
+        [AllowNull()]$Row
     )
+
+    $wave = ''
+    $objectType = ''
+    if ($null -ne $Row) {
+        if (-not $Identity) { $Identity = Get-PlanRowIdentity -Row $Row }
+        $wave = [string](Get-MigrationCsvValue -Row $Row -Name 'Wave' -Default '')
+        $objectType = [string](Get-MigrationCsvValue -Row $Row -Name 'ObjectType' -Default '')
+    }
+    if (-not $Identity) { $Identity = $Action }
 
     return [pscustomobject]@{
         Identity   = $Identity
@@ -265,8 +246,8 @@ function New-CheckResult {
         Status     = $Status
         Detail     = $Detail
         Stage      = $Stage
-        Wave       = $Wave
-        ObjectType = $ObjectType
+        Wave       = $wave
+        ObjectType = $objectType
     }
 }
 
@@ -274,41 +255,35 @@ function ConvertTo-BareAddress {
     <#
     .SYNOPSIS
         Strips an Exchange proxy-address prefix and returns the bare, lower-cased address.
-
     .DESCRIPTION
-        Plan aliases and Exchange EmailAddresses both carry a type prefix - 'smtp:', 'SMTP:',
-        'X500:', 'sip:'. Only SMTP addresses take part in address clash detection, so anything else
-        returns an empty string and the caller drops it.
-
+        Only SMTP addresses take part in clash detection, so an X500, SIP or SPO entry returns an
+        empty string and the caller drops it.
     .PARAMETER Value
         The raw proxy address.
+    .EXAMPLE
+        ConvertTo-BareAddress -Value 'SMTP:John.Smith@newco.com'
     #>
     [CmdletBinding()]
     [OutputType([string])]
-    param(
-        [AllowNull()][AllowEmptyString()][string]$Value
-    )
+    param([AllowNull()][AllowEmptyString()][string]$Value)
 
-    $text = ([string]$Value).Trim()
-    if (-not $text) { return '' }
-    if ($text -notmatch ':') { return $text.ToLowerInvariant() }
-    if ($text -match '^(?i)smtp:(.+)$') { return $Matches[1].Trim().ToLowerInvariant() }
-    return ''
+    $parsed = Split-MigrationProxyAddress -Entry $Value
+    if ($parsed.Kind -ne 'Smtp') { return '' }
+    return $parsed.Address.Trim().ToLowerInvariant()
 }
 
 function Get-AddressDomain {
     <#
     .SYNOPSIS
         Returns the domain half of an address, lower-cased, or an empty string.
-
     .PARAMETER Value
-        A UPN or SMTP address.
+        A UPN or SMTP address. Guest UPNs carry '@' inside the local part, so the last one wins.
+    .EXAMPLE
+        Get-AddressDomain -Value 'John.Smith@Newco.COM'
     #>
     [CmdletBinding()]
     [OutputType([string])]
-    param(
-        [AllowNull()][AllowEmptyString()][string]$Value
-    )
+    param([AllowNull()][AllowEmptyString()][string]$Value)
 
     $text = ([string]$Value).Trim()
     $index = $text.LastIndexOf('@')
@@ -320,36 +295,33 @@ function Get-PlanAddressCandidate {
     <#
     .SYNOPSIS
         Lists every destination-side identifier one plan row wants to claim.
-
     .DESCRIPTION
-        The clash and domain checks both need the same list: the target and interim UPNs, the target
-        and interim primary SMTP addresses, the SMTP aliases, and the mail nickname. X500 entries in
-        TargetAliases are routing history, not claims on an address, so they are excluded here and
-        checked only by the Post stage.
-
+        X500 entries in TargetAliases are routing history, not claims on an address, so they are
+        excluded here and checked only by the Post stage.
     .PARAMETER Row
         The identity plan row.
+    .EXAMPLE
+        Get-PlanAddressCandidate -Row $planRow
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory)][AllowNull()]$Row
-    )
+    param([Parameter(Mandatory)][AllowNull()]$Row)
 
     $candidate = [System.Collections.Generic.List[object]]::new()
     $add = {
         param([string]$Kind, [string]$Scope, [string]$Value)
         $text = ([string]$Value).Trim()
-        if ($text) {
-            $candidate.Add([pscustomobject]@{ Kind = $Kind; Scope = $Scope; Value = $text.ToLowerInvariant() })
-        }
+        if ($text) { $candidate.Add([pscustomobject]@{ Kind = $Kind; Scope = $Scope; Value = $text.ToLowerInvariant() }) }
     }
 
-    & $add 'Upn' 'Target' (Get-MigrationCsvValue -Row $Row -Name 'TargetUserPrincipalName' -Default '')
-    & $add 'Upn' 'Interim' (Get-MigrationCsvValue -Row $Row -Name 'InterimUserPrincipalName' -Default '')
-    & $add 'Smtp' 'Target' (Get-MigrationCsvValue -Row $Row -Name 'TargetPrimarySmtp' -Default '')
-    & $add 'Smtp' 'Interim' (Get-MigrationCsvValue -Row $Row -Name 'InterimPrimarySmtp' -Default '')
-    & $add 'MailNickname' 'Target' (Get-MigrationCsvValue -Row $Row -Name 'TargetMailNickname' -Default '')
+    foreach ($claim in @(
+            @{ Kind = 'Upn'; Scope = 'Target'; Column = 'TargetUserPrincipalName' }
+            @{ Kind = 'Upn'; Scope = 'Interim'; Column = 'InterimUserPrincipalName' }
+            @{ Kind = 'Smtp'; Scope = 'Target'; Column = 'TargetPrimarySmtp' }
+            @{ Kind = 'Smtp'; Scope = 'Interim'; Column = 'InterimPrimarySmtp' }
+            @{ Kind = 'MailNickname'; Scope = 'Target'; Column = 'TargetMailNickname' })) {
+        & $add $claim.Kind $claim.Scope (Get-MigrationCsvValue -Row $Row -Name $claim.Column -Default '')
+    }
 
     foreach ($alias in @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $Row -Name 'TargetAliases' -Default ''))) {
         & $add 'Smtp' 'Alias' (ConvertTo-BareAddress -Value $alias)
@@ -358,47 +330,23 @@ function Get-PlanAddressCandidate {
     return $candidate.ToArray()
 }
 
-function Get-PlanRowIdentity {
-    <#
-    .SYNOPSIS
-        Picks the most useful label for a plan row in a result file.
-
-    .PARAMETER Row
-        The identity plan row.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory)][AllowNull()]$Row
-    )
-
-    foreach ($column in @('TargetUserPrincipalName', 'TargetPrimarySmtp', 'InterimUserPrincipalName',
-            'SourceUserPrincipalName', 'SourcePrimarySmtp', 'DisplayName')) {
-        $value = Get-MigrationCsvValue -Row $Row -Name $column -Default ''
-        if ($value) { return $value }
-    }
-    return '(unnamed plan row)'
-}
-
 function Test-AddressClash {
     <#
     .SYNOPSIS
         Reports every planned identifier that something in the destination tenant already holds.
-
     .DESCRIPTION
-        Pure: it takes the plan rows and a flat list of destination objects, so the clash rules can
-        be exercised offline against a fake recipient list. An object whose id matches the row's own
-        TargetObjectId is not a clash - that is the row's own, already-provisioned object.
-
+        Pure, so the clash rules can be exercised offline against a fake recipient list. An object
+        whose id matches the row's own TargetObjectId is not a clash - it is the row's own,
+        already-provisioned object.
     .PARAMETER Row
         The plan rows to check.
-
     .PARAMETER ExistingObject
         Destination objects, each with Id, Kind, DisplayName, MailNickname and an Address array of
         bare SMTP addresses and UPNs.
-
     .PARAMETER Stage
         Stamped onto every result row.
+    .EXAMPLE
+        Test-AddressClash -Row $planRows -ExistingObject $destinationObjects -Stage Pre
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -410,42 +358,40 @@ function Test-AddressClash {
 
     $byAddress = @{}
     $byNickname = @{}
+    $index = {
+        param([hashtable]$Table, [string]$Key, $Value)
+        if (-not $Key) { return }
+        if (-not $Table.ContainsKey($Key)) { $Table[$Key] = [System.Collections.Generic.List[object]]::new() }
+        $Table[$Key].Add($Value)
+    }
+
     foreach ($existing in @($ExistingObject)) {
-        foreach ($address in @(Get-PropertyValue -InputObject $existing -Name 'Address' -Default @())) {
-            $key = ([string]$address).Trim().ToLowerInvariant()
-            if (-not $key) { continue }
-            if (-not $byAddress.ContainsKey($key)) { $byAddress[$key] = [System.Collections.Generic.List[object]]::new() }
-            $byAddress[$key].Add($existing)
+        foreach ($address in @(Get-MigrationProperty -InputObject $existing -Name 'Address' -Default @())) {
+            & $index $byAddress ([string]$address).Trim().ToLowerInvariant() $existing
         }
-        $nickname = ([string](Get-PropertyValue -InputObject $existing -Name 'MailNickname' -Default '')).Trim().ToLowerInvariant()
-        if (-not $nickname) { continue }
-        if (-not $byNickname.ContainsKey($nickname)) { $byNickname[$nickname] = [System.Collections.Generic.List[object]]::new() }
-        $byNickname[$nickname].Add($existing)
+        & $index $byNickname ([string](Get-MigrationProperty -InputObject $existing -Name 'MailNickname' -Default '')).Trim().ToLowerInvariant() $existing
     }
 
     $results = [System.Collections.Generic.List[object]]::new()
     foreach ($planRow in @($Row)) {
-        $identity = Get-PlanRowIdentity -Row $planRow
         $ownId = Get-MigrationCsvValue -Row $planRow -Name 'TargetObjectId' -Default ''
         $reported = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
         foreach ($candidate in (Get-PlanAddressCandidate -Row $planRow)) {
-            $index = if ($candidate.Kind -eq 'MailNickname') { $byNickname } else { $byAddress }
-            if (-not $index.ContainsKey($candidate.Value)) { continue }
+            $table = if ($candidate.Kind -eq 'MailNickname') { $byNickname } else { $byAddress }
+            if (-not $table.ContainsKey($candidate.Value)) { continue }
 
-            foreach ($hit in $index[$candidate.Value]) {
-                $hitId = [string](Get-PropertyValue -InputObject $hit -Name 'Id' -Default '')
+            foreach ($hit in $table[$candidate.Value]) {
+                $hitId = [string](Get-MigrationProperty -InputObject $hit -Name 'Id' -Default '')
                 if ($ownId -and $hitId -and $hitId -eq $ownId) { continue }
 
-                $kind = [string](Get-PropertyValue -InputObject $hit -Name 'Kind' -Default 'object')
-                $name = [string](Get-PropertyValue -InputObject $hit -Name 'DisplayName' -Default '')
+                $kind = [string](Get-MigrationProperty -InputObject $hit -Name 'Kind' -Default 'object')
+                $name = [string](Get-MigrationProperty -InputObject $hit -Name 'DisplayName' -Default '')
                 if (-not $reported.Add("$($candidate.Value)|$kind|$hitId")) { continue }
 
                 $held = if ($name) { "$kind '$name'" } else { $kind }
-                $results.Add((New-CheckResult -Identity $identity -Action 'AddressClash' -Status 'Failed' `
-                    -Detail "$($candidate.Scope) $($candidate.Kind) '$($candidate.Value)' is already held by $held." `
-                    -Stage $Stage -Wave (Get-MigrationCsvValue -Row $planRow -Name 'Wave' -Default '') `
-                    -ObjectType (Get-MigrationCsvValue -Row $planRow -Name 'ObjectType' -Default '')))
+                $results.Add((New-CheckResult -Row $planRow -Action 'AddressClash' -Status 'Failed' -Stage $Stage `
+                            -Detail "$($candidate.Scope) $($candidate.Kind) '$($candidate.Value)' is already held by $held."))
             }
         }
     }
@@ -457,17 +403,16 @@ function Measure-SeatRequirement {
     <#
     .SYNOPSIS
         Totals the seats a plan asks for per SKU and compares them with the destination's spare seats.
-
     .DESCRIPTION
         Pure, so the arithmetic is testable without a tenant. A part number the destination does not
-        subscribe to is reported with Status 'Unknown' - almost always a SKU map that was written
-        against the source tenant's product names.
-
+        subscribe to gets Status 'Unknown' - almost always a SKU map written against the source
+        tenant's product names.
     .PARAMETER Row
         The plan rows to total.
-
     .PARAMETER Catalog
         Output of Get-MigrationSkuCatalog (needs SkuPartNumber and Available).
+    .EXAMPLE
+        Measure-SeatRequirement -Row $planRows -Catalog (Get-MigrationSkuCatalog)
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -484,31 +429,26 @@ function Measure-SeatRequirement {
         }
     }
 
-    $catalogByPart = @{}
+    $available = @{}
     foreach ($sku in @($Catalog)) {
-        $part = [string](Get-PropertyValue -InputObject $sku -Name 'SkuPartNumber' -Default '')
-        if ($part) { $catalogByPart[$part] = $sku }
+        $part = [string](Get-MigrationProperty -InputObject $sku -Name 'SkuPartNumber' -Default '')
+        if ($part) { $available[$part] = [int](Get-MigrationProperty -InputObject $sku -Name 'Available' -Default 0) }
     }
 
     $rows = [System.Collections.Generic.List[object]]::new()
     foreach ($part in $needed.Keys) {
         $count = [int]$needed[$part]
-        if (-not $catalogByPart.ContainsKey($part)) {
-            $rows.Add([pscustomobject]@{
-                SkuPartNumber = $part; Needed = $count; Available = 0; Shortfall = $count; Status = 'Unknown'
-            })
-            continue
-        }
-
-        $available = [int](Get-PropertyValue -InputObject $catalogByPart[$part] -Name 'Available' -Default 0)
-        $shortfall = [Math]::Max(0, $count - $available)
+        $spare = if ($available.ContainsKey($part)) { [int]$available[$part] } else { 0 }
+        $shortfall = [Math]::Max(0, $count - $spare)
         $rows.Add([pscustomobject]@{
-            SkuPartNumber = $part
-            Needed        = $count
-            Available     = $available
-            Shortfall     = $shortfall
-            Status        = if ($shortfall -gt 0) { 'Shortfall' } else { 'Sufficient' }
-        })
+                SkuPartNumber = $part
+                Needed        = $count
+                Available     = $spare
+                Shortfall     = $shortfall
+                Status        = if (-not $available.ContainsKey($part)) { 'Unknown' }
+                elseif ($shortfall -gt 0) { 'Shortfall' }
+                else { 'Sufficient' }
+            })
     }
 
     return $rows.ToArray()
@@ -518,41 +458,32 @@ function ConvertTo-QuotaGigabyte {
     <#
     .SYNOPSIS
         Turns an Exchange quota string into gigabytes.
-
     .DESCRIPTION
         ProhibitSendReceiveQuota reads like '100 GB (107,374,182,400 bytes)'. The parenthesised byte
         count is the exact figure and is preferred; the leading unit string is the fallback.
         'Unlimited' returns [double]::MaxValue so a comparison against it always passes.
-
     .PARAMETER Value
         The quota as Exchange renders it.
+    .EXAMPLE
+        ConvertTo-QuotaGigabyte -Value '100 GB (107,374,182,400 bytes)'
     #>
     [CmdletBinding()]
     [OutputType([double])]
-    param(
-        [AllowNull()][AllowEmptyString()][string]$Value
-    )
+    param([AllowNull()][AllowEmptyString()][string]$Value)
 
     $text = ([string]$Value).Trim()
     if (-not $text) { return 0 }
     if ($text -match '(?i)^unlimited$') { return [double]::MaxValue }
 
+    $parsed = 0.0
     if ($text -match '\(([\d,\.]+)\s*bytes\)') {
-        $bytes = $Matches[1] -replace '[,\s]', ''
-        $parsed = 0.0
-        if ([double]::TryParse($bytes, [ref]$parsed)) { return [Math]::Round($parsed / 1GB, 3) }
+        if ([double]::TryParse(($Matches[1] -replace '[,\s]', ''), [ref]$parsed)) { return [Math]::Round($parsed / 1GB, 3) }
     }
 
     if ($text -match '(?i)^([\d,\.]+)\s*(KB|MB|GB|TB)') {
-        $number = $Matches[1] -replace ',', ''
-        $parsed = 0.0
-        if ([double]::TryParse($number, [ref]$parsed)) {
-            $factor = switch ($Matches[2].ToUpperInvariant()) {
-                'KB' { 1 / 1MB }
-                'MB' { 1 / 1KB }
-                'TB' { 1024 }
-                default { 1 }
-            }
+        $unit = $Matches[2].ToUpperInvariant()
+        if ([double]::TryParse(($Matches[1] -replace ',', ''), [ref]$parsed)) {
+            $factor = switch ($unit) { 'KB' { 1 / 1MB } 'MB' { 1 / 1KB } 'TB' { 1024 } default { 1 } }
             return [Math]::Round($parsed * $factor, 3)
         }
     }
@@ -564,50 +495,44 @@ function Test-GraphNotFound {
     <#
     .SYNOPSIS
         Says whether a failed Graph call was a 404 rather than a real problem.
-
     .DESCRIPTION
         A 404 from GET /users/{id}/drive means OneDrive has not been provisioned yet, which is a
-        finding rather than an error. The module's own status-code helper is private, so the two
-        signals that matter - the response status and the Graph error code - are read here.
-
+        finding rather than an error. Get-MigrationGraphErrorStatusCode does the reading; the one
+        signal it does not map is the 'itemNotFound' code the drive endpoint returns in its body,
+        so that is checked here as well.
     .PARAMETER ErrorRecord
         The ErrorRecord from the catch block.
+    .EXAMPLE
+        try { Invoke-MigrationGraphRequest -Method GET -Uri $uri }
+        catch { if (-not (Test-GraphNotFound -ErrorRecord $_)) { throw } }
     #>
     [CmdletBinding()]
     [OutputType([bool])]
-    param(
-        [Parameter(Mandatory)]$ErrorRecord
-    )
+    param([Parameter(Mandatory)]$ErrorRecord)
 
-    $response = $ErrorRecord.Exception.PSObject.Properties['Response']
-    if ($response -and $response.Value) {
-        $status = $response.Value.PSObject.Properties['StatusCode']
-        if ($status -and $status.Value) { return ([int]$status.Value -eq 404) }
-    }
+    if ((Get-MigrationGraphErrorStatusCode -ErrorRecord $ErrorRecord) -eq 404) { return $true }
 
-    $detail = ''
-    if ($ErrorRecord.ErrorDetails) { $detail = [string]$ErrorRecord.ErrorDetails.Message }
-    if ($detail -match '(?i)"code"\s*:\s*"(itemNotFound|notFound|ResourceNotFound|Request_ResourceNotFound)"') {
-        return $true
-    }
+    $detail = if ($ErrorRecord.ErrorDetails) { [string]$ErrorRecord.ErrorDetails.Message } else { '' }
+    if ($detail -match '(?i)"code"\s*:\s*"itemNotFound"') { return $true }
 
-    return ([string]$ErrorRecord.Exception.Message -match '(?i)\b404\b|not\s*found')
+    return ([string]$ErrorRecord.Exception.Message -match '(?i)not\s*found')
 }
 
 function Get-VerifiedDomain {
     <#
     .SYNOPSIS
         Returns the verified domain names on the connected tenant, lower-cased.
+    .EXAMPLE
+        Get-VerifiedDomain
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
     param()
 
-    $domains = @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/domains' -All)
     $verified = [System.Collections.Generic.List[string]]::new()
-    foreach ($domain in $domains) {
-        if (-not [bool](Get-PropertyValue -InputObject $domain -Name 'isVerified' -Default $false)) { continue }
-        $name = [string](Get-PropertyValue -InputObject $domain -Name 'id' -Default '')
+    foreach ($domain in @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/domains' -All)) {
+        if (-not [bool](Get-MigrationProperty -InputObject $domain -Name 'isVerified' -Default $false)) { continue }
+        $name = [string](Get-MigrationProperty -InputObject $domain -Name 'id' -Default '')
         if ($name) { $verified.Add($name.ToLowerInvariant()) }
     }
     return $verified.ToArray()
@@ -617,23 +542,20 @@ function Get-DirectoryClashObject {
     <#
     .SYNOPSIS
         Reads the destination users, groups and soft-deleted users that hold any of the given identifiers.
-
     .DESCRIPTION
         One Graph call per batch of equality clauses rather than one per plan row. Soft-deleted users
-        are queried separately under /directory/deletedItems because a deleted user still owns its
-        UPN and proxy addresses, and will fail a create or a rename with 409 until it is purged.
-
+        are queried separately because a deleted user still owns its UPN and proxy addresses, and
+        fails a create or a rename with 409 until it is purged.
     .PARAMETER UserPrincipalName
         UPNs to look for.
-
     .PARAMETER EmailAddress
         Bare SMTP addresses to look for.
-
     .PARAMETER MailNickname
         Mail nicknames to look for.
-
     .PARAMETER BatchSize
         Equality clauses per request.
+    .EXAMPLE
+        Get-DirectoryClashObject -UserPrincipalName $upns -EmailAddress $addresses -MailNickname $nicknames
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -646,63 +568,50 @@ function Get-DirectoryClashObject {
 
     $found = [System.Collections.Generic.List[object]]::new()
 
+    $clauseFor = {
+        param([string]$Property, [string[]]$Value)
+        @($Value | Where-Object { $_ } | Sort-Object -Unique |
+            ForEach-Object { "$Property eq '$(ConvertTo-MigrationODataString -Value $_)'" })
+    }
+    $upnClause = @(& $clauseFor 'userPrincipalName' $UserPrincipalName)
+    $mailClause = @(& $clauseFor 'mail' $EmailAddress)
+    $nicknameClause = @(& $clauseFor 'mailNickname' $MailNickname)
+
     $invokeBatched = {
         param([string[]]$Clause, [string]$Uri, [string]$Kind, [int]$Size)
 
         for ($offset = 0; $offset -lt $Clause.Count; $offset += $Size) {
             $take = [Math]::Min($Size, $Clause.Count - $offset)
             $filter = [uri]::EscapeDataString((@($Clause[$offset..($offset + $take - 1)]) -join ' or '))
-            try {
-                $page = @(Invoke-MigrationGraphRequest -Method GET -Uri "$Uri&`$filter=$filter" -All)
-            }
-            catch {
-                throw "Could not read destination $Kind objects from Graph: $($_.Exception.Message)"
-            }
+            try { $page = @(Invoke-MigrationGraphRequest -Method GET -Uri "$Uri&`$filter=$filter" -All) }
+            catch { throw "Could not read destination $Kind objects from Graph: $($_.Exception.Message)" }
 
             foreach ($item in $page) {
                 $address = [System.Collections.Generic.List[string]]::new()
-                $upn = [string](Get-PropertyValue -InputObject $item -Name 'userPrincipalName' -Default '')
-                if ($upn) { $address.Add($upn.ToLowerInvariant()) }
-                $mail = [string](Get-PropertyValue -InputObject $item -Name 'mail' -Default '')
-                if ($mail) { $address.Add($mail.ToLowerInvariant()) }
-                foreach ($proxy in @(Get-PropertyValue -InputObject $item -Name 'proxyAddresses' -Default @())) {
+                foreach ($name in @('userPrincipalName', 'mail')) {
+                    $value = [string](Get-MigrationProperty -InputObject $item -Name $name -Default '')
+                    if ($value) { $address.Add($value.ToLowerInvariant()) }
+                }
+                foreach ($proxy in @(Get-MigrationProperty -InputObject $item -Name 'proxyAddresses' -Default @())) {
                     $bare = ConvertTo-BareAddress -Value ([string]$proxy)
                     if ($bare) { $address.Add($bare) }
                 }
 
                 $found.Add([pscustomobject]@{
-                    Id           = [string](Get-PropertyValue -InputObject $item -Name 'id' -Default '')
-                    Kind         = $Kind
-                    DisplayName  = [string](Get-PropertyValue -InputObject $item -Name 'displayName' -Default '')
-                    MailNickname = ([string](Get-PropertyValue -InputObject $item -Name 'mailNickname' `
-                        -Default '')).ToLowerInvariant()
-                    Address      = @($address | Sort-Object -Unique)
-                })
+                        Id           = [string](Get-MigrationProperty -InputObject $item -Name 'id' -Default '')
+                        Kind         = $Kind
+                        DisplayName  = [string](Get-MigrationProperty -InputObject $item -Name 'displayName' -Default '')
+                        MailNickname = ([string](Get-MigrationProperty -InputObject $item -Name 'mailNickname' -Default '')).ToLowerInvariant()
+                        Address      = @($address | Sort-Object -Unique)
+                    })
             }
         }
     }
 
-    $upnClause = [System.Collections.Generic.List[string]]::new()
-    $mailClause = [System.Collections.Generic.List[string]]::new()
-    $nicknameClause = [System.Collections.Generic.List[string]]::new()
-    foreach ($value in @($UserPrincipalName | Sort-Object -Unique)) {
-        if ($value) { $upnClause.Add("userPrincipalName eq '$(ConvertTo-MigrationODataString -Value $value)'") }
-    }
-    foreach ($value in @($EmailAddress | Sort-Object -Unique)) {
-        if ($value) { $mailClause.Add("mail eq '$(ConvertTo-MigrationODataString -Value $value)'") }
-    }
-    foreach ($value in @($MailNickname | Sort-Object -Unique)) {
-        if ($value) { $nicknameClause.Add("mailNickname eq '$(ConvertTo-MigrationODataString -Value $value)'") }
-    }
-
-    $userUri = "/v1.0/users?`$select=id,displayName,userPrincipalName,mail,mailNickname,proxyAddresses&`$top=999"
-    $groupUri = "/v1.0/groups?`$select=id,displayName,mail,mailNickname,proxyAddresses&`$top=999"
-    $deletedSelect = 'id,displayName,userPrincipalName,mail,mailNickname,proxyAddresses'
-    $deletedUri = "/v1.0/directory/deletedItems/microsoft.graph.user?`$select=$deletedSelect&`$top=999"
-
-    & $invokeBatched @($upnClause + $mailClause + $nicknameClause) $userUri 'User' $BatchSize
-    & $invokeBatched @($mailClause + $nicknameClause) $groupUri 'Group' $BatchSize
-    & $invokeBatched @($upnClause + $mailClause) $deletedUri 'SoftDeletedUser' $BatchSize
+    $select = 'id,displayName,userPrincipalName,mail,mailNickname,proxyAddresses'
+    & $invokeBatched @($upnClause + $mailClause + $nicknameClause) "/v1.0/users?`$select=$select&`$top=999" 'User' $BatchSize
+    & $invokeBatched @($mailClause + $nicknameClause) "/v1.0/groups?`$select=id,displayName,mail,mailNickname,proxyAddresses&`$top=999" 'Group' $BatchSize
+    & $invokeBatched @($upnClause + $mailClause) "/v1.0/directory/deletedItems/microsoft.graph.user?`$select=$select&`$top=999" 'SoftDeletedUser' $BatchSize
 
     return $found.ToArray()
 }
@@ -711,18 +620,16 @@ function Get-RecipientClashObject {
     <#
     .SYNOPSIS
         Reads the Exchange recipients that hold any of the given SMTP addresses.
-
     .DESCRIPTION
-        Get-EXORecipient covers mailboxes, mail users, mail contacts and distribution groups in one
-        pass, which is the whole mail-enabled surface a new address can collide with. The addresses
-        go into a single OPATH filter per batch rather than one Get-EXORecipient call per plan row -
-        tenant-wide recipient reads are exactly what throttles on a large org.
-
+        Get-EXORecipient covers the whole mail-enabled surface a new address can collide with. The
+        addresses go into one OPATH filter per batch rather than one call per plan row - tenant-wide
+        recipient reads are exactly what throttles on a large org.
     .PARAMETER EmailAddress
         Bare SMTP addresses to look for.
-
     .PARAMETER BatchSize
         Addresses per Exchange filter.
+    .EXAMPLE
+        Get-RecipientClashObject -EmailAddress $addresses -BatchSize 20
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -733,38 +640,31 @@ function Get-RecipientClashObject {
 
     $wanted = @($EmailAddress | Where-Object { $_ } | Sort-Object -Unique)
     $found = [System.Collections.Generic.List[object]]::new()
-    if ($wanted.Count -eq 0) { return $found.ToArray() }
 
     for ($offset = 0; $offset -lt $wanted.Count; $offset += $BatchSize) {
         $take = [Math]::Min($BatchSize, $wanted.Count - $offset)
-        $clause = foreach ($address in $wanted[$offset..($offset + $take - 1)]) {
-            "EmailAddresses -eq 'smtp:$(ConvertTo-MigrationODataString -Value $address)'"
-        }
-        $filter = ($clause -join ' -or ')
+        $filter = (@($wanted[$offset..($offset + $take - 1)] | ForEach-Object {
+                    "EmailAddresses -eq 'smtp:$(ConvertTo-MigrationODataString -Value $_)'" }) -join ' -or ')
 
-        try {
-            $page = @(Get-EXORecipient -Filter $filter -ResultSize Unlimited -ErrorAction Stop)
-        }
-        catch {
-            throw "Could not read Exchange recipients: $($_.Exception.Message)"
-        }
+        try { $page = @(Get-EXORecipient -Filter $filter -ResultSize Unlimited -ErrorAction Stop) }
+        catch { throw "Could not read Exchange recipients: $($_.Exception.Message)" }
 
         foreach ($recipient in $page) {
             $address = [System.Collections.Generic.List[string]]::new()
-            foreach ($proxy in @(Get-PropertyValue -InputObject $recipient -Name 'EmailAddresses' -Default @())) {
+            foreach ($proxy in @(Get-MigrationProperty -InputObject $recipient -Name 'EmailAddresses' -Default @())) {
                 $bare = ConvertTo-BareAddress -Value ([string]$proxy)
                 if ($bare) { $address.Add($bare) }
             }
-            $primary = [string](Get-PropertyValue -InputObject $recipient -Name 'PrimarySmtpAddress' -Default '')
+            $primary = [string](Get-MigrationProperty -InputObject $recipient -Name 'PrimarySmtpAddress' -Default '')
             if ($primary) { $address.Add($primary.ToLowerInvariant()) }
 
             $found.Add([pscustomobject]@{
-                Id           = [string](Get-PropertyValue -InputObject $recipient -Name 'ExternalDirectoryObjectId' -Default '')
-                Kind         = [string](Get-PropertyValue -InputObject $recipient -Name 'RecipientType' -Default 'Recipient')
-                DisplayName  = [string](Get-PropertyValue -InputObject $recipient -Name 'DisplayName' -Default '')
-                MailNickname = ([string](Get-PropertyValue -InputObject $recipient -Name 'Alias' -Default '')).ToLowerInvariant()
-                Address      = @($address | Sort-Object -Unique)
-            })
+                    Id           = [string](Get-MigrationProperty -InputObject $recipient -Name 'ExternalDirectoryObjectId' -Default '')
+                    Kind         = [string](Get-MigrationProperty -InputObject $recipient -Name 'RecipientType' -Default 'Recipient')
+                    DisplayName  = [string](Get-MigrationProperty -InputObject $recipient -Name 'DisplayName' -Default '')
+                    MailNickname = ([string](Get-MigrationProperty -InputObject $recipient -Name 'Alias' -Default '')).ToLowerInvariant()
+                    Address      = @($address | Sort-Object -Unique)
+                })
         }
     }
 
@@ -775,26 +675,21 @@ function Test-ProvisionedRow {
     <#
     .SYNOPSIS
         Grades one already-provisioned plan row and returns its check rows plus the plan writeback values.
-
     .DESCRIPTION
-        Pure: the caller does the reading, this decides what the readings mean, so every branch is
-        testable with plain objects. Returns Row (the check results), MailboxProvisioned and
-        OneDriveProvisioned ('True'/'False' as the plan schema stores booleans).
-
+        Pure: the caller reads, this decides what the readings mean. Returns Row (the check results)
+        plus MailboxProvisioned and OneDriveProvisioned as the 'True'/'False' the plan schema stores.
     .PARAMETER Row
         The identity plan row.
-
     .PARAMETER User
         The destination Graph user, or $null when the lookup returned 404.
-
     .PARAMETER Mailbox
         The destination mailbox from Get-EXOMailbox, or $null when there is none yet.
-
     .PARAMETER DriveExists
         Whether GET /users/{id}/drive returned a drive.
-
     .PARAMETER SourceMailbox
         The matching source mailbox inventory row, or $null when no inventory was supplied.
+    .EXAMPLE
+        Test-ProvisionedRow -Row $planRow -User $user -Mailbox $mailbox -DriveExists
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -806,54 +701,48 @@ function Test-ProvisionedRow {
         [AllowNull()]$SourceMailbox
     )
 
-    $identity = Get-PlanRowIdentity -Row $Row
-    $wave = Get-MigrationCsvValue -Row $Row -Name 'Wave' -Default ''
-    $objectType = Get-MigrationCsvValue -Row $Row -Name 'ObjectType' -Default ''
+    # Captured under its own name so the closures below read as what they are.
+    $planRow = $Row
     $results = [System.Collections.Generic.List[object]]::new()
-
     $newRow = {
         param([string]$Action, [string]$Status, [string]$Detail)
-        New-CheckResult -Identity $identity -Action $Action -Status $Status -Detail $Detail `
-            -Stage 'Provisioned' -Wave $wave -ObjectType $objectType
+        $results.Add((New-CheckResult -Row $planRow -Action $Action -Status $Status -Detail $Detail -Stage 'Provisioned'))
+    }
+    $verdict = {
+        param([string]$Action, [bool]$Pass, [string]$Good, [string]$Bad)
+        & $newRow $Action $(if ($Pass) { 'Succeeded' } else { 'Failed' }) $(if ($Pass) { $Good } else { $Bad })
     }
 
     if ($null -eq $User) {
-        $results.Add((& $newRow 'UserExists' 'Failed' 'No destination user with this TargetObjectId.'))
+        & $newRow 'UserExists' 'Failed' 'No destination user with this TargetObjectId.'
         return @{ Row = $results.ToArray(); MailboxProvisioned = 'False'; OneDriveProvisioned = 'False' }
     }
-    $results.Add((& $newRow 'UserExists' 'Succeeded' `
-        ([string](Get-PropertyValue -InputObject $User -Name 'userPrincipalName' -Default ''))))
+    & $newRow 'UserExists' 'Succeeded' ([string](Get-MigrationProperty -InputObject $User -Name 'userPrincipalName' -Default ''))
 
     $hasMailbox = $null -ne $Mailbox
-    $results.Add((& $newRow 'MailboxExists' $(if ($hasMailbox) { 'Succeeded' } else { 'Failed' }) `
-        $(if ($hasMailbox) { [string](Get-PropertyValue -InputObject $Mailbox -Name 'PrimarySmtpAddress' -Default '') }
-          else { 'No mailbox yet - the licence may still be provisioning.' })))
+    & $verdict 'MailboxExists' $hasMailbox `
+        ([string](Get-MigrationProperty -InputObject $Mailbox -Name 'PrimarySmtpAddress' -Default '')) `
+        'No mailbox yet - the licence may still be provisioning.'
 
     if ($hasMailbox) {
         # Third-party move tools refuse a destination mailbox that is on hold, so this is a blocker
         # rather than a note.
-        $hold = [bool](Get-PropertyValue -InputObject $Mailbox -Name 'LitigationHoldEnabled' -Default $false)
-        $results.Add((& $newRow 'LitigationHoldOff' $(if ($hold) { 'Failed' } else { 'Succeeded' }) `
-            $(if ($hold) { 'Litigation hold is on; the migration tool will refuse this mailbox.' } else { 'Off.' })))
+        $hold = [bool](Get-MigrationProperty -InputObject $Mailbox -Name 'LitigationHoldEnabled' -Default $false)
+        & $verdict 'LitigationHoldOff' (-not $hold) 'Off.' 'Litigation hold is on; the migration tool will refuse this mailbox.'
 
-        $sourceArchive = ''
-        if ($null -ne $SourceMailbox) {
-            $sourceArchive = Get-MigrationCsvValue -Row $SourceMailbox -Name 'ArchiveStatus' -Default ''
-        }
+        $sourceArchive = if ($null -ne $SourceMailbox) { Get-MigrationCsvValue -Row $SourceMailbox -Name 'ArchiveStatus' -Default '' } else { '' }
         if (-not $sourceArchive) {
-            $results.Add((& $newRow 'ArchiveEnabled' 'Skipped' 'No source archive state; supply -SourceMailboxesCsv.'))
+            & $newRow 'ArchiveEnabled' 'Skipped' 'No source archive state; supply -SourceMailboxesCsv.'
         }
         elseif ($sourceArchive -match '(?i)^(none|disabled|false)$') {
-            $results.Add((& $newRow 'ArchiveEnabled' 'Succeeded' 'Source had no archive; none required.'))
+            & $newRow 'ArchiveEnabled' 'Succeeded' 'Source had no archive; none required.'
         }
         else {
-            $archiveState = [string](Get-PropertyValue -InputObject $Mailbox -Name 'ArchiveStatus' -Default '')
-            $archiveGuid = [string](Get-PropertyValue -InputObject $Mailbox -Name 'ArchiveGuid' -Default '')
-            $hasArchive = ($archiveState -match '(?i)active') -or
+            $archiveGuid = [string](Get-MigrationProperty -InputObject $Mailbox -Name 'ArchiveGuid' -Default '')
+            $hasArchive = ([string](Get-MigrationProperty -InputObject $Mailbox -Name 'ArchiveStatus' -Default '') -match '(?i)active') -or
                 ($archiveGuid -and $archiveGuid -ne '00000000-0000-0000-0000-000000000000')
-            $results.Add((& $newRow 'ArchiveEnabled' $(if ($hasArchive) { 'Succeeded' } else { 'Failed' }) `
-                $(if ($hasArchive) { "Archive present (source: $sourceArchive)." }
-                  else { "Source archive is '$sourceArchive' but the destination has no archive." })))
+            & $verdict 'ArchiveEnabled' $hasArchive "Archive present (source: $sourceArchive)." `
+                "Source archive is '$sourceArchive' but the destination has no archive."
         }
 
         $sourceSize = 0.0
@@ -862,21 +751,18 @@ function Test-ProvisionedRow {
             if ($raw) { $null = [double]::TryParse($raw, [ref]$sourceSize) }
         }
         if ($sourceSize -le 0) {
-            $results.Add((& $newRow 'MailboxQuota' 'Skipped' 'No source mailbox size; supply -SourceMailboxesCsv.'))
+            & $newRow 'MailboxQuota' 'Skipped' 'No source mailbox size; supply -SourceMailboxesCsv.'
         }
         else {
-            $quotaGb = ConvertTo-QuotaGigabyte -Value ([string](Get-PropertyValue -InputObject $Mailbox `
-                -Name 'ProhibitSendReceiveQuota' -Default ''))
-            $fits = $quotaGb -ge $sourceSize
+            $quotaGb = ConvertTo-QuotaGigabyte -Value ([string](Get-MigrationProperty -InputObject $Mailbox -Name 'ProhibitSendReceiveQuota' -Default ''))
             $quotaText = if ($quotaGb -ge [double]::MaxValue) { 'unlimited' } else { "$quotaGb GB" }
-            $results.Add((& $newRow 'MailboxQuota' $(if ($fits) { 'Succeeded' } else { 'Failed' }) `
-                "Destination quota $quotaText vs source $sourceSize GB."))
+            $detail = "Destination quota $quotaText vs source $sourceSize GB."
+            & $verdict 'MailboxQuota' ($quotaGb -ge $sourceSize) $detail $detail
         }
     }
 
-    $results.Add((& $newRow 'OneDriveExists' $(if ($DriveExists) { 'Succeeded' } else { 'Failed' }) `
-        $(if ($DriveExists) { 'Drive present.' }
-          else { 'GET /users/{id}/drive returned 404; pre-provision with Request-SPOPersonalSite.' })))
+    & $verdict 'OneDriveExists' ([bool]$DriveExists) 'Drive present.' `
+        'GET /users/{id}/drive returned 404; pre-provision with Request-SPOPersonalSite.'
 
     return @{
         Row                 = $results.ToArray()
@@ -889,19 +775,17 @@ function Test-PostRow {
     <#
     .SYNOPSIS
         Grades one plan row after cutover: addresses, visibility and account state.
-
     .DESCRIPTION
         Pure, for the same reason Test-ProvisionedRow is. Aliases are compared with their type prefix
         intact so that an X500 entry is only satisfied by an X500 entry.
-
     .PARAMETER Row
         The identity plan row.
-
     .PARAMETER User
         The destination Graph user, or $null.
-
     .PARAMETER Mailbox
         The destination mailbox from Get-EXOMailbox, or $null.
+    .EXAMPLE
+        Test-PostRow -Row $planRow -User $user -Mailbox $mailbox
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -911,55 +795,44 @@ function Test-PostRow {
         [AllowNull()]$Mailbox
     )
 
-    $identity = Get-PlanRowIdentity -Row $Row
-    $wave = Get-MigrationCsvValue -Row $Row -Name 'Wave' -Default ''
-    $objectType = Get-MigrationCsvValue -Row $Row -Name 'ObjectType' -Default ''
     $results = [System.Collections.Generic.List[object]]::new()
-
     $newRow = {
         param([string]$Action, [string]$Status, [string]$Detail)
-        New-CheckResult -Identity $identity -Action $Action -Status $Status -Detail $Detail `
-            -Stage 'Post' -Wave $wave -ObjectType $objectType
+        $results.Add((New-CheckResult -Row $Row -Action $Action -Status $Status -Detail $Detail -Stage 'Post'))
+    }
+    $verdict = {
+        param([string]$Action, [bool]$Pass, [string]$Good, [string]$Bad)
+        & $newRow $Action $(if ($Pass) { 'Succeeded' } else { 'Failed' }) $(if ($Pass) { $Good } else { $Bad })
+    }
+    # Both address checks ask the same question of a different column pair.
+    $matchesPlan = {
+        param([string]$Action, [string]$Column, $Actual, [string]$SkipDetail)
+        $wanted = Get-MigrationCsvValue -Row $Row -Name $Column -Default ''
+        $found = [string]$Actual
+        if (-not $wanted) { & $newRow $Action 'Skipped' $SkipDetail; return }
+        & $verdict $Action ([bool]($found -and $found -eq $wanted)) $found "Expected '$wanted' but found '$found'."
     }
 
     if ($null -eq $User) {
-        $results.Add((& $newRow 'UserExists' 'Failed' 'No destination user with this TargetObjectId.'))
+        & $newRow 'UserExists' 'Failed' 'No destination user with this TargetObjectId.'
         return $results.ToArray()
     }
 
-    $wantedUpn = Get-MigrationCsvValue -Row $Row -Name 'TargetUserPrincipalName' -Default ''
-    $actualUpn = [string](Get-PropertyValue -InputObject $User -Name 'userPrincipalName' -Default '')
-    if (-not $wantedUpn) {
-        $results.Add((& $newRow 'UpnMatchesPlan' 'Skipped' 'The plan has no TargetUserPrincipalName.'))
-    }
-    else {
-        $match = $actualUpn -and ($actualUpn -eq $wantedUpn)
-        $results.Add((& $newRow 'UpnMatchesPlan' $(if ($match) { 'Succeeded' } else { 'Failed' }) `
-            $(if ($match) { $actualUpn } else { "Expected '$wantedUpn' but found '$actualUpn'." })))
-    }
-
-    $enabled = [bool](Get-PropertyValue -InputObject $User -Name 'accountEnabled' -Default $false)
-    $results.Add((& $newRow 'AccountEnabled' $(if ($enabled) { 'Succeeded' } else { 'Failed' }) `
-        $(if ($enabled) { 'Enabled.' } else { 'The account is disabled.' })))
+    & $matchesPlan 'UpnMatchesPlan' 'TargetUserPrincipalName' `
+        (Get-MigrationProperty -InputObject $User -Name 'userPrincipalName' -Default '') 'The plan has no TargetUserPrincipalName.'
+    & $verdict 'AccountEnabled' ([bool](Get-MigrationProperty -InputObject $User -Name 'accountEnabled' -Default $false)) `
+        'Enabled.' 'The account is disabled.'
 
     if ($null -eq $Mailbox) {
-        $results.Add((& $newRow 'PrimarySmtpMatchesPlan' 'Failed' 'No mailbox to read addresses from.'))
+        & $newRow 'PrimarySmtpMatchesPlan' 'Failed' 'No mailbox to read addresses from.'
         return $results.ToArray()
     }
 
-    $wantedSmtp = Get-MigrationCsvValue -Row $Row -Name 'TargetPrimarySmtp' -Default ''
-    $actualSmtp = [string](Get-PropertyValue -InputObject $Mailbox -Name 'PrimarySmtpAddress' -Default '')
-    if (-not $wantedSmtp) {
-        $results.Add((& $newRow 'PrimarySmtpMatchesPlan' 'Skipped' 'The plan has no TargetPrimarySmtp.'))
-    }
-    else {
-        $match = $actualSmtp -and ($actualSmtp -eq $wantedSmtp)
-        $results.Add((& $newRow 'PrimarySmtpMatchesPlan' $(if ($match) { 'Succeeded' } else { 'Failed' }) `
-            $(if ($match) { $actualSmtp } else { "Expected '$wantedSmtp' but found '$actualSmtp'." })))
-    }
+    & $matchesPlan 'PrimarySmtpMatchesPlan' 'TargetPrimarySmtp' `
+        (Get-MigrationProperty -InputObject $Mailbox -Name 'PrimarySmtpAddress' -Default '') 'The plan has no TargetPrimarySmtp.'
 
     $present = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($proxy in @(Get-PropertyValue -InputObject $Mailbox -Name 'EmailAddresses' -Default @())) {
+    foreach ($proxy in @(Get-MigrationProperty -InputObject $Mailbox -Name 'EmailAddresses' -Default @())) {
         [void]$present.Add(([string]$proxy).Trim())
     }
     $wantedAlias = @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $Row -Name 'TargetAliases' -Default ''))
@@ -967,21 +840,18 @@ function Test-PostRow {
     if ($sourceX500) { $wantedAlias += $sourceX500 }
 
     if (@($wantedAlias).Count -eq 0) {
-        $results.Add((& $newRow 'AliasesPresent' 'Skipped' 'The plan lists no target aliases.'))
+        & $newRow 'AliasesPresent' 'Skipped' 'The plan lists no target aliases.'
     }
     else {
-        $missing = [System.Collections.Generic.List[string]]::new()
-        foreach ($alias in $wantedAlias) {
-            if (-not $present.Contains($alias.Trim())) { $missing.Add($alias.Trim()) }
-        }
-        $results.Add((& $newRow 'AliasesPresent' $(if ($missing.Count -eq 0) { 'Succeeded' } else { 'Failed' }) `
-            $(if ($missing.Count -eq 0) { "All $(@($wantedAlias).Count) planned address(es) present." }
-              else { "Missing: $(Join-MigrationList -Values $missing.ToArray())" })))
+        $missing = @($wantedAlias | ForEach-Object { $_.Trim() } | Where-Object { -not $present.Contains($_) })
+        & $verdict 'AliasesPresent' ($missing.Count -eq 0) `
+            "All $(@($wantedAlias).Count) planned address(es) present." `
+            "Missing: $(Join-MigrationList -Values $missing)"
     }
 
-    $hidden = [bool](Get-PropertyValue -InputObject $Mailbox -Name 'HiddenFromAddressListsEnabled' -Default $false)
-    $results.Add((& $newRow 'VisibleInAddressList' $(if ($hidden) { 'Failed' } else { 'Succeeded' }) `
-        $(if ($hidden) { 'Still hidden from address lists.' } else { 'Visible.' })))
+    & $verdict 'VisibleInAddressList' `
+        (-not [bool](Get-MigrationProperty -InputObject $Mailbox -Name 'HiddenFromAddressListsEnabled' -Default $false)) `
+        'Visible.' 'Still hidden from address lists.'
 
     return $results.ToArray()
 }
@@ -990,32 +860,30 @@ function Write-CheckTable {
     <#
     .SYNOPSIS
         Prints the pass/fail table that closes every run.
-
     .PARAMETER Result
         Every result row produced by the run.
+    .EXAMPLE
+        Write-CheckTable -Result $results.ToArray()
     #>
     [CmdletBinding()]
     [OutputType([void])]
-    param(
-        [AllowNull()][AllowEmptyCollection()][object[]]$Result
-    )
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Result)
 
+    $format = '  {0,-24} {1,7} {2,7} {3,8}  {4}'
     Write-MigrationLog -Message '--- Readiness checks ---' -Level SUCCESS
     if (@($Result).Count -eq 0) {
         Write-MigrationLog -Message '  (no checks ran)' -Level WARNING
         return
     }
 
-    Write-MigrationLog -Message ('  {0,-24} {1,7} {2,7} {3,8}  {4}' -f
-        'Check', 'Passed', 'Failed', 'Skipped', 'Verdict') -Level SUCCESS
+    Write-MigrationLog -Message ($format -f 'Check', 'Passed', 'Failed', 'Skipped', 'Verdict') -Level SUCCESS
     foreach ($group in (@($Result) | Group-Object -Property Action | Sort-Object -Property Name)) {
         $passed = @($group.Group | Where-Object { $_.Status -eq 'Succeeded' }).Count
         $failed = @($group.Group | Where-Object { $_.Status -eq 'Failed' }).Count
         $skipped = @($group.Group | Where-Object { $_.Status -eq 'Skipped' }).Count
         $verdict = if ($failed -gt 0) { 'FAIL' } elseif ($passed -gt 0) { 'PASS' } else { 'SKIPPED' }
         $level = if ($failed -gt 0) { 'ERROR' } elseif ($passed -gt 0) { 'SUCCESS' } else { 'WARNING' }
-        Write-MigrationLog -Message ('  {0,-24} {1,7} {2,7} {3,8}  {4}' -f
-            $group.Name, $passed, $failed, $skipped, $verdict) -Level $level
+        Write-MigrationLog -Message ($format -f $group.Name, $passed, $failed, $skipped, $verdict) -Level $level
     }
 }
 
@@ -1037,7 +905,7 @@ try {
     if ($scopedRows.Count -eq 0) {
         # Bail out before signing in: connecting to check nothing is pure cost, and an empty scope is
         # almost always a -Wave value that does not appear in the plan.
-        throw ("No plan rows are in scope. Check -Wave against the Wave column in '$PlanPath'.")
+        throw "No plan rows are in scope. Check -Wave against the Wave column in '$PlanPath'."
     }
     Write-MigrationLog -Message "Stage '$Stage' over $($scopedRows.Count) plan row(s)." -Level INFO
 
@@ -1056,19 +924,16 @@ try {
     if ($Stage -eq 'Pre') {
         # PlanClean - anything the planner could not resolve is a blocker, not a warning.
         $dirty = @($scopedRows | Where-Object {
-            $dirtyPlanStatus -contains (Get-MigrationCsvValue -Row $_ -Name 'PlanStatus' -Default '')
-        })
+                $dirtyPlanStatus -contains (Get-MigrationCsvValue -Row $_ -Name 'PlanStatus' -Default '')
+            })
         foreach ($row in $dirty) {
-            $planStatus = Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default ''
-            $planDetail = Get-MigrationCsvValue -Row $row -Name 'PlanDetail' -Default 'no detail recorded'
-            $results.Add((New-CheckResult -Identity (Get-PlanRowIdentity -Row $row) -Action 'PlanClean' -Status 'Failed' `
-                -Detail "PlanStatus is '$planStatus': $planDetail" `
-                -Stage $Stage -Wave (Get-MigrationCsvValue -Row $row -Name 'Wave' -Default '') `
-                -ObjectType (Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default '')))
+            $results.Add((New-CheckResult -Row $row -Action 'PlanClean' -Status 'Failed' -Stage $Stage -Detail (
+                        "PlanStatus is '$(Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default '')': " +
+                        "$(Get-MigrationCsvValue -Row $row -Name 'PlanDetail' -Default 'no detail recorded')")))
         }
         if ($dirty.Count -eq 0) {
-            $results.Add((New-CheckResult -Identity 'PlanClean' -Action 'PlanClean' -Status 'Succeeded' `
-                -Detail "No NeedsReview, Invalid or Collision rows in $($scopedRows.Count) row(s)." -Stage $Stage))
+            $results.Add((New-CheckResult -Action 'PlanClean' -Status 'Succeeded' -Stage $Stage `
+                        -Detail "No NeedsReview, Invalid or Collision rows in $($scopedRows.Count) row(s)."))
         }
 
         # DomainVerified - every domain the plan intends to use must already be verified.
@@ -1083,46 +948,42 @@ try {
         }
         foreach ($domain in $plannedDomain) {
             $isVerified = $verifiedDomain -contains $domain
-            $results.Add((New-CheckResult -Identity $domain -Action 'DomainVerified' `
-                -Status $(if ($isVerified) { 'Succeeded' } else { 'Failed' }) `
-                -Detail $(if ($isVerified) { 'Verified in the destination tenant.' }
-                    else { 'Not a verified domain in the destination tenant.' }) -Stage $Stage))
+            $results.Add((New-CheckResult -Identity $domain -Action 'DomainVerified' -Stage $Stage `
+                        -Status $(if ($isVerified) { 'Succeeded' } else { 'Failed' }) `
+                        -Detail $(if ($isVerified) { 'Verified in the destination tenant.' }
+                            else { 'Not a verified domain in the destination tenant.' })))
         }
         if ($plannedDomain.Count -eq 0) {
-            $results.Add((New-CheckResult -Identity 'DomainVerified' -Action 'DomainVerified' -Status 'Skipped' `
-                -Detail 'The plan names no target or interim addresses.' -Stage $Stage))
+            $results.Add((New-CheckResult -Action 'DomainVerified' -Status 'Skipped' -Stage $Stage `
+                        -Detail 'The plan names no target or interim addresses.'))
         }
 
         # SkuSeats - the seat arithmetic the tenant will enforce, run before anyone waits on it.
-        $catalog = @(Get-MigrationSkuCatalog)
-        $seat = @(Measure-SeatRequirement -Row $scopedRows -Catalog $catalog)
+        $seat = @(Measure-SeatRequirement -Row $scopedRows -Catalog @(Get-MigrationSkuCatalog))
         foreach ($sku in $seat) {
-            $status = if ($sku.Status -eq 'Sufficient') { 'Succeeded' } else { 'Failed' }
             $detail = switch ($sku.Status) {
                 'Unknown' { "The destination tenant has no subscription with part number '$($sku.SkuPartNumber)'." }
                 'Shortfall' { "Needs $($sku.Needed), $($sku.Available) available - short by $($sku.Shortfall)." }
                 default { "Needs $($sku.Needed) of $($sku.Available) available." }
             }
-            $results.Add((New-CheckResult -Identity $sku.SkuPartNumber -Action 'SkuSeats' -Status $status `
-                -Detail $detail -Stage $Stage))
+            $results.Add((New-CheckResult -Identity $sku.SkuPartNumber -Action 'SkuSeats' -Stage $Stage -Detail $detail `
+                        -Status $(if ($sku.Status -eq 'Sufficient') { 'Succeeded' } else { 'Failed' })))
         }
         if ($seat.Count -eq 0) {
-            $results.Add((New-CheckResult -Identity 'SkuSeats' -Action 'SkuSeats' -Status 'Skipped' `
-                -Detail 'No plan row asks for a licence.' -Stage $Stage))
+            $results.Add((New-CheckResult -Action 'SkuSeats' -Status 'Skipped' -Stage $Stage `
+                        -Detail 'No plan row asks for a licence.'))
         }
 
         # UsageLocation - assignLicense fails outright without one.
         $licensed = @($scopedRows | Where-Object { (Get-MigrationCsvValue -Row $_ -Name 'TargetLicenses' -Default '') })
         $noLocation = @($licensed | Where-Object { -not (Get-MigrationCsvValue -Row $_ -Name 'UsageLocation' -Default '') })
         foreach ($row in $noLocation) {
-            $results.Add((New-CheckResult -Identity (Get-PlanRowIdentity -Row $row) -Action 'UsageLocation' -Status 'Failed' `
-                -Detail 'Row is licensed but has no UsageLocation; assignLicense will fail unless a default is supplied.' `
-                -Stage $Stage -Wave (Get-MigrationCsvValue -Row $row -Name 'Wave' -Default '') `
-                -ObjectType (Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default '')))
+            $results.Add((New-CheckResult -Row $row -Action 'UsageLocation' -Status 'Failed' -Stage $Stage `
+                        -Detail 'Row is licensed but has no UsageLocation; assignLicense will fail unless a default is supplied.'))
         }
         if ($noLocation.Count -eq 0) {
-            $results.Add((New-CheckResult -Identity 'UsageLocation' -Action 'UsageLocation' -Status 'Succeeded' `
-                -Detail "All $($licensed.Count) licensed row(s) carry a usage location." -Stage $Stage))
+            $results.Add((New-CheckResult -Action 'UsageLocation' -Status 'Succeeded' -Stage $Stage `
+                        -Detail "All $($licensed.Count) licensed row(s) carry a usage location."))
         }
 
         # AddressClash - users, groups, soft-deleted users (Graph) plus every mail-enabled recipient (EXO).
@@ -1141,41 +1002,37 @@ try {
 
         $existing = [System.Collections.Generic.List[object]]::new()
         $existing.AddRange(@(Get-DirectoryClashObject -UserPrincipalName $upnList.ToArray() `
-            -EmailAddress $addressList.ToArray() -MailNickname $nicknameList.ToArray() -BatchSize $graphFilterBatchSize))
+                    -EmailAddress $addressList.ToArray() -MailNickname $nicknameList.ToArray() -BatchSize $graphFilterBatchSize))
         $existing.AddRange(@(Get-RecipientClashObject -EmailAddress $addressList.ToArray() -BatchSize $exoFilterBatchSize))
         Write-MigrationLog -Message "Found $($existing.Count) destination object(s) holding a planned identifier." -Level INFO
 
         $clash = @(Test-AddressClash -Row $scopedRows -ExistingObject $existing.ToArray() -Stage $Stage)
         foreach ($row in $clash) { $results.Add($row) }
         if ($clash.Count -eq 0) {
-            $results.Add((New-CheckResult -Identity 'AddressClash' -Action 'AddressClash' -Status 'Succeeded' `
-                -Detail 'No planned UPN, address or mail nickname is already taken.' -Stage $Stage))
+            $results.Add((New-CheckResult -Action 'AddressClash' -Status 'Succeeded' -Stage $Stage `
+                        -Detail 'No planned UPN, address or mail nickname is already taken.'))
         }
 
         # SyncedSource - a directory-synced source object cannot have its addresses edited in EXO.
         $synced = @($scopedRows | Where-Object { (Get-MigrationCsvValue -Row $_ -Name 'IsSynced' -Default '') -match '(?i)^true$' })
         foreach ($row in $synced) {
-            $results.Add((New-CheckResult -Identity (Get-PlanRowIdentity -Row $row) -Action 'SyncedSource' -Status 'Skipped' `
-                -Detail ('Source object is directory-synced; addresses must be edited on-premises and ' +
-                    'synced, not in Exchange Online.') `
-                -Stage $Stage -Wave (Get-MigrationCsvValue -Row $row -Name 'Wave' -Default '') `
-                -ObjectType (Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default '')))
+            $results.Add((New-CheckResult -Row $row -Action 'SyncedSource' -Status 'Skipped' -Stage $Stage `
+                        -Detail ('Source object is directory-synced; addresses must be edited on-premises and ' +
+                            'synced, not in Exchange Online.')))
         }
         if ($synced.Count -gt 0) {
             Write-MigrationLog -Message "$($synced.Count) plan row(s) are directory-synced at the source." -Level WARNING
         }
         else {
-            $results.Add((New-CheckResult -Identity 'SyncedSource' -Action 'SyncedSource' -Status 'Succeeded' `
-                -Detail 'No directory-synced source objects in scope.' -Stage $Stage))
+            $results.Add((New-CheckResult -Action 'SyncedSource' -Status 'Succeeded' -Stage $Stage `
+                        -Detail 'No directory-synced source objects in scope.'))
         }
     }
     else {
         $provisionedRows = @($scopedRows | Where-Object { (Get-MigrationCsvValue -Row $_ -Name 'TargetObjectId' -Default '') })
         foreach ($row in @($scopedRows | Where-Object { -not (Get-MigrationCsvValue -Row $_ -Name 'TargetObjectId' -Default '') })) {
-            $results.Add((New-CheckResult -Identity (Get-PlanRowIdentity -Row $row) -Action 'UserExists' -Status 'Skipped' `
-                -Detail 'No TargetObjectId yet; the row has not been provisioned.' -Stage $Stage `
-                -Wave (Get-MigrationCsvValue -Row $row -Name 'Wave' -Default '') `
-                -ObjectType (Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default '')))
+            $results.Add((New-CheckResult -Row $row -Action 'UserExists' -Status 'Skipped' -Stage $Stage `
+                        -Detail 'No TargetObjectId yet; the row has not been provisioned.'))
         }
 
         $changed = $false
@@ -1187,9 +1044,7 @@ try {
                 $user = Invoke-MigrationGraphRequest -Method GET `
                     -Uri "/v1.0/users/$objectId`?`$select=id,userPrincipalName,displayName,accountEnabled,usageLocation"
             }
-            catch {
-                if (-not (Test-GraphNotFound -ErrorRecord $_)) { throw }
-            }
+            catch { if (-not (Test-GraphNotFound -ErrorRecord $_)) { throw } }
 
             $mailbox = $null
             try {
@@ -1198,9 +1053,7 @@ try {
                     'HiddenFromAddressListsEnabled', 'EmailAddresses', 'PrimarySmtpAddress'
                 )
             }
-            catch {
-                Write-MigrationLog -Message "No mailbox for $objectId - $($_.Exception.Message)" -Level DEBUG
-            }
+            catch { Write-MigrationLog -Message "No mailbox for $objectId - $($_.Exception.Message)" -Level DEBUG }
 
             if ($Stage -eq 'Post') {
                 foreach ($resultRow in @(Test-PostRow -Row $row -User $user -Mailbox $mailbox)) { $results.Add($resultRow) }
@@ -1209,19 +1062,14 @@ try {
 
             # Application permissions never auto-provision OneDrive, so a 404 here is a real finding.
             $driveExists = $false
-            try {
-                $drive = Invoke-MigrationGraphRequest -Method GET -Uri "/v1.0/users/$objectId/drive"
-                $driveExists = $null -ne $drive
-            }
-            catch {
-                if (-not (Test-GraphNotFound -ErrorRecord $_)) { throw }
-            }
+            try { $driveExists = $null -ne (Invoke-MigrationGraphRequest -Method GET -Uri "/v1.0/users/$objectId/drive") }
+            catch { if (-not (Test-GraphNotFound -ErrorRecord $_)) { throw } }
 
-            $sourceMailbox = $null
             $sourceAddress = ([string](Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default '')).ToLowerInvariant()
-            if ($sourceAddress -and $sourceMailboxByAddress.ContainsKey($sourceAddress)) {
-                $sourceMailbox = $sourceMailboxByAddress[$sourceAddress]
+            $sourceMailbox = if ($sourceAddress -and $sourceMailboxByAddress.ContainsKey($sourceAddress)) {
+                $sourceMailboxByAddress[$sourceAddress]
             }
+            else { $null }
 
             $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox `
                 -DriveExists:$driveExists -SourceMailbox $sourceMailbox
@@ -1259,18 +1107,14 @@ catch {
 Write-CheckTable -Result $results.ToArray()
 
 if ($results.Count -gt 0) {
-    try {
-        $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Test-MigrationReadiness'
-    }
+    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Test-MigrationReadiness' }
     catch {
         Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
         $exitCode = 1
     }
 }
 
-if ($exitCode -eq 0 -and @($results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) {
-    $exitCode = 2
-}
+if ($exitCode -eq 0 -and @($results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { $exitCode = 2 }
 
 exit (Complete-MigrationRun -ExitCode $exitCode)
 

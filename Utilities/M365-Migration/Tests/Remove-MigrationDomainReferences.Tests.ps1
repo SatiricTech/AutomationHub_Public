@@ -717,29 +717,6 @@ Describe 'Remove-MigrationDomainReferences' {
         }
     }
 
-    Context 'Two-pass reporting' {
-
-        It 'Writes the references report with the run prefix and a timestamp' {
-            $rows = @(
-                [pscustomobject]@{ Identity = 'sam@contoso.com'; Class = 'Fixable'; Reason = 'UpnOnDomain' }
-                [pscustomobject]@{ Identity = 'old@contoso.com'; Class = 'Blocker'; Reason = 'SoftDeletedUser' }
-            )
-
-            $path = Export-DomainReferenceReport -Rows $rows -Name 'DomainReferences' `
-                -Directory $script:workspace -Prefix 'Contoso'
-
-            [System.IO.Path]::GetFileName($path) |
-                Should -Match '^Contoso_DomainReferences_\d{8}-\d{6}\.csv$'
-            @(Import-Csv -LiteralPath $path) | Should -HaveCount 2
-        }
-
-        It 'Still writes a file when nothing references the domain' {
-            $path = Export-DomainReferenceReport -Rows @() -Name 'DomainBlockers' -Directory $script:workspace
-            Test-Path -LiteralPath $path | Should -BeTrue
-            [System.IO.Path]::GetFileName($path) | Should -Match '^DomainBlockers_\d{8}-\d{6}\.csv$'
-        }
-    }
-
     Context 'Reference record factory' {
 
         It 'Fills every schema property with a default' {

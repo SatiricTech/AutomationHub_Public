@@ -166,119 +166,6 @@ $learningPreferHeader = @{ Prefer = 'include-unknown-enum-members' }
 
 #region Functions --------------------------------------------------------------
 
-function Get-VivaGraphStatusCode {
-    <#
-        Best-effort HTTP status code from a failed Graph request. The SDK doesn't
-        expose the response object consistently, so the Graph error body's code
-        string and the exception text are both consulted. The module has an
-        equivalent private helper but does not export it.
-    #>
-    [CmdletBinding()]
-    [OutputType([int])]
-    param([Parameter(Mandatory)]$ErrorRecord)
-
-    $response = $ErrorRecord.Exception.PSObject.Properties['Response']
-    if ($response -and $response.Value) {
-        $status = $response.Value.PSObject.Properties['StatusCode']
-        if ($status -and $status.Value) { return [int]$status.Value }
-    }
-
-    # ErrorDetails is null on many SDK failures and strict mode makes a blind read
-    # on it fatal, so it is checked before being dereferenced.
-    $detail = ''
-    if ($ErrorRecord.ErrorDetails) { $detail = [string]$ErrorRecord.ErrorDetails.Message }
-    if ($detail) {
-        # A non-JSON body (or none) just means we fall through to the message text.
-        $code = [string]$(try { (ConvertFrom-Json $detail -ErrorAction Stop).error.code } catch { $null })
-        switch -Regex ($code) {
-            '^(notFound|ResourceNotFound|Request_ResourceNotFound)$' { return 404 }
-            '^tooManyRequests$' { return 429 }
-            '^serviceUnavailable$' { return 503 }
-            '^(forbidden|accessDenied|Authorization_RequestDenied)$' { return 403 }
-            '^badRequest$' { return 400 }
-            '^(unauthorized|InvalidAuthenticationToken)$' { return 401 }
-        }
-    }
-
-    $message = [string]$ErrorRecord.Exception.Message
-    if ($message -match 'HTTP/[\d.]+\s+(\d{3})' -or $message -match '\b([45]\d{2})\s*\(' -or
-        $message -match '\b(40[0-9]|429|50[0-9])\b') {
-        return [int]$Matches[1]
-    }
-    return 0
-}
-
-function Get-VivaProperty {
-    <#
-        Strict-mode-safe read of an optional property on a Graph object. Almost
-        every learningCourseActivity and learningContent field is optional on the
-        wire, and a missing property is a fatal error under Set-StrictMode.
-    #>
-    [CmdletBinding()]
-    param(
-        [AllowNull()]$InputObject,
-        [Parameter(Mandatory)][string]$Name,
-        $Default = $null
-    )
-
-    if ($null -eq $InputObject) { return $Default }
-    $property = $InputObject.PSObject.Properties[$Name]
-    if (-not $property -or $null -eq $property.Value) { return $Default }
-    return $property.Value
-}
-
-function Invoke-VivaLearningRequest {
-    <#
-        A paged, retrying GET that carries a request header. It exists only because
-        Invoke-MigrationGraphRequest has no -Headers parameter and the employee
-        learning API drops peerRecommended assignment types without
-        'Prefer: include-unknown-enum-members'. Retry and paging follow the same
-        contract as the module function so behaviour is identical everywhere else.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Uri,
-        [Parameter(Mandatory)][hashtable]$Headers,
-        [ValidateRange(1, 20)][int]$MaxRetry = 5
-    )
-
-    $items = [System.Collections.Generic.List[object]]::new()
-    $next = $Uri
-
-    while (-not [string]::IsNullOrWhiteSpace($next)) {
-        $attempt = 0
-        $page = $null
-        while ($true) {
-            $attempt++
-            try {
-                $page = Invoke-MgGraphRequest -Method GET -Uri $next -Headers $Headers -OutputType PSObject -ErrorAction Stop
-                break
-            }
-            catch {
-                $statusCode = Get-VivaGraphStatusCode -ErrorRecord $_
-                if ($statusCode -notin @(429, 503, 504) -or $attempt -ge $MaxRetry) { throw }
-
-                # The employee learning API expresses its retry hint in MINUTES in the
-                # error body rather than the usual Retry-After seconds header.
-                $delay = [int][Math]::Min([Math]::Pow(2, $attempt), 60)
-                $errorBody = ''
-                if ($_.ErrorDetails) { $errorBody = [string]$_.ErrorDetails.Message }
-                if ($errorBody -match 'Retry after (\d+) minute') { $delay = [int]$Matches[1] * 60 }
-
-                Write-MigrationLog -Message "Graph returned $statusCode - waiting $delay second(s) before retry $attempt of $MaxRetry." -Level WARNING
-                Start-Sleep -Seconds $delay
-            }
-        }
-
-        if ($page -and $page.PSObject.Properties['value'] -and $null -ne $page.value) {
-            $items.AddRange(@($page.value))
-        }
-        $next = [string](Get-VivaProperty -InputObject $page -Name '@odata.nextLink' -Default '')
-    }
-
-    return $items.ToArray()
-}
-
 function ConvertTo-FlatDateTime {
     <# Graph returns some timestamps without the trailing 'Z' - normalise to ISO 8601 UTC. #>
     [CmdletBinding()]
@@ -332,6 +219,16 @@ $run = Initialize-MigrationRun -ScriptName 'Get-MigrationVivaLearningHistory' -O
     -Prefix $Prefix -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
 
 $results = [System.Collections.Generic.List[object]]::new()
+$addResult = {
+    param([string]$Identity, [string]$Action, [string]$Status, [string]$Detail, [int]$ActivityCount = 0)
+    $results.Add([pscustomobject][ordered]@{
+            Identity      = $Identity
+            Action        = $Action
+            Status        = $Status
+            Detail        = $Detail
+            ActivityCount = $ActivityCount
+        })
+}
 
 try {
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -348,23 +245,14 @@ try {
 
         $planned = if ($User) { @($User) } else { @('(every member user in the tenant)') }
         foreach ($identity in $planned) {
-            $results.Add([pscustomobject][ordered]@{
-                    Identity      = $identity
-                    Action        = 'ExportLearningHistory'
-                    Status        = 'Planned'
-                    Detail        = "Would read learningCourseActivities and write $historyCsv."
-                    ActivityCount = 0
-                })
+            & $addResult $identity 'ExportLearningHistory' 'Planned' "Would read learningCourseActivities and write $historyCsv."
         }
     }
     else {
-        #region Connect --------------------------------------------------------
         $context = Connect-VivaLearningGraph -ScopeSets $graphScopeSets -Tenant $TenantId
         $grantedLearningScopes = @(@($context.Scopes) | Where-Object { $_ -like 'Learning*' })
         Write-MigrationLog -Message "Granted learning scopes: $($grantedLearningScopes -join ', ')" -Level INFO
-        #endregion -------------------------------------------------------------
 
-        #region Resolve the user set -------------------------------------------
         $targetUsers = [System.Collections.Generic.List[object]]::new()
 
         if ($User) {
@@ -380,7 +268,7 @@ try {
                     # Only a genuine 404 means the account doesn't exist - anything else
                     # (403 consent gap, exhausted throttle, network) must not masquerade
                     # as "not found" or the operator chases the wrong problem.
-                    $statusCode = Get-VivaGraphStatusCode -ErrorRecord $_
+                    $statusCode = Get-MigrationGraphErrorStatusCode -ErrorRecord $_
                     $detail = if ($statusCode -eq 404) {
                         'Not found in this tenant.'
                     }
@@ -388,13 +276,7 @@ try {
                         "Could not be resolved (HTTP $statusCode): $($_.Exception.Message)"
                     }
                     Write-MigrationLog -Message "  [Failed] $identity - $detail" -Level ERROR
-                    $results.Add([pscustomobject][ordered]@{
-                            Identity      = $identity
-                            Action        = 'ResolveUser'
-                            Status        = 'Failed'
-                            Detail        = $detail
-                            ActivityCount = 0
-                        })
+                    & $addResult $identity 'ResolveUser' 'Failed' $detail
                 }
             }
         }
@@ -403,7 +285,7 @@ try {
             $allUsers = @(Invoke-MigrationGraphRequest -Method GET -All `
                     -Uri '/v1.0/users?$select=id,userPrincipalName,displayName,accountEnabled,userType&$top=999')
             foreach ($u in $allUsers) {
-                if (-not $IncludeGuests -and [string](Get-VivaProperty -InputObject $u -Name 'userType') -eq 'Guest') { continue }
+                if (-not $IncludeGuests -and [string](Get-MigrationProperty -InputObject $u -Name 'userType') -eq 'Guest') { continue }
                 $targetUsers.Add($u)
             }
         }
@@ -414,9 +296,7 @@ try {
         else {
             Write-MigrationLog -Message "Users to read: $($targetUsers.Count)" -Level INFO
         }
-        #endregion -------------------------------------------------------------
 
-        #region Read provider catalogs for course metadata ---------------------
         # Course metadata is only exposed for API-registered providers; built-in
         # sources (LinkedIn Learning, Microsoft Learn...) may not be resolvable.
         # Activities whose content cannot be resolved export with blank Course*
@@ -429,14 +309,14 @@ try {
             try {
                 $providers = @(Invoke-MigrationGraphRequest -Method GET -All -Uri '/v1.0/employeeExperience/learningProviders')
                 foreach ($provider in $providers) {
-                    $providerId = [string](Get-VivaProperty -InputObject $provider -Name 'id')
-                    $providerName = [string](Get-VivaProperty -InputObject $provider -Name 'displayName')
+                    $providerId = [string](Get-MigrationProperty -InputObject $provider -Name 'id')
+                    $providerName = [string](Get-MigrationProperty -InputObject $provider -Name 'displayName')
                     $providerNamesById[$providerId] = $providerName
                     try {
                         $contents = @(Invoke-MigrationGraphRequest -Method GET -All `
                                 -Uri "/v1.0/employeeExperience/learningProviders/$providerId/learningContents")
                         foreach ($content in $contents) {
-                            $contentById[[string](Get-VivaProperty -InputObject $content -Name 'id')] = $content
+                            $contentById[[string](Get-MigrationProperty -InputObject $content -Name 'id')] = $content
                         }
                         Write-MigrationLog -Message "  ${providerName}: $($contents.Count) catalog item(s)" -Level INFO
                     }
@@ -449,12 +329,7 @@ try {
                 Write-MigrationLog -Message "  Could not list learning providers - continuing without course metadata: $($_.Exception.Message)" -Level WARNING
             }
         }
-        #endregion -------------------------------------------------------------
 
-        #region Pull activities per user ---------------------------------------
-        # Every other call in this script goes through Invoke-MigrationGraphRequest;
-        # only the activity listing needs the Prefer header, so only it uses the
-        # local wrapper.
         $rows = [System.Collections.Generic.List[object]]::new()
         $rawByUser = [System.Collections.Generic.List[object]]::new()
         $assignerUpnById = @{}
@@ -465,9 +340,9 @@ try {
 
         foreach ($target in $targetUsers) {
             $index++
-            $upn = [string](Get-VivaProperty -InputObject $target -Name 'userPrincipalName')
-            $userId = [string](Get-VivaProperty -InputObject $target -Name 'id')
-            $displayName = [string](Get-VivaProperty -InputObject $target -Name 'displayName')
+            $upn = [string](Get-MigrationProperty -InputObject $target -Name 'userPrincipalName')
+            $userId = [string](Get-MigrationProperty -InputObject $target -Name 'id')
+            $displayName = [string](Get-MigrationProperty -InputObject $target -Name 'displayName')
             Write-Progress -Activity 'Exporting Viva Learning history' `
                 -Status "$index of $($targetUsers.Count): $upn" `
                 -PercentComplete (($index / [math]::Max($targetUsers.Count, 1)) * 100)
@@ -483,52 +358,28 @@ try {
 
             $activities = @()
             try {
-                $activities = @(Invoke-VivaLearningRequest -Uri $listUri -Headers $learningPreferHeader)
+                $activities = @(Invoke-MigrationGraphRequest -Method GET -Uri $listUri -Headers $learningPreferHeader -All)
             }
             catch {
-                $statusCode = Get-VivaGraphStatusCode -ErrorRecord $_
+                $statusCode = Get-MigrationGraphErrorStatusCode -ErrorRecord $_
                 if ($statusCode -eq 403) {
                     $deniedUsers++
                     Write-MigrationLog -Message "  [Denied] $upn - 403 reading this user's activities." -Level WARNING
-                    $results.Add([pscustomobject][ordered]@{
-                            Identity      = $upn
-                            Action        = 'ExportLearningHistory'
-                            Status        = 'Failed'
-                            Detail        = "403 reading this user's learningCourseActivities - the delegated token may not read other users."
-                            ActivityCount = 0
-                        })
+                    & $addResult $upn 'ExportLearningHistory' 'Failed' "403 reading this user's learningCourseActivities - the delegated token may not read other users."
                     continue
                 }
                 if ($statusCode -eq 404) {
                     # The user has no employee experience surface at all.
-                    $results.Add([pscustomobject][ordered]@{
-                            Identity      = $upn
-                            Action        = 'ExportLearningHistory'
-                            Status        = 'Skipped'
-                            Detail        = 'No employee experience surface for this user (404).'
-                            ActivityCount = 0
-                        })
+                    & $addResult $upn 'ExportLearningHistory' 'Skipped' 'No employee experience surface for this user (404).'
                     continue
                 }
                 Write-MigrationLog -Message "  [Failed] $upn - $($_.Exception.Message)" -Level ERROR
-                $results.Add([pscustomobject][ordered]@{
-                        Identity      = $upn
-                        Action        = 'ExportLearningHistory'
-                        Status        = 'Failed'
-                        Detail        = "HTTP $statusCode - $($_.Exception.Message)"
-                        ActivityCount = 0
-                    })
+                & $addResult $upn 'ExportLearningHistory' 'Failed' "HTTP $statusCode - $($_.Exception.Message)"
                 continue
             }
 
             if ($activities.Count -eq 0) {
-                $results.Add([pscustomobject][ordered]@{
-                        Identity      = $upn
-                        Action        = 'ExportLearningHistory'
-                        Status        = 'Skipped'
-                        Detail        = 'No learner history recorded for this user.'
-                        ActivityCount = 0
-                    })
+                & $addResult $upn 'ExportLearningHistory' 'Skipped' 'No learner history recorded for this user.'
                 continue
             }
 
@@ -540,18 +391,18 @@ try {
                 })
 
             foreach ($activity in $activities) {
-                $odataType = [string](Get-VivaProperty -InputObject $activity -Name '@odata.type')
+                $odataType = [string](Get-MigrationProperty -InputObject $activity -Name '@odata.type')
                 $activityType = if ($odataType -match 'learningAssignment') { 'Assignment' } else { 'SelfInitiated' }
 
                 # Resolve the assigner's UPN so the destination tenant can remap it - the
                 # raw GUID is meaningless outside this tenant. Deleted assigners resolve blank.
                 $assignerUpn = $null
-                $assignerId = [string](Get-VivaProperty -InputObject $activity -Name 'assignerUserId')
+                $assignerId = [string](Get-MigrationProperty -InputObject $activity -Name 'assignerUserId')
                 if ($assignerId) {
                     if (-not $assignerUpnById.ContainsKey($assignerId)) {
                         try {
                             $assigner = Invoke-MigrationGraphRequest -Method GET -Uri "/v1.0/users/$assignerId`?`$select=userPrincipalName"
-                            $assignerUpnById[$assignerId] = [string](Get-VivaProperty -InputObject $assigner -Name 'userPrincipalName')
+                            $assignerUpnById[$assignerId] = [string](Get-MigrationProperty -InputObject $assigner -Name 'userPrincipalName')
                         }
                         catch {
                             $assignerUpnById[$assignerId] = $null
@@ -560,64 +411,56 @@ try {
                     $assignerUpn = $assignerUpnById[$assignerId]
                 }
 
-                $content = $contentById[[string](Get-VivaProperty -InputObject $activity -Name 'learningContentId')]
+                $content = $contentById[[string](Get-MigrationProperty -InputObject $activity -Name 'learningContentId')]
                 if (-not $content) { $unresolvedContent++ }
 
                 # dueDateTime is a dateTimeTimeZone object and notes an itemBody object on
                 # the wire (whatever the doc tables claim) - flatten both for the CSV.
-                $dueDateTime = Get-VivaProperty -InputObject $activity -Name 'dueDateTime'
-                $notes = Get-VivaProperty -InputObject $activity -Name 'notes'
-                $providerId = [string](Get-VivaProperty -InputObject $activity -Name 'learningProviderId')
+                $dueDateTime = Get-MigrationProperty -InputObject $activity -Name 'dueDateTime'
+                $notes = Get-MigrationProperty -InputObject $activity -Name 'notes'
+                $providerId = [string](Get-MigrationProperty -InputObject $activity -Name 'learningProviderId')
 
                 $rows.Add([pscustomobject][ordered]@{
                         UserPrincipalName         = $upn
                         UserDisplayName           = $displayName
                         UserId                    = $userId
                         ActivityType              = $activityType
-                        Status                    = [string](Get-VivaProperty -InputObject $activity -Name 'status')
-                        CompletionPercentage      = Get-VivaProperty -InputObject $activity -Name 'completionPercentage'
-                        CompletedDateTime         = ConvertTo-FlatDateTime -Value (Get-VivaProperty -InputObject $activity -Name 'completedDateTime')
-                        StartedDateTime           = ConvertTo-FlatDateTime -Value (Get-VivaProperty -InputObject $activity -Name 'startedDateTime')
-                        AssignedDateTime          = ConvertTo-FlatDateTime -Value (Get-VivaProperty -InputObject $activity -Name 'assignedDateTime')
-                        AssignmentType            = [string](Get-VivaProperty -InputObject $activity -Name 'assignmentType')
+                        Status                    = [string](Get-MigrationProperty -InputObject $activity -Name 'status')
+                        CompletionPercentage      = Get-MigrationProperty -InputObject $activity -Name 'completionPercentage'
+                        CompletedDateTime         = ConvertTo-FlatDateTime -Value (Get-MigrationProperty -InputObject $activity -Name 'completedDateTime')
+                        StartedDateTime           = ConvertTo-FlatDateTime -Value (Get-MigrationProperty -InputObject $activity -Name 'startedDateTime')
+                        AssignedDateTime          = ConvertTo-FlatDateTime -Value (Get-MigrationProperty -InputObject $activity -Name 'assignedDateTime')
+                        AssignmentType            = [string](Get-MigrationProperty -InputObject $activity -Name 'assignmentType')
                         AssignerUserId            = $assignerId
                         AssignerUserPrincipalName = $assignerUpn
-                        DueDateTime               = [string](Get-VivaProperty -InputObject $dueDateTime -Name 'dateTime')
-                        DueDateTimeZone           = [string](Get-VivaProperty -InputObject $dueDateTime -Name 'timeZone')
-                        Notes                     = [string](Get-VivaProperty -InputObject $notes -Name 'content')
-                        ActivityId                = [string](Get-VivaProperty -InputObject $activity -Name 'id')
-                        ExternalCourseActivityId  = [string](Get-VivaProperty -InputObject $activity -Name 'externalCourseActivityId')
+                        DueDateTime               = [string](Get-MigrationProperty -InputObject $dueDateTime -Name 'dateTime')
+                        DueDateTimeZone           = [string](Get-MigrationProperty -InputObject $dueDateTime -Name 'timeZone')
+                        Notes                     = [string](Get-MigrationProperty -InputObject $notes -Name 'content')
+                        ActivityId                = [string](Get-MigrationProperty -InputObject $activity -Name 'id')
+                        ExternalCourseActivityId  = [string](Get-MigrationProperty -InputObject $activity -Name 'externalCourseActivityId')
                         LearningProviderId        = $providerId
                         LearningProviderName      = $providerNamesById[$providerId]
-                        LearningContentId         = [string](Get-VivaProperty -InputObject $activity -Name 'learningContentId')
-                        CourseExternalId          = [string](Get-VivaProperty -InputObject $content -Name 'externalId')
-                        CourseTitle               = [string](Get-VivaProperty -InputObject $content -Name 'title')
-                        CourseWebUrl              = [string](Get-VivaProperty -InputObject $content -Name 'contentWebUrl')
-                        CourseDescription         = [string](Get-VivaProperty -InputObject $content -Name 'description')
-                        CourseLanguage            = [string](Get-VivaProperty -InputObject $content -Name 'languageTag')
-                        CourseDuration            = [string](Get-VivaProperty -InputObject $content -Name 'duration')
-                        CourseFormat              = [string](Get-VivaProperty -InputObject $content -Name 'format')
-                        CourseLevel               = [string](Get-VivaProperty -InputObject $content -Name 'level')
-                        CourseSourceName          = [string](Get-VivaProperty -InputObject $content -Name 'sourceName')
-                        CourseThumbnailUrl        = [string](Get-VivaProperty -InputObject $content -Name 'thumbnailWebUrl')
-                        CourseSkillTags           = (@(Get-VivaProperty -InputObject $content -Name 'skillTags' -Default @()) -join ';')
-                        CourseContributors        = (@(Get-VivaProperty -InputObject $content -Name 'contributors' -Default @()) -join ';')
+                        LearningContentId         = [string](Get-MigrationProperty -InputObject $activity -Name 'learningContentId')
+                        CourseExternalId          = [string](Get-MigrationProperty -InputObject $content -Name 'externalId')
+                        CourseTitle               = [string](Get-MigrationProperty -InputObject $content -Name 'title')
+                        CourseWebUrl              = [string](Get-MigrationProperty -InputObject $content -Name 'contentWebUrl')
+                        CourseDescription         = [string](Get-MigrationProperty -InputObject $content -Name 'description')
+                        CourseLanguage            = [string](Get-MigrationProperty -InputObject $content -Name 'languageTag')
+                        CourseDuration            = [string](Get-MigrationProperty -InputObject $content -Name 'duration')
+                        CourseFormat              = [string](Get-MigrationProperty -InputObject $content -Name 'format')
+                        CourseLevel               = [string](Get-MigrationProperty -InputObject $content -Name 'level')
+                        CourseSourceName          = [string](Get-MigrationProperty -InputObject $content -Name 'sourceName')
+                        CourseThumbnailUrl        = [string](Get-MigrationProperty -InputObject $content -Name 'thumbnailWebUrl')
+                        CourseSkillTags           = (@(Get-MigrationProperty -InputObject $content -Name 'skillTags' -Default @()) -join ';')
+                        CourseContributors        = (@(Get-MigrationProperty -InputObject $content -Name 'contributors' -Default @()) -join ';')
                     })
             }
 
-            $results.Add([pscustomobject][ordered]@{
-                    Identity      = $upn
-                    Action        = 'ExportLearningHistory'
-                    Status        = 'Succeeded'
-                    Detail        = "Exported $($activities.Count) activity record(s)."
-                    ActivityCount = $activities.Count
-                })
+            & $addResult $upn 'ExportLearningHistory' 'Succeeded' "Exported $($activities.Count) activity record(s)." $activities.Count
         }
 
         Write-Progress -Activity 'Exporting Viva Learning history' -Completed
-        #endregion -------------------------------------------------------------
 
-        #region Write the export -----------------------------------------------
         if ($deniedUsers -gt 0 -and $usersWithActivities -eq 0 -and $targetUsers.Count -gt 1) {
             Write-MigrationLog -Message "Every cross-user read was denied (403 x $deniedUsers)." -Level ERROR
             Write-MigrationLog -Message ("Reading OTHER users' learner history with a delegated token is a documented grey area of " +
@@ -646,7 +489,6 @@ try {
             Write-MigrationLog -Message "History CSV : $historyCsv" -Level SUCCESS
             Write-MigrationLog -Message "Raw JSON    : $historyJson" -Level SUCCESS
         }
-        #endregion -------------------------------------------------------------
     }
 
     $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Get-VivaLearningHistory'

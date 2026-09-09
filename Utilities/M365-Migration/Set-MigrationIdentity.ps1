@@ -238,259 +238,6 @@ $upnConflictHint = 'Graph reported a conflict (409). A soft-deleted user can sti
 
 #region Functions -------------------------------------------------------------------------------
 
-function Split-AddressEntry {
-    <#
-    .SYNOPSIS
-        Splits a proxy address into its prefix and address, and classifies it.
-
-    .DESCRIPTION
-        Exchange stores proxy addresses as '<prefix>:<value>'. Case matters for SMTP - an uppercase
-        'SMTP:' marks the primary and a lowercase 'smtp:' marks an alias - so the prefix is compared
-        case-sensitively for that one decision and case-insensitively everywhere else. An entry with
-        no prefix at all is treated as a plain SMTP alias, which is how operators usually type them.
-
-    .PARAMETER Entry
-        A single proxy address, e.g. 'SMTP:john.smith@contoso.com' or 'X500:/o=ExchangeLabs/...'.
-
-    .EXAMPLE
-        Split-AddressEntry -Entry 'SMTP:john.smith@contoso.com'
-
-        Returns Prefix 'SMTP', Address 'john.smith@contoso.com', Kind 'Smtp', IsPrimary true.
-    #>
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string]$Entry
-    )
-
-    $text = ([string]$Entry).Trim()
-    $prefix = ''
-    $address = $text
-
-    $separator = $text.IndexOf(':')
-    if ($separator -gt 0) {
-        $prefix = $text.Substring(0, $separator)
-        $address = $text.Substring($separator + 1)
-    }
-
-    $kind = switch -Regex ($prefix) {
-        '^$'      { 'Smtp' }
-        '^smtp$'  { 'Smtp' }
-        '^sip$'   { 'Sip' }
-        '^x500$'  { 'X500' }
-        '^spo$'   { 'Spo' }
-        default   { 'Other' }
-    }
-
-    [pscustomobject]@{
-        Entry     = $text
-        Prefix    = $prefix
-        Address   = $address
-        Kind      = $kind
-        IsPrimary = ($kind -eq 'Smtp' -and $prefix -ceq 'SMTP')
-    }
-}
-
-function Test-ProtectedAddress {
-    <#
-    .SYNOPSIS
-        Reports whether an address must never be removed from an object.
-
-    .DESCRIPTION
-        Three classes of address are load-bearing after a tenant move and are protected here rather
-        than at each call site, so no future edit can forget one:
-          - the tenant routing address (MOERA, *.onmicrosoft.com), which Exchange uses internally;
-          - SIP addresses, which Teams and Skype sign-in are keyed to;
-          - X500 addresses, which are the whole reason cached Outlook entries and old replies still
-            resolve after a cross-tenant move.
-
-    .PARAMETER AddressEntry
-        An object produced by Split-AddressEntry.
-
-    .EXAMPLE
-        Test-ProtectedAddress -AddressEntry (Split-AddressEntry -Entry 'smtp:john@contoso.mail.onmicrosoft.com')
-
-        Returns $true - the tenant routing address is never removed.
-    #>
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        $AddressEntry
-    )
-
-    if ($AddressEntry.Kind -in @('Sip', 'X500', 'Spo', 'Other')) { return $true }
-    if ($AddressEntry.Address -match '(?i)\.onmicrosoft\.com$') { return $true }
-    return $false
-}
-
-function Get-AddressChangeSet {
-    <#
-    .SYNOPSIS
-        Computes the EmailAddresses add/remove set for one object from its current addresses and
-        the plan's targets.
-
-    .DESCRIPTION
-        Pure function - no tenant calls, which is what makes the risky part of this script testable
-        offline. It returns three ordered buckets because the order matters to Exchange:
-
-          RemoveBeforeAdd  A lowercase 'smtp:' entry that already holds the address we are about to
-                           promote. Exchange rejects an add of an address the object already has, so
-                           the alias is released first and re-added as the uppercase primary.
-          Add              'SMTP:' primary, then 'smtp:' aliases, then 'X500:' entries.
-          RemoveAfterAdd   The demoted old primary, only with -RemoveOldPrimaryAlias, and never when
-                           it is a protected address. It cannot be removed before the add because an
-                           object may not be left without a primary.
-
-        Nothing else is ever removed. Aliases present on the object but absent from the plan are
-        left alone: this script's job is to add the new identity, not to prune whatever the previous
-        administrator had good reason to leave behind.
-
-    .PARAMETER CurrentAddress
-        The object's current EmailAddresses / proxyAddresses values.
-
-    .PARAMETER TargetPrimarySmtp
-        The plan's TargetPrimarySmtp. Ignored when 'PrimarySmtp' is not in -Apply.
-
-    .PARAMETER TargetAlias
-        The plan's TargetAliases entries, with or without an 'smtp:' prefix.
-
-    .PARAMETER TargetX500
-        X500 values, with or without an 'X500:' prefix. Usually the source LegacyExchangeDN.
-
-    .PARAMETER Apply
-        Which of PrimarySmtp, Aliases and X500 to include in the change set.
-
-    .PARAMETER RemoveOldPrimaryAlias
-        Remove the demoted old primary rather than keeping it as an alias.
-
-    .EXAMPLE
-        Get-AddressChangeSet -CurrentAddress @('SMTP:jsmith@contoso.com','smtp:j@contoso.mail.onmicrosoft.com') `
-            -TargetPrimarySmtp 'john.smith@newco.com' -Apply PrimarySmtp
-
-        Returns Add = @('SMTP:john.smith@newco.com') and no removals - the old primary is demoted by
-        Exchange and the routing address is protected.
-    #>
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory = $false)]
-        [AllowNull()][AllowEmptyCollection()]
-        [string[]]$CurrentAddress = @(),
-
-        [Parameter(Mandatory = $false)]
-        [AllowEmptyString()]
-        [string]$TargetPrimarySmtp = '',
-
-        [Parameter(Mandatory = $false)]
-        [AllowNull()][AllowEmptyCollection()]
-        [string[]]$TargetAlias = @(),
-
-        [Parameter(Mandatory = $false)]
-        [AllowNull()][AllowEmptyCollection()]
-        [string[]]$TargetX500 = @(),
-
-        [Parameter(Mandatory = $false)]
-        [AllowNull()][AllowEmptyCollection()]
-        [string[]]$Apply = @('PrimarySmtp', 'Aliases', 'X500'),
-
-        [Parameter(Mandatory = $false)]
-        [switch]$RemoveOldPrimaryAlias
-    )
-
-    $apply = @($Apply | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    $entries = @(@($CurrentAddress) |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        ForEach-Object { Split-AddressEntry -Entry $_ })
-
-    $currentPrimaryEntry = @($entries | Where-Object { $_.IsPrimary }) | Select-Object -First 1
-    $currentPrimary = if ($currentPrimaryEntry) { $currentPrimaryEntry.Address } else { '' }
-
-    $removeBefore = [System.Collections.Generic.List[string]]::new()
-    $add = [System.Collections.Generic.List[string]]::new()
-    $removeAfter = [System.Collections.Generic.List[string]]::new()
-    $aliasAdded = [System.Collections.Generic.List[string]]::new()
-    $x500Added = [System.Collections.Generic.List[string]]::new()
-
-    $newPrimary = ''
-    $primaryDetail = ''
-
-    if ($apply -contains 'PrimarySmtp') {
-        $wanted = ([string]$TargetPrimarySmtp).Trim() -replace '^(?i)smtp:', ''
-        if ([string]::IsNullOrWhiteSpace($wanted)) {
-            $primaryDetail = 'The plan row has no TargetPrimarySmtp.'
-        }
-        elseif ($wanted -ieq $currentPrimary) {
-            $primaryDetail = "Primary SMTP is already $currentPrimary."
-        }
-        else {
-            $held = @($entries | Where-Object { $_.Kind -eq 'Smtp' -and -not $_.IsPrimary -and $_.Address -ieq $wanted }) |
-                Select-Object -First 1
-            if ($held) {
-                # Exchange will not add an address the object already carries, so the alias form is
-                # released in a separate call and immediately re-added as the uppercase primary.
-                $removeBefore.Add("smtp:$($held.Address)")
-            }
-
-            $add.Add("SMTP:$wanted")
-            $newPrimary = $wanted
-            $primaryDetail = "Primary SMTP set to $wanted."
-
-            if ($RemoveOldPrimaryAlias -and $currentPrimaryEntry) {
-                if (Test-ProtectedAddress -AddressEntry $currentPrimaryEntry) {
-                    $primaryDetail += " Kept $currentPrimary - protected address."
-                }
-                else {
-                    $removeAfter.Add("smtp:$currentPrimary")
-                    $primaryDetail += " Removed the demoted $currentPrimary."
-                }
-            }
-        }
-    }
-
-    $effectivePrimary = if ($newPrimary) { $newPrimary } else { $currentPrimary }
-
-    if ($apply -contains 'Aliases') {
-        foreach ($candidate in @($TargetAlias)) {
-            $alias = ([string]$candidate).Trim() -replace '^(?i)smtp:', ''
-            if ([string]::IsNullOrWhiteSpace($alias)) { continue }
-            if ($alias -ieq $effectivePrimary) { continue }
-            if (@($entries | Where-Object { $_.Kind -eq 'Smtp' -and $_.Address -ieq $alias }).Count -gt 0) { continue }
-            if (@($add | Where-Object { $_ -imatch '^smtp:' -and ($_ -replace '^(?i)smtp:', '') -ieq $alias }).Count -gt 0) { continue }
-
-            $add.Add("smtp:$alias")
-            $aliasAdded.Add($alias)
-        }
-    }
-
-    if ($apply -contains 'X500') {
-        foreach ($candidate in @($TargetX500)) {
-            $dn = ([string]$candidate).Trim() -replace '^(?i)x500:', ''
-            if ([string]::IsNullOrWhiteSpace($dn)) { continue }
-            if (@($entries | Where-Object { $_.Kind -eq 'X500' -and $_.Address -ieq $dn }).Count -gt 0) { continue }
-            if (@($x500Added | Where-Object { $_ -ieq $dn }).Count -gt 0) { continue }
-
-            $add.Add("X500:$dn")
-            $x500Added.Add($dn)
-        }
-    }
-
-    [pscustomobject]@{
-        CurrentPrimary  = $currentPrimary
-        NewPrimary      = $newPrimary
-        PrimaryChanged  = [bool]$newPrimary
-        PrimaryDetail   = $primaryDetail
-        RemoveBeforeAdd = $removeBefore.ToArray()
-        Add             = $add.ToArray()
-        RemoveAfterAdd  = $removeAfter.ToArray()
-        AliasAdded      = $aliasAdded.ToArray()
-        X500Added       = $x500Added.ToArray()
-    }
-}
-
 function Resolve-IdentityMatch {
     <#
     .SYNOPSIS
@@ -504,12 +251,6 @@ function Resolve-IdentityMatch {
         deliberately no fallback, because silently matching on a different column than the operator
         asked for is how the wrong object gets renamed.
 
-    .PARAMETER Row
-        A plan row.
-
-    .PARAMETER Strategy
-        TargetObjectId, Interim or Source. Empty means auto.
-
     .EXAMPLE
         Resolve-IdentityMatch -Row $row -Strategy 'Source'
 
@@ -518,13 +259,8 @@ function Resolve-IdentityMatch {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        $Row,
-
-        [Parameter(Mandatory = $false)]
-        [AllowEmptyString()]
-        [string]$Strategy = ''
+        [Parameter(Mandatory)][ValidateNotNull()]$Row,
+        [Parameter(Mandatory = $false)][AllowEmptyString()][string]$Strategy = ''
     )
 
     $columns = [ordered]@{
@@ -565,10 +301,8 @@ function Get-PlanX500 {
     .DESCRIPTION
         A plan usually carries the source LegacyExchangeDN rather than a ready-made X500 entry, so
         both columns are consulted: explicit SourceX500 values first, then the LegacyExchangeDN
-        promoted to an X500 address. Duplicates are collapsed case-insensitively.
-
-    .PARAMETER Row
-        A plan row.
+        promoted to an X500 address. ConvertTo-MigrationX500 strips any prefix already present and
+        collapses duplicates case-insensitively.
 
     .EXAMPLE
         Get-PlanX500 -Row $row
@@ -579,104 +313,12 @@ function Get-PlanX500 {
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        $Row
+        [Parameter(Mandatory)][ValidateNotNull()]$Row
     )
 
-    $values = [System.Collections.Generic.List[string]]::new()
-
-    foreach ($entry in (Split-MigrationList -Value (Get-MigrationCsvValue -Row $Row -Name 'SourceX500' -Default ''))) {
-        $dn = ([string]$entry).Trim() -replace '^(?i)x500:', ''
-        if ($dn -and -not ($values | Where-Object { $_ -ieq $dn })) { $values.Add($dn) }
-    }
-
-    $legacyDn = ([string](Get-MigrationCsvValue -Row $Row -Name 'LegacyExchangeDN' -Default '')).Trim()
-    $legacyDn = $legacyDn -replace '^(?i)x500:', ''
-    if ($legacyDn -and -not ($values | Where-Object { $_ -ieq $legacyDn })) { $values.Add($legacyDn) }
-
-    return [string[]]$values.ToArray()
-}
-
-function Get-RowBlock {
-    <#
-    .SYNOPSIS
-        Decides whether a whole plan row is disqualified before any operation is attempted.
-
-    .DESCRIPTION
-        Four things stop a row dead, and they are collected here so the ordering is explicit and can
-        be proved offline rather than being buried in the per-row loop:
-
-          PlanStatus     the planning phase has not signed the row off;
-          ObjectType     the object is a group or contact, which New-MigrationRecipients owns;
-          MatchDetail    no plan column identified the object in this tenant;
-          IsSynced       the object is directory-synced.
-
-        The last two are Failed rather than Skipped. A row nobody can locate, and a row whose
-        attributes Entra ID and Exchange Online will both refuse to write, are unfinished work - and
-        a migration that quietly leaves users behind is worse than one that stops and says so.
-
-        Pure function - no tenant calls.
-
-    .PARAMETER PlanStatus
-        The row's PlanStatus.
-
-    .PARAMETER ObjectType
-        The row's ObjectType.
-
-    .PARAMETER ActionableStatus
-        The statuses this run is willing to act on.
-
-    .PARAMETER SupportedObjectType
-        The object types this script handles.
-
-    .PARAMETER MatchDetail
-        The reason Resolve-IdentityMatch gave for finding no identity, or an empty string.
-
-    .PARAMETER IsSynced
-        The object's onPremisesSyncEnabled value, once it is known.
-
-    .EXAMPLE
-        Get-RowBlock -PlanStatus Planned -ObjectType User -ActionableStatus Planned `
-            -SupportedObjectType User -IsSynced $true
-
-        Returns IsBlocked $true with Status 'Failed' and the directory-sync explanation.
-    #>
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory)][AllowEmptyString()][string]$PlanStatus,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$ObjectType,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$ActionableStatus,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$SupportedObjectType,
-        [Parameter(Mandatory = $false)][AllowEmptyString()][string]$MatchDetail = '',
-        [Parameter(Mandatory = $false)][bool]$IsSynced = $false
-    )
-
-    $blocked = { param([string]$Status, [string]$Detail)
-        [pscustomobject]@{ IsBlocked = $true; Status = $Status; Detail = $Detail } }
-
-    if ($ActionableStatus -notcontains $PlanStatus) {
-        return & $blocked 'Skipped' ("PlanStatus is '$PlanStatus' - this script only acts on " +
-            "$($ActionableStatus -join ', ').")
-    }
-
-    if ($SupportedObjectType -notcontains $ObjectType) {
-        return & $blocked 'Skipped' ("ObjectType '$ObjectType' is not a mailbox object - groups and " +
-            'contacts are handled by New-MigrationRecipients.')
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($MatchDetail)) {
-        return & $blocked 'Failed' $MatchDetail
-    }
-
-    if ($IsSynced) {
-        return & $blocked 'Failed' ('Object is directory-synced (onPremisesSyncEnabled). ' +
-            'UserPrincipalName and proxyAddresses must be changed on-premises and allowed to sync - ' +
-            'Entra ID and Exchange Online both reject the write.')
-    }
-
-    [pscustomobject]@{ IsBlocked = $false; Status = ''; Detail = '' }
+    return ConvertTo-MigrationX500 -NoPrefix -Value @(
+        (Get-MigrationCsvValue -Row $Row -Name 'SourceX500' -Default ''),
+        (Get-MigrationCsvValue -Row $Row -Name 'LegacyExchangeDN' -Default ''))
 }
 
 function New-IdentityResult {
@@ -688,33 +330,6 @@ function New-IdentityResult {
         Every operation the script considers produces exactly one row, whether it ran, was skipped
         or failed, so the results file is a complete record of what was asked of each object rather
         than only of what changed.
-
-    .PARAMETER Identity
-        The identity the script used to address the object.
-
-    .PARAMETER Action
-        Upn, PrimarySmtp, Aliases, X500, MailNickname or GalVisibility.
-
-    .PARAMETER Status
-        Planned, Succeeded, Skipped or Failed.
-
-    .PARAMETER Detail
-        Human-readable outcome.
-
-    .PARAMETER Row
-        The plan row, used for the ObjectType and Wave columns.
-
-    .PARAMETER MatchedBy
-        Which plan column produced the identity.
-
-    .PARAMETER ObjectId
-        The destination object id, when it is known.
-
-    .PARAMETER CurrentValue
-        The value found on the object before the change.
-
-    .PARAMETER TargetValue
-        The value the plan asked for.
 
     .EXAMPLE
         New-IdentityResult -Identity 'john@newco.com' -Action Upn -Status Succeeded -Detail 'UPN updated.'
@@ -761,15 +376,6 @@ function Set-MailboxAddress {
         which is what lets the DryRun guarantee be tested. Invoke-MigrationAction short-circuits in
         DryRun mode, so Set-Mailbox is never reached.
 
-    .PARAMETER Identity
-        The mailbox to change.
-
-    .PARAMETER Address
-        The proxy address entries to add or remove, prefix included.
-
-    .PARAMETER Operation
-        Add or Remove.
-
     .EXAMPLE
         Set-MailboxAddress -Identity 'john@newco.com' -Address 'SMTP:john.smith@newco.com' -Operation Add
 
@@ -803,18 +409,6 @@ function Set-MailboxAttribute {
         One call site per scalar attribute keeps the DryRun guarantee testable and keeps the
         per-row loop readable. Splatting is used so a $null value can never be passed by accident.
 
-    .PARAMETER Identity
-        The mailbox to change.
-
-    .PARAMETER Name
-        Alias, HiddenFromAddressListsEnabled or EmailAddressPolicyEnabled.
-
-    .PARAMETER Value
-        The value to set.
-
-    .PARAMETER Description
-        The text logged for the action.
-
     .EXAMPLE
         Set-MailboxAttribute -Identity 'john@newco.com' -Name Alias -Value 'john.smith' -Description 'Set alias'
 
@@ -825,8 +419,7 @@ function Set-MailboxAttribute {
         Justification = 'The caller gates the row with ShouldProcess and Invoke-MigrationAction honours -DryRun.')]
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Identity,
-        [Parameter(Mandatory)][ValidateSet('Alias', 'HiddenFromAddressListsEnabled', 'EmailAddressPolicyEnabled')]
-        [string]$Name,
+        [Parameter(Mandatory)][ValidateSet('Alias', 'HiddenFromAddressListsEnabled', 'EmailAddressPolicyEnabled')][string]$Name,
         [Parameter(Mandatory)]$Value,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Description
     )
@@ -848,15 +441,6 @@ function Get-UpnFailureDetail {
         The two failures that actually happen in the field - a privileged-account rename refused
         with 403, and a soft-deleted user still squatting the target UPN returning 409 - are
         indistinguishable from generic noise in the raw Graph error, so they are named explicitly.
-
-    .PARAMETER ErrorRecord
-        The ErrorRecord caught around the PATCH.
-
-    .PARAMETER PrivilegedHint
-        Text to append for a 403.
-
-    .PARAMETER ConflictHint
-        Text to append for a 409.
 
     .EXAMPLE
         Get-UpnFailureDetail -ErrorRecord $_ -PrivilegedHint $privilegedRoleHint -ConflictHint $upnConflictHint
@@ -902,9 +486,6 @@ try {
     }
     Write-MigrationLog -Message "Operations: $($requestedActions -join ', ')" -Level INFO
 
-    $actionableStatuses = @('Planned', 'ManualOverride', 'UpnSmtpDiverge')
-    if ($IncludeCollisions) { $actionableStatuses += 'Collision' }
-
     $planRows = @(Import-MigrationPlan -Path $PlanPath -Wave $Wave)
     Write-MigrationLog -Message "Loaded $($planRows.Count) plan row(s) from $PlanPath" -Level INFO
 
@@ -918,8 +499,6 @@ try {
     $index = 0
     foreach ($row in $planRows) {
         $index++
-        $objectType = Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default ''
-        $planStatus = Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default ''
         $match = Resolve-IdentityMatch -Row $row -Strategy $MatchOn
         $label = if ($match.Identity) { $match.Identity } else { Get-MigrationCsvValue -Row $row -Name 'DisplayName' -Default "row $index" }
 
@@ -928,14 +507,18 @@ try {
 
         # A whole-object verdict still emits one row per requested action, so the CSV can be pivoted
         # on Action without some objects mysteriously missing from a column.
-        $block = Get-RowBlock -PlanStatus $planStatus -ObjectType $objectType `
-            -ActionableStatus $actionableStatuses -SupportedObjectType $supportedObjectTypes `
-            -MatchDetail $match.Detail
+        # -AllowSynced here: the object's real onPremisesSyncEnabled is only known after the Graph
+        # lookup below, and the plan's own IsSynced column describes the *source* object.
+        $block = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions `
+            -SupportedObjectType $supportedObjectTypes -AllowSynced
+        if ($block.Actionable -and $match.Detail) {
+            $block = [pscustomobject]@{ Actionable = $false; Status = 'Failed'; Reason = $match.Detail }
+        }
 
-        if ($block.IsBlocked) {
+        if (-not $block.Actionable) {
             foreach ($action in $requestedActions) {
                 $results.Add((New-IdentityResult -Identity $label -Action $action -Status $block.Status `
-                    -Detail $block.Detail -Row $row -MatchedBy $match.MatchedBy))
+                    -Detail $block.Reason -Row $row -MatchedBy $match.MatchedBy))
             }
             if ($block.Status -eq 'Failed') { $exitCode = 2 }
             continue
@@ -974,13 +557,13 @@ try {
 
         # Hard stop rather than a skip: EXO and Entra are both read-only for these attributes on a
         # synced object, so reporting the row as "not applicable" would hide real work.
-        $syncBlock = Get-RowBlock -PlanStatus $planStatus -ObjectType $objectType `
-            -ActionableStatus $actionableStatuses -SupportedObjectType $supportedObjectTypes -IsSynced $isSynced
+        $syncBlock = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions `
+            -SupportedObjectType $supportedObjectTypes -IsSynced $isSynced
 
-        if ($syncBlock.IsBlocked) {
+        if (-not $syncBlock.Actionable) {
             foreach ($action in $requestedActions) {
                 $results.Add((New-IdentityResult -Identity $identity -Action $action -Status $syncBlock.Status `
-                    -Detail $syncBlock.Detail -Row $row -MatchedBy $match.MatchedBy -ObjectId $objectId))
+                    -Detail $syncBlock.Reason -Row $row -MatchedBy $match.MatchedBy -ObjectId $objectId))
             }
             $exitCode = 2
             continue
@@ -1000,12 +583,12 @@ try {
         $changeSet = $null
         $addressActionsRequested = @($requestedActions | Where-Object { $addressActions -contains $_ })
         if ($mailbox -and $addressActionsRequested.Count -gt 0) {
-            $changeSet = Get-AddressChangeSet -CurrentAddress @($mailbox.EmailAddresses) `
+            $changeSet = Get-MigrationAddressChangeSet -CurrentAddress @($mailbox.EmailAddresses) `
                 -TargetPrimarySmtp (Get-MigrationCsvValue -Row $row -Name 'TargetPrimarySmtp' -Default '') `
                 -TargetAlias (Split-MigrationList -Value (Get-MigrationCsvValue -Row $row -Name 'TargetAliases' -Default '')) `
                 -TargetX500 (Get-PlanX500 -Row $row) `
                 -Apply $addressActionsRequested `
-                -RemoveOldPrimaryAlias:$RemoveOldPrimaryAlias
+                -RemoveOldPrimary:$RemoveOldPrimaryAlias
         }
 
         # The address policy is disabled once per object, before any address is touched, because a

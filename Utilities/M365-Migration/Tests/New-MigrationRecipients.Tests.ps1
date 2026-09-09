@@ -81,7 +81,7 @@ BeforeAll {
     # --- Shared fixtures ------------------------------------------------------------------
     $script:planRows = @(Import-MigrationPlan -Path (Join-Path $script:fixtureRoot 'IdentityPlan.csv'))
     $script:groupRows = @(Import-MigrationCsv -Path (Join-Path $script:fixtureRoot 'Groups.csv'))
-    $script:addressMap = ConvertTo-RecipientAddressMap -Rows $script:planRows
+    $script:addressMap = Get-MigrationPlanAddressMap -Rows $script:planRows
 
     $script:booleanGroupSetting = @('HiddenFromAddressListsEnabled', 'RequireSenderAuthenticationEnabled',
         'ModerationEnabled', 'ReportToManagerEnabled')
@@ -164,7 +164,7 @@ Describe 'New-MigrationRecipients - Get-RowTargetAddress' {
     }
 }
 
-Describe 'New-MigrationRecipients - ConvertTo-RecipientAddressMap' {
+Describe 'New-MigrationRecipients - Get-MigrationPlanAddressMap' {
 
     It 'Maps the source UPN, primary SMTP, aliases and display name onto one target address' {
         $script:addressMap['jsmith@contoso.com'] | Should -BeExactly 'john.smith@newco.com'
@@ -179,7 +179,7 @@ Describe 'New-MigrationRecipients - ConvertTo-RecipientAddressMap' {
     }
 
     It 'Maps to interim addresses with -UseInterim' {
-        $interimMap = ConvertTo-RecipientAddressMap -Rows $script:planRows -UseInterim
+        $interimMap = Get-MigrationPlanAddressMap -Rows $script:planRows -UseInterim
         $interimMap['jsmith@contoso.com'] | Should -BeExactly 'john.smith@newco.onmicrosoft.com'
         $interimMap['accounts@contoso.com'] | Should -BeExactly 'accounts@newco.onmicrosoft.com'
     }
@@ -204,9 +204,12 @@ Describe 'New-MigrationRecipients - member mapping' {
     }
 
     It 'Resolves a single address and returns empty for an unknown one' {
-        Resolve-MappedAddress -Address 'JSmith@Contoso.com' -Map $script:addressMap | Should -BeExactly 'john.smith@newco.com'
-        Resolve-MappedAddress -Address 'smtp:ap@contoso.com' -Map $script:addressMap | Should -BeExactly 'accounts@newco.com'
-        Resolve-MappedAddress -Address 'nobody@contoso.com' -Map $script:addressMap | Should -BeExactly ''
+        (Resolve-MigrationPlanAddress -Map $script:addressMap -Address 'JSmith@Contoso.com').Address |
+            Should -BeExactly 'john.smith@newco.com'
+        (Resolve-MigrationPlanAddress -Map $script:addressMap -Address 'smtp:ap@contoso.com').Address |
+            Should -BeExactly 'accounts@newco.com'
+        (Resolve-MigrationPlanAddress -Map $script:addressMap -Address 'nobody@contoso.com').Address |
+            Should -BeExactly ''
     }
 }
 

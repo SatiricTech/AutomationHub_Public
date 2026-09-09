@@ -8,25 +8,20 @@
     Third-party movers - AvePoint Fly today - do not care how a destination address was
     decided; they want a two-column list saying "this source object becomes that destination
     object". This script produces that list from the identity plan, so the mapping the mover
-    consumes and the plan the operator signed off can never drift apart.
+    consumes and the plan the operator signed off can never drift apart. It never connects to
+    a tenant.
 
-    Tool formats live in one registry ($script:ToolFormats) near the top of the script. Each
-    entry declares the output file name, whether it is a workbook or a CSV, the worksheet
-    name, and a scriptblock turning one source/destination pair into one output row - the
-    row object's property names become the header. Supporting another tool means adding one
-    entry; -Tool is validated against the registry at runtime, so nothing else changes.
+    Tool formats live in one registry ($script:ToolFormats) near the top of the script, so
+    supporting another tool means adding one entry and nothing else.
 
-    A CSV twin is always written alongside a workbook. Workbooks are convenient for the
-    person uploading them and useless for everything else: diffing two runs, grepping for an
-    address, or feeding the mapping into another script all want the CSV. When ImportExcel is
-    unavailable and cannot be installed, the script warns and the CSV alone is written rather
-    than failing the run.
+    A CSV twin is always written alongside a workbook: workbooks suit the person uploading
+    them and nothing else - diffing two runs, grepping for an address or feeding the mapping
+    into another script all want the CSV. When ImportExcel is unavailable and cannot be
+    installed, the script warns and writes the CSV alone rather than failing the run.
 
-    Rows that have no destination address - anything excluded, needing review, or not yet
-    named - are reported as Skipped in the results file rather than silently dropped, because
-    a mapping file that is quietly short by four rows is how mailboxes get left behind.
-
-    This script never connects to a tenant.
+    Rows with no destination address - excluded, needing review, or not yet named - are
+    reported as Skipped rather than silently dropped, because a mapping file that is quietly
+    short by four rows is how mailboxes get left behind.
 
 .PARAMETER PlanPath
     The IdentityPlan.csv to read.
@@ -40,25 +35,21 @@
 
 .PARAMETER ObjectType
     Plan object types to map. Defaults to the types a mover handles: User, Shared, Room,
-    Equipment, Distribution, MailEnabledSecurity and Contact. Guests, dynamic distribution
-    groups and Microsoft 365 groups are excluded by default.
+    Equipment, Distribution, MailEnabledSecurity and Contact.
 
 .PARAMETER UseInterim
     Map to the interim addresses (InterimPrimarySmtp / InterimUserPrincipalName) instead of
-    the final target addresses. Use this for the first pass, when the vanity domain has not
-    yet been moved to the destination tenant.
+    the final target addresses - the first pass, before the vanity domain moves tenants.
 
 .PARAMETER SkipExcel
     Write only the CSV twin, never the workbook. Also stops the script trying to install
     ImportExcel.
 
 .PARAMETER OutputPath
-    Directory for the mapping file, the results CSV and the log. Defaults to the toolkit
-    output root.
+    Directory for the mapping file, the results CSV and the log. Defaults to the toolkit root.
 
 .PARAMETER Prefix
-    Client or run name. When supplied, output lands in <OutputPath>\<Prefix>\ and file names
-    start with '<Prefix>_'.
+    Client or run name. Output lands in <OutputPath>\<Prefix>\ and file names start '<Prefix>_'.
 
 .PARAMETER LogPath
     Override for the log file path.
@@ -68,8 +59,7 @@
     mapping file itself.
 
 .PARAMETER Verbosity
-    Console noise level: Low (errors and successes), Medium (adds warnings, the default) or
-    High (everything). The log file always receives everything.
+    Console noise level: Low, Medium (default) or High. The log file always gets everything.
 
 .EXAMPLE
     .\Export-MigrationMappingFile.ps1 -PlanPath .\Contoso_IdentityPlan_20260908-101500.csv -Prefix Contoso
@@ -114,15 +104,11 @@ param(
     [string[]]$ObjectType = @('User', 'Shared', 'Room', 'Equipment', 'Distribution', 'MailEnabledSecurity', 'Contact'),
 
     [switch]$UseInterim,
-
     [switch]$SkipExcel,
 
     [string]$OutputPath,
-
     [string]$Prefix,
-
     [string]$LogPath,
-
     [switch]$DryRun,
 
     [ValidateSet('Low', 'Medium', 'High')]
@@ -138,13 +124,11 @@ Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Fo
 
 # One entry per migration tool. Adding a tool here is the only change needed to support it:
 # the key becomes a valid -Tool value automatically.
-#   Description   : shown in errors and in the run log.
-#   FileName      : output file name; '{timestamp}' is replaced at runtime.
+#   FileName      : '{timestamp}' is replaced at runtime.
 #   FileType      : 'Csv' or 'Xlsx'. Xlsx needs ImportExcel and always gets a CSV twin.
-#   WorksheetName : Xlsx only - the sheet name the tool expects.
-#   NewRow        : scriptblock turning one (Source, Destination) pair into one output row;
-#                   the object's property names become the header row, so match the tool's
-#                   own template exactly.
+#   WorksheetName : Xlsx only.
+#   NewRow        : turns one (Source, Destination) pair into one output row; the object's
+#                   property names become the header, so match the tool's template exactly.
 $script:ToolFormats = [ordered]@{
     # Matches AvePoint's Fly_User_Mapping.xlsx template: one sheet named 'Migration mappings'
     # with the columns 'Source user/group' and 'Destination user/group'.
@@ -161,79 +145,10 @@ $script:ToolFormats = [ordered]@{
             }
         }
     }
-    # To add another tool, copy the shape above, for example:
-    # BitTitan = @{
-    #     Description = 'BitTitan MigrationWiz recipient mapping CSV'
-    #     FileName    = 'BitTitan-RecipientMapping_{timestamp}.csv'
-    #     FileType    = 'Csv'
-    #     NewRow      = {
-    #         param($Source, $Destination)
-    #         [pscustomobject][ordered]@{ 'Source Email Address' = $Source; 'Destination Email Address' = $Destination }
-    #     }
-    # }
+    # Another tool is one more entry of the same shape; FileType 'Csv' omits WorksheetName.
 }
 
 $script:ExcelMinimumVersion = '7.1.0'
-
-#endregion -----------------------------------------------------------------------------
-
-#region Functions ----------------------------------------------------------------------
-
-function Resolve-MappingToolFormat {
-    <#
-    .SYNOPSIS
-        Returns the registry entry for the requested tool.
-    .PARAMETER Name
-        The -Tool value to look up, matched case-insensitively.
-    .EXAMPLE
-        Resolve-MappingToolFormat -Name AvePoint
-    #>
-    [CmdletBinding()]
-    [OutputType([hashtable])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name
-    )
-
-    $key = @($script:ToolFormats.Keys | Where-Object { $_ -ieq $Name } | Select-Object -First 1)
-    if ($key.Count -eq 0) {
-        throw ("'$Name' is not a known mapping tool. Supported tools: " +
-            (($script:ToolFormats.Keys | Sort-Object) -join ', ') + '.')
-    }
-    return $script:ToolFormats[$key[0]]
-}
-
-function Test-MappingExcelSupport {
-    <#
-    .SYNOPSIS
-        Reports whether the workbook can be written, installing ImportExcel if needed.
-    .DESCRIPTION
-        The workbook is a convenience, not the deliverable - the CSV twin carries the same
-        rows - so a missing or unusable ImportExcel is a warning rather than a failed run.
-    .PARAMETER MinimumVersion
-        The lowest ImportExcel version that loads cleanly on PowerShell 7.
-    .EXAMPLE
-        if (Test-MappingExcelSupport -MinimumVersion '7.1.0') { $rows | Export-Excel -Path $path }
-    #>
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$MinimumVersion
-    )
-
-    try {
-        Initialize-MigrationModule -Name 'ImportExcel' -MinimumVersion $MinimumVersion
-        return $true
-    }
-    catch {
-        Write-MigrationLog -Message ("The workbook cannot be written: $($_.Exception.Message) " +
-            'The CSV twin holds the same mappings - use it, or re-run with -SkipExcel to silence this.') -Level WARNING
-        return $false
-    }
-}
 
 #endregion -----------------------------------------------------------------------------
 
@@ -246,19 +161,19 @@ try {
         -Prefix $Prefix -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity `
         -BoundParameters $PSBoundParameters
 
-    $format = Resolve-MappingToolFormat -Name $Tool
+    $formatKey = @($script:ToolFormats.Keys | Where-Object { $_ -ieq $Tool } | Select-Object -First 1)
+    if ($formatKey.Count -eq 0) {
+        throw ("'$Tool' is not a known mapping tool. Supported tools: " +
+            (($script:ToolFormats.Keys | Sort-Object) -join ', ') + '.')
+    }
+    $format = $script:ToolFormats[$formatKey[0]]
     Write-MigrationLog -Message "Mapping format: $($format.Description)" -Level INFO
 
     $planRows = @(Import-MigrationPlan -Path $PlanPath -Wave $Wave -ObjectType $ObjectType)
 
-    $sourceColumn = 'SourcePrimarySmtp'
-    $destinationColumns = if ($UseInterim) {
-        @('InterimPrimarySmtp', 'InterimUserPrincipalName')
-    }
-    else {
-        @('TargetPrimarySmtp', 'TargetUserPrincipalName')
-    }
-    Write-MigrationLog -Message ("Destination addresses come from " + ($destinationColumns -join ', then ')) -Level INFO
+    $destinationColumns = if ($UseInterim) { @('InterimPrimarySmtp', 'InterimUserPrincipalName') }
+    else { @('TargetPrimarySmtp', 'TargetUserPrincipalName') }
+    Write-MigrationLog -Message ('Destination addresses come from ' + ($destinationColumns -join ', then ')) -Level INFO
 
     $results = [System.Collections.Generic.List[object]]::new()
     $mappings = [System.Collections.Generic.List[object]]::new()
@@ -270,7 +185,7 @@ try {
         $rowObjectType = Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default ''
         $rowWave = Get-MigrationCsvValue -Row $row -Name 'Wave' -Default ''
 
-        $source = Get-MigrationCsvValue -Row $row -Name $sourceColumn -Default ''
+        $source = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default ''
         if (-not $source) { $source = Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default '' }
 
         $destination = ''
@@ -294,31 +209,28 @@ try {
             Wave        = $rowWave
             PlanStatus  = $planStatus
         }
+        $results.Add($result)
 
+        # A row that cannot be mapped is reported, not dropped: a mapping file quietly short by
+        # four rows is how mailboxes get left behind.
         if (-not $source) {
             $result.Detail = 'The plan row has neither a source primary SMTP address nor a source user principal name.'
-            $results.Add($result)
             continue
         }
-
         if (-not $destination) {
             $addressKind = if ($UseInterim) { 'interim' } else { 'target' }
             $result.Detail = "No $addressKind address in the plan (PlanStatus $planStatus); resolve the row before mapping it."
-            $results.Add($result)
             continue
         }
-
         if (-not $seenSources.Add($source)) {
             $duplicateCount++
             $result.Detail = 'Duplicate source address; the first occurrence was kept.'
-            $results.Add($result)
             continue
         }
 
         $mappings.Add((& $format.NewRow $source $destination))
         $result.Status = if ($DryRun) { 'Planned' } else { 'Succeeded' }
         $result.Detail = "$source maps to $destination"
-        $results.Add($result)
     }
 
     if ($mappings.Count -eq 0) {
@@ -326,11 +238,9 @@ try {
             'Resolve the NeedsReview, Collision and Invalid rows, or widen -Wave / -ObjectType.')
     }
 
-    # --- Write the mapping file(s) ------------------------------------------------------
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $fileName = $leader + ($format.FileName -replace '\{timestamp\}', $timestamp)
-    $mappingPath = Join-Path -Path $run.OutputDirectory -ChildPath $fileName
+    $mappingPath = Join-Path -Path $run.OutputDirectory -ChildPath (
+        $leader + ($format.FileName -replace '\{timestamp\}', (Get-Date -Format 'yyyyMMdd-HHmmss')))
     $csvPath = [System.IO.Path]::ChangeExtension($mappingPath, '.csv')
 
     if ($PSCmdlet.ShouldProcess($csvPath, "Write $($mappings.Count) mapping row(s)")) {
@@ -344,7 +254,17 @@ try {
             Write-MigrationLog -Message '-SkipExcel was supplied; the workbook was not written. The CSV twin holds the same mappings.' -Level WARNING
         }
         elseif ($PSCmdlet.ShouldProcess($mappingPath, "Write $($mappings.Count) mapping row(s)")) {
-            if (Test-MappingExcelSupport -MinimumVersion $script:ExcelMinimumVersion) {
+            # The workbook is a convenience, not the deliverable - the CSV twin carries the same
+            # rows - so a missing ImportExcel is a warning rather than a failed run.
+            $excelReady = $true
+            try { Initialize-MigrationModule -Name 'ImportExcel' -MinimumVersion $script:ExcelMinimumVersion }
+            catch {
+                Write-MigrationLog -Message ("The workbook cannot be written: $($_.Exception.Message) " +
+                    'The CSV twin holds the same mappings - use it, or re-run with -SkipExcel to silence this.') -Level WARNING
+                $excelReady = $false
+            }
+
+            if ($excelReady) {
                 Invoke-MigrationAction -Description "Write the $Tool workbook to $mappingPath" -Action {
                     if (Test-Path -LiteralPath $mappingPath) { Remove-Item -LiteralPath $mappingPath -Force -ErrorAction Stop }
                     $mappings | Export-Excel -Path $mappingPath -WorksheetName $format.WorksheetName -ErrorAction Stop

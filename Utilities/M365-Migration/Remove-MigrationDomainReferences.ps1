@@ -5,41 +5,27 @@
     Releases a vanity domain in the SOURCE tenant by clearing every object that still references it.
 
 .DESCRIPTION
-    Phase 4 of the migration toolkit, and the only script that runs against the tenant being left
-    behind. A custom domain cannot be removed from a tenant - and therefore cannot be verified in the
-    destination tenant - while any directory object still carries an address on it. This script finds
-    those objects, reports them, and (when explicitly acknowledged) moves them off the domain.
+    Phase 4 of the toolkit, and the only script that runs against the tenant being left behind. A
+    custom domain cannot be removed from a tenant - and so cannot be verified in the destination -
+    while any directory object still carries an address on it.
 
-    It always runs in two passes:
+    Pass 1 enumerates and reports: every reference to a References CSV and every unresolvable one to
+    a Blockers CSV, before a single change is made, even in a real run.
 
-      Pass 1 - enumerate and report. Every reference is written to a References CSV and every
-      unresolvable reference to a Blockers CSV, before a single change is made. That happens even in a
-      real run, so the operator has the "before" picture on disk if the run has to be reconstructed.
+    Pass 2 remediates, but only when the run is not -ReportOnly and not -DryRun AND
+    -AcknowledgeSourceTenant was supplied. The connected tenant is logged prominently first, because
+    the failure that matters here is running a destructive cleanup against the destination tenant by
+    mistake. Users have their userPrincipalName PATCHed onto the fallback domain; recipients get an
+    onmicrosoft address promoted to primary (after disabling the email address policy where the type
+    supports it) and then every @Domain proxy address removed.
 
-      Pass 2 - remediate, but only when the run is not -ReportOnly and not -DryRun AND
-      -AcknowledgeSourceTenant was supplied. The connected tenant id and display name are logged and
-      echoed prominently before the first mutation, because the whole point of failure here is running
-      a destructive cleanup against the destination tenant by mistake.
+    Reported as blockers rather than touched: directory-synced objects, soft-deleted users still
+    holding the domain, guests carrying an address on it, and any reference Graph cannot map to a
+    supported object. A guest whose #EXT# UPN merely embeds the domain in its generated local part is
+    informational - Entra owns that form and rewriting it would break the guest.
 
-    What it changes, per object class:
-
-      Users     - PATCH userPrincipalName to <localpart>@<FallbackDomain>. The fallback defaults to the
-                  tenant's initial .onmicrosoft.com domain, discovered from Get-MgDomain isInitial.
-      Recipients- mailboxes, distribution groups, dynamic groups, mail users, mail contacts and
-                  Microsoft 365 groups: when the vanity address is the primary, an onmicrosoft address
-                  is promoted to primary first (disabling the email address policy first where the
-                  recipient type supports the toggle), then every @Domain proxy address is removed.
-
-    What it will not touch, and reports as a blocker instead: directory-synced objects (they must be
-    fixed in on-premises AD), soft-deleted users still holding the domain (restore or purge them),
-    guests that carry an address on the domain, and any reference Graph reports that this script
-    cannot map to a supported object. Guest #EXT# UPNs that merely embed the domain in their mangled
-    local part are reported as informational: Entra generates that form itself, it is not a
-    domainNameReference, and rewriting it would break the guest.
-
-    After remediation the domain is re-enumerated and anything still blocking is printed. The script
-    exits 2 when blockers remain or when any row failed, so a pipeline can tell "domain is clear" from
-    "domain still has references" without parsing the CSV.
+    After remediation the domain is re-enumerated. The script exits 2 when blockers remain or any row
+    failed, so a pipeline can tell "domain is clear" from "domain still has references".
 
 .PARAMETER Domain
     The vanity domain being released, for example contoso.com. Must be a custom domain on the
@@ -50,22 +36,20 @@
     .onmicrosoft.com domain.
 
 .PARAMETER TenantId
-    The tenant to sign in to for Microsoft Graph. Recommended whenever the operator has access to more
-    than one tenant, which during a migration is always.
+    The tenant to sign in to for Microsoft Graph. Recommended whenever the operator has access to
+    more than one tenant, which during a migration is always.
 
 .PARAMETER DelegatedOrganization
-    The customer tenant for GDAP delegated Exchange Online access, for example
-    contoso.onmicrosoft.com.
+    The customer tenant for GDAP delegated Exchange Online access.
 
 .PARAMETER Scope
-    Limits which object classes are remediated: Users, Groups, Contacts, Mailboxes. Defaults to all
-    four. Objects outside the scope are still enumerated and still reported as blockers, because they
-    still block the domain removal - they are simply not modified.
+    Limits which object classes are remediated: Users, Groups, Contacts, Mailboxes (default: all
+    four). Objects outside the scope are still enumerated and still reported as blockers - they
+    block the domain removal either way - they are simply not modified.
 
 .PARAMETER AcknowledgeSourceTenant
-    Required for any change. Without it the script runs as a report even when -ReportOnly and -DryRun
-    are absent. It exists so that "I meant to run this against the other tenant" costs a report rather
-    than a rebuild.
+    Required for any change. Without it the script runs as a report, so that "I meant to run this
+    against the other tenant" costs a report rather than a rebuild.
 
 .PARAMETER ReportOnly
     Enumerates and reports without changing anything. Identical in effect to -DryRun; it exists
@@ -90,20 +74,19 @@
 .EXAMPLE
     .\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -ReportOnly -Prefix Contoso
 
-    Produces the References and Blockers CSVs for contoso.com and changes nothing. This is the first
-    thing to run: it tells you how much of the domain release is automatable before you commit to it.
+    Produces the References and Blockers CSVs and changes nothing. Run this first: it says how much
+    of the domain release is automatable before you commit to it.
 
 .EXAMPLE
     .\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -TenantId fabrikam.onmicrosoft.com -DryRun
 
-    Full rehearsal against the named tenant. Every UPN rewrite and address change is computed and
-    logged with a [DRYRUN] prefix, and the results file is written with Status Planned.
+    Full rehearsal against the named tenant, logging every computed change with a [DRYRUN] prefix.
 
 .EXAMPLE
     .\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -AcknowledgeSourceTenant -Scope Users,Mailboxes
 
-    Moves user UPNs and mailbox addresses off contoso.com, leaving groups and contacts alone. Groups
-    and contacts still on the domain are reported as blockers so nothing is silently missed.
+    Moves user UPNs and mailbox addresses off contoso.com, reporting groups and contacts still on the
+    domain as blockers so nothing is silently missed.
 
 .EXAMPLE
     .\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -FallbackDomain newco.onmicrosoft.com `
@@ -115,24 +98,19 @@
     Author: AutomationHub
     Written with assistance from Claude (Anthropic).
 
-    Required Microsoft Graph scopes:
-      Domain.Read.All      - read the domain and its domainNameReferences
-      User.ReadWrite.All   - read users and soft-deleted users, PATCH userPrincipalName
-      Directory.Read.All   - resolve directory objects returned by domainNameReferences
+    Graph scopes: Domain.Read.All (the domain and its domainNameReferences), User.ReadWrite.All
+    (users, soft-deleted users, PATCH userPrincipalName), Directory.Read.All.
 
-    Required Exchange Online roles: Recipient Management (Exchange Administrator covers it). The
-    Set-UnifiedGroup path additionally needs Groups management rights.
+    EXO roles: Recipient Management (Exchange Administrator covers it); the Set-UnifiedGroup path
+    also needs Groups management rights. Changing an administrator's UPN needs Privileged
+    Authentication Administrator; a 403 there is reported with that hint, not as a generic failure.
 
-    Changing the UPN of an administrator is a sensitive action: Privileged Authentication
-    Administrator or Global Administrator is required, and a 403 on that call is reported with that
-    hint rather than as a generic failure.
-
-    GDAP: supported. -DelegatedOrganization is passed through to Connect-ExchangeOnline and -TenantId
-    to Connect-MgGraph. Certificate app-only auth cannot be combined with -DelegatedOrganization.
+    GDAP: supported. -DelegatedOrganization goes to Connect-ExchangeOnline and -TenantId to
+    Connect-MgGraph. Certificate app-only auth cannot be combined with -DelegatedOrganization.
 
     Hybrid tenants: Exchange Online refuses EmailAddresses edits on directory-synced recipients
-    ("out of the current user's write scope"). Those objects are reported as blockers - fix
-    proxyAddresses on-premises and let Entra Connect sync the change.
+    ("out of the current user's write scope"). Those are reported as blockers - fix proxyAddresses
+    on-premises and let Entra Connect sync the change.
 
     Exit codes: 0 clear, 1 fatal, 2 completed with blockers remaining or rows failed.
 #>
@@ -193,77 +171,20 @@ $requiredGraphScopes = @(
     'Directory.Read.All'
 )
 
-# Graph page size for the two full-directory enumerations. 999 is the documented maximum for /users.
+# Graph page size for the directory enumerations. 999 is the documented maximum for /users.
 $graphPageSize = 999
 
 #endregion Configuration
 
 #region Functions
 
-function Get-ReferenceProperty {
-    <#
-    .SYNOPSIS
-        Reads a property from a Graph or Exchange object without assuming it is there.
-    .DESCRIPTION
-        Graph omits properties that are null and Exchange varies its property set by cmdlet and by
-        module version. Under Set-StrictMode -Version Latest a missing property is a terminating
-        error, so every read of an externally supplied object goes through here. The raw value is
-        returned - unlike Get-MigrationCsvValue, which stringifies - because proxy address lists and
-        boolean flags both matter here.
-    .PARAMETER Object
-        The object to read from.
-    .PARAMETER Name
-        The property name.
-    .PARAMETER Default
-        Returned when the property is absent or null.
-    .EXAMPLE
-        $addresses = Get-ReferenceProperty -Object $recipient -Name 'EmailAddresses' -Default @()
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [AllowNull()]
-        $Object,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name,
-
-        $Default = $null
-    )
-
-    if ($null -eq $Object) { return $Default }
-
-    if ($Object -is [System.Collections.IDictionary]) {
-        if (-not $Object.Contains($Name)) { return $Default }
-        $value = $Object[$Name]
-        if ($null -eq $value) { return $Default }
-        return $value
-    }
-
-    if (-not $Object.PSObject.Properties[$Name]) { return $Default }
-    $value = $Object.PSObject.Properties[$Name].Value
-    if ($null -eq $value) { return $Default }
-    return $value
-}
-
 function ConvertTo-DomainReferenceRecord {
     <#
-    .SYNOPSIS
-        Builds the canonical reference record every later stage reads.
-    .DESCRIPTION
-        Enumeration pulls from three different shapes - Graph users, Exchange recipients and Graph
-        deleted items - and the classifier has to treat them identically. This factory is the single
-        place that defines the record schema, so the classifier can use plain property access under
-        StrictMode and the tests can build fixtures that are guaranteed to match production records.
-
-        An unknown property name throws rather than being silently absorbed: a typo in a fixture that
-        produced a record the classifier then treated as "no addresses" would be a test that passes
-        for the wrong reason.
-    .PARAMETER Properties
-        The subset of the schema to populate; everything else takes its default.
-    .EXAMPLE
-        $record = ConvertTo-DomainReferenceRecord -Properties @{ Kind = 'UserUpn'; Identity = 'sam@contoso.com' }
+        The canonical record every later stage reads. Enumeration pulls from three shapes - Graph
+        users, Exchange recipients and Graph deleted items - and the classifier has to treat them
+        identically, so one factory defines the schema. An unknown property name throws rather than
+        being absorbed: a typo in a fixture that produced a record the classifier then read as "no
+        addresses" would be a test passing for the wrong reason.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -302,18 +223,9 @@ function ConvertTo-DomainReferenceRecord {
 
 function Split-AddressEntry {
     <#
-    .SYNOPSIS
-        Parses one proxy address entry into its prefix, address and domain.
-    .DESCRIPTION
-        Exchange stores addresses as '<type>:<address>' where an uppercase SMTP prefix marks the
-        primary. Everything this script decides - what is on the domain, what is primary, what may be
-        promoted - comes from that split, so it is done once, here, rather than with a regex at each
-        decision point.
-    .PARAMETER Entry
-        The raw entry, for example 'SMTP:sam@contoso.com', 'smtp:sam@newco.onmicrosoft.com',
-        'sip:sam@contoso.com' or a bare 'sam@contoso.com'.
-    .EXAMPLE
-        (Split-AddressEntry -Entry 'SMTP:sam@contoso.com').IsPrimary
+        Split-MigrationProxyAddress plus the two things this script decides on: the domain of the
+        address, and a lowercase type. A prefix the recipient model does not define is not a type -
+        the whole entry is treated as a bare SMTP address, which is how operators type them.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -323,55 +235,31 @@ function Split-AddressEntry {
         [string]$Entry
     )
 
-    $result = [pscustomobject]@{
-        Entry     = [string]$Entry
-        Prefix    = ''
-        Type      = 'smtp'
-        IsPrimary = $false
-        Address   = ''
-        Domain    = ''
-    }
-
-    if ([string]::IsNullOrWhiteSpace($Entry)) { return $result }
-
-    $value = $Entry.Trim()
-    $address = $value
-    $separator = $value.IndexOf(':')
-    if ($separator -gt 0) {
-        $candidate = $value.Substring(0, $separator)
-        if ($candidate -match '^(?i)(smtp|sip|spo|x500|x400|eum|eai|mailto)$') {
-            $result.Prefix = $candidate
-            $result.Type = $candidate.ToLowerInvariant()
-            # Only SMTP uses case to mark the primary; a bare address is assumed to be an alias.
-            $result.IsPrimary = ($candidate -ceq 'SMTP')
-            $address = $value.Substring($separator + 1)
-        }
-    }
-
-    $result.Address = $address
+    $parsed = Split-MigrationProxyAddress -Entry ([string]$Entry)
+    $isKnown = $parsed.Prefix -match '^(?i)(smtp|sip|spo|x500|x400|eum|eai|mailto)$'
+    $address = if ($isKnown) { $parsed.Address } else { $parsed.Entry }
     $at = $address.LastIndexOf('@')
-    if ($at -ge 0 -and $at -lt ($address.Length - 1)) {
-        $result.Domain = $address.Substring($at + 1).ToLowerInvariant()
-    }
 
-    return $result
+    [pscustomobject]@{
+        Entry     = [string]$Entry
+        Prefix    = if ($isKnown) { $parsed.Prefix } else { '' }
+        # Only SMTP uses case to mark the primary; a bare address is assumed to be an alias.
+        Type      = if ($isKnown) { $parsed.Prefix.ToLowerInvariant() } else { 'smtp' }
+        IsPrimary = $parsed.IsPrimary
+        Address   = $address
+        Domain    = if ($at -ge 0 -and $at -lt ($address.Length - 1)) {
+            $address.Substring($at + 1).ToLowerInvariant()
+        }
+        else { '' }
+    }
 }
 
 function ConvertTo-FallbackUpn {
     <#
-    .SYNOPSIS
-        Rewrites a UPN onto the fallback domain, keeping the local part.
-    .DESCRIPTION
-        The local part is preserved verbatim: this script is releasing a domain, not redesigning
-        identity, and any renaming belongs to Set-MigrationIdentity where the plan says what the new
-        name should be. Guest #EXT# UPNs return an empty string - Entra owns that form and rewriting
-        it breaks the guest - which the caller turns into a blocker.
-    .PARAMETER UserPrincipalName
-        The current UPN.
-    .PARAMETER FallbackDomain
-        The domain to move it to.
-    .EXAMPLE
-        ConvertTo-FallbackUpn -UserPrincipalName 'sam@contoso.com' -FallbackDomain 'newco.onmicrosoft.com'
+        Rewrites a UPN onto the fallback domain, keeping the local part verbatim: this script
+        releases a domain, it does not redesign identity - renaming belongs to Set-MigrationIdentity,
+        where the plan says what the new name should be. Guest #EXT# UPNs return an empty string,
+        which the caller turns into a blocker: Entra owns that form and rewriting it breaks the guest.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -399,18 +287,10 @@ function ConvertTo-FallbackUpn {
 
 function Resolve-RecipientCmdlet {
     <#
-    .SYNOPSIS
-        Maps an Exchange recipient type to the Set-* cmdlet that edits its addresses.
-    .DESCRIPTION
-        Address edits are not one cmdlet: mailboxes, distribution groups, dynamic groups, mail users,
-        contacts and Microsoft 365 groups each have their own, and only some of them expose
-        -EmailAddressPolicyEnabled. Getting that wrong produces a parameter-binding error halfway
-        through a cutover, so the mapping is data rather than a chain of if statements at the call
-        site - and it is unit tested.
-    .PARAMETER RecipientTypeDetails
-        The RecipientTypeDetails value from Get-EXORecipient.
-    .EXAMPLE
-        (Resolve-RecipientCmdlet -RecipientTypeDetails 'SharedMailbox').SetCmdlet
+        Maps an Exchange recipient type to the Set-* cmdlet that edits its addresses and says whether
+        that cmdlet exposes -EmailAddressPolicyEnabled. Address edits are not one cmdlet, and binding
+        a parameter the cmdlet does not have fails halfway through a cutover, so the mapping is data
+        and unit tested rather than a chain of if statements at the call site.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -420,61 +300,39 @@ function Resolve-RecipientCmdlet {
         [string]$RecipientTypeDetails
     )
 
-    $result = [pscustomobject]@{
+    # Contacts are not subject to email address policies, and Set-UnifiedGroup exposes no toggle.
+    $map = @{
+        'UserMailbox'                    = @('Set-Mailbox', $true)
+        'SharedMailbox'                  = @('Set-Mailbox', $true)
+        'RoomMailbox'                    = @('Set-Mailbox', $true)
+        'EquipmentMailbox'               = @('Set-Mailbox', $true)
+        'SchedulingMailbox'              = @('Set-Mailbox', $true)
+        'TeamMailbox'                    = @('Set-Mailbox', $true)
+        'LinkedMailbox'                  = @('Set-Mailbox', $true)
+        'DiscoveryMailbox'               = @('Set-Mailbox', $true)
+        'MailUser'                       = @('Set-MailUser', $true)
+        'GuestMailUser'                  = @('Set-MailUser', $true)
+        'MailContact'                    = @('Set-MailContact', $false)
+        'MailUniversalDistributionGroup' = @('Set-DistributionGroup', $true)
+        'MailUniversalSecurityGroup'     = @('Set-DistributionGroup', $true)
+        'MailNonUniversalGroup'          = @('Set-DistributionGroup', $true)
+        'RoomList'                       = @('Set-DistributionGroup', $true)
+        'DynamicDistributionGroup'       = @('Set-DynamicDistributionGroup', $true)
+        'GroupMailbox'                   = @('Set-UnifiedGroup', $false)
+    }
+
+    $entry = $map[([string]$RecipientTypeDetails).Trim()]
+
+    [pscustomobject]@{
         RecipientTypeDetails = [string]$RecipientTypeDetails
-        SetCmdlet            = ''
-        SupportsPolicyToggle = $false
-        IsSupported          = $false
+        SetCmdlet            = if ($entry) { [string]$entry[0] } else { '' }
+        SupportsPolicyToggle = [bool]($entry -and $entry[1])
+        IsSupported          = [bool]$entry
     }
-
-    $type = ([string]$RecipientTypeDetails).Trim()
-
-    $mailboxes = @(
-        'UserMailbox', 'SharedMailbox', 'RoomMailbox', 'EquipmentMailbox'
-        'SchedulingMailbox', 'TeamMailbox', 'LinkedMailbox', 'DiscoveryMailbox'
-    )
-    $distributionGroups = @(
-        'MailUniversalDistributionGroup', 'MailUniversalSecurityGroup'
-        'MailNonUniversalGroup', 'RoomList'
-    )
-
-    if ($mailboxes -contains $type) {
-        $result.SetCmdlet = 'Set-Mailbox'
-        $result.SupportsPolicyToggle = $true
-    }
-    elseif (@('MailUser', 'GuestMailUser') -contains $type) {
-        $result.SetCmdlet = 'Set-MailUser'
-        $result.SupportsPolicyToggle = $true
-    }
-    elseif ($type -eq 'MailContact') {
-        # Contacts are not subject to email address policies, so there is no toggle to disable.
-        $result.SetCmdlet = 'Set-MailContact'
-    }
-    elseif ($distributionGroups -contains $type) {
-        $result.SetCmdlet = 'Set-DistributionGroup'
-        $result.SupportsPolicyToggle = $true
-    }
-    elseif ($type -eq 'DynamicDistributionGroup') {
-        $result.SetCmdlet = 'Set-DynamicDistributionGroup'
-        $result.SupportsPolicyToggle = $true
-    }
-    elseif ($type -eq 'GroupMailbox') {
-        $result.SetCmdlet = 'Set-UnifiedGroup'
-    }
-
-    $result.IsSupported = [bool]$result.SetCmdlet
-    return $result
 }
 
 function Resolve-DomainReferenceScope {
-    <#
-    .SYNOPSIS
-        Returns the -Scope token that governs a reference record.
-    .PARAMETER Reference
-        A record from ConvertTo-DomainReferenceRecord.
-    .EXAMPLE
-        Resolve-DomainReferenceScope -Reference $record
-    #>
+    <# The -Scope token that governs a reference record, or '' when no token applies. #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -498,28 +356,15 @@ function Resolve-DomainReferenceScope {
 
 function Resolve-DomainAddressPlan {
     <#
-    .SYNOPSIS
-        Works out, offline, exactly which address changes a recipient needs.
-    .DESCRIPTION
-        The order matters and is the reason this is computed up front rather than improvised in the
-        loop. Disabling the email address policy has to happen before the primary changes, or the
-        policy can reassert the vanity address on its next application; the promotion has to happen
-        before the removal, or Exchange refuses to remove the primary address; and the removal list
-        uses bare addresses for SMTP entries because the old primary is demoted to a lowercase alias
-        by the promotion, which makes a literal 'SMTP:...' removal miss.
+        Works out offline exactly which address changes a recipient needs. The order is load-bearing:
+        the email address policy has to be disabled before the primary changes or it can reassert the
+        vanity address, the promotion has to precede the removal or Exchange refuses to remove the
+        primary, and SMTP entries are removed by bare address because the promotion demotes the old
+        primary to a lowercase alias, which makes a literal 'SMTP:...' removal miss.
 
-        The plan is deliberately allowed to come back incomplete - no non-vanity address to promote, an
-        unsupported recipient type, a contact whose external address is on the domain - so the caller
-        can report a blocker instead of half-applying a change.
-    .PARAMETER Reference
-        A record from ConvertTo-DomainReferenceRecord.
-    .PARAMETER Domain
-        The domain being released.
-    .PARAMETER FallbackDomain
-        The preferred domain for the promoted primary address.
-    .EXAMPLE
-        $plan = Resolve-DomainAddressPlan -Reference $record -Domain contoso.com -FallbackDomain newco.onmicrosoft.com
-        $plan.Steps
+        The plan is deliberately allowed to come back incomplete - nothing to promote, an unsupported
+        recipient type, a contact whose external address is on the domain - so the caller reports a
+        blocker instead of half-applying a change.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -592,6 +437,8 @@ function Resolve-DomainAddressPlan {
     $steps = [System.Collections.Generic.List[string]]::new()
 
     if ($plan.PrimaryIsVanity) {
+        # Prefer the fallback domain, then the initial onmicrosoft domain, then the mail routing
+        # domain; anything else is a last resort.
         $rank = {
             param($item)
             if ($item.Domain -eq $fallbackLower) { return 0 }
@@ -620,8 +467,6 @@ function Resolve-DomainAddressPlan {
         $steps.Add('PromotePrimary')
     }
 
-    # SMTP entries are removed by bare address: after the promotion the old primary is a lowercase
-    # alias, so removing the 'SMTP:' form Exchange reported a moment ago would no longer match.
     $plan.RemoveAddresses = @(
         $vanity | ForEach-Object {
             if ($_.Type -eq 'smtp') { $_.Address } else { '{0}:{1}' -f $_.Type, $_.Address }
@@ -635,33 +480,13 @@ function Resolve-DomainAddressPlan {
 
 function Resolve-DomainReferenceClass {
     <#
-    .SYNOPSIS
-        Decides whether a reference is fixable here, a blocker, or informational.
-    .DESCRIPTION
-        This is the judgement the whole script turns on, so it is a pure function over a record and
-        can be tested without a tenant.
+        Decides whether a reference is fixable here, a blocker, or informational - the judgement the
+        whole script turns on, so it is a pure function over a record and is tested without a tenant.
 
         Blocker means the domain cannot be removed until a human does something this script must not
-        do on their behalf: change an object that on-premises AD owns, deal with a soft-deleted user,
-        or decide what a guest's identity should become.
-
-        Informational means the reference is real but harmless - notably a guest whose #EXT# UPN
-        embeds the domain in its mangled local part. Entra generates that form for a guest invited
-        from an address on the domain; it is not returned by domainNameReferences, it does not block
-        the removal, and rewriting it would break the guest's sign-in.
-    .PARAMETER Reference
-        A record from ConvertTo-DomainReferenceRecord.
-    .PARAMETER Domain
-        The domain being released.
-    .PARAMETER FallbackDomain
-        The domain UPNs move to.
-    .PARAMETER Scope
-        The object classes the operator allowed this run to change.
-    .PARAMETER AddressPlan
-        The plan from Resolve-DomainAddressPlan, for recipient records.
-    .EXAMPLE
-        $class = Resolve-DomainReferenceClass -Reference $record -Domain contoso.com `
-            -FallbackDomain newco.onmicrosoft.com
+        do on their behalf: change an object on-premises AD owns, deal with a soft-deleted user, or
+        decide what a guest's identity should become. Informational means the reference is real but
+        harmless - notably a guest whose #EXT# UPN embeds the domain in its generated local part.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -786,19 +611,10 @@ function Resolve-DomainReferenceClass {
 
 function Get-DomainReferenceErrorDetail {
     <#
-    .SYNOPSIS
-        Turns an Exchange or Graph failure into a message that says what to do next.
-    .DESCRIPTION
-        Three failures dominate this script and all three have a specific remedy that a raw exception
-        message does not convey: a 403 on a UPN change means the caller lacks Privileged
-        Authentication Administrator for a privileged target, a 409 means a soft-deleted object holds
-        the target UPN, and Exchange's "write scope" refusal means the recipient is directory-synced.
-    .PARAMETER Message
-        The exception message.
-    .PARAMETER Action
-        The action that failed, used to pick the UPN-specific hints.
-    .EXAMPLE
-        Get-DomainReferenceErrorDetail -Message $_.Exception.Message -Action 'SetUpn'
+        Three failures dominate this script and each has a specific remedy a raw exception message
+        does not convey: a 403 on a UPN change means the caller lacks Privileged Authentication
+        Administrator for a privileged target, a 409 means a soft-deleted object holds the target
+        UPN, and Exchange's "write scope" refusal means the recipient is directory-synced.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -829,27 +645,13 @@ function Get-DomainReferenceErrorDetail {
 
 function Repair-DomainReference {
     <#
-    .SYNOPSIS
-        Applies the computed change for one reference and returns its result row.
-    .DESCRIPTION
-        Every mutation the script makes happens here, wrapped in Invoke-MigrationAction and gated by
-        ShouldProcess, which is what makes the DryRun promise checkable: in a dry run
-        Invoke-MigrationAction never invokes the scriptblock, so nothing can reach Graph or Exchange
-        no matter what the plan says.
+        Applies the computed change for one reference and returns its result row. Every mutation the
+        script makes happens here, wrapped in Invoke-MigrationAction and gated by ShouldProcess,
+        which is what makes the DryRun promise checkable: in a dry run Invoke-MigrationAction never
+        invokes the scriptblock, so nothing can reach Graph or Exchange whatever the plan says. Steps
+        run in the order the plan lists them - see Resolve-DomainAddressPlan for why that matters.
 
-        The steps run in the order the plan lists them - policy off, promote, remove - because that
-        order is load-bearing rather than cosmetic (see Resolve-DomainAddressPlan).
-    .PARAMETER Reference
-        The record being repaired.
-    .PARAMETER Classification
-        The result of Resolve-DomainReferenceClass; only Fixable records should be passed.
-    .PARAMETER AddressPlan
-        The plan from Resolve-DomainAddressPlan, required for UpdateAddresses.
-    .PARAMETER AsPlanned
-        Labels the row Status 'Planned' rather than 'Succeeded'. Set for dry runs, where the actions
-        are computed and logged but never invoked.
-    .EXAMPLE
-        $row = Repair-DomainReference -Reference $record -Classification $class -AddressPlan $plan
+        -AsPlanned labels the row Planned rather than Succeeded, for dry runs.
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     [OutputType([pscustomobject])]
@@ -872,7 +674,7 @@ function Repair-DomainReference {
     $row = [pscustomobject]@{
         Identity      = $identity
         Action        = [string]$Classification.Action
-        Status        = 'Succeeded'
+        Status        = if ($AsPlanned) { 'Planned' } else { 'Succeeded' }
         Detail        = [string]$Classification.Detail
         ObjectType    = [string]$Reference.ObjectType
         ObjectId      = [string]$Reference.ObjectId
@@ -882,7 +684,6 @@ function Repair-DomainReference {
         Target        = ''
         Steps         = ($steps -join ';')
     }
-    if ($AsPlanned) { $row.Status = 'Planned' }
 
     if (-not $PSCmdlet.ShouldProcess($identity, "$($Classification.Action) to release the domain")) {
         $row.Status = 'Skipped'
@@ -913,8 +714,7 @@ function Repair-DomainReference {
                 foreach ($step in $steps) {
                     switch ($step) {
                         'DisableEmailAddressPolicy' {
-                            $message = "Disable the email address policy on $identity"
-                            Invoke-MigrationAction -Description $message -Action {
+                            Invoke-MigrationAction -Description "Disable the email address policy on $identity" -Action {
                                 & $setCmdlet -Identity $objectId -EmailAddressPolicyEnabled $false -ErrorAction Stop
                             }
                         }
@@ -926,8 +726,7 @@ function Repair-DomainReference {
                         }
                         'RemoveAddresses' {
                             $remove = @($AddressPlan.RemoveAddresses)
-                            $joined = $remove -join ', '
-                            Invoke-MigrationAction -Description "Remove $joined from $identity" -Action {
+                            Invoke-MigrationAction -Description "Remove $($remove -join ', ') from $identity" -Action {
                                 & $setCmdlet -Identity $objectId -EmailAddresses @{ remove = $remove } -ErrorAction Stop
                             }
                         }
@@ -948,92 +747,21 @@ function Repair-DomainReference {
     return $row
 }
 
-function Export-DomainReferenceReport {
-    <#
-    .SYNOPSIS
-        Writes one of the two-pass report CSVs into the run's output folder.
-    .DESCRIPTION
-        These are reports rather than results - they describe the tenant, not what the script did - so
-        they are written alongside the results file with the same prefix and timestamp convention
-        instead of through Export-MigrationResult.
-    .PARAMETER Rows
-        The report rows.
-    .PARAMETER Name
-        The report name, for example 'DomainReferences'.
-    .PARAMETER Directory
-        The run's output directory, from the context Initialize-MigrationRun returned. It is passed in
-        rather than read from the module, whose run context lives in its own module scope.
-    .PARAMETER Prefix
-        The run prefix, from the same context.
-    .EXAMPLE
-        Export-DomainReferenceReport -Rows $references -Name 'DomainReferences' -Directory $run.OutputDirectory
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$Rows,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Directory,
-
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Prefix
-    )
-
-    $directory = $Directory
-    $prefix = [string]$Prefix
-    $leader = if ($prefix) { "${prefix}_" } else { '' }
-    $fileName = '{0}{1}_{2}.csv' -f $leader, $Name, (Get-Date -Format 'yyyyMMdd-HHmmss')
-    $filePath = Join-Path -Path $directory -ChildPath $fileName
-
-    try {
-        if (@($Rows).Count -eq 0) {
-            # An empty report is still evidence: it says the enumeration ran and found nothing.
-            Set-Content -LiteralPath $filePath -Value '' -Encoding utf8 -ErrorAction Stop
-        }
-        else {
-            @($Rows) | Export-Csv -LiteralPath $filePath -NoTypeInformation -Encoding utf8 -ErrorAction Stop
-        }
-    }
-    catch {
-        throw "Could not write the report '$filePath': $($_.Exception.Message)"
-    }
-
-    Write-MigrationLog -Message "$Name report written to $filePath ($(@($Rows).Count) row(s))" -Level SUCCESS
-    return $filePath
-}
-
 function Get-DomainReferenceSet {
     <#
-    .SYNOPSIS
-        Enumerates every object in the connected tenant that references the domain.
-    .DESCRIPTION
-        Four passes, because no single source is complete:
+        Enumerates every object in the connected tenant that references the domain. Four passes,
+        because no single source is complete:
 
           Exchange Online recipients - the only reliable source for proxy addresses, and the only
           place they can be edited. Filtered server-side on EmailAddresses.
-          Graph users - UPNs on the domain, guests whose #EXT# form embeds it, and users holding an
-          address on the domain that Exchange does not know about. Enumerated in full rather than with
-          an endsWith filter, which would require the ConsistencyLevel=eventual advanced query header.
+          Graph users - UPNs on the domain, addresses Exchange does not know about, and guests. The
+          advanced query (endsWith, ConsistencyLevel eventual, $count=true) keeps this off a full
+          directory walk; if the tenant rejects it the full walk is still there as a fallback.
           Graph deleted items - soft-deleted users still holding the domain, which block the removal
           and cannot be fixed by editing anything live.
-          domainNameReferences - Microsoft's own answer to "what is still using this domain". Anything
-          it returns that the first three passes did not explain becomes an UnresolvedReference, so
-          the operator is never told the domain is clear when Graph disagrees.
-    .PARAMETER Domain
-        The domain being released.
-    .PARAMETER PageSize
-        Graph page size for the two full-directory enumerations.
-    .EXAMPLE
-        $references = Get-DomainReferenceSet -Domain contoso.com
+          domainNameReferences - Microsoft's own answer to "what is still using this domain".
+          Anything it returns the first three passes did not explain becomes an UnresolvedReference,
+          so the operator is never told the domain is clear when Graph disagrees.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1048,13 +776,13 @@ function Get-DomainReferenceSet {
 
     $domainLower = $Domain.ToLowerInvariant()
     $suffix = "@$domainLower"
+    $escaped = ConvertTo-MigrationODataString -Value $domainLower
     $records = [System.Collections.Generic.List[object]]::new()
     $exchangeIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $seenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     Write-MigrationLog -Message "Enumerating Exchange Online recipients with an address on $Domain" -Level INFO
-    $filter = "EmailAddresses -like '*@$(ConvertTo-MigrationODataString -Value $domainLower)'"
-    $recipients = @()
+    $filter = "EmailAddresses -like '*@$escaped'"
     try {
         $recipients = @(Get-EXORecipient -Filter $filter -ResultSize Unlimited -Properties `
                 EmailAddresses, ExternalEmailAddress, EmailAddressPolicyEnabled, IsDirSynced -ErrorAction Stop)
@@ -1067,50 +795,62 @@ function Get-DomainReferenceSet {
     Write-MigrationLog -Message "Exchange Online returned $($recipients.Count) recipient(s)" -Level INFO
 
     foreach ($recipient in $recipients) {
-        $objectId = [string](Get-ReferenceProperty -Object $recipient -Name 'ExternalDirectoryObjectId' -Default '')
-        $identity = [string](Get-ReferenceProperty -Object $recipient -Name 'PrimarySmtpAddress' -Default '')
-        if (-not $identity) {
-            $identity = [string](Get-ReferenceProperty -Object $recipient -Name 'Identity' -Default '')
-        }
+        $objectId = [string](Get-MigrationProperty $recipient 'ExternalDirectoryObjectId' '')
+        $identity = [string](Get-MigrationProperty $recipient 'PrimarySmtpAddress' '')
+        if (-not $identity) { $identity = [string](Get-MigrationProperty $recipient 'Identity' '') }
         if ($objectId) { $null = $exchangeIds.Add($objectId) }
-        $policyEnabled = [bool](Get-ReferenceProperty $recipient 'EmailAddressPolicyEnabled' $true)
 
         $records.Add((ConvertTo-DomainReferenceRecord -Properties @{
                     Kind                      = 'RecipientAddress'
                     Source                    = 'ExchangeOnline'
                     ObjectId                  = $objectId
                     Identity                  = $identity
-                    DisplayName               = [string](Get-ReferenceProperty $recipient 'DisplayName' '')
+                    DisplayName               = [string](Get-MigrationProperty $recipient 'DisplayName' '')
                     ObjectType                = 'Recipient'
-                    RecipientTypeDetails      = [string](Get-ReferenceProperty $recipient 'RecipientTypeDetails' '')
+                    RecipientTypeDetails      = [string](Get-MigrationProperty $recipient 'RecipientTypeDetails' '')
                     PrimarySmtpAddress        = $identity
-                    ExternalEmailAddress      = [string](Get-ReferenceProperty $recipient 'ExternalEmailAddress' '')
-                    Addresses                 = @(Get-ReferenceProperty $recipient 'EmailAddresses' @())
-                    IsSynced                  = [bool](Get-ReferenceProperty $recipient 'IsDirSynced' $false)
-                    EmailAddressPolicyEnabled = $policyEnabled
+                    ExternalEmailAddress      = [string](Get-MigrationProperty $recipient 'ExternalEmailAddress' '')
+                    Addresses                 = @(Get-MigrationProperty $recipient 'EmailAddresses' @())
+                    IsSynced                  = [bool](Get-MigrationProperty $recipient 'IsDirSynced' $false)
+                    EmailAddressPolicyEnabled = [bool](Get-MigrationProperty $recipient 'EmailAddressPolicyEnabled' $true)
                     ReferenceKinds            = @('Address')
                 }))
     }
 
-    Write-MigrationLog -Message 'Enumerating Entra users' -Level INFO
+    Write-MigrationLog -Message 'Enumerating Entra users that touch the domain' -Level INFO
     $select = 'id,displayName,userPrincipalName,mail,proxyAddresses,onPremisesSyncEnabled,userType'
-    $users = @(Invoke-MigrationGraphRequest -Method GET -All `
-            -Uri "/v1.0/users?`$select=$select&`$top=$PageSize")
+    $userFilter = @(
+        "endsWith(userPrincipalName,'@$escaped')"
+        "endsWith(mail,'@$escaped')"
+        "proxyAddresses/any(p:endsWith(p,'@$escaped'))"
+        "otherMails/any(o:endsWith(o,'@$escaped'))"
+    ) -join ' or '
+
+    try {
+        # endsWith on a directory property is an advanced query: it needs ConsistencyLevel eventual
+        # and $count=true, and Graph rejects it without both.
+        $users = @(Invoke-MigrationGraphRequest -Method GET -All -Headers @{ ConsistencyLevel = 'eventual' } -Uri (
+                "/v1.0/users?`$select=$select&`$top=$PageSize&`$count=true&`$filter=" +
+                [uri]::EscapeDataString($userFilter)))
+    }
+    catch {
+        Write-MigrationLog -Message ("The advanced user query failed ($($_.Exception.Message)); " +
+            'falling back to enumerating every user.') -Level WARNING
+        $users = @(Invoke-MigrationGraphRequest -Method GET -All -Uri "/v1.0/users?`$select=$select&`$top=$PageSize")
+    }
     Write-MigrationLog -Message "Graph returned $($users.Count) user(s)" -Level INFO
 
     foreach ($user in $users) {
-        $upn = [string](Get-ReferenceProperty -Object $user -Name 'userPrincipalName' -Default '')
-        $userId = [string](Get-ReferenceProperty -Object $user -Name 'id' -Default '')
-        $proxies = @(Get-ReferenceProperty -Object $user -Name 'proxyAddresses' -Default @())
-        $userType = [string](Get-ReferenceProperty -Object $user -Name 'userType' -Default '')
-        $isSynced = [bool](Get-ReferenceProperty -Object $user -Name 'onPremisesSyncEnabled' -Default $false)
+        $upn = [string](Get-MigrationProperty $user 'userPrincipalName' '')
+        $userId = [string](Get-MigrationProperty $user 'id' '')
+        $proxies = @(Get-MigrationProperty $user 'proxyAddresses' @())
+        $userType = [string](Get-MigrationProperty $user 'userType' '')
         $upnLower = $upn.ToLowerInvariant()
         $isGuest = ($userType -eq 'Guest') -or ($upnLower -match '(?i)#ext#@')
 
         $vanityProxies = @(
             foreach ($entry in $proxies) {
-                $parsed = Split-AddressEntry -Entry ([string]$entry)
-                if ($parsed.Domain -eq $domainLower) { [string]$entry }
+                if ((Split-AddressEntry -Entry ([string]$entry)).Domain -eq $domainLower) { [string]$entry }
             }
         )
         $upnOnDomain = $upnLower.EndsWith($suffix)
@@ -1133,12 +873,12 @@ function Get-DomainReferenceSet {
                     Source             = 'Graph'
                     ObjectId           = $userId
                     Identity           = $upn
-                    DisplayName        = [string](Get-ReferenceProperty -Object $user -Name 'displayName' -Default '')
+                    DisplayName        = [string](Get-MigrationProperty $user 'displayName' '')
                     ObjectType         = if ($isGuest) { 'Guest' } else { 'User' }
                     UserPrincipalName  = $upn
-                    PrimarySmtpAddress = [string](Get-ReferenceProperty -Object $user -Name 'mail' -Default '')
+                    PrimarySmtpAddress = [string](Get-MigrationProperty $user 'mail' '')
                     Addresses          = @($vanityProxies)
-                    IsSynced           = $isSynced
+                    IsSynced           = [bool](Get-MigrationProperty $user 'onPremisesSyncEnabled' $false)
                     IsGuest            = $isGuest
                     ReferenceKinds     = $kinds.ToArray()
                 }))
@@ -1151,8 +891,8 @@ function Get-DomainReferenceSet {
                 '/v1.0/directory/deletedItems/microsoft.graph.user' +
                 "?`$select=id,displayName,userPrincipalName,proxyAddresses&`$top=$PageSize"))
         foreach ($item in $deleted) {
-            $upn = [string](Get-ReferenceProperty -Object $item -Name 'userPrincipalName' -Default '')
-            $proxies = @(Get-ReferenceProperty -Object $item -Name 'proxyAddresses' -Default @())
+            $upn = [string](Get-MigrationProperty $item 'userPrincipalName' '')
+            $proxies = @(Get-MigrationProperty $item 'proxyAddresses' @())
             $hasDomain = $upn.ToLowerInvariant().Contains($suffix) -or @(
                 foreach ($entry in $proxies) {
                     if ((Split-AddressEntry -Entry ([string]$entry)).Domain -eq $domainLower) { $entry }
@@ -1163,9 +903,9 @@ function Get-DomainReferenceSet {
             $records.Add((ConvertTo-DomainReferenceRecord -Properties @{
                         Kind              = 'DeletedUser'
                         Source            = 'GraphDeleted'
-                        ObjectId          = [string](Get-ReferenceProperty -Object $item -Name 'id' -Default '')
+                        ObjectId          = [string](Get-MigrationProperty $item 'id' '')
                         Identity          = $upn
-                        DisplayName       = [string](Get-ReferenceProperty $item 'displayName' '')
+                        DisplayName       = [string](Get-MigrationProperty $item 'displayName' '')
                         ObjectType        = 'DeletedUser'
                         UserPrincipalName = $upn
                         Addresses         = @($proxies)
@@ -1185,7 +925,7 @@ function Get-DomainReferenceSet {
         Write-MigrationLog -Message "Graph reports $($graphReferences.Count) domain name reference(s)" -Level INFO
 
         foreach ($item in $graphReferences) {
-            $referenceId = [string](Get-ReferenceProperty -Object $item -Name 'id' -Default '')
+            $referenceId = [string](Get-MigrationProperty $item 'id' '')
             if (-not $referenceId) { continue }
             if ($seenIds.Contains($referenceId) -or $exchangeIds.Contains($referenceId)) { continue }
 
@@ -1194,8 +934,8 @@ function Get-DomainReferenceSet {
                         Source      = 'DomainNameReference'
                         ObjectId    = $referenceId
                         Identity    = $referenceId
-                        DisplayName = [string](Get-ReferenceProperty -Object $item -Name 'displayName' -Default '')
-                        ObjectType  = [string](Get-ReferenceProperty $item '@odata.type' 'directoryObject')
+                        DisplayName = [string](Get-MigrationProperty $item 'displayName' '')
+                        ObjectType  = [string](Get-MigrationProperty $item '@odata.type' 'directoryObject')
                     }))
         }
     }
@@ -1205,6 +945,43 @@ function Get-DomainReferenceSet {
     }
 
     return $records.ToArray()
+}
+
+function Get-DomainReferenceAssessment {
+    <#
+        One enumerate-and-classify pass. Both the "before" report and the post-change recheck need
+        the same reference, plan and classification triple; only what they report differs.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Domain,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$FallbackDomain,
+
+        [Parameter(Mandatory)]
+        [string[]]$Scope,
+
+        [ValidateRange(1, 999)]
+        [int]$PageSize = 999
+    )
+
+    foreach ($reference in @(Get-DomainReferenceSet -Domain $Domain -PageSize $PageSize)) {
+        $plan = $null
+        if ($reference.Kind -eq 'RecipientAddress') {
+            $plan = Resolve-DomainAddressPlan -Reference $reference -Domain $Domain -FallbackDomain $FallbackDomain
+        }
+        [pscustomobject]@{
+            Reference      = $reference
+            Plan           = $plan
+            Classification = Resolve-DomainReferenceClass -Reference $reference -Domain $Domain `
+                -FallbackDomain $FallbackDomain -Scope $Scope -AddressPlan $plan
+        }
+    }
 }
 
 #endregion Functions
@@ -1219,7 +996,7 @@ try {
     # Invoke-MigrationAction as the single gate on every mutation.
     $effectiveDryRun = [bool]($DryRun -or $ReportOnly -or (-not $AcknowledgeSourceTenant))
 
-    $run = Initialize-MigrationRun -ScriptName 'Remove-MigrationDomainReferences' -OutputPath $OutputPath `
+    $null = Initialize-MigrationRun -ScriptName 'Remove-MigrationDomainReferences' -OutputPath $OutputPath `
         -Prefix $Prefix -LogPath $LogPath -DryRun:$effectiveDryRun -Verbosity $Verbosity `
         -BoundParameters $PSBoundParameters
 
@@ -1233,11 +1010,10 @@ try {
 
     $organization = @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/organization?$select=id,displayName')
     $tenantName = if ($organization.Count -gt 0) {
-        [string](Get-ReferenceProperty -Object $organization[0] -Name 'displayName' -Default '(unknown)')
+        [string](Get-MigrationProperty $organization[0] 'displayName' '(unknown)')
     }
     else { '(unknown)' }
-    $tenantIdentifier = [string](Get-ReferenceProperty -Object $graphContext -Name 'TenantId' -Default '(unknown)')
-    $tenantLabel = "$tenantName ($tenantIdentifier)"
+    $tenantLabel = "$tenantName ($([string](Get-MigrationProperty $graphContext 'TenantId' '(unknown)')))"
 
     # This banner is the last line of defence against running a destructive cleanup on the wrong
     # tenant, so it is logged at WARNING and repeated in the confirmation prompt below.
@@ -1248,59 +1024,45 @@ try {
 
     $domains = @(Invoke-MigrationGraphRequest -Method GET -All -Uri '/v1.0/domains?$select=id,isInitial,isVerified')
     $domainEntry = $domains |
-        Where-Object { [string](Get-ReferenceProperty -Object $_ -Name 'id' -Default '') -eq $Domain } |
+        Where-Object { [string](Get-MigrationProperty $_ 'id' '') -eq $Domain } |
         Select-Object -First 1
     if ($null -eq $domainEntry) {
         throw "Domain '$Domain' is not present on tenant $tenantLabel. Check -TenantId and the spelling."
     }
-    if ([bool](Get-ReferenceProperty -Object $domainEntry -Name 'isInitial' -Default $false)) {
+    if ([bool](Get-MigrationProperty $domainEntry 'isInitial' $false)) {
         throw "'$Domain' is the tenant's initial onmicrosoft.com domain and can never be removed."
     }
 
     $resolvedFallback = $FallbackDomain
     if ([string]::IsNullOrWhiteSpace($resolvedFallback)) {
-        $initial = $domains | Where-Object {
-            [bool](Get-ReferenceProperty -Object $_ -Name 'isInitial' -Default $false)
-        } | Select-Object -First 1
+        $initial = $domains |
+            Where-Object { [bool](Get-MigrationProperty $_ 'isInitial' $false) } |
+            Select-Object -First 1
         if ($null -eq $initial) {
             throw 'Could not find the tenant initial onmicrosoft.com domain; supply -FallbackDomain.'
         }
-        $resolvedFallback = [string](Get-ReferenceProperty -Object $initial -Name 'id' -Default '')
+        $resolvedFallback = [string](Get-MigrationProperty $initial 'id' '')
         Write-MigrationLog -Level INFO -Message (
             "Fallback domain defaulted to the tenant initial domain $resolvedFallback")
     }
     if ($resolvedFallback -eq $Domain) {
         throw 'The fallback domain cannot be the domain being released.'
     }
-    $fallbackEntry = $domains | Where-Object {
-        [string](Get-ReferenceProperty -Object $_ -Name 'id' -Default '') -eq $resolvedFallback
-    } | Select-Object -First 1
+    $fallbackEntry = $domains |
+        Where-Object { [string](Get-MigrationProperty $_ 'id' '') -eq $resolvedFallback } |
+        Select-Object -First 1
     if ($null -eq $fallbackEntry) {
         throw "Fallback domain '$resolvedFallback' is not present on tenant $tenantLabel."
     }
-    if (-not [bool](Get-ReferenceProperty -Object $fallbackEntry -Name 'isVerified' -Default $false)) {
+    if (-not [bool](Get-MigrationProperty $fallbackEntry 'isVerified' $false)) {
         throw "Fallback domain '$resolvedFallback' is not verified; a UPN cannot be moved onto it."
     }
 
     Write-MigrationLog -Message "Scope: $($Scope -join ', ')" -Level INFO
 
     # --- Pass 1: enumerate and report, before anything is touched. -------------------------------
-    $references = @(Get-DomainReferenceSet -Domain $Domain -PageSize $graphPageSize)
-
-    $assessed = [System.Collections.Generic.List[object]]::new()
-    foreach ($reference in $references) {
-        $plan = $null
-        if ($reference.Kind -eq 'RecipientAddress') {
-            $plan = Resolve-DomainAddressPlan -Reference $reference -Domain $Domain -FallbackDomain $resolvedFallback
-        }
-        $classification = Resolve-DomainReferenceClass -Reference $reference -Domain $Domain `
-            -FallbackDomain $resolvedFallback -Scope $Scope -AddressPlan $plan
-        $assessed.Add([pscustomobject]@{
-                Reference      = $reference
-                Plan           = $plan
-                Classification = $classification
-            })
-    }
+    $assessed = @(Get-DomainReferenceAssessment -Domain $Domain -FallbackDomain $resolvedFallback `
+            -Scope $Scope -PageSize $graphPageSize)
 
     $reportRows = foreach ($item in $assessed) {
         [pscustomobject]@{
@@ -1320,10 +1082,8 @@ try {
             Source               = $item.Reference.Source
         }
     }
-    $null = Export-DomainReferenceReport -Rows @($reportRows) -Name 'DomainReferences' `
-        -Directory $run.OutputDirectory -Prefix $run.Prefix
-    $null = Export-DomainReferenceReport -Rows @($reportRows | Where-Object { $_.Class -eq 'Blocker' }) `
-        -Name 'DomainBlockers' -Directory $run.OutputDirectory -Prefix $run.Prefix
+    $null = Export-MigrationReport -Rows @($reportRows) -Name 'DomainReferences'
+    $null = Export-MigrationReport -Rows @($reportRows | Where-Object { $_.Class -eq 'Blocker' }) -Name 'DomainBlockers'
 
     $fixable = @($assessed | Where-Object { $_.Classification.Class -eq 'Fixable' })
     $blocked = @($assessed | Where-Object { $_.Classification.Class -eq 'Blocker' })
@@ -1373,24 +1133,12 @@ try {
 
     # --- Re-enumerate so the operator is told the truth about what is left. ----------------------
     $remaining = @($blocked)
-    $changed = @($results | Where-Object { $_.Status -eq 'Succeeded' })
-    if ($changed.Count -gt 0) {
+    if (@($results | Where-Object { $_.Status -eq 'Succeeded' }).Count -gt 0) {
         Write-MigrationLog -Message 'Re-enumerating the domain after the changes' -Level INFO
-        $after = @(Get-DomainReferenceSet -Domain $Domain -PageSize $graphPageSize)
-        $remaining = @(
-            foreach ($reference in $after) {
-                $plan = $null
-                if ($reference.Kind -eq 'RecipientAddress') {
-                    $plan = Resolve-DomainAddressPlan -Reference $reference -Domain $Domain `
-                        -FallbackDomain $resolvedFallback
-                }
-                $classification = Resolve-DomainReferenceClass -Reference $reference -Domain $Domain `
-                    -FallbackDomain $resolvedFallback -Scope $Scope -AddressPlan $plan
-                if ($classification.Class -ne 'Informational') {
-                    [pscustomobject]@{ Reference = $reference; Plan = $plan; Classification = $classification }
-                }
-            }
-        )
+        $remaining = @(Get-DomainReferenceAssessment -Domain $Domain -FallbackDomain $resolvedFallback `
+                -Scope $Scope -PageSize $graphPageSize |
+                Where-Object { $_.Classification.Class -ne 'Informational' })
+
         $recheckRows = foreach ($item in $remaining) {
             [pscustomobject]@{
                 Identity      = $item.Reference.Identity
@@ -1402,8 +1150,7 @@ try {
                 ObjectId      = $item.Reference.ObjectId
             }
         }
-        $null = Export-DomainReferenceReport -Rows @($recheckRows) -Name 'DomainBlockers-Recheck' `
-            -Directory $run.OutputDirectory -Prefix $run.Prefix
+        $null = Export-MigrationReport -Rows @($recheckRows) -Name 'DomainBlockers' -Suffix 'Recheck'
     }
 
     if (@($remaining).Count -eq 0) {

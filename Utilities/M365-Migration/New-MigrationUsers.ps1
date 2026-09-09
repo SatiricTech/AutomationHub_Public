@@ -5,88 +5,72 @@
     Creates destination-tenant user accounts from a migration identity plan.
 
 .DESCRIPTION
-    Phase 3 of the migration toolkit. The identity plan produced by the planning phase is
-    the single source of truth for who gets created and what they are called; this script
-    turns the plan's User rows into Microsoft Entra accounts and writes the resulting
-    object IDs back into the plan so the later phases (licensing, mailbox identity,
-    permissions) can find the accounts they are about to touch.
+    Phase 3 of the migration toolkit. The identity plan is the single source of truth for
+    who gets created and what they are called; this script turns its User rows into
+    Microsoft Entra accounts and writes the resulting object IDs back into the plan so the
+    later phases can find the accounts they are about to touch.
 
     Address choice. A wave is usually staged on the destination tenant's onmicrosoft.com
     domain first, because the vanity domain is still answering mail in the source tenant.
-    By default each row is created on its TargetUserPrincipalName when that domain is
-    verified in the destination tenant, and falls back to the InterimUserPrincipalName
-    with a per-row warning when it is not. -UseInterim forces the interim address for the
-    whole run, which is the usual choice for a staged cutover.
+    Each row is created on its TargetUserPrincipalName when that domain is verified in the
+    destination tenant, and falls back to the InterimUserPrincipalName with a per-row
+    warning when it is not. -UseInterim forces the interim address for the whole run.
 
     Hiding from the GAL. Freshly created users have no mailbox, so Set-Mailbox has nothing
     to act on. -HideFromAddressLists therefore sets the directory's showInAddressList
-    property at creation time, which is the only lever available until a mailbox exists.
-    Microsoft documents showInAddressList as a known issue - Exchange's own
-    HiddenFromAddressListsEnabled wins once a mailbox is provisioned - so treat this as a
-    pre-mailbox stopgap and re-apply the hide through Set-MigrationIdentity after
-    licensing has created the mailbox.
+    property at creation time. Microsoft documents that as a known issue - Exchange's own
+    HiddenFromAddressListsEnabled wins once a mailbox is provisioned - so treat it as a
+    pre-mailbox stopgap and re-apply the hide through Set-MigrationIdentity afterwards.
 
     Licensing. -AssignLicenses assigns each row's TargetLicenses immediately after
-    creation using the same POST /users/{id}/assignLicense call as Set-MigrationLicenses.
-    A usage location is mandatory for that call, so a row with no UsageLocation and no
-    -DefaultUsageLocation is created but reported as licence-skipped rather than failed.
-    Set-MigrationLicenses remains the tool for a licensing-only pass, seat pre-checks and
-    removals; this switch exists so a small wave can be created and licensed in one go.
+    creation. A usage location is mandatory for that call, so a row with no UsageLocation
+    and no -DefaultUsageLocation is created but reported as licence-skipped rather than
+    failed. Set-MigrationLicenses remains the tool for a licensing-only pass, seat
+    pre-checks and removals.
 
     Managers. -SetManagers runs a second pass once every row has been created, because a
-    manager frequently appears later in the plan than the people reporting to them. Each
-    ManagerUpn is resolved through the plan (source UPN, target UPN or interim UPN) to a
-    provisioned target object ID; managers outside the plan are reported, not guessed at.
+    manager frequently appears later in the plan than the people reporting to them.
+    Managers outside the plan are reported, not guessed at.
 
     Passwords are generated per user and written to the results CSV only. They are never
     logged. Store the results file the way you would store any other password list.
 
     -DryRun connects read-only, evaluates every row, and writes a results file whose rows
-    are all Status 'Planned'. No account is created, no licence assigned, no manager set
-    and the plan file is not written back.
+    are all Status 'Planned'.
 
 .PARAMETER PlanPath
-    The identity plan CSV (IdentityPlan.csv) produced by New-MigrationIdentityPlan. It is
-    read in full, filtered in memory, and written back in place with the object IDs of
-    everything this run created.
+    The identity plan CSV from New-MigrationIdentityPlan. Read in full, filtered in
+    memory, and written back in place with the object IDs this run created.
 
 .PARAMETER Wave
     Restricts the run to these plan waves. Omit to process every wave in the file.
 
 .PARAMETER UseInterim
-    Creates every account on its InterimUserPrincipalName instead of the target UPN. Use
-    this while the vanity domain still belongs to the source tenant.
+    Creates every account on its InterimUserPrincipalName instead of the target UPN.
 
 .PARAMETER HideFromAddressLists
-    Sets showInAddressList to false at creation so the staged accounts do not appear in
-    the destination GAL before cutover. See the DESCRIPTION for the Exchange caveat.
+    Sets showInAddressList to false at creation. See the DESCRIPTION for the caveat.
 
 .PARAMETER AssignLicenses
     Assigns each row's TargetLicenses immediately after the account is created.
 
 .PARAMETER SetManagers
-    Runs a second pass that resolves ManagerUpn through the plan and sets the manager
-    relationship on every account that has a target object ID.
+    Runs a second pass that resolves ManagerUpn through the plan and sets the manager.
 
 .PARAMETER ForceChangePassword
     Whether the generated password must be changed at first sign-in. Defaults to $true.
-    Set to $false when the technician hands the password over in person and a forced
-    change would break an unattended first sign-in.
 
 .PARAMETER PasswordLength
     Length of the generated password. Defaults to 16.
 
 .PARAMETER DefaultUsageLocation
-    Two-letter ISO country code used when a plan row has no UsageLocation. Required in
-    practice whenever -AssignLicenses is used against a plan with blank usage locations.
+    Two-letter ISO country code used when a plan row has no UsageLocation.
 
 .PARAMETER TenantId
-    The destination tenant to sign in to. Recommended when the technician has access to
-    several tenants.
+    The destination tenant to sign in to.
 
 .PARAMETER IncludeCollisions
-    Also processes rows whose PlanStatus is 'Collision'. Without it only Planned,
-    ManualOverride and UpnSmtpDiverge rows are acted on.
+    Also processes rows whose PlanStatus is 'Collision'.
 
 .PARAMETER OutputPath
     Overrides the output root for the log and results files.
@@ -106,14 +90,13 @@
 .EXAMPLE
     .\New-MigrationUsers.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -DryRun
 
-    Rehearses wave one: reports the UPN each account would be created on, which rows are
-    skipped and why, and writes a DryRun results file. Nothing is created.
+    Rehearses wave one: reports the UPN each account would be created on and which rows
+    are skipped and why. Nothing is created.
 
 .EXAMPLE
     .\New-MigrationUsers.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -UseInterim -HideFromAddressLists -DefaultUsageLocation US -Prefix Contoso
 
-    Stages wave one on newco.onmicrosoft.com, hidden from the destination GAL, ready for
-    the vanity domain to be moved across later.
+    Stages wave one on newco.onmicrosoft.com, hidden from the destination GAL.
 
 .EXAMPLE
     .\New-MigrationUsers.ps1 -PlanPath .\IdentityPlan.csv -AssignLicenses -SetManagers -DefaultUsageLocation GB -TenantId newco.onmicrosoft.com
@@ -133,8 +116,7 @@
     Roles: User Administrator is enough for ordinary accounts. Creating or re-parenting an
     account that holds a privileged role needs Privileged Authentication Administrator.
 
-    GDAP: supported. Connect-MgGraph -TenantId <customer> works for a partner user under an
-    active GDAP relationship, so pass -TenantId with the customer tenant. There is no
+    GDAP: supported - pass -TenantId with the customer tenant. There is no
     -DelegatedOrganization here; that parameter belongs to the Exchange Online scripts.
 
     Exit codes: 0 success, 1 fatal error, 2 completed with row failures.
@@ -198,16 +180,11 @@ Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Fo
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Declared here rather than at the call site so a reviewer can see the blast radius of a
-# run without reading the body. Organization.Read.All is only requested when it is needed:
-# asking for consent to a scope the run will not use is how tenants end up over-permissioned.
+# Declared here so a reviewer can see the blast radius of a run without reading the body.
+# Organization.Read.All is only requested when it is needed: asking for consent to a scope
+# the run will not use is how tenants end up over-permissioned.
 $requiredGraphScopes = @('User.ReadWrite.All', 'Directory.ReadWrite.All')
 if ($AssignLicenses) { $requiredGraphScopes += 'Organization.Read.All' }
-
-# Writers act only on these statuses. Everything else is reported as Skipped naming the
-# status, so a plan row is never silently ignored.
-$eligiblePlanStatuses = @('Planned', 'ManualOverride', 'UpnSmtpDiverge')
-if ($IncludeCollisions) { $eligiblePlanStatuses += 'Collision' }
 
 $script:results = [System.Collections.Generic.List[object]]::new()
 
@@ -215,83 +192,17 @@ $script:results = [System.Collections.Generic.List[object]]::new()
 
 #region Functions ---------------------------------------------------------------------
 
-function Get-GraphPropertyValue {
-    <#
-    .SYNOPSIS
-        Reads one property from a Graph response as a string, tolerating its absence.
-
-    .DESCRIPTION
-        Invoke-MigrationGraphRequest returns PSObjects, but Invoke-MgGraphRequest can be
-        configured to return hashtables and a 204 returns nothing at all. Under
-        Set-StrictMode -Version Latest a missing property is a terminating error, so every
-        read of a Graph response goes through here and collapses to an empty string.
-
-    .PARAMETER InputObject
-        The Graph response object, or $null.
-
-    .PARAMETER Name
-        The property name to read.
-
-    .EXAMPLE
-        Get-GraphPropertyValue -InputObject $created -Name 'id'
-
-        Returns the new object's ID, or '' when the call returned nothing.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [AllowNull()]
-        $InputObject,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name
-    )
-
-    if ($null -eq $InputObject) { return '' }
-
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        if ($InputObject.Contains($Name)) { return [string]$InputObject[$Name] }
-        return ''
-    }
-
-    $property = $InputObject.PSObject.Properties[$Name]
-    if ($property) { return [string]$property.Value }
-    return ''
-}
-
 function Resolve-RowIdentity {
     <#
     .SYNOPSIS
         Chooses the UPN and mail nickname a plan row should be created with.
 
     .DESCRIPTION
-        A staged migration creates accounts on the destination's onmicrosoft.com domain
-        and re-homes them on the vanity domain at cutover, because the vanity domain
-        cannot be verified in two tenants at once. Getting that choice wrong produces a
-        run where every row fails with 'Property userPrincipalName is invalid', so the
-        decision is made here, once, and reported per row.
-
-        Without -UseInterim the target UPN is preferred and used whenever its domain is
-        verified in the destination tenant. When the domain is not verified the interim
-        UPN is used instead and a warning is returned for the row's Detail. When the
-        verified-domain list is empty - the caller could not read it, or -UseInterim made
-        it unnecessary - no domain check is applied.
-
-    .PARAMETER Row
-        The identity plan row.
-
-    .PARAMETER VerifiedDomain
-        The destination tenant's verified domain names, lowercased. An empty list disables
-        the check.
-
-    .PARAMETER UseInterim
-        Forces the interim UPN.
-
-    .EXAMPLE
-        Resolve-RowIdentity -Row $row -VerifiedDomain @('newco.onmicrosoft.com') -UseInterim
-
-        Returns the row's interim UPN and mail nickname.
+        A staged migration creates accounts on the destination's onmicrosoft.com domain and
+        re-homes them on the vanity domain at cutover, because the vanity domain cannot be
+        verified in two tenants at once. Getting that choice wrong produces a run where
+        every row fails with 'Property userPrincipalName is invalid', so the decision is
+        made here, once, and reported per row.
 
     .EXAMPLE
         Resolve-RowIdentity -Row $row -VerifiedDomain $verified
@@ -302,13 +213,8 @@ function Resolve-RowIdentity {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]
-        $Row,
-
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$VerifiedDomain,
-
+        [Parameter(Mandatory)]$Row,
+        [AllowNull()][AllowEmptyCollection()][string[]]$VerifiedDomain,
         [switch]$UseInterim
     )
 
@@ -388,34 +294,9 @@ function ConvertTo-UserRequestBody {
     .DESCRIPTION
         Optional attributes are omitted rather than sent empty: Graph accepts an empty
         string for givenName, and an account created that way looks populated in the admin
-        centre while the attribute is in fact blank, which is worse than a visibly missing
-        value. Only accountEnabled, displayName, userPrincipalName, mailNickname and
-        passwordProfile are always present, because Graph requires them.
-
-        showInAddressList is only emitted when the caller asked to hide the account, so an
-        unhidden account is left at the directory default rather than being pinned to a
-        value Exchange will later disagree with.
-
-    .PARAMETER Row
-        The identity plan row.
-
-    .PARAMETER UserPrincipalName
-        The UPN chosen by Resolve-RowIdentity.
-
-    .PARAMETER MailNickname
-        The mail nickname chosen by Resolve-RowIdentity.
-
-    .PARAMETER UsageLocation
-        The two-letter usage location, already defaulted by the caller.
-
-    .PARAMETER Password
-        The generated initial password.
-
-    .PARAMETER ForceChangePassword
-        Whether the password must be changed at first sign-in.
-
-    .PARAMETER HideFromAddressLists
-        Adds showInAddressList = false.
+        centre while the attribute is in fact blank. showInAddressList is only emitted when
+        the caller asked to hide the account, so an unhidden account is left at the
+        directory default rather than pinned to a value Exchange will later disagree with.
 
     .EXAMPLE
         ConvertTo-UserRequestBody -Row $row -UserPrincipalName 'john.smith@newco.com' -MailNickname 'john.smith' -UsageLocation 'US' -Password $generated
@@ -429,26 +310,12 @@ function ConvertTo-UserRequestBody {
         Justification = 'These are not sign-in credentials. UserPrincipalName is the address the account is being created on and Password is the generated initial password for that new account; a PSCredential cannot express the pair being sent to Graph in one JSON body.')]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
     param(
-        [Parameter(Mandatory)]
-        $Row,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$UserPrincipalName,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$MailNickname,
-
-        [AllowEmptyString()]
-        [string]$UsageLocation = '',
-
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string]$Password,
-
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$UserPrincipalName,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$MailNickname,
+        [AllowEmptyString()][string]$UsageLocation = '',
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Password,
         [bool]$ForceChangePassword = $true,
-
         [switch]$HideFromAddressLists
     )
 
@@ -500,17 +367,9 @@ function ConvertTo-FailureDetail {
         Turns a Graph error into a sentence a technician can act on.
 
     .DESCRIPTION
-        The four failures that account for almost every red row in a provisioning run all
+        The four failures that account for almost every red row in a provisioning run
         arrive as the same shape of Graph error, and the raw message names none of the
-        fixes. Mapping them here means the results CSV is a work list rather than a
-        research project; anything unrecognised is passed through unchanged so no detail
-        is lost.
-
-    .PARAMETER Message
-        The exception message from the failed call.
-
-    .PARAMETER UserPrincipalName
-        The UPN the call was made for, quoted back in the mapped message.
+        fixes. Anything unrecognised is passed through unchanged so no detail is lost.
 
     .EXAMPLE
         ConvertTo-FailureDetail -Message $_.Exception.Message -UserPrincipalName $upn
@@ -520,12 +379,8 @@ function ConvertTo-FailureDetail {
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string]$Message,
-
-        [AllowEmptyString()]
-        [string]$UserPrincipalName = ''
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
+        [AllowEmptyString()][string]$UserPrincipalName = ''
     )
 
     $text = [string]$Message
@@ -556,27 +411,11 @@ function Invoke-LicenseAssignment {
         Assigns planned licences to one freshly created account.
 
     .DESCRIPTION
-        Deliberately a local copy of the assignLicense call rather than a dependency on
+        A local copy of the assignLicense call rather than a dependency on
         Set-MigrationLicenses: creating a user and licensing it are separate phases with
-        separate failure modes, and a create run must not fail because the licensing
-        script is mid-edit. Set-MigrationLicenses remains the tool for seat pre-checks,
-        group-assigned licence detection and removals.
-
-        Part numbers that are not in the tenant's SKU catalogue are returned rather than
-        thrown, so one mistyped licence in the plan does not fail the account that was
-        successfully created.
-
-    .PARAMETER UserId
-        The new account's directory object ID.
-
-    .PARAMETER SkuPartNumber
-        The part numbers from the row's TargetLicenses.
-
-    .PARAMETER Catalog
-        The tenant SKU catalogue from Get-MigrationSkuCatalog.
-
-    .PARAMETER Identity
-        The identity used in the action description written to the log.
+        separate failure modes. Part numbers that are not in the tenant's SKU catalogue are
+        returned rather than thrown, so one mistyped licence in the plan does not fail the
+        account that was successfully created.
 
     .EXAMPLE
         Invoke-LicenseAssignment -UserId $id -SkuPartNumber @('SPE_E3') -Catalog $catalog -Identity 'john.smith@newco.com'
@@ -588,21 +427,10 @@ function Invoke-LicenseAssignment {
         Justification = 'UserId is consumed inside the Invoke-MigrationAction scriptblock, which the analyzer does not follow. The scriptblock exists so the call can be suppressed under -DryRun.')]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$UserId,
-
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [string[]]$SkuPartNumber,
-
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$Catalog,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Identity
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$UserId,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$SkuPartNumber,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Catalog,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Identity
     )
 
     $addLicenses = [System.Collections.Generic.List[object]]::new()
@@ -621,8 +449,7 @@ function Invoke-LicenseAssignment {
 
     if ($addLicenses.Count -gt 0) {
         $body = @{ addLicenses = $addLicenses.ToArray(); removeLicenses = @() }
-        $description = "Assign licence(s) $($assigned -join ', ') to $Identity"
-        $null = Invoke-MigrationAction -Description $description -Action {
+        $null = Invoke-MigrationAction -Description "Assign licence(s) $($assigned -join ', ') to $Identity" -Action {
             Invoke-MigrationGraphRequest -Method POST -Uri "/v1.0/users/$UserId/assignLicense" -Body $body
         }
     }
@@ -631,69 +458,6 @@ function Invoke-LicenseAssignment {
         Assigned = $assigned.ToArray()
         Unknown  = $unknown.ToArray()
     }
-}
-
-function New-InitialPassword {
-    <#
-    .SYNOPSIS
-        Generates a random initial password for a newly created account.
-
-    .DESCRIPTION
-        A local copy of the module's private New-MigrationRandomPassword, because that
-        helper is not exported by the manifest and this script must not edit the manifest.
-        See the script notes: exporting it would remove this duplication.
-
-        One character is taken from each of four classes so the result satisfies the
-        default Entra complexity policy, then the whole string is shuffled so the
-        guaranteed characters do not always land at the front - a predictable prefix is a
-        predictable password. Characters that are easy to confuse when a password is read
-        aloud or copied off a screen (l, I, 1, O, 0) are left out of the alphabet.
-
-        All randomness comes from RandomNumberGenerator, not Get-Random, because
-        Get-Random is not a cryptographic source.
-
-    .PARAMETER Length
-        Total password length. Defaults to 16.
-
-    .EXAMPLE
-        New-InitialPassword -Length 20
-
-        Returns a 20-character password containing all four character classes.
-    #>
-    [CmdletBinding()]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
-        Justification = 'Generates an in-memory value; changes no system state.')]
-    [OutputType([string])]
-    param(
-        [ValidateRange(12, 128)]
-        [int]$Length = 16
-    )
-
-    $classes = @(
-        'abcdefghijkmnpqrstuvwxyz',
-        'ABCDEFGHJKLMNPQRSTUVWXYZ',
-        '23456789',
-        '!@#$%^*-_=+?'
-    )
-
-    $characters = [System.Collections.Generic.List[char]]::new()
-    foreach ($class in $classes) {
-        $characters.Add($class[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32($class.Length)])
-    }
-
-    $pool = -join $classes
-    while ($characters.Count -lt $Length) {
-        $characters.Add($pool[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32($pool.Length)])
-    }
-
-    for ($i = $characters.Count - 1; $i -gt 0; $i--) {
-        $j = [System.Security.Cryptography.RandomNumberGenerator]::GetInt32($i + 1)
-        $swap = $characters[$i]
-        $characters[$i] = $characters[$j]
-        $characters[$j] = $swap
-    }
-
-    return (-join $characters)
 }
 
 function Add-ResultRow {
@@ -705,40 +469,7 @@ function Add-ResultRow {
         Every results file in the toolkit leads with Identity, Action, Status and Detail so
         a technician reading a migration folder does not have to learn a new layout per
         script. Building the rows in one place is what keeps that promise true across the
-        eight or nine places this script reports an outcome from.
-
-    .PARAMETER Identity
-        The source identity the row is about.
-
-    .PARAMETER Action
-        What was attempted, for example 'CreateUser' or 'SetManager'.
-
-    .PARAMETER Status
-        Planned, Succeeded, Skipped or Failed.
-
-    .PARAMETER Detail
-        Why. Always populated for Skipped and Failed.
-
-    .PARAMETER ObjectType
-        The plan row's ObjectType.
-
-    .PARAMETER PlanStatus
-        The plan row's PlanStatus.
-
-    .PARAMETER TargetUserPrincipalName
-        The UPN the account was (or would be) created on.
-
-    .PARAMETER TargetObjectId
-        The destination object ID, when known.
-
-    .PARAMETER UsageLocation
-        The usage location applied.
-
-    .PARAMETER LicensesAssigned
-        Semicolon-separated part numbers assigned.
-
-    .PARAMETER GeneratedPassword
-        The generated initial password. Empty for anything that was not actually created.
+        places this script reports an outcome from.
 
     .EXAMPLE
         Add-ResultRow -Identity $identity -Action 'CreateUser' -Status 'Succeeded' -Detail 'Account created.'
@@ -752,41 +483,17 @@ function Add-ResultRow {
         Justification = 'The function builds a CSV row, not a sign-in. TargetUserPrincipalName and GeneratedPassword are two columns of the results file and are never used to authenticate.')]
     [OutputType([void])]
     param(
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string]$Identity,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Action,
-
-        [Parameter(Mandatory)]
-        [ValidateSet('Planned', 'Succeeded', 'Skipped', 'Failed')]
-        [string]$Status,
-
-        [AllowEmptyString()]
-        [string]$Detail = '',
-
-        [AllowEmptyString()]
-        [string]$ObjectType = '',
-
-        [AllowEmptyString()]
-        [string]$PlanStatus = '',
-
-        [AllowEmptyString()]
-        [string]$TargetUserPrincipalName = '',
-
-        [AllowEmptyString()]
-        [string]$TargetObjectId = '',
-
-        [AllowEmptyString()]
-        [string]$UsageLocation = '',
-
-        [AllowEmptyString()]
-        [string]$LicensesAssigned = '',
-
-        [AllowEmptyString()]
-        [string]$GeneratedPassword = ''
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Identity,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Action,
+        [Parameter(Mandatory)][ValidateSet('Planned', 'Succeeded', 'Skipped', 'Failed')][string]$Status,
+        [AllowEmptyString()][string]$Detail = '',
+        [AllowEmptyString()][string]$ObjectType = '',
+        [AllowEmptyString()][string]$PlanStatus = '',
+        [AllowEmptyString()][string]$TargetUserPrincipalName = '',
+        [AllowEmptyString()][string]$TargetObjectId = '',
+        [AllowEmptyString()][string]$UsageLocation = '',
+        [AllowEmptyString()][string]$LicensesAssigned = '',
+        [AllowEmptyString()][string]$GeneratedPassword = ''
     )
 
     $script:results.Add([pscustomobject][ordered]@{
@@ -843,8 +550,8 @@ if (-not $UseInterim) {
     try {
         $domains = @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/domains?$select=id,isVerified' -All)
         $verifiedDomains = @($domains |
-                Where-Object { (Get-GraphPropertyValue -InputObject $_ -Name 'isVerified') -eq 'True' } |
-                ForEach-Object { (Get-GraphPropertyValue -InputObject $_ -Name 'id').ToLowerInvariant() } |
+                Where-Object { [string](Get-MigrationProperty -InputObject $_ -Name 'isVerified' -Default '') -eq 'True' } |
+                ForEach-Object { ([string](Get-MigrationProperty -InputObject $_ -Name 'id' -Default '')).ToLowerInvariant() } |
                 Where-Object { $_ })
         Write-MigrationLog -Message "Destination tenant has $($verifiedDomains.Count) verified domain(s)." -Level INFO
     }
@@ -896,9 +603,14 @@ foreach ($row in $waveRows) {
         continue
     }
 
-    if ($planStatus -notin $eligiblePlanStatuses) {
-        $hint = if ($planStatus -eq 'Collision') { ' Re-run with -IncludeCollisions to process it.' } else { '' }
-        Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail "PlanStatus is '$planStatus'.$hint"
+    # -AllowSynced: a directory-synced source object is no reason not to create a fresh
+    # cloud account in the destination tenant. The gate's sync check belongs to the scripts
+    # that write back to an existing object.
+    $gate = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions -AllowSynced
+    if (-not $gate.Actionable) {
+        $detail = $gate.Reason
+        if ($planStatus -eq 'Collision') { $detail += ' Re-run with -IncludeCollisions to process it.' }
+        Add-ResultRow @common -Action 'CreateUser' -Status $gate.Status -Detail $detail
         continue
     }
 
@@ -932,7 +644,7 @@ foreach ($row in $waveRows) {
                 -Uri "/v1.0/users?`$filter=userPrincipalName eq '$filterValue'&`$select=id,userPrincipalName")
 
         if ($existing.Count -gt 0) {
-            $existingId = Get-GraphPropertyValue -InputObject $existing[0] -Name 'id'
+            $existingId = [string](Get-MigrationProperty -InputObject $existing[0] -Name 'id' -Default '')
             $row.TargetObjectId = $existingId
             $row.ProvisionStatus = 'Exists'
             $row.ProvisionDetail = "Account already present in the destination tenant as $upn."
@@ -950,7 +662,7 @@ foreach ($row in $waveRows) {
 
         # A password is only minted for a run that will actually create something, so a
         # rehearsal never leaves a live credential in a DryRun results file.
-        $password = if ($DryRun) { '' } else { New-InitialPassword -Length $PasswordLength }
+        $password = if ($DryRun) { '' } else { New-MigrationRandomPassword -Length $PasswordLength }
 
         $body = ConvertTo-UserRequestBody -Row $row -UserPrincipalName $upn -MailNickname $chosen.MailNickname `
             -UsageLocation $usageLocation -Password $password -ForceChangePassword $ForceChangePassword `
@@ -978,7 +690,7 @@ foreach ($row in $waveRows) {
         }
 
         $generatedPassword = $password
-        $newObjectId = Get-GraphPropertyValue -InputObject $created -Name 'id'
+        $newObjectId = [string](Get-MigrationProperty -InputObject $created -Name 'id' -Default '')
         $detail.Insert(0, "Account created on the $($chosen.AddressSource.ToLowerInvariant()) address.")
 
         $row.TargetObjectId = $newObjectId
@@ -1034,7 +746,8 @@ if ($SetManagers) {
     Write-MigrationLog -Message 'Second pass: setting managers.' -Level INFO
 
     # Built from the whole plan, not the wave: a manager is frequently in an earlier wave
-    # that this run is not touching, and their object ID is already recorded there.
+    # that this run is not touching, and their object ID is already recorded there. This is
+    # an address -> object ID index, which is not what Get-MigrationPlanAddressMap returns.
     $objectIdByAddress = @{}
     foreach ($planRow in $planRows) {
         $planRowObjectId = Get-MigrationCsvValue -Row $planRow -Name 'TargetObjectId' -Default ''
@@ -1089,13 +802,10 @@ if ($SetManagers) {
             }
 
             $managerReference = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/users/$managerObjectId" }
-            $managerUri = "https://graph.microsoft.com/v1.0/users/$userObjectId/manager/`$ref"
+            $managerUri = "/v1.0/users/$userObjectId/manager/`$ref"
 
-            # Invoke-MigrationGraphRequest does not accept PUT, and the manager reference
-            # endpoint only answers to PUT. See the script notes for the module change.
             $null = Invoke-MigrationAction -Description "Set manager of $identity to $managerUpn" -Action {
-                Invoke-MgGraphRequest -Method PUT -Uri $managerUri -Body ($managerReference | ConvertTo-Json -Depth 3) `
-                    -ContentType 'application/json' -ErrorAction Stop
+                Invoke-MigrationGraphRequest -Method PUT -Uri $managerUri -Body $managerReference
             }
 
             $status = if ($DryRun) { 'Planned' } else { 'Succeeded' }

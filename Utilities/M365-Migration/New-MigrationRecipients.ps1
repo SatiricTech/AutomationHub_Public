@@ -215,9 +215,6 @@ Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Fo
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$eligiblePlanStatuses = @('Planned', 'ManualOverride', 'UpnSmtpDiverge')
-if ($IncludeCollisions) { $eligiblePlanStatuses += 'Collision' }
-
 $doCreate = $Mode -in @('Create', 'CreateAndUpdate')
 $doUpdate = $Mode -in @('UpdateSettings', 'CreateAndUpdate')
 
@@ -261,9 +258,6 @@ function ConvertTo-AddressArray {
         Values are trimmed, empties dropped, an 'smtp:' prefix removed and the result
         de-duplicated case-insensitively while keeping the first spelling seen.
 
-    .PARAMETER Value
-        The raw value: string, array, or Exchange multi-valued property.
-
     .EXAMPLE
         ConvertTo-AddressArray -Value 'ap@contoso.com; smtp:accounts@contoso.com'
 
@@ -272,8 +266,7 @@ function ConvertTo-AddressArray {
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
-        [AllowNull()]
-        $Value
+        [AllowNull()]$Value
     )
 
     if ($null -eq $Value) { return @() }
@@ -306,9 +299,6 @@ function ConvertTo-RecipientBoolean {
         'explicitly off', because the settings diff must leave a setting alone when the
         inventory has no opinion about it rather than switching it off.
 
-    .PARAMETER Value
-        The raw cell value.
-
     .EXAMPLE
         ConvertTo-RecipientBoolean -Value 'True'
 
@@ -317,8 +307,7 @@ function ConvertTo-RecipientBoolean {
     [CmdletBinding()]
     [OutputType([bool])]
     param(
-        [AllowNull()]
-        $Value
+        [AllowNull()]$Value
     )
 
     if ($null -eq $Value) { return $null }
@@ -342,12 +331,6 @@ function Get-RowTargetAddress {
         and falling back to the UPN means the one function serves every row type, which is
         what the address map needs when it indexes users and recipients together.
 
-    .PARAMETER Row
-        The identity plan row.
-
-    .PARAMETER UseInterim
-        Prefers the interim address over the target address.
-
     .EXAMPLE
         Get-RowTargetAddress -Row $row -UseInterim
 
@@ -356,9 +339,7 @@ function Get-RowTargetAddress {
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [Parameter(Mandatory)]
-        $Row,
-
+        [Parameter(Mandatory)]$Row,
         [switch]$UseInterim
     )
 
@@ -377,111 +358,6 @@ function Get-RowTargetAddress {
     return ''
 }
 
-function ConvertTo-RecipientAddressMap {
-    <#
-    .SYNOPSIS
-        Builds the Source-to-Target address map used to translate members and delegates.
-
-    .DESCRIPTION
-        Every membership, ownership and delivery-restriction value in a source inventory is
-        a source-tenant address. Applying one of those to a destination object either fails
-        or resolves to the wrong recipient, so all of them are translated through this map.
-
-        Each row contributes every address it is known by - source UPN, source primary SMTP,
-        each source alias and its display name - all pointing at the one address the row
-        will exist on in the destination. Display names are included because the inventory
-        falls back to a display name for members Exchange could not resolve to an address.
-
-        Keys are lowercased. A later row never overwrites an earlier key, so a duplicated
-        alias resolves to the first row that claimed it rather than to whichever row the
-        file happened to end with.
-
-    .PARAMETER Rows
-        The full set of plan rows, not just the wave being processed - a member is very
-        often in a different wave from the group that contains them.
-
-    .PARAMETER UseInterim
-        Maps to interim addresses rather than target addresses.
-
-    .EXAMPLE
-        $map = ConvertTo-RecipientAddressMap -Rows $planRows
-
-        Returns a hashtable mapping every known source address to its destination address.
-    #>
-    [CmdletBinding()]
-    [OutputType([hashtable])]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$Rows,
-
-        [switch]$UseInterim
-    )
-
-    $map = @{}
-
-    foreach ($row in $Rows) {
-        $target = Get-RowTargetAddress -Row $row -UseInterim:$UseInterim
-        if (-not $target) { continue }
-
-        $keys = [System.Collections.Generic.List[string]]::new()
-        foreach ($column in @('SourceUserPrincipalName', 'SourcePrimarySmtp', 'DisplayName')) {
-            $value = Get-MigrationCsvValue -Row $row -Name $column -Default ''
-            if ($value) { $keys.Add($value) }
-        }
-        foreach ($alias in (ConvertTo-AddressArray -Value (Get-MigrationCsvValue -Row $row -Name 'SourceAliases' -Default ''))) {
-            if ($alias -notmatch '^(?i)x500:') { $keys.Add($alias) }
-        }
-
-        foreach ($key in $keys) {
-            $lookup = $key.ToLowerInvariant()
-            if (-not $map.ContainsKey($lookup)) { $map[$lookup] = $target }
-        }
-    }
-
-    return $map
-}
-
-function Resolve-MappedAddress {
-    <#
-    .SYNOPSIS
-        Translates one source address to its destination address.
-
-    .PARAMETER Address
-        The source address or display name.
-
-    .PARAMETER Map
-        The map from ConvertTo-RecipientAddressMap.
-
-    .DESCRIPTION
-        Returns an empty string when the address is not in the plan. The caller reports
-        that rather than falling back to the source address: silently granting rights to an
-        address that still resolves in the source tenant is exactly the failure this map
-        exists to prevent.
-
-    .EXAMPLE
-        Resolve-MappedAddress -Address 'jsmith@contoso.com' -Map $map
-
-        Returns 'john.smith@newco.com'.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Address,
-
-        [Parameter(Mandatory)]
-        [hashtable]$Map
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Address)) { return '' }
-
-    $lookup = $Address.Trim().ToLowerInvariant() -replace '^(?i)smtp:', ''
-    if ($Map.ContainsKey($lookup)) { return [string]$Map[$lookup] }
-    return ''
-}
-
 function Resolve-MappedAddressList {
     <#
     .SYNOPSIS
@@ -491,12 +367,6 @@ function Resolve-MappedAddressList {
         Returns what could be mapped and what could not, separately, so the caller can apply
         the first and report the second. A list of forty members with one departed employee
         in it should still be created with thirty-nine.
-
-    .PARAMETER Value
-        The raw list: a delimited cell or an array.
-
-    .PARAMETER Map
-        The map from ConvertTo-RecipientAddressMap.
 
     .EXAMPLE
         $members = Resolve-MappedAddressList -Value $row.Members -Map $map
@@ -508,18 +378,15 @@ function Resolve-MappedAddressList {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [AllowNull()]
-        $Value,
-
-        [Parameter(Mandatory)]
-        [hashtable]$Map
+        [AllowNull()]$Value,
+        [Parameter(Mandatory)][hashtable]$Map
     )
 
     $mapped = [System.Collections.Generic.List[string]]::new()
     $unmapped = [System.Collections.Generic.List[string]]::new()
 
     foreach ($address in (ConvertTo-AddressArray -Value $Value)) {
-        $target = Resolve-MappedAddress -Address $address -Map $Map
+        $target = (Resolve-MigrationPlanAddress -Map $Map -Address $address).Address
         if ($target) {
             if (-not $mapped.Contains($target)) { $mapped.Add($target) }
         }
@@ -549,22 +416,6 @@ function ConvertTo-GroupSettingState {
         A setting the source object says nothing about is left out of the result entirely,
         not defaulted, so the diff can tell 'off' from 'not stated'.
 
-    .PARAMETER InputObject
-        The inventory row or Exchange group object.
-
-    .PARAMETER BooleanSetting
-        Names of the boolean settings to read.
-
-    .PARAMETER TextSetting
-        Names of the plain-text settings to read.
-
-    .PARAMETER AddressSetting
-        Names of the recipient-list settings to read.
-
-    .PARAMETER Map
-        When supplied, address lists are translated through this Source-to-Target map and
-        anything unmappable is returned in Unmapped.
-
     .EXAMPLE
         ConvertTo-GroupSettingState -InputObject $group -BooleanSetting $booleanGroupSetting -TextSetting $textGroupSetting -AddressSetting $addressGroupSetting
 
@@ -573,23 +424,11 @@ function ConvertTo-GroupSettingState {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [AllowNull()]
-        $InputObject,
-
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$BooleanSetting = @(),
-
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$TextSetting = @(),
-
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$AddressSetting = @(),
-
-        [AllowNull()]
-        [hashtable]$Map
+        [AllowNull()]$InputObject,
+        [AllowNull()][AllowEmptyCollection()][string[]]$BooleanSetting = @(),
+        [AllowNull()][AllowEmptyCollection()][string[]]$TextSetting = @(),
+        [AllowNull()][AllowEmptyCollection()][string[]]$AddressSetting = @(),
+        [AllowNull()][hashtable]$Map
     )
 
     $settings = [ordered]@{}
@@ -665,12 +504,6 @@ function Get-GroupSettingChange {
         Address lists compare as case-insensitive sets: order is not meaningful to Exchange,
         so a reordered ManagedBy is not a change.
 
-    .PARAMETER Desired
-        The normalised desired settings.
-
-    .PARAMETER Current
-        The normalised current settings. An empty table means everything desired is a change.
-
     .EXAMPLE
         $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
         if ($changes.Count -gt 0) { Set-DistributionGroup -Identity $id @changes }
@@ -680,12 +513,8 @@ function Get-GroupSettingChange {
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
-        [Parameter(Mandatory)]
-        [AllowNull()]
-        $Desired,
-
-        [AllowNull()]
-        $Current
+        [Parameter(Mandatory)][AllowNull()]$Desired,
+        [AllowNull()]$Current
     )
 
     $changes = @{}
@@ -728,12 +557,6 @@ function Get-CsvIndex {
         alias, display name - means a plan built from one export still joins to an inventory
         exported at a different time or by a different technician.
 
-    .PARAMETER Rows
-        The inventory rows.
-
-    .PARAMETER KeyColumn
-        The columns to index on, in priority order.
-
     .EXAMPLE
         $groupIndex = Get-CsvIndex -Rows $groupRows -KeyColumn 'PrimarySmtpAddress', 'DisplayName'
 
@@ -742,13 +565,8 @@ function Get-CsvIndex {
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [object[]]$Rows,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string[]]$KeyColumn
+        [AllowNull()][AllowEmptyCollection()][object[]]$Rows,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$KeyColumn
     )
 
     $index = @{}
@@ -768,12 +586,6 @@ function Find-IndexedRow {
     .SYNOPSIS
         Looks a plan row up in an inventory index by any of its source addresses.
 
-    .PARAMETER Row
-        The plan row.
-
-    .PARAMETER Index
-        The index from Get-CsvIndex.
-
     .DESCRIPTION
         Tries the source primary SMTP, then the source UPN, then the display name, then each
         source alias, and returns the first inventory row that matches. Returns $null when
@@ -788,11 +600,8 @@ function Find-IndexedRow {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]
-        $Row,
-
-        [Parameter(Mandatory)]
-        [hashtable]$Index
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][hashtable]$Index
     )
 
     $candidates = [System.Collections.Generic.List[string]]::new()
@@ -826,12 +635,6 @@ function Get-PlanAliasAddress {
         The primary address is excluded so Exchange is never asked to add an address the
         object already holds as its primary.
 
-    .PARAMETER Row
-        The identity plan row.
-
-    .PARAMETER PrimaryAddress
-        The address the recipient was created on.
-
     .EXAMPLE
         Get-PlanAliasAddress -Row $row -PrimaryAddress 'accounts@newco.com'
 
@@ -840,11 +643,8 @@ function Get-PlanAliasAddress {
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
-        [Parameter(Mandatory)]
-        $Row,
-
-        [AllowEmptyString()]
-        [string]$PrimaryAddress = ''
+        [Parameter(Mandatory)]$Row,
+        [AllowEmptyString()][string]$PrimaryAddress = ''
     )
 
     $addresses = [System.Collections.Generic.List[string]]::new()
@@ -857,17 +657,55 @@ function Get-PlanAliasAddress {
         if (-not $addresses.Contains($text)) { $addresses.Add($text) }
     }
 
+    # An explicit SourceX500 wins; the LegacyExchangeDN is only promoted when there is none.
     $x500 = Get-MigrationCsvValue -Row $Row -Name 'SourceX500' -Default ''
-    if (-not $x500) {
-        $legacyDn = Get-MigrationCsvValue -Row $Row -Name 'LegacyExchangeDN' -Default ''
-        if ($legacyDn) { $x500 = "X500:$legacyDn" }
-    }
-    if ($x500) {
-        if ($x500 -notmatch '^(?i)x500:') { $x500 = "X500:$x500" }
-        if (-not $addresses.Contains($x500)) { $addresses.Add($x500) }
+    if (-not $x500) { $x500 = Get-MigrationCsvValue -Row $Row -Name 'LegacyExchangeDN' -Default '' }
+    foreach ($entry in @(ConvertTo-MigrationX500 -Value $x500)) {
+        if (-not $addresses.Contains($entry)) { $addresses.Add($entry) }
     }
 
     return $addresses.ToArray()
+}
+
+function Invoke-SettingChange {
+    <#
+    .SYNOPSIS
+        Applies a settings diff through one Set-* cmdlet and returns the names it changed.
+
+    .DESCRIPTION
+        Groups, mailboxes and contacts all reach Exchange the same way - splat the diff onto a
+        Set-* cmdlet with an Identity - and having that in one place is what keeps the DryRun
+        guarantee, the log wording and the SettingsChanged column consistent across all three.
+
+    .EXAMPLE
+        Invoke-SettingChange -Cmdlet 'Set-DistributionGroup' -Identity $targetAddress -Change $changes
+
+        Applies the diff and returns @('ManagedBy', 'ModerationEnabled').
+    #>
+    [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'The caller gates the row with ShouldProcess and Invoke-MigrationAction honours -DryRun.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+        Justification = 'Cmdlet and Change are consumed inside the Invoke-MigrationAction scriptblock, which the analyzer does not follow. The scriptblock exists so the call can be suppressed under -DryRun.')]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Cmdlet,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Identity,
+        [Parameter(Mandatory)][AllowNull()][hashtable]$Change
+    )
+
+    if ($null -eq $Change -or $Change.Count -eq 0) { return @() }
+
+    $names = @($Change.Keys | Sort-Object)
+    $parameters = $Change.Clone()
+    $parameters['Identity'] = $Identity
+    $parameters['ErrorAction'] = 'Stop'
+
+    $null = Invoke-MigrationAction -Description "Apply $($names -join ', ') to $Identity" -Action {
+        & $Cmdlet @parameters
+    }
+
+    return [string[]]$names
 }
 
 function Add-ResultRow {
@@ -880,39 +718,6 @@ function Add-ResultRow {
         the rows in one place is what keeps that true across the dozen places this script
         reports an outcome from.
 
-    .PARAMETER Identity
-        The source identity the row is about.
-
-    .PARAMETER Action
-        What was attempted, for example 'CreateRecipient' or 'UpdateSettings'.
-
-    .PARAMETER Status
-        Planned, Succeeded, Skipped or Failed.
-
-    .PARAMETER Detail
-        Why. Always populated for Skipped and Failed.
-
-    .PARAMETER ObjectType
-        The plan row's ObjectType.
-
-    .PARAMETER PlanStatus
-        The plan row's PlanStatus.
-
-    .PARAMETER TargetAddress
-        The address the recipient was (or would be) created on.
-
-    .PARAMETER TargetObjectId
-        The destination ExternalDirectoryObjectId, when known.
-
-    .PARAMETER SettingsChanged
-        Semicolon-separated names of the settings this run changed.
-
-    .PARAMETER MembersAdded
-        How many members were added.
-
-    .PARAMETER Unmappable
-        Semicolon-separated source addresses the plan could not translate.
-
     .EXAMPLE
         Add-ResultRow -Identity $identity -Action 'CreateRecipient' -Status 'Succeeded' -Detail 'Shared mailbox created.'
 
@@ -921,41 +726,17 @@ function Add-ResultRow {
     [CmdletBinding()]
     [OutputType([void])]
     param(
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string]$Identity,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Action,
-
-        [Parameter(Mandatory)]
-        [ValidateSet('Planned', 'Succeeded', 'Skipped', 'Failed')]
-        [string]$Status,
-
-        [AllowEmptyString()]
-        [string]$Detail = '',
-
-        [AllowEmptyString()]
-        [string]$ObjectType = '',
-
-        [AllowEmptyString()]
-        [string]$PlanStatus = '',
-
-        [AllowEmptyString()]
-        [string]$TargetAddress = '',
-
-        [AllowEmptyString()]
-        [string]$TargetObjectId = '',
-
-        [AllowEmptyString()]
-        [string]$SettingsChanged = '',
-
-        [AllowEmptyString()]
-        [string]$MembersAdded = '',
-
-        [AllowEmptyString()]
-        [string]$Unmappable = ''
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Identity,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Action,
+        [Parameter(Mandatory)][ValidateSet('Planned', 'Succeeded', 'Skipped', 'Failed')][string]$Status,
+        [AllowEmptyString()][string]$Detail = '',
+        [AllowEmptyString()][string]$ObjectType = '',
+        [AllowEmptyString()][string]$PlanStatus = '',
+        [AllowEmptyString()][string]$TargetAddress = '',
+        [AllowEmptyString()][string]$TargetObjectId = '',
+        [AllowEmptyString()][string]$SettingsChanged = '',
+        [AllowEmptyString()][string]$MembersAdded = '',
+        [AllowEmptyString()][string]$Unmappable = ''
     )
 
     $script:results.Add([pscustomobject][ordered]@{
@@ -998,7 +779,7 @@ if ($waveRows.Count -eq 0) {
 }
 Write-MigrationLog -Message "Processing $($waveRows.Count) plan row(s) in mode $Mode." -Level INFO
 
-$addressMap = ConvertTo-RecipientAddressMap -Rows $planRows -UseInterim:$UseInterim
+$addressMap = Get-MigrationPlanAddressMap -Rows $planRows -UseInterim:$UseInterim
 Write-MigrationLog -Message "Address map holds $($addressMap.Count) source address(es)." -Level INFO
 
 $groupIndex = @{}
@@ -1072,9 +853,13 @@ foreach ($row in $waveRows) {
 
     $common = @{ Identity = $identity; ObjectType = $objectType; PlanStatus = $planStatus }
 
-    if ($planStatus -notin $eligiblePlanStatuses) {
-        $hint = if ($planStatus -eq 'Collision') { ' Re-run with -IncludeCollisions to process it.' } else { '' }
-        Add-ResultRow @common -Action 'CreateRecipient' -Status 'Skipped' -Detail "PlanStatus is '$planStatus'.$hint"
+    # -AllowSynced: this script creates fresh destination objects, so the source object's
+    # directory-sync state is not a reason to skip the row.
+    $gate = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions -AllowSynced
+    if (-not $gate.Actionable) {
+        $detail = $gate.Reason
+        if ($planStatus -eq 'Collision') { $detail += ' Re-run with -IncludeCollisions to process it.' }
+        Add-ResultRow @common -Action 'CreateRecipient' -Status $gate.Status -Detail $detail
         continue
     }
 
@@ -1261,14 +1046,9 @@ foreach ($row in $waveRows) {
                 $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
 
                 if ($changes.Count -gt 0 -and $setCmdlet) {
-                    $changeNames = @($changes.Keys | Sort-Object)
-                    $settingParameters = $changes.Clone()
-                    $settingParameters['Identity'] = $targetAddress
-                    $settingParameters['ErrorAction'] = 'Stop'
-                    $null = Invoke-MigrationAction -Description "Apply $($changeNames -join ', ') to $targetAddress" -Action {
-                        & $setCmdlet @settingParameters
+                    foreach ($name in (Invoke-SettingChange -Cmdlet $setCmdlet -Identity $targetAddress -Change $changes)) {
+                        $settingsChanged.Add($name)
                     }
-                    foreach ($name in $changeNames) { $settingsChanged.Add($name) }
                 }
                 elseif ($changes.Count -eq 0) {
                     $updateDetail.Add('Settings already match the source.')
@@ -1317,15 +1097,8 @@ foreach ($row in $waveRows) {
                     -BooleanSetting @('HiddenFromAddressListsEnabled') -AddressSetting @('GrantSendOnBehalfTo')
                 $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
 
-                if ($changes.Count -gt 0) {
-                    $changeNames = @($changes.Keys | Sort-Object)
-                    $mailboxParameters = $changes.Clone()
-                    $mailboxParameters['Identity'] = $targetAddress
-                    $mailboxParameters['ErrorAction'] = 'Stop'
-                    $null = Invoke-MigrationAction -Description "Apply $($changeNames -join ', ') to $targetAddress" -Action {
-                        Set-Mailbox @mailboxParameters
-                    }
-                    foreach ($name in $changeNames) { $settingsChanged.Add($name) }
+                foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-Mailbox' -Identity $targetAddress -Change $changes)) {
+                    $settingsChanged.Add($name)
                 }
             }
 
@@ -1337,7 +1110,8 @@ foreach ($row in $waveRows) {
                     $right = Get-MigrationCsvValue -Row $permission -Name 'Permission' -Default ''
                     if ($right -notin @('FullAccess', 'SendAs')) { continue }
 
-                    $trustee = Resolve-MappedAddress -Address (Get-MigrationCsvValue -Row $permission -Name 'Trustee' -Default '') -Map $addressMap
+                    $trustee = (Resolve-MigrationPlanAddress -Map $addressMap `
+                            -Address (Get-MigrationCsvValue -Row $permission -Name 'Trustee' -Default '')).Address
                     if (-not $trustee) {
                         $rawTrustee = Get-MigrationCsvValue -Row $permission -Name 'Trustee' -Default '(blank)'
                         $unmappable.Add("${right}: $rawTrustee")
@@ -1373,14 +1147,8 @@ foreach ($row in $waveRows) {
                 $desired = ConvertTo-GroupSettingState -InputObject $inventoryRow -BooleanSetting @('HiddenFromAddressListsEnabled')
                 $current = ConvertTo-GroupSettingState -InputObject $recipient -BooleanSetting @('HiddenFromAddressListsEnabled')
                 $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
-                if ($changes.Count -gt 0) {
-                    $contactParameters = $changes.Clone()
-                    $contactParameters['Identity'] = $targetAddress
-                    $contactParameters['ErrorAction'] = 'Stop'
-                    $null = Invoke-MigrationAction -Description "Apply HiddenFromAddressListsEnabled to $targetAddress" -Action {
-                        Set-MailContact @contactParameters
-                    }
-                    $settingsChanged.Add('HiddenFromAddressListsEnabled')
+                foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-MailContact' -Identity $targetAddress -Change $changes)) {
+                    $settingsChanged.Add($name)
                 }
             }
         }

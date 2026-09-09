@@ -5,131 +5,110 @@
     Turns source-tenant inventory CSVs into the identity plan every later phase reads.
 
 .DESCRIPTION
-    This is the offline heart of the migration toolkit. It never connects to a tenant: it
-    reads the CSVs produced by Get-MigrationInventory.ps1, decides what every source object
-    is going to be called in the destination tenant, and writes one IdentityPlan.csv that
-    the provisioning, licensing and cutover scripts then act on.
+    The offline heart of the toolkit. It reads the CSVs produced by Get-MigrationInventory.ps1,
+    decides what every source object is going to be called in the destination tenant, and writes
+    one IdentityPlan.csv that the provisioning, licensing and cutover scripts then act on. No
+    tenant connection is made, so -DryRun computes the whole plan and simply writes nothing.
 
-    Deciding names offline matters because the plan is the artefact the client signs off.
-    An operator can open it, correct a surname, override an address, and re-run the writers
-    without ever asking the tool to guess again.
+    Deciding names offline matters because the plan is the artefact the client signs off. An
+    operator can open it, correct a surname, override an address, and re-run the writers without
+    ever asking the tool to guess again.
 
-    For every source object the script:
-      * classifies it (User, Guest, Shared, Room, Equipment, Distribution,
-        MailEnabledSecurity, DynamicDistribution, Contact, M365Group);
-      * excludes what must not be migrated - break-glass accounts, service accounts,
-        directory-synced objects, disabled accounts, guests, Entra groups Fly handles -
-        recording why in ExcludeReason rather than dropping the row;
-      * builds the destination local part from a naming template (-UpnFormat, -SmtpFormat,
-        -MailNicknameFormat), transliterating accents and stripping apostrophes;
-      * resolves collisions deterministically, preferring a middle initial over a numeric
-        suffix, taking addresses already used in the destination into account;
-      * validates every address it produced;
-      * maps source licences through a SKU map;
-      * carries the LegacyExchangeDN across as an X500 address so that replies to old mail
-        do not bounce with an IMCEAEX non-delivery report;
-      * assigns waves.
+    For every source object the script classifies it (User, Guest, Shared, Room, Equipment,
+    Distribution, MailEnabledSecurity, DynamicDistribution, Contact, M365Group), excludes what
+    must not be migrated - break-glass and service accounts, directory-synced objects, disabled
+    accounts, guests, Entra groups Fly handles - recording why in ExcludeReason rather than
+    dropping the row, builds the destination local part from a naming template, resolves
+    collisions deterministically, validates every address it produced, maps source licences
+    through a SKU map, carries the LegacyExchangeDN across as an X500 address so replies to old
+    mail do not bounce with an IMCEAEX non-delivery report, and assigns waves.
 
-    Nothing is guessed. A name that cannot be templated (no surname, a name written only in
-    a non-Latin script) is marked NeedsReview with the target columns left empty, which is
-    the operator's cue to fill it in by hand.
+    Nothing is guessed. A name that cannot be templated (no surname, a name written only in a
+    non-Latin script) is marked NeedsReview with the target columns left empty, which is the
+    operator's cue to fill it in by hand.
 
-    Re-running the script against an updated inventory is safe: with -ExistingPlanPath, any
-    row that has already been provisioned (a non-empty TargetObjectId) or that an operator
-    has marked ManualOverride keeps its destination identity verbatim, and its addresses are
-    treated as reserved so no newly planned object can take them.
-
-    The script is read-only apart from the plan file it writes, so -DryRun computes the whole
-    plan, prints the summary, and writes nothing.
+    Re-running against an updated inventory is safe: with -ExistingPlanPath, any row already
+    provisioned (a non-empty TargetObjectId) or marked ManualOverride keeps its destination
+    identity verbatim, and its addresses are treated as reserved.
 
 .PARAMETER UsersCsv
     The Users tab from Get-MigrationInventory. Required - it is the spine of the plan.
 
 .PARAMETER UserMailboxesCsv
-    The UserMailboxes tab. Optional but strongly recommended: it supplies LegacyExchangeDN,
-    the existing proxy addresses and the recipient type, none of which Entra ID exposes.
+    The UserMailboxes tab. Strongly recommended: it supplies LegacyExchangeDN, the proxy
+    addresses and the recipient type, none of which Entra ID exposes.
 
 .PARAMETER SharedMailboxesCsv
     The SharedMailboxes tab (shared, room, equipment and scheduling mailboxes).
 
 .PARAMETER GroupsCsv
     The Groups tab. Distribution, mail-enabled security and dynamic distribution groups are
-    planned; Microsoft 365 groups, Teams and plain security groups are recorded as excluded
-    because a third-party mover (Fly) or Entra itself owns them.
+    planned; Microsoft 365 groups, Teams and security groups are recorded as excluded.
 
 .PARAMETER ContactsCsv
     The Contacts tab (mail contacts).
 
 .PARAMETER TargetDomain
-    The destination vanity domain, with or without a leading '@' - for example newco.com.
-    Every templated address is built in this domain.
+    Destination vanity domain, with or without a leading '@'. Every templated address is built
+    in this domain.
 
 .PARAMETER InterimDomain
-    An optional routing domain used before the vanity domain cuts over, typically
-    newco.onmicrosoft.com. When supplied the Interim* columns are built in this domain;
-    when omitted the Interim* columns simply mirror the Target* columns.
+    Routing domain used before the vanity domain cuts over, typically newco.onmicrosoft.com.
+    When omitted the Interim* columns mirror the Target* columns.
 
 .PARAMETER UpnFormat
-    Naming template or preset for the destination user principal name. Default 'First.Last'.
-    Presets: First.Last, FLast, F.Last, FirstLast, First, First.L, FirstL, First.M.Last,
-    FMLast, Last.First, Keep. Templates use {first} {last} {middle} {f} {m} {l} {source}
-    {display} with optional truncation, for example '{f}{last:12}'.
+    Naming template or preset for the destination UPN. Default 'First.Last'. Presets:
+    First.Last, FLast, F.Last, FirstLast, First, First.L, FirstL, First.M.Last, FMLast,
+    Last.First, Keep. Templates use {first} {last} {middle} {f} {m} {l} {source} {display} with
+    optional truncation, for example '{f}{last:12}'.
 
 .PARAMETER SmtpFormat
-    Naming template or preset for the destination primary SMTP address. Defaults to
-    -UpnFormat, which is what keeps the UPN and the mail address identical.
+    Template for the primary SMTP address. Defaults to -UpnFormat, which keeps the UPN and the
+    mail address identical.
 
 .PARAMETER MailNicknameFormat
-    Naming template or preset for the mail nickname (Exchange alias). When omitted the
-    resolved SMTP local part is used, which is the behaviour you almost always want because
-    it survives collision resolution.
+    Template for the mail nickname. When omitted the resolved SMTP local part is used, which
+    survives collision resolution.
 
 .PARAMETER SkuMapPath
-    CSV of SourceSkuPartNumber,TargetSkuPartNumber. A ';' separated target maps one source
-    licence to several; an empty target drops the licence. Source SKUs absent from the map
-    are carried through unchanged and called out in PlanDetail so the readiness check can
-    flag them.
+    CSV of SourceSkuPartNumber,TargetSkuPartNumber. A ';' separated target maps one licence to
+    several; an empty target drops it. Unmapped SKUs are carried through and noted in PlanDetail.
 
 .PARAMETER ExclusionRulesPath
-    CSV of Pattern,MatchOn,Reason with an optional MatchType column (Wildcard, the default,
-    or Regex). Any object whose MatchOn column matches the pattern is excluded.
+    CSV of Pattern,MatchOn,Reason with an optional MatchType column (Wildcard, the default, or
+    Regex). Any object whose MatchOn column matches the pattern is excluded.
 
 .PARAMETER WaveMapPath
-    CSV of UserPrincipalName,Wave. Matched against the source UPN and then the source primary
-    SMTP address. Objects not listed get -DefaultWave.
+    CSV of UserPrincipalName,Wave, matched against the source UPN then the source primary SMTP
+    address. Objects not listed get -DefaultWave.
 
 .PARAMETER DefaultWave
     Wave assigned to everything the wave map does not name. Default '1'.
 
 .PARAMETER DefaultUsageLocation
-    Two-letter usage location applied when the source object has none. Assigning a licence
-    fails without a usage location, so setting this saves a round trip in phase 3.
+    Two-letter usage location applied when the source object has none. Licence assignment fails
+    without one.
 
 .PARAMETER ExistingPlanPath
-    A previous IdentityPlan.csv. Rows in it that carry a TargetObjectId or the PlanStatus
-    ManualOverride keep their destination identity, wave and provisioning state verbatim,
-    and their addresses become reserved.
+    A previous IdentityPlan.csv. Rows carrying a TargetObjectId or the PlanStatus ManualOverride
+    keep their destination identity, wave and provisioning state verbatim.
 
 .PARAMETER ReservedAddressesPath
-    One or more files listing addresses already in use in the destination. Each file may be
-    a destination inventory CSV (Users, Groups or Contacts - the address columns are read
-    automatically) or a plain text list of one address per line ('#' starts a comment).
+    Files listing addresses already in use in the destination. Each may be a destination
+    inventory CSV or a plain text list of one address per line ('#' starts a comment).
 
 .PARAMETER IncludeDisabled
     Plan disabled source accounts instead of excluding them.
 
 .PARAMETER IncludeGuests
-    Plan guest (#EXT#) accounts instead of excluding them. Guests keep their existing
-    external identity verbatim - no template is applied.
+    Plan guest (#EXT#) accounts. Guests keep their existing external identity verbatim.
 
 .PARAMETER IncludeSynced
-    Plan directory-synced objects instead of excluding them. Synced objects are excluded by
-    default because their authoritative copy lives in on-premises Active Directory.
+    Plan directory-synced objects, whose authoritative copy lives in on-premises AD.
 
 .PARAMETER PreserveAliases
     Carry the source proxy addresses across as destination aliases, re-domained through
-    -AliasDomainMap. Without -AliasDomainMap there is nothing to re-domain, so the switch
-    only warns.
+    -AliasDomainMap. Without that map there is nothing to re-domain, so the switch only warns.
 
 .PARAMETER AliasDomainMap
     Hashtable of source domain to destination domain, for example
@@ -139,8 +118,7 @@
     Directory for the plan and the log. Defaults to the toolkit output root.
 
 .PARAMETER Prefix
-    Client or run name. When supplied, output lands in <OutputPath>\<Prefix>\ and file names
-    start with '<Prefix>_'.
+    Client or run name. Output lands in <OutputPath>\<Prefix>\ and file names start '<Prefix>_'.
 
 .PARAMETER LogPath
     Override for the log file path.
@@ -149,8 +127,7 @@
     Compute the entire plan and print the summary without writing the plan file.
 
 .PARAMETER Verbosity
-    Console noise level: Low (errors and successes), Medium (adds warnings, the default) or
-    High (everything). The log file always receives everything.
+    Console noise level: Low, Medium (default) or High. The log file always gets everything.
 
 .EXAMPLE
     .\New-MigrationIdentityPlan.ps1 -UsersCsv .\Contoso_Users_20260908-101500.csv `
@@ -168,22 +145,19 @@
         -ExclusionRulesPath .\Templates\ExclusionRules.sample.csv -WaveMapPath .\Waves.csv `
         -PreserveAliases -AliasDomainMap @{ 'contoso.com' = 'newco.com' } -DryRun
 
-    Full offline dress rehearsal: every object type, interim routing addresses, licence
-    mapping, aliases re-domained, waves applied - summary printed, nothing written.
+    Full offline dress rehearsal - summary printed, nothing written.
 
 .EXAMPLE
     .\New-MigrationIdentityPlan.ps1 -UsersCsv .\Users.csv -TargetDomain newco.com `
         -ExistingPlanPath .\Contoso_IdentityPlan_20260901-090000.csv `
         -ReservedAddressesPath .\Destination_Users.csv, .\Destination_Groups.csv
 
-    Re-plans after a second inventory pull. Already provisioned and manually overridden rows
-    keep their identity, and addresses already live in the destination are never reused.
+    Re-plans after a second inventory pull, keeping provisioned and overridden identities.
 
 .NOTES
     Author      : AutomationHub
-    Requires    : PowerShell 7.4+ and the bundled M365Migration module. No tenant connection
-                  is made and no Graph scope or Exchange Online role is needed - this script
-                  is entirely offline, so GDAP does not apply.
+    Requires    : PowerShell 7.4+ and the bundled M365Migration module. Entirely offline - no
+                  Graph scope or Exchange Online role is needed, so GDAP does not apply.
     Exit codes  : 0 success (rows needing review are the operator's to-do, not a failure),
                   1 fatal error.
     Written with assistance from Claude (Anthropic).
@@ -245,21 +219,15 @@ param(
     [string[]]$ReservedAddressesPath,
 
     [switch]$IncludeDisabled,
-
     [switch]$IncludeGuests,
-
     [switch]$IncludeSynced,
-
     [switch]$PreserveAliases,
 
     [hashtable]$AliasDomainMap,
 
     [string]$OutputPath,
-
     [string]$Prefix,
-
     [string]$LogPath,
-
     [switch]$DryRun,
 
     [ValidateSet('Low', 'Medium', 'High')]
@@ -273,29 +241,23 @@ Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Fo
 
 #region Configuration ------------------------------------------------------------------
 
-# Exchange recipient type to plan ObjectType. Scheduling mailboxes are resource mailboxes
-# that behave like equipment, so they land in the same bucket rather than inventing a type.
+# Scheduling mailboxes are resource mailboxes that behave like equipment, so they land in the
+# same bucket rather than inventing a plan type for them.
 $script:MailboxTypeMap = @{
-    'SharedMailbox'     = 'Shared'
-    'RoomMailbox'       = 'Room'
-    'EquipmentMailbox'  = 'Equipment'
-    'SchedulingMailbox' = 'Equipment'
+    'SharedMailbox' = 'Shared'; 'RoomMailbox' = 'Room'
+    'EquipmentMailbox' = 'Equipment'; 'SchedulingMailbox' = 'Equipment'
 }
 
-# Inventory GroupType to plan ObjectType. The three informational kinds are recorded so the
-# operator can see they were considered, but no writer in the toolkit acts on them.
+# The informational kinds are recorded so the operator can see they were considered, but no
+# writer in the toolkit acts on them.
 $script:GroupTypeMap = @{
-    'Distribution'        = 'Distribution'
-    'MailEnabledSecurity' = 'MailEnabledSecurity'
-    'DynamicDistribution' = 'DynamicDistribution'
-    'M365Group'           = 'M365Group'
-    'Team'                = 'M365Group'
-    'SecurityGroup'       = 'M365Group'
+    'Distribution' = 'Distribution'; 'MailEnabledSecurity' = 'MailEnabledSecurity'
+    'DynamicDistribution' = 'DynamicDistribution'; 'M365Group' = 'M365Group'
+    'Team' = 'M365Group'; 'SecurityGroup' = 'M365Group'
 }
 
 $script:GroupExcludeReasons = @{
-    'M365Group'     = 'Migrated by Fly'
-    'Team'          = 'Migrated by Fly'
+    'M365Group' = 'Migrated by Fly'; 'Team' = 'Migrated by Fly'
     'SecurityGroup' = 'Not mail-enabled'
 }
 
@@ -306,154 +268,144 @@ $script:ReservedAddressColumns = @(
     'ExternalEmailAddress', 'TargetAliases'
 )
 
+# Columns whose plan name and inventory name are identical, per source kind.
+$script:PassThroughColumns = @{
+    'User'          = @('DisplayName', 'FirstName', 'MiddleName', 'LastName', 'JobTitle',
+        'Department', 'Office', 'MobilePhone', 'ManagerUpn', 'AccountEnabled', 'IsSynced')
+    'SharedMailbox' = @('DisplayName', 'AccountEnabled', 'IsSynced')
+    'Group'         = @('DisplayName', 'IsSynced')
+    'Contact'       = @('DisplayName', 'FirstName', 'LastName')
+}
+
+# Columns preserved verbatim from a previous plan, and the columns a row is matched on.
+$script:PreservedFields = @(
+    'Wave', 'InterimUserPrincipalName', 'InterimPrimarySmtp', 'TargetUserPrincipalName',
+    'TargetPrimarySmtp', 'TargetAliases', 'TargetMailNickname', 'TargetLicenses', 'PlanStatus',
+    'PlanDetail', 'ExcludeReason', 'TargetObjectId', 'MailboxProvisioned', 'OneDriveProvisioned',
+    'ProvisionStatus', 'ProvisionDetail'
+)
+$script:IdentityColumns = @('SourceObjectId', 'SourcePrimarySmtp', 'SourceUserPrincipalName')
+
 #endregion -----------------------------------------------------------------------------
 
 #region Functions ----------------------------------------------------------------------
 
-function Get-PlanLocalPart {
+function Split-PlanAddress {
     <#
     .SYNOPSIS
-        Returns the part of an address before the '@'.
+        Splits an address into its local part and its lowercased domain.
     .DESCRIPTION
-        Guest UPNs contain '#EXT#' before the '@' and must survive untouched, so the split
-        is deliberately naive: everything up to the first '@' is the local part.
-    .PARAMETER Address
-        The address to split. A value with no '@' is returned unchanged.
-    .EXAMPLE
-        Get-PlanLocalPart -Address 'jsmith@contoso.com'
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Address
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Address)) { return '' }
-    $trimmed = $Address.Trim()
-    if (-not $trimmed.Contains('@')) { return $trimmed }
-    return $trimmed.Split('@', 2)[0]
-}
-
-function Get-PlanDomainPart {
-    <#
-    .SYNOPSIS
-        Returns the domain of an address, lowercased.
+        Deliberately naive - everything up to the first '@' is the local part - so the '#EXT#'
+        marker in a guest UPN survives untouched. A value with no '@' is all local part.
     .PARAMETER Address
         The address to split.
     .EXAMPLE
-        Get-PlanDomainPart -Address 'jsmith@Contoso.com'
+        (Split-PlanAddress -Address 'jsmith@Contoso.com').Domain
     #>
     [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Address
-    )
+    [OutputType([pscustomobject])]
+    param([AllowNull()][AllowEmptyString()][string]$Address)
 
-    if ([string]::IsNullOrWhiteSpace($Address)) { return '' }
-    $trimmed = $Address.Trim()
-    if (-not $trimmed.Contains('@')) { return '' }
-    return $trimmed.Split('@', 2)[1].ToLowerInvariant()
+    $text = ([string]$Address).Trim()
+    $at = $text.IndexOf('@')
+    if ($at -lt 0) { return [pscustomobject]@{ Local = $text; Domain = '' } }
+
+    [pscustomobject]@{ Local = $text.Substring(0, $at); Domain = $text.Substring($at + 1).ToLowerInvariant() }
 }
 
-function Get-PlanProxyAddressSet {
+function Get-PlanAddressSet {
     <#
     .SYNOPSIS
-        Splits a proxy-address list into SMTP aliases and X500 addresses.
+        Splits an inventory proxy-address list into destination-relevant aliases and X500s.
     .DESCRIPTION
-        Exchange stores every address of a recipient in one multi-valued attribute using a
-        prefix convention: uppercase 'SMTP:' is the primary, lowercase 'smtp:' an alias,
-        'X500:' a legacy distinguished name and 'sip:'/'spo:'/'eum:' belong to other
-        workloads. Only the mail addresses and the X500 entries are migration-relevant, so
-        the rest are dropped rather than carried into the destination.
+        SIP, SPO and EUM addresses are dropped: the workloads that own them re-create them in
+        the destination. The primary is dropped from the alias list because the plan already
+        records it as SourcePrimarySmtp.
     .PARAMETER Value
         The ';' separated proxy-address list from the inventory.
     .PARAMETER PrimaryAddress
-        The recipient's primary SMTP address, which is excluded from the alias list because
-        the plan already records it as SourcePrimarySmtp.
+        The recipient's primary SMTP address.
     .EXAMPLE
-        Get-PlanProxyAddressSet -Value 'SMTP:a@contoso.com;smtp:b@contoso.com' -PrimaryAddress 'a@contoso.com'
+        Get-PlanAddressSet -Value 'SMTP:a@contoso.com;smtp:b@contoso.com' -PrimaryAddress 'a@contoso.com'
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Value,
-
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$PrimaryAddress
+        [AllowNull()][AllowEmptyString()][string]$Value,
+        [AllowNull()][AllowEmptyString()][string]$PrimaryAddress
     )
 
-    $primary = ''
-    if (-not [string]::IsNullOrWhiteSpace($PrimaryAddress)) { $primary = $PrimaryAddress.Trim().ToLowerInvariant() }
-
+    $primary = ([string]$PrimaryAddress).Trim().ToLowerInvariant()
     $aliases = [System.Collections.Generic.List[string]]::new()
-    $x500 = [System.Collections.Generic.List[string]]::new()
+    $legacyDns = [System.Collections.Generic.List[string]]::new()
 
     foreach ($entry in @(Split-MigrationList -Value $Value)) {
-        $prefix = 'smtp'
-        $rest = $entry
-        if ($entry -match '^(?<prefix>[A-Za-z0-9]+):(?<rest>.+)$') {
-            $prefix = $Matches['prefix'].ToLowerInvariant()
-            $rest = $Matches['rest']
-        }
-
-        switch ($prefix) {
-            'smtp' {
-                $address = $rest.Trim().ToLowerInvariant()
-                if ($address -and $address -ne $primary) {
-                    $candidate = "smtp:$address"
-                    if (-not $aliases.Contains($candidate)) { $aliases.Add($candidate) }
+        $parsed = Split-MigrationProxyAddress -Entry $entry
+        switch ($parsed.Kind) {
+            'Smtp' {
+                $address = $parsed.Address.Trim().ToLowerInvariant()
+                if ($address -and $address -ne $primary -and -not $aliases.Contains("smtp:$address")) {
+                    $aliases.Add("smtp:$address")
                 }
             }
-            'x500' {
-                $candidate = 'X500:' + $rest.Trim()
-                if (-not $x500.Contains($candidate)) { $x500.Add($candidate) }
-            }
-            default {
-                # sip:, spo: and eum: addresses belong to Teams, SharePoint and Unified
-                # Messaging; they are re-created by those workloads in the destination.
-            }
+            'X500' { $legacyDns.Add($parsed.Address) }
         }
     }
 
-    return [pscustomobject]@{
+    [pscustomobject]@{
         Aliases = [string[]]$aliases.ToArray()
-        X500    = [string[]]$x500.ToArray()
+        X500    = [string[]]@(ConvertTo-MigrationX500 -Value $legacyDns.ToArray())
     }
 }
 
-function Get-PlanX500List {
+function New-PlanSourceRow {
     <#
     .SYNOPSIS
-        Normalises legacy distinguished names into X500 proxy-address form.
-    .PARAMETER Value
-        A ';' separated list of X500 addresses or bare legacy distinguished names.
+        Builds the plan-row columns that every source kind shares.
+    .DESCRIPTION
+        The identity, the proxy-address split and the X500 set are the same work for a user, a
+        shared mailbox, a group and a contact; only the type columns differ, so the caller sets
+        those on the row this returns.
+    .PARAMETER Source
+        The inventory row.
+    .PARAMETER Kind
+        Selects the pass-through column list: User, SharedMailbox, Group or Contact.
+    .PARAMETER Primary
+        The recipient's primary SMTP address.
+    .PARAMETER ProxyValue
+        The ';' separated proxy-address list to split.
+    .PARAMETER Detail
+        The row holding LegacyExchangeDN and X500Addresses. Defaults to -Source; a user's live
+        on its mailbox row instead.
     .EXAMPLE
-        Get-PlanX500List -Value '/o=ExchangeLabs/ou=Exchange Administrative Group/cn=Recipients/cn=abc'
+        New-PlanSourceRow -Source $source -Kind Group -Primary $primary -ProxyValue $addresses
     #>
     [CmdletBinding()]
-    [OutputType([string[]])]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Creates an in-memory object only; nothing is written to disk or to a tenant.')]
+    [OutputType([pscustomobject])]
     param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Value
+        [Parameter(Mandatory)][ValidateNotNull()]$Source,
+        [Parameter(Mandatory)][ValidateSet('User', 'SharedMailbox', 'Group', 'Contact')][string]$Kind,
+        [AllowNull()][AllowEmptyString()][string]$Primary,
+        [AllowNull()][AllowEmptyString()][string]$ProxyValue,
+        [AllowNull()]$Detail
     )
 
-    $result = [System.Collections.Generic.List[string]]::new()
-    foreach ($entry in @(Split-MigrationList -Value $Value)) {
-        $text = $entry.Trim()
-        if (-not $text) { continue }
-        if ($text -notmatch '^(?i)x500:') { $text = "X500:$text" }
-        else { $text = 'X500:' + $text.Substring(5) }
-        if (-not $result.Contains($text)) { $result.Add($text) }
+    if ($null -eq $Detail) { $Detail = $Source }
+    $addressSet = Get-PlanAddressSet -Value $ProxyValue -PrimaryAddress $Primary
+
+    $row = New-MigrationPlanRow
+    foreach ($name in $script:PassThroughColumns[$Kind]) {
+        $row.$name = Get-MigrationCsvValue -Row $Source -Name $name -Default ''
     }
-    return [string[]]$result.ToArray()
+    $row.SourceObjectId = Get-MigrationCsvValue -Row $Source -Name 'ObjectId' -Default ''
+    $row.SourcePrimarySmtp = $Primary
+    $row.SourceAliases = Join-MigrationList -Values $addressSet.Aliases
+    $row.LegacyExchangeDN = Get-MigrationCsvValue -Row $Detail -Name 'LegacyExchangeDN' -Default ''
+    $row.SourceX500 = Join-MigrationList -Values @(ConvertTo-MigrationX500 -Value (
+            @(Get-MigrationCsvValue -Row $Detail -Name 'X500Addresses' -Default '') + $addressSet.X500))
+    return $row
 }
 
 function Import-PlanExclusionRule {
@@ -461,9 +413,8 @@ function Import-PlanExclusionRule {
     .SYNOPSIS
         Reads the exclusion rule file.
     .DESCRIPTION
-        Rules are wildcard patterns by default because that is what an operator writes by
-        hand ('break-glass*', '*.breakglass@*'). A rule that needs the full expressive power
-        of a regular expression sets MatchType to Regex in an optional fourth column.
+        Rules are wildcard patterns by default because that is what an operator writes by hand
+        ('break-glass*'); a rule needing a regular expression sets MatchType to Regex.
     .PARAMETER Path
         The exclusion rules CSV: Pattern, MatchOn, Reason and optionally MatchType.
     .EXAMPLE
@@ -471,39 +422,31 @@ function Import-PlanExclusionRule {
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Path
-    )
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
 
-    $rows = @(Import-MigrationCsv -Path $Path -RequiredColumns @('Pattern', 'MatchOn'))
     $rules = [System.Collections.Generic.List[object]]::new()
     $lineNumber = 1
 
-    foreach ($row in $rows) {
+    foreach ($row in @(Import-MigrationCsv -Path $Path -RequiredColumns @('Pattern', 'MatchOn'))) {
         $lineNumber++
         $pattern = Get-MigrationCsvValue -Row $row -Name 'Pattern' -Default ''
         $matchOn = Get-MigrationCsvValue -Row $row -Name 'MatchOn' -Default ''
+        $matchType = Get-MigrationCsvValue -Row $row -Name 'MatchType' -Default 'Wildcard'
+
         if (-not $pattern -or -not $matchOn) {
             throw "The exclusion rules file '$Path' has an empty Pattern or MatchOn on line $lineNumber."
         }
-
-        $matchType = Get-MigrationCsvValue -Row $row -Name 'MatchType' -Default 'Wildcard'
         if ($matchType -notin @('Wildcard', 'Regex')) {
             throw "The exclusion rules file '$Path' has MatchType '$matchType' on line $lineNumber; use Wildcard or Regex."
         }
-
         if ($matchType -eq 'Regex') {
             try { $null = [regex]::new($pattern) }
             catch { throw "The exclusion rules file '$Path' has an invalid regular expression on line ${lineNumber}: $($_.Exception.Message)" }
         }
 
         $rules.Add([pscustomobject]@{
-                Pattern   = $pattern
-                MatchOn   = $matchOn
-                MatchType = $matchType
-                Reason    = (Get-MigrationCsvValue -Row $row -Name 'Reason' -Default "Matched exclusion rule '$pattern' on $matchOn")
+                Pattern = $pattern; MatchOn = $matchOn; MatchType = $matchType
+                Reason  = (Get-MigrationCsvValue -Row $row -Name 'Reason' -Default "Matched exclusion rule '$pattern' on $matchOn")
             })
     }
 
@@ -525,19 +468,13 @@ function Get-PlanExclusionReason {
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [Parameter(Mandatory)]
-        [AllowNull()]
-        $Row,
-
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [object[]]$Rule
+        [Parameter(Mandatory)][AllowNull()]$Row,
+        [AllowNull()][AllowEmptyCollection()][object[]]$Rule
     )
 
     foreach ($rule in @($Rule)) {
         $value = Get-MigrationCsvValue -Row $Row -Name $rule.MatchOn -Default ''
         if (-not $value) { continue }
-
         $isMatch = if ($rule.MatchType -eq 'Regex') { $value -match $rule.Pattern } else { $value -like $rule.Pattern }
         if ($isMatch) { return [string]$rule.Reason }
     }
@@ -545,49 +482,15 @@ function Get-PlanExclusionReason {
     return ''
 }
 
-function Import-PlanWaveMap {
-    <#
-    .SYNOPSIS
-        Reads the wave map into an address-keyed hashtable.
-    .PARAMETER Path
-        CSV of UserPrincipalName,Wave.
-    .EXAMPLE
-        Import-PlanWaveMap -Path .\Waves.csv
-    #>
-    [CmdletBinding()]
-    [OutputType([hashtable])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Path
-    )
-
-    $rows = @(Import-MigrationCsv -Path $Path -RequiredColumns @('UserPrincipalName', 'Wave'))
-    $map = @{}
-    $lineNumber = 1
-
-    foreach ($row in $rows) {
-        $lineNumber++
-        $identity = Get-MigrationCsvValue -Row $row -Name 'UserPrincipalName' -Default ''
-        $wave = Get-MigrationCsvValue -Row $row -Name 'Wave' -Default ''
-        if (-not $identity) { throw "The wave map '$Path' has an empty UserPrincipalName on line $lineNumber." }
-        if (-not $wave) { throw "The wave map '$Path' has an empty Wave on line $lineNumber." }
-        $map[$identity.ToLowerInvariant()] = $wave
-    }
-
-    Write-MigrationLog -Message "Loaded $($map.Count) wave assignment(s) from $Path" -Level INFO
-    return $map
-}
-
 function Get-PlanReservedAddress {
     <#
     .SYNOPSIS
-        Collects addresses that are already in use in the destination tenant.
+        Collects addresses already in use in the destination tenant.
     .DESCRIPTION
-        Accepts either a destination inventory CSV - in which case every address-bearing
-        column is harvested - or a plain text list of one address per line. Detecting the
-        shape rather than demanding a format means an operator can paste a list of addresses
-        into a text file and it just works.
+        Accepts either a destination inventory CSV - in which case every address-bearing column
+        is harvested - or a plain text list of one address per line. Detecting the shape rather
+        than demanding a format means an operator can paste addresses into a text file and it
+        just works.
     .PARAMETER Path
         One or more files to read.
     .EXAMPLE
@@ -595,40 +498,22 @@ function Get-PlanReservedAddress {
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string[]]$Path
-    )
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$Path)
 
     $reserved = [System.Collections.Generic.List[string]]::new()
 
     $addValue = {
         param([string]$Raw)
         foreach ($entry in @(Split-MigrationList -Value $Raw)) {
-            $text = $entry.Trim()
-            # The capture groups are read into locals immediately: the -ne test below would
-            # otherwise be a second match operation and would overwrite $Matches.
-            $entryPrefix = ''
-            $entryRest = ''
-            if ($text -match '^(?<prefix>[A-Za-z0-9]+):(?<rest>.+)$') {
-                $entryPrefix = $Matches['prefix']
-                $entryRest = $Matches['rest'].Trim()
-            }
-            if ($entryPrefix) {
-                if ($entryPrefix -ne 'smtp') { continue }
-                $text = $entryRest
-            }
-            if (-not $text.Contains('@')) { continue }
-            $text = $text.ToLowerInvariant()
-            if (-not $reserved.Contains($text)) { $reserved.Add($text) }
+            $parsed = Split-MigrationProxyAddress -Entry $entry
+            if ($parsed.Kind -ne 'Smtp') { continue }
+            $text = $parsed.Address.Trim().ToLowerInvariant()
+            if ($text.Contains('@') -and -not $reserved.Contains($text)) { $reserved.Add($text) }
         }
     }
 
     foreach ($file in $Path) {
-        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-            throw "Reserved address file not found: $file"
-        }
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Reserved address file not found: $file" }
 
         try { $lines = @(Get-Content -LiteralPath $file -Encoding utf8 -ErrorAction Stop) }
         catch { throw "Could not read the reserved address file '$file': $($_.Exception.Message)" }
@@ -653,8 +538,7 @@ function Get-PlanReservedAddress {
         else {
             foreach ($line in $lines) {
                 $text = $line.Trim()
-                if (-not $text -or $text.StartsWith('#')) { continue }
-                & $addValue $text
+                if ($text -and -not $text.StartsWith('#')) { & $addValue $text }
             }
         }
     }
@@ -668,9 +552,9 @@ function Get-PlanTargetLicense {
     .SYNOPSIS
         Maps a source licence list through the SKU map.
     .DESCRIPTION
-        An unmapped SKU is kept rather than dropped: the destination readiness check then
-        reports it as unavailable, which is a far louder signal than a silently missing
-        licence discovered on cutover day.
+        An unmapped SKU is kept rather than dropped: the destination readiness check then reports
+        it as unavailable, which is a far louder signal than a silently missing licence
+        discovered on cutover day.
     .PARAMETER SourceLicense
         The ';' separated source SkuPartNumber list.
     .PARAMETER SkuMap
@@ -681,134 +565,36 @@ function Get-PlanTargetLicense {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$SourceLicense,
-
-        [AllowNull()]
-        [hashtable]$SkuMap
+        [AllowNull()][AllowEmptyString()][string]$SourceLicense,
+        [AllowNull()][hashtable]$SkuMap
     )
 
     $targets = [System.Collections.Generic.List[string]]::new()
     $unmapped = [System.Collections.Generic.List[string]]::new()
     $dropped = [System.Collections.Generic.List[string]]::new()
-
-    foreach ($sku in @(Split-MigrationList -Value $SourceLicense)) {
-        if ($null -eq $SkuMap) {
-            if (-not $targets.Contains($sku)) { $targets.Add($sku) }
-            continue
-        }
-
-        $key = @($SkuMap.Keys | Where-Object { $_ -ieq $sku } | Select-Object -First 1)
-        if ($key.Count -eq 0) {
-            if (-not $unmapped.Contains($sku)) { $unmapped.Add($sku) }
-            if (-not $targets.Contains($sku)) { $targets.Add($sku) }
-            continue
-        }
-
-        $mapped = @($SkuMap[$key[0]])
-        if ($mapped.Count -eq 0) {
-            if (-not $dropped.Contains($sku)) { $dropped.Add($sku) }
-            continue
-        }
-
-        foreach ($target in $mapped) {
-            if (-not $targets.Contains($target)) { $targets.Add($target) }
-        }
+    $add = {
+        param([System.Collections.Generic.List[string]]$List, [string]$Value)
+        if (-not $List.Contains($Value)) { $List.Add($Value) }
     }
 
-    return [pscustomobject]@{
+    foreach ($sku in @(Split-MigrationList -Value $SourceLicense)) {
+        # A plain hashtable compares keys case-insensitively, which is what a hand-typed map needs.
+        if ($null -eq $SkuMap -or -not $SkuMap.ContainsKey($sku)) {
+            if ($null -ne $SkuMap) { & $add $unmapped $sku }
+            & $add $targets $sku
+            continue
+        }
+
+        $mapped = @($SkuMap[$sku])
+        if ($mapped.Count -eq 0) { & $add $dropped $sku; continue }
+        foreach ($target in $mapped) { & $add $targets $target }
+    }
+
+    [pscustomobject]@{
         Licenses = [string[]]$targets.ToArray()
         Unmapped = [string[]]$unmapped.ToArray()
         Dropped  = [string[]]$dropped.ToArray()
     }
-}
-
-function Get-PlanRedomainedAlias {
-    <#
-    .SYNOPSIS
-        Re-domains the source addresses that the alias domain map covers.
-    .DESCRIPTION
-        Mail sent to an old address keeps arriving for months after a move, so the old local
-        part is re-created in the destination domain. Only domains the operator named in
-        -AliasDomainMap are re-domained; anything else is left behind deliberately, because
-        re-creating an address in a domain nobody owns produces a non-routable alias.
-    .PARAMETER Address
-        The source addresses to consider (primary plus aliases, in 'smtp:x@y' or plain form).
-    .PARAMETER DomainMap
-        Hashtable of source domain to destination domain.
-    .EXAMPLE
-        Get-PlanRedomainedAlias -Address 'smtp:jsmith@contoso.com' -DomainMap @{ 'contoso.com' = 'newco.com' }
-    #>
-    [CmdletBinding()]
-    [OutputType([string[]])]
-    param(
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$Address,
-
-        [AllowNull()]
-        [hashtable]$DomainMap
-    )
-
-    $result = [System.Collections.Generic.List[string]]::new()
-    if ($null -eq $DomainMap -or $DomainMap.Count -eq 0) { return [string[]]$result.ToArray() }
-
-    $lookup = @{}
-    foreach ($key in $DomainMap.Keys) {
-        $lookup[([string]$key).Trim().TrimStart('@').ToLowerInvariant()] = ([string]$DomainMap[$key]).Trim().TrimStart('@').ToLowerInvariant()
-    }
-
-    foreach ($entry in @($Address)) {
-        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
-        $text = $entry.Trim()
-        if ($text -match '^(?i)smtp:(?<rest>.+)$') { $text = $Matches['rest'].Trim() }
-        if (-not $text.Contains('@')) { continue }
-
-        $localPart = Get-PlanLocalPart -Address $text
-        $domain = Get-PlanDomainPart -Address $text
-        if (-not $lookup.ContainsKey($domain)) { continue }
-
-        $candidate = 'smtp:' + $localPart.ToLowerInvariant() + '@' + $lookup[$domain]
-        if (-not $result.Contains($candidate)) { $result.Add($candidate) }
-    }
-
-    return [string[]]$result.ToArray()
-}
-
-function Get-PlanCollisionDetail {
-    <#
-    .SYNOPSIS
-        Explains, in one sentence, who took the address a row wanted.
-    .PARAMETER Kind
-        'UPN' or 'SMTP', used to open the sentence.
-    .PARAMETER WantedLocalPart
-        The local part the row would have had.
-    .PARAMETER Domain
-        The domain the collision happened in.
-    .PARAMETER ResolvedLocalPart
-        The local part actually assigned.
-    .PARAMETER Claimant
-        Description of the object holding the wanted address, or an empty string when it was
-        reserved by the destination rather than by another planned row.
-    .EXAMPLE
-        Get-PlanCollisionDetail -Kind UPN -WantedLocalPart john.smith -Domain newco.com -ResolvedLocalPart john.q.smith -Claimant 'jsmith@contoso.com'
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory)][ValidateSet('UPN', 'SMTP')][string]$Kind,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$WantedLocalPart,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Domain,
-        [AllowEmptyString()][string]$ResolvedLocalPart,
-        [AllowEmptyString()][string]$Claimant
-    )
-
-    $taken = if ($Claimant) { "taken by $Claimant" } else { 'already reserved in the destination' }
-    if ([string]::IsNullOrWhiteSpace($ResolvedLocalPart)) {
-        return "$Kind ${WantedLocalPart}@$Domain is $taken and no free alternative was found - assign one by hand."
-    }
-    return "$Kind ${WantedLocalPart}@$Domain is $taken; used ${ResolvedLocalPart}@$Domain."
 }
 
 #endregion -----------------------------------------------------------------------------
@@ -828,43 +614,52 @@ try {
     $nicknameTemplate = if ($PSBoundParameters.ContainsKey('MailNicknameFormat')) { $MailNicknameFormat } else { '' }
 
     if ($PreserveAliases -and (-not $AliasDomainMap -or $AliasDomainMap.Count -eq 0)) {
-        Write-MigrationLog -Message '-PreserveAliases was supplied without -AliasDomainMap, so no source alias can be re-domained. Only X500 addresses will be carried across.' -Level WARNING
+        Write-MigrationLog -Message ('-PreserveAliases was supplied without -AliasDomainMap, so no source alias can ' +
+            'be re-domained. Only X500 addresses will be carried across.') -Level WARNING
     }
 
-    # --- Supporting files ------------------------------------------------------------
-    $skuMap = $null
-    if ($SkuMapPath) { $skuMap = Resolve-MigrationSkuMap -Path $SkuMapPath }
-
-    $exclusionRules = @()
-    if ($ExclusionRulesPath) { $exclusionRules = @(Import-PlanExclusionRule -Path $ExclusionRulesPath) }
-
-    $waveMap = @{}
-    if ($WaveMapPath) { $waveMap = Import-PlanWaveMap -Path $WaveMapPath }
-
-    $reservedAddresses = [System.Collections.Generic.List[string]]::new()
-    if ($ReservedAddressesPath) {
-        foreach ($address in @(Get-PlanReservedAddress -Path $ReservedAddressesPath)) {
-            if (-not $reservedAddresses.Contains($address)) { $reservedAddresses.Add($address) }
+    # Source domain to destination domain, normalised once for the alias pass below.
+    $aliasDomainLookup = @{}
+    if ($AliasDomainMap) {
+        foreach ($key in @($AliasDomainMap.Keys)) {
+            $aliasDomainLookup[([string]$key).Trim().TrimStart('@').ToLowerInvariant()] =
+                ([string]$AliasDomainMap[$key]).Trim().TrimStart('@').ToLowerInvariant()
         }
     }
 
-    # --- Rows preserved from a previous plan ------------------------------------------
+    # --- Supporting files ---------------------------------------------------------------------
+    $skuMap = if ($SkuMapPath) { Resolve-MigrationSkuMap -Path $SkuMapPath } else { $null }
+    $exclusionRules = @(if ($ExclusionRulesPath) { Import-PlanExclusionRule -Path $ExclusionRulesPath })
+
+    $waveMap = @{}
+    if ($WaveMapPath) {
+        foreach ($row in @(Import-MigrationCsv -Path $WaveMapPath -RequiredColumns @('UserPrincipalName', 'Wave'))) {
+            $identity = Get-MigrationCsvValue -Row $row -Name 'UserPrincipalName' -Default ''
+            $wave = Get-MigrationCsvValue -Row $row -Name 'Wave' -Default ''
+            if (-not $identity -or -not $wave) { throw "The wave map '$WaveMapPath' has a row with an empty UserPrincipalName or Wave." }
+            $waveMap[$identity.ToLowerInvariant()] = $wave
+        }
+        Write-MigrationLog -Message "Loaded $($waveMap.Count) wave assignment(s) from $WaveMapPath" -Level INFO
+    }
+
+    $reservedAddresses = [System.Collections.Generic.List[string]]::new()
+    $reserve = {
+        param([string]$Address)
+        $text = ([string]$Address).Trim().ToLowerInvariant()
+        if ($text -and -not $reservedAddresses.Contains($text)) { $reservedAddresses.Add($text) }
+    }
+    if ($ReservedAddressesPath) {
+        foreach ($address in @(Get-PlanReservedAddress -Path $ReservedAddressesPath)) { & $reserve $address }
+    }
+
+    # --- Rows preserved from a previous plan ---------------------------------------------------
     $preservedIndex = @{}
-    $preservedFields = @(
-        'Wave', 'InterimUserPrincipalName', 'InterimPrimarySmtp', 'TargetUserPrincipalName',
-        'TargetPrimarySmtp', 'TargetAliases', 'TargetMailNickname', 'TargetLicenses',
-        'PlanStatus', 'PlanDetail', 'ExcludeReason', 'TargetObjectId', 'MailboxProvisioned',
-        'OneDriveProvisioned', 'ProvisionStatus', 'ProvisionDetail'
-    )
-
     if ($ExistingPlanPath) {
-        $existingRows = @(Import-MigrationPlan -Path $ExistingPlanPath)
-        foreach ($existing in $existingRows) {
+        foreach ($existing in @(Import-MigrationPlan -Path $ExistingPlanPath)) {
             $hasTargetObject = -not [string]::IsNullOrWhiteSpace((Get-MigrationCsvValue -Row $existing -Name 'TargetObjectId' -Default ''))
-            $isOverride = (Get-MigrationCsvValue -Row $existing -Name 'PlanStatus' -Default '') -eq 'ManualOverride'
-            if (-not $hasTargetObject -and -not $isOverride) { continue }
+            if (-not $hasTargetObject -and (Get-MigrationCsvValue -Row $existing -Name 'PlanStatus' -Default '') -ne 'ManualOverride') { continue }
 
-            foreach ($keyColumn in @('SourceObjectId', 'SourcePrimarySmtp', 'SourceUserPrincipalName')) {
+            foreach ($keyColumn in $script:IdentityColumns) {
                 $keyValue = Get-MigrationCsvValue -Row $existing -Name $keyColumn -Default ''
                 if (-not $keyValue) { continue }
                 $indexKey = "$keyColumn|$($keyValue.ToLowerInvariant())"
@@ -873,14 +668,16 @@ try {
 
             # A preserved identity is, by definition, already spoken for in the destination.
             foreach ($column in @('TargetUserPrincipalName', 'TargetPrimarySmtp', 'InterimUserPrincipalName', 'InterimPrimarySmtp')) {
-                $address = (Get-MigrationCsvValue -Row $existing -Name $column -Default '').ToLowerInvariant()
-                if ($address -and -not $reservedAddresses.Contains($address)) { $reservedAddresses.Add($address) }
+                & $reserve (Get-MigrationCsvValue -Row $existing -Name $column -Default '')
             }
         }
-        Write-MigrationLog -Message "Existing plan '$ExistingPlanPath' contributes $((@($preservedIndex.Values) | Sort-Object -Property SourceObjectId -Unique).Count) preserved row(s)." -Level INFO
+        Write-MigrationLog -Message ("Existing plan '$ExistingPlanPath' contributes " +
+            "$((@($preservedIndex.Values) | Sort-Object -Property SourceObjectId -Unique).Count) preserved row(s).") -Level INFO
     }
 
-    # --- Mailbox detail keyed by address ------------------------------------------------
+    # --- Build the source item list -------------------------------------------------------------
+    # Entra ID knows nothing of LegacyExchangeDN, the proxy addresses or the recipient type, so a
+    # user's mailbox row is looked up by either of its addresses.
     $mailboxIndex = @{}
     if ($UserMailboxesCsv) {
         foreach ($mailbox in @(Import-MigrationCsv -Path $UserMailboxesCsv)) {
@@ -893,174 +690,91 @@ try {
         }
     }
 
-    # --- Build the source item list ------------------------------------------------------
     $items = [System.Collections.Generic.List[hashtable]]::new()
 
-    # Users -------------------------------------------------------------------------------
-    $userRows = @(Import-MigrationCsv -Path $UsersCsv -RequiredColumns @('UserPrincipalName'))
-    foreach ($source in $userRows) {
+    foreach ($source in @(Import-MigrationCsv -Path $UsersCsv -RequiredColumns @('UserPrincipalName'))) {
         $sourceUpn = Get-MigrationCsvValue -Row $source -Name 'UserPrincipalName' -Default ''
         $sourceSmtp = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
-        $userType = Get-MigrationCsvValue -Row $source -Name 'UserType' -Default 'Member'
-        $isGuest = ($userType -ieq 'Guest') -or ($sourceUpn -match '#EXT#')
+        $isGuest = ((Get-MigrationCsvValue -Row $source -Name 'UserType' -Default 'Member') -ieq 'Guest') -or ($sourceUpn -match '#EXT#')
+        $primary = if ($sourceSmtp) { $sourceSmtp } else { $sourceUpn }
 
         $mailbox = $null
         foreach ($lookup in @($sourceUpn, $sourceSmtp)) {
-            if ($lookup -and $mailboxIndex.ContainsKey($lookup.ToLowerInvariant())) {
-                $mailbox = $mailboxIndex[$lookup.ToLowerInvariant()]
-                break
-            }
+            if ($lookup -and $mailboxIndex.ContainsKey($lookup.ToLowerInvariant())) { $mailbox = $mailboxIndex[$lookup.ToLowerInvariant()]; break }
         }
 
-        $primary = if ($sourceSmtp) { $sourceSmtp } else { $sourceUpn }
         $proxyRaw = Get-MigrationCsvValue -Row $source -Name 'ProxyAddresses' -Default ''
         if (-not $proxyRaw -and $mailbox) { $proxyRaw = Get-MigrationCsvValue -Row $mailbox -Name 'EmailAddresses' -Default '' }
-        $proxySet = Get-PlanProxyAddressSet -Value $proxyRaw -PrimaryAddress $primary
 
-        $legacyDn = ''
-        $x500List = @()
-        $mailboxType = 'UserMailbox'
-        if ($mailbox) {
-            $legacyDn = Get-MigrationCsvValue -Row $mailbox -Name 'LegacyExchangeDN' -Default ''
-            $x500List = @(Get-PlanX500List -Value (Get-MigrationCsvValue -Row $mailbox -Name 'X500Addresses' -Default ''))
-            $mailboxType = Get-MigrationCsvValue -Row $mailbox -Name 'RecipientTypeDetails' -Default 'UserMailbox'
-        }
-        if ($proxySet.X500.Count -gt 0) {
-            $x500List = @($x500List + $proxySet.X500 | Select-Object -Unique)
-        }
-
-        $row = New-MigrationPlanRow
+        $row = New-PlanSourceRow -Source $source -Kind 'User' -Primary $primary -ProxyValue $proxyRaw -Detail $mailbox
         $row.ObjectType = if ($isGuest) { 'Guest' } else { 'User' }
-        $row.SourceObjectId = Get-MigrationCsvValue -Row $source -Name 'ObjectId' -Default ''
         $row.SourceUserPrincipalName = $sourceUpn
         $row.SourcePrimarySmtp = $sourceSmtp
-        $row.SourceAliases = Join-MigrationList -Values $proxySet.Aliases
-        $row.LegacyExchangeDN = $legacyDn
-        $row.SourceX500 = Join-MigrationList -Values ([string[]]$x500List)
-        $row.DisplayName = Get-MigrationCsvValue -Row $source -Name 'DisplayName' -Default ''
-        $row.FirstName = Get-MigrationCsvValue -Row $source -Name 'FirstName' -Default ''
-        $row.MiddleName = Get-MigrationCsvValue -Row $source -Name 'MiddleName' -Default ''
-        $row.LastName = Get-MigrationCsvValue -Row $source -Name 'LastName' -Default ''
-        $row.JobTitle = Get-MigrationCsvValue -Row $source -Name 'JobTitle' -Default ''
-        $row.Department = Get-MigrationCsvValue -Row $source -Name 'Department' -Default ''
-        $row.Office = Get-MigrationCsvValue -Row $source -Name 'Office' -Default ''
-        $row.MobilePhone = Get-MigrationCsvValue -Row $source -Name 'MobilePhone' -Default ''
         $row.UsageLocation = Get-MigrationCsvValue -Row $source -Name 'UsageLocation' -Default $DefaultUsageLocation
-        $row.ManagerUpn = Get-MigrationCsvValue -Row $source -Name 'ManagerUpn' -Default ''
-        $row.MailboxType = $mailboxType
-        $row.AccountEnabled = Get-MigrationCsvValue -Row $source -Name 'AccountEnabled' -Default ''
-        $row.IsSynced = Get-MigrationCsvValue -Row $source -Name 'IsSynced' -Default ''
+        $row.MailboxType = if ($mailbox) { Get-MigrationCsvValue -Row $mailbox -Name 'RecipientTypeDetails' -Default 'UserMailbox' } else { 'UserMailbox' }
         $row.SourceLicenses = Get-MigrationCsvValue -Row $source -Name 'Licenses' -Default ''
 
         $items.Add(@{
-            Row          = $row
-            Source       = $source
-            Key          = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
-            IsGuest      = $isGuest
-            UsesTemplate = -not $isGuest
-            SourceKind   = 'User'
+                Row = $row; Source = $source; SourceKind = 'User'; IsGuest = $isGuest; UsesTemplate = -not $isGuest
+                Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
             })
     }
 
-    # Shared, room and equipment mailboxes ------------------------------------------------
     if ($SharedMailboxesCsv) {
         foreach ($source in @(Import-MigrationCsv -Path $SharedMailboxesCsv -RequiredColumns @('PrimarySmtpAddress'))) {
             $primary = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
             $recipientType = Get-MigrationCsvValue -Row $source -Name 'RecipientTypeDetails' -Default 'SharedMailbox'
-            $objectType = if ($script:MailboxTypeMap.ContainsKey($recipientType)) { $script:MailboxTypeMap[$recipientType] } else { 'Shared' }
-            $proxySet = Get-PlanProxyAddressSet -Value (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '') -PrimaryAddress $primary
-            $x500List = @(Get-PlanX500List -Value (Get-MigrationCsvValue -Row $source -Name 'X500Addresses' -Default ''))
-            if ($proxySet.X500.Count -gt 0) { $x500List = @($x500List + $proxySet.X500 | Select-Object -Unique) }
 
-            $row = New-MigrationPlanRow
-            $row.ObjectType = $objectType
-            $row.SourceObjectId = Get-MigrationCsvValue -Row $source -Name 'ObjectId' -Default ''
+            $row = New-PlanSourceRow -Source $source -Kind 'SharedMailbox' -Primary $primary `
+                -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
+            $row.ObjectType = if ($script:MailboxTypeMap.ContainsKey($recipientType)) { $script:MailboxTypeMap[$recipientType] } else { 'Shared' }
             $row.SourceUserPrincipalName = Get-MigrationCsvValue -Row $source -Name 'UserPrincipalName' -Default ''
-            $row.SourcePrimarySmtp = $primary
-            $row.SourceAliases = Join-MigrationList -Values $proxySet.Aliases
-            $row.LegacyExchangeDN = Get-MigrationCsvValue -Row $source -Name 'LegacyExchangeDN' -Default ''
-            $row.SourceX500 = Join-MigrationList -Values ([string[]]$x500List)
-            $row.DisplayName = Get-MigrationCsvValue -Row $source -Name 'DisplayName' -Default ''
             $row.MailboxType = $recipientType
-            $row.AccountEnabled = Get-MigrationCsvValue -Row $source -Name 'AccountEnabled' -Default ''
-            $row.IsSynced = Get-MigrationCsvValue -Row $source -Name 'IsSynced' -Default ''
 
             $items.Add(@{
-                Row          = $row
-                Source       = $source
-                Key          = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
-                IsGuest      = $false
-                UsesTemplate = $false
-                SourceKind   = 'SharedMailbox'
+                    Row = $row; Source = $source; SourceKind = 'SharedMailbox'; IsGuest = $false; UsesTemplate = $false
+                    Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
                 })
         }
     }
 
-    # Groups --------------------------------------------------------------------------------
     if ($GroupsCsv) {
         foreach ($source in @(Import-MigrationCsv -Path $GroupsCsv -RequiredColumns @('DisplayName'))) {
             $primary = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
             $groupType = Get-MigrationCsvValue -Row $source -Name 'GroupType' -Default 'Distribution'
-            $objectType = if ($script:GroupTypeMap.ContainsKey($groupType)) { $script:GroupTypeMap[$groupType] } else { 'Distribution' }
-            $proxySet = Get-PlanProxyAddressSet -Value (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '') -PrimaryAddress $primary
 
-            $row = New-MigrationPlanRow
-            $row.ObjectType = $objectType
-            $row.SourceObjectId = Get-MigrationCsvValue -Row $source -Name 'ObjectId' -Default ''
-            $row.SourcePrimarySmtp = $primary
-            $row.SourceAliases = Join-MigrationList -Values $proxySet.Aliases
-            $row.LegacyExchangeDN = Get-MigrationCsvValue -Row $source -Name 'LegacyExchangeDN' -Default ''
-            $row.SourceX500 = Join-MigrationList -Values $proxySet.X500
-            $row.DisplayName = Get-MigrationCsvValue -Row $source -Name 'DisplayName' -Default ''
-            # The plan enum has no SecurityGroup member, so the real Entra group type is kept
-            # in MailboxType where the operator - and the readiness check - can still see it.
+            $row = New-PlanSourceRow -Source $source -Kind 'Group' -Primary $primary `
+                -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
+            $row.ObjectType = if ($script:GroupTypeMap.ContainsKey($groupType)) { $script:GroupTypeMap[$groupType] } else { 'Distribution' }
+            # The plan enum has no SecurityGroup member, so the real Entra group type is kept in
+            # MailboxType where the operator - and the readiness check - can still see it.
             $row.MailboxType = $groupType
-            $row.IsSynced = Get-MigrationCsvValue -Row $source -Name 'IsSynced' -Default ''
-
-            $excludeReason = ''
-            if ($script:GroupExcludeReasons.ContainsKey($groupType)) { $excludeReason = $script:GroupExcludeReasons[$groupType] }
-            elseif (-not $primary) { $excludeReason = 'Not mail-enabled' }
 
             $items.Add(@{
-                Row              = $row
-                Source           = $source
-                Key              = if ($row.SourceObjectId) { $row.SourceObjectId } else { $row.DisplayName }
-                IsGuest          = $false
-                UsesTemplate     = $false
-                SourceKind       = 'Group'
-                PresetExcludeWhy = $excludeReason
+                    Row = $row; Source = $source; SourceKind = 'Group'; IsGuest = $false; UsesTemplate = $false
+                    Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $row.DisplayName }
+                    PresetExcludeWhy = if ($script:GroupExcludeReasons.ContainsKey($groupType)) { $script:GroupExcludeReasons[$groupType] }
+                    elseif (-not $primary) { 'Not mail-enabled' }
+                    else { '' }
                 })
         }
     }
 
-    # Contacts -------------------------------------------------------------------------------
     if ($ContactsCsv) {
         foreach ($source in @(Import-MigrationCsv -Path $ContactsCsv -RequiredColumns @('DisplayName'))) {
             $primary = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
-            $external = Get-MigrationCsvValue -Row $source -Name 'ExternalEmailAddress' -Default ''
-            $proxySet = Get-PlanProxyAddressSet -Value (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '') -PrimaryAddress $primary
 
-            $row = New-MigrationPlanRow
+            $row = New-PlanSourceRow -Source $source -Kind 'Contact' -Primary $primary `
+                -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
             $row.ObjectType = 'Contact'
-            $row.SourceObjectId = Get-MigrationCsvValue -Row $source -Name 'ObjectId' -Default ''
-            $row.SourcePrimarySmtp = $primary
-            $row.SourceAliases = Join-MigrationList -Values $proxySet.Aliases
-            $row.SourceX500 = Join-MigrationList -Values $proxySet.X500
-            $row.DisplayName = Get-MigrationCsvValue -Row $source -Name 'DisplayName' -Default ''
-            $row.FirstName = Get-MigrationCsvValue -Row $source -Name 'FirstName' -Default ''
-            $row.LastName = Get-MigrationCsvValue -Row $source -Name 'LastName' -Default ''
             $row.MailboxType = 'MailContact'
-            # The external address is what a contact actually points at, so it is recorded as
-            # the manager-free equivalent of a source UPN for traceability.
-            $row.SourceUserPrincipalName = $external
+            # What a contact actually points at, recorded as the manager-free equivalent of a
+            # source UPN for traceability.
+            $row.SourceUserPrincipalName = Get-MigrationCsvValue -Row $source -Name 'ExternalEmailAddress' -Default ''
 
             $items.Add(@{
-                Row          = $row
-                Source       = $source
-                Key          = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
-                IsGuest      = $false
-                UsesTemplate = $false
-                SourceKind   = 'Contact'
+                    Row = $row; Source = $source; SourceKind = 'Contact'; IsGuest = $false; UsesTemplate = $false
+                    Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
                 })
         }
     }
@@ -1068,237 +782,173 @@ try {
     Write-MigrationLog -Message "Prepared $($items.Count) source object(s) for planning." -Level INFO
     if ($items.Count -eq 0) { throw 'No source objects were loaded - check the inventory CSVs.' }
 
-    # --- Exclusions, preservation and waves ---------------------------------------------------
+    # --- Exclusions, preservation and waves -----------------------------------------------------
     foreach ($item in $items) {
         $row = $item.Row
 
-        $waveKeys = @($row.SourceUserPrincipalName, $row.SourcePrimarySmtp) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            ForEach-Object { $_.ToLowerInvariant() }
-        $wave = $DefaultWave
-        foreach ($waveKey in $waveKeys) {
-            if ($waveMap.ContainsKey($waveKey)) { $wave = $waveMap[$waveKey]; break }
+        $row.Wave = $DefaultWave
+        foreach ($waveKey in @($row.SourceUserPrincipalName, $row.SourcePrimarySmtp)) {
+            if ($waveKey -and $waveMap.ContainsKey($waveKey.ToLowerInvariant())) {
+                $row.Wave = $waveMap[$waveKey.ToLowerInvariant()]
+                break
+            }
         }
-        $row.Wave = $wave
 
         $preserved = $null
-        foreach ($keyColumn in @('SourceObjectId', 'SourcePrimarySmtp', 'SourceUserPrincipalName')) {
+        foreach ($keyColumn in $script:IdentityColumns) {
             $keyValue = Get-MigrationCsvValue -Row $row -Name $keyColumn -Default ''
             if (-not $keyValue) { continue }
             $indexKey = "$keyColumn|$($keyValue.ToLowerInvariant())"
             if ($preservedIndex.ContainsKey($indexKey)) { $preserved = $preservedIndex[$indexKey]; break }
         }
 
+        $item['IsPreserved'] = [bool]$preserved
         if ($preserved) {
-            foreach ($field in $preservedFields) { $row.$field = Get-MigrationCsvValue -Row $preserved -Name $field -Default '' }
-            $item['IsPreserved'] = $true
+            foreach ($field in $script:PreservedFields) { $row.$field = Get-MigrationCsvValue -Row $preserved -Name $field -Default '' }
             continue
         }
-        $item['IsPreserved'] = $false
 
-        $excludeReason = ''
-        if ($item.ContainsKey('PresetExcludeWhy') -and $item['PresetExcludeWhy']) {
-            $excludeReason = $item['PresetExcludeWhy']
-        }
+        $excludeReason = if ($item.ContainsKey('PresetExcludeWhy')) { [string]$item['PresetExcludeWhy'] } else { '' }
         if (-not $excludeReason) { $excludeReason = Get-PlanExclusionReason -Row $item.Source -Rule $exclusionRules }
-        if (-not $excludeReason -and $row.IsSynced -eq 'True' -and -not $IncludeSynced) {
-            $excludeReason = 'Directory-synced'
-        }
+        if (-not $excludeReason -and $row.IsSynced -eq 'True' -and -not $IncludeSynced) { $excludeReason = 'Directory-synced' }
         if (-not $excludeReason -and $item.SourceKind -eq 'User') {
             if ($row.AccountEnabled -eq 'False' -and -not $IncludeDisabled) { $excludeReason = 'Account disabled' }
             elseif ($item.IsGuest -and -not $IncludeGuests) { $excludeReason = 'Guest account' }
         }
 
+        $item['IsExcluded'] = [bool]$excludeReason
         if ($excludeReason) {
             $row.PlanStatus = 'Excluded'
             $row.ExcludeReason = $excludeReason
-            $item['IsExcluded'] = $true
-        }
-        else {
-            $item['IsExcluded'] = $false
         }
     }
 
-    # --- Naming -------------------------------------------------------------------------------
+    # --- Naming ---------------------------------------------------------------------------------
     $planned = @($items | Where-Object { -not $_.IsPreserved -and -not $_.IsExcluded })
 
     foreach ($item in $planned) {
         $row = $item.Row
-        $sourceAddress = if ($row.SourcePrimarySmtp) { $row.SourcePrimarySmtp } else { $row.SourceUserPrincipalName }
-        $sourceLocalPart = Get-PlanLocalPart -Address $sourceAddress
 
         if ($item.IsGuest) {
-            # A guest is an invitation to an identity that lives in another tenant. Rewriting
-            # it would break the link, so it is carried across exactly as Entra ID stores it.
+            # A guest is an invitation to an identity that lives in another tenant. Rewriting it
+            # would break the link, so it is carried across exactly as Entra ID stores it, and the
+            # nickname is only a legal placeholder - Entra generates the real one.
             $item['UpnLocalPart'] = ''
             $item['SmtpLocalPart'] = ''
-            # Entra ID generates a guest's mail nickname itself; this is only a legal
-            # placeholder, so the '#EXT#' marker and any other illegal character is stripped.
-            $guestLocalPart = (Get-PlanLocalPart -Address $row.SourceUserPrincipalName).ToLowerInvariant()
-            $item['NicknameLocalPart'] = ($guestLocalPart -replace '[^a-z0-9._-]', '')
+            $item['NicknameLocalPart'] = ((Split-PlanAddress -Address $row.SourceUserPrincipalName).Local.ToLowerInvariant() -replace '[^a-z0-9._-]', '')
             $item['MissingTokens'] = @()
             continue
         }
 
-        # Only a user account carries a user principal name. Shared mailboxes, groups and
-        # contacts are addressed by their primary SMTP address alone, so their UPN columns
-        # stay empty rather than being filled with an address nothing will ever sign in to.
-        $isUserPrincipal = $row.ObjectType -eq 'User'
-        $smtpTemplateForItem = if ($item.UsesTemplate) { $smtpTemplate } else { 'Keep' }
-
+        $sourceAddress = if ($row.SourcePrimarySmtp) { $row.SourcePrimarySmtp } else { $row.SourceUserPrincipalName }
         $nameArguments = @{
             FirstName       = $row.FirstName
             MiddleName      = $row.MiddleName
             LastName        = $row.LastName
-            SourceLocalPart = $sourceLocalPart
+            SourceLocalPart = (Split-PlanAddress -Address $sourceAddress).Local
             DisplayName     = $row.DisplayName
         }
 
         $missing = [System.Collections.Generic.List[string]]::new()
-
-        $upnLocalPart = ''
-        if ($isUserPrincipal) {
-            $upnResult = ConvertTo-MigrationLocalPart -Template $UpnFormat @nameArguments
-            $upnLocalPart = $upnResult.LocalPart
-            foreach ($token in @($upnResult.MissingTokens)) {
+        $build = {
+            param([string]$Template)
+            $result = ConvertTo-MigrationLocalPart -Template $Template @nameArguments
+            foreach ($token in @($result.MissingTokens)) {
                 if ($token -and -not $missing.Contains($token)) { $missing.Add($token) }
             }
+            return [string]$result.LocalPart
         }
 
-        $smtpResult = ConvertTo-MigrationLocalPart -Template $smtpTemplateForItem @nameArguments
-        foreach ($token in @($smtpResult.MissingTokens)) {
-            if ($token -and -not $missing.Contains($token)) { $missing.Add($token) }
-        }
-
-        $item['UpnLocalPart'] = $upnLocalPart
-        $item['SmtpLocalPart'] = $smtpResult.LocalPart
-        $item['WantedUpnLocalPart'] = $upnLocalPart
-        $item['WantedSmtpLocalPart'] = $smtpResult.LocalPart
+        # Only a user account carries a user principal name. Shared mailboxes, groups and contacts
+        # are addressed by their primary SMTP address alone, so their UPN columns stay empty rather
+        # than holding an address nothing will ever sign in to.
+        $item['UpnLocalPart'] = if ($row.ObjectType -eq 'User') { & $build $UpnFormat } else { '' }
+        $item['SmtpLocalPart'] = & $build $(if ($item.UsesTemplate) { $smtpTemplate } else { 'Keep' })
+        $item['NicknameLocalPart'] = if ($nicknameTemplate) { & $build $nicknameTemplate } else { '' }
+        $item['WantedUpnLocalPart'] = $item['UpnLocalPart']
+        $item['WantedSmtpLocalPart'] = $item['SmtpLocalPart']
         $item['MissingTokens'] = [string[]]$missing.ToArray()
 
-        if ($nicknameTemplate) {
-            $nicknameResult = ConvertTo-MigrationLocalPart -Template $nicknameTemplate @nameArguments
-            $item['NicknameLocalPart'] = $nicknameResult.LocalPart
-            foreach ($token in @($nicknameResult.MissingTokens)) {
-                if ($token -and -not $missing.Contains($token)) { $missing.Add($token) }
-            }
-            $item['MissingTokens'] = [string[]]$missing.ToArray()
-        }
-        else {
-            $item['NicknameLocalPart'] = ''
-        }
-
-        if (@($item['MissingTokens']).Count -gt 0) {
+        if ($missing.Count -gt 0) {
             $row.PlanStatus = 'NeedsReview'
             $row.PlanDetail = 'Could not build a destination address from the source name (missing: ' +
-                (@($item['MissingTokens']) -join ', ') + '). Fill in the target columns by hand.'
+                ($missing.ToArray() -join ', ') + '). Fill in the target columns by hand.'
         }
     }
 
-    # --- Collision resolution --------------------------------------------------------------------
+    # --- Collision resolution -------------------------------------------------------------------
     $namedItems = @($planned | Where-Object { $_.Row.PlanStatus -ne 'NeedsReview' -and -not $_.IsGuest })
-
-    $upnCandidates = [System.Collections.Generic.List[object]]::new()
-    $smtpCandidates = [System.Collections.Generic.List[object]]::new()
-
-    foreach ($item in $namedItems) {
-        $middleInitial = ''
-        if ($item.Row.MiddleName) { $middleInitial = $item.Row.MiddleName }
-
-        # Only users hold a user principal name; every other recipient type is addressed by
-        # its primary SMTP address alone, which is why the UPN set is deliberately smaller.
-        if ($item.Row.ObjectType -eq 'User') {
-            $upnCandidates.Add([pscustomobject]@{
-                    Key = [string]$item.Key; LocalPart = [string]$item['UpnLocalPart']
-                    MiddleInitial = $middleInitial; Domain = $targetDomainName
-                })
+    $newCandidate = {
+        param($Item, [string]$Slot)
+        [pscustomobject]@{
+            Key = [string]$Item.Key; LocalPart = [string]$Item[$Slot]
+            MiddleInitial = [string]$Item.Row.MiddleName; Domain = $targetDomainName
         }
-        $smtpCandidates.Add([pscustomobject]@{
-                Key = [string]$item.Key; LocalPart = [string]$item['SmtpLocalPart']
-                MiddleInitial = $middleInitial; Domain = $targetDomainName
-            })
     }
 
-    $reservedArray = [string[]]$reservedAddresses.ToArray()
-    $upnResolved = @(Resolve-MigrationCollision -Candidates $upnCandidates.ToArray() -Reserved $reservedArray)
-    $smtpResolved = @(Resolve-MigrationCollision -Candidates $smtpCandidates.ToArray() -Reserved $reservedArray)
-
-    $upnByKey = @{}
-    foreach ($resolved in $upnResolved) { $upnByKey[[string]$resolved.Key] = $resolved }
-    $smtpByKey = @{}
-    foreach ($resolved in $smtpResolved) { $smtpByKey[[string]$resolved.Key] = $resolved }
+    # Only users hold a user principal name, which is why the UPN set is deliberately smaller.
+    $collisionSets = @(
+        @{ Kind = 'UPN'; Slot = 'UpnLocalPart'; Resolved = @(Resolve-MigrationCollision -Reserved $reservedAddresses.ToArray() `
+                    -Candidates @($namedItems | Where-Object { $_.Row.ObjectType -eq 'User' } | ForEach-Object { & $newCandidate $_ 'UpnLocalPart' })) }
+        @{ Kind = 'SMTP'; Slot = 'SmtpLocalPart'; Resolved = @(Resolve-MigrationCollision -Reserved $reservedAddresses.ToArray() `
+                    -Candidates @($namedItems | ForEach-Object { & $newCandidate $_ 'SmtpLocalPart' })) }
+    )
+    foreach ($set in $collisionSets) {
+        $set['ByKey'] = @{}
+        foreach ($resolved in $set.Resolved) { $set['ByKey'][[string]$resolved.Key] = $resolved }
+    }
 
     # Who ended up holding each address, so a collision message can name the winner.
     $itemByKey = @{}
     foreach ($item in $items) { $itemByKey[[string]$item.Key] = $item }
-
     $describeClaimant = {
         param([object[]]$Resolved, [string]$LocalPart)
         foreach ($entry in $Resolved) {
             if ([string]$entry.ResolvedLocalPart -ne $LocalPart) { continue }
             $owner = $itemByKey[[string]$entry.Key]
             if ($null -eq $owner) { return '' }
-            $identity = $owner.Row.SourceUserPrincipalName
-            if (-not $identity) { $identity = $owner.Row.SourcePrimarySmtp }
-            if (-not $identity) { $identity = $owner.Row.DisplayName }
-            return [string]$identity
+            return [string](@($owner.Row.SourceUserPrincipalName, $owner.Row.SourcePrimarySmtp,
+                    $owner.Row.DisplayName) | Where-Object { $_ } | Select-Object -First 1)
         }
         return ''
     }
 
     foreach ($item in $namedItems) {
-        $row = $item.Row
         $key = [string]$item.Key
         $details = [System.Collections.Generic.List[string]]::new()
-        $isCollision = $false
 
-        if ($upnByKey.ContainsKey($key)) {
-            $resolved = $upnByKey[$key]
-            $item['UpnLocalPart'] = [string]$resolved.ResolvedLocalPart
-            if ($resolved.Collided) {
-                $isCollision = $true
-                $wanted = [string]$item['WantedUpnLocalPart']
-                $claimant = & $describeClaimant $upnResolved $wanted
-                if ($resolved.Resolution -eq 'Unresolved') {
-                    $item['UpnLocalPart'] = ''
-                    $details.Add((Get-PlanCollisionDetail -Kind UPN -WantedLocalPart $wanted -Domain $targetDomainName -ResolvedLocalPart '' -Claimant $claimant))
-                }
-                else {
-                    $details.Add((Get-PlanCollisionDetail -Kind UPN -WantedLocalPart $wanted -Domain $targetDomainName -ResolvedLocalPart $resolved.ResolvedLocalPart -Claimant $claimant))
-                }
+        foreach ($set in $collisionSets) {
+            if (-not $set.ByKey.ContainsKey($key)) { continue }
+            $resolved = $set.ByKey[$key]
+            $item[$set.Slot] = [string]$resolved.ResolvedLocalPart
+            if (-not $resolved.Collided) { continue }
+
+            $wanted = [string]$item["Wanted$($set.Slot)"]
+            $claimant = & $describeClaimant $set.Resolved $wanted
+            $taken = if ($claimant) { "taken by $claimant" } else { 'already reserved in the destination' }
+
+            if ($resolved.Resolution -eq 'Unresolved') {
+                $item[$set.Slot] = ''
+                $details.Add("$($set.Kind) ${wanted}@$targetDomainName is $taken and no free alternative was found - assign one by hand.")
+            }
+            else {
+                $details.Add("$($set.Kind) ${wanted}@$targetDomainName is $taken; used $($resolved.ResolvedLocalPart)@$targetDomainName.")
             }
         }
 
-        if ($smtpByKey.ContainsKey($key)) {
-            $resolved = $smtpByKey[$key]
-            $item['SmtpLocalPart'] = [string]$resolved.ResolvedLocalPart
-            if ($resolved.Collided) {
-                $isCollision = $true
-                $wanted = [string]$item['WantedSmtpLocalPart']
-                $claimant = & $describeClaimant $smtpResolved $wanted
-                if ($resolved.Resolution -eq 'Unresolved') {
-                    $item['SmtpLocalPart'] = ''
-                    $details.Add((Get-PlanCollisionDetail -Kind SMTP -WantedLocalPart $wanted -Domain $targetDomainName -ResolvedLocalPart '' -Claimant $claimant))
-                }
-                else {
-                    $details.Add((Get-PlanCollisionDetail -Kind SMTP -WantedLocalPart $wanted -Domain $targetDomainName -ResolvedLocalPart $resolved.ResolvedLocalPart -Claimant $claimant))
-                }
-            }
-        }
-
-        if ($isCollision) {
-            $row.PlanStatus = 'Collision'
-            $row.PlanDetail = ($details -join ' ')
+        if ($details.Count -gt 0) {
+            $item.Row.PlanStatus = 'Collision'
+            $item.Row.PlanDetail = ($details -join ' ')
         }
     }
 
-    # --- Addresses, licences, aliases and validation ----------------------------------------------
+    # --- Addresses, licences, aliases and validation ---------------------------------------------
     foreach ($item in $planned) {
         $row = $item.Row
 
         if ($item.IsGuest) {
             $row.TargetUserPrincipalName = $row.SourceUserPrincipalName
-            $row.TargetPrimarySmtp = if ($row.SourcePrimarySmtp) { $row.SourcePrimarySmtp } else { '' }
+            $row.TargetPrimarySmtp = $row.SourcePrimarySmtp
             $row.TargetMailNickname = [string]$item['NicknameLocalPart']
             $row.InterimUserPrincipalName = $row.TargetUserPrincipalName
             $row.InterimPrimarySmtp = $row.TargetPrimarySmtp
@@ -1320,10 +970,9 @@ try {
             }
 
             $nickname = if ($item['NicknameLocalPart']) { [string]$item['NicknameLocalPart'] } else { $smtpLocalPart }
-            $row.TargetMailNickname = ($nickname -replace "[^a-z0-9._-]", '')
+            $row.TargetMailNickname = ($nickname -replace '[^a-z0-9._-]', '')
         }
 
-        # Licences ---------------------------------------------------------------------------
         $licenseResult = Get-PlanTargetLicense -SourceLicense $row.SourceLicenses -SkuMap $skuMap
         $row.TargetLicenses = Join-MigrationList -Values $licenseResult.Licenses
         $licenseNotes = [System.Collections.Generic.List[string]]::new()
@@ -1334,29 +983,31 @@ try {
             $licenseNotes.Add('SKU map drops ' + ($licenseResult.Dropped -join ', ') + '.')
         }
 
-        # Aliases ----------------------------------------------------------------------------
+        # Mail sent to an old address keeps arriving for months, so the old local part is re-created
+        # in the destination - but only in a domain the operator named, because an address in a
+        # domain nobody owns is not routable.
         $aliases = [System.Collections.Generic.List[string]]::new()
         if ($PreserveAliases) {
-            $sourceAddresses = [System.Collections.Generic.List[string]]::new()
-            if ($row.SourcePrimarySmtp) { $sourceAddresses.Add($row.SourcePrimarySmtp) }
-            foreach ($alias in @(Split-MigrationList -Value $row.SourceAliases)) { $sourceAddresses.Add($alias) }
-            foreach ($redomained in @(Get-PlanRedomainedAlias -Address $sourceAddresses.ToArray() -DomainMap $AliasDomainMap)) {
-                if (-not $aliases.Contains($redomained)) { $aliases.Add($redomained) }
+            foreach ($entry in @($row.SourcePrimarySmtp) + @(Split-MigrationList -Value $row.SourceAliases)) {
+                $parsed = Split-MigrationProxyAddress -Entry $entry
+                if ($parsed.Kind -ne 'Smtp') { continue }
+                $split = Split-PlanAddress -Address $parsed.Address
+                if (-not $aliasDomainLookup.ContainsKey($split.Domain)) { continue }
+                $candidate = 'smtp:' + $split.Local.ToLowerInvariant() + '@' + $aliasDomainLookup[$split.Domain]
+                if (-not $aliases.Contains($candidate)) { $aliases.Add($candidate) }
             }
         }
 
-        # The legacy DN always travels, aliases or not: without it, replies to pre-migration
-        # mail bounce with an IMCEAEX non-delivery report.
-        foreach ($x500 in @(Get-PlanX500List -Value $row.LegacyExchangeDN) + @(Split-MigrationList -Value $row.SourceX500)) {
-            if ($x500 -and -not $aliases.Contains($x500)) { $aliases.Add($x500) }
+        # The legacy DN always travels, aliases or not: without it, replies to pre-migration mail
+        # bounce with an IMCEAEX non-delivery report.
+        foreach ($x500 in @(ConvertTo-MigrationX500 -Value @($row.LegacyExchangeDN, $row.SourceX500))) {
+            if (-not $aliases.Contains($x500)) { $aliases.Add($x500) }
         }
 
         $primaryForms = @($row.TargetPrimarySmtp, $row.InterimPrimarySmtp) |
-            Where-Object { $_ } |
-            ForEach-Object { 'smtp:' + $_.ToLowerInvariant() }
+            Where-Object { $_ } | ForEach-Object { 'smtp:' + $_.ToLowerInvariant() }
         $row.TargetAliases = Join-MigrationList -Values ([string[]]@($aliases | Where-Object { $primaryForms -notcontains $_ }))
 
-        # Status -------------------------------------------------------------------------------
         if ($row.PlanStatus -eq 'NeedsReview') {
             foreach ($column in @('TargetUserPrincipalName', 'TargetPrimarySmtp', 'TargetAliases',
                     'TargetMailNickname', 'InterimUserPrincipalName', 'InterimPrimarySmtp')) {
@@ -1365,16 +1016,13 @@ try {
             continue
         }
 
-        $validationChecks = @(
-            @{ Column = 'TargetUserPrincipalName'; Kind = 'Upn' }
-            @{ Column = 'InterimUserPrincipalName'; Kind = 'Upn' }
-            @{ Column = 'TargetPrimarySmtp'; Kind = 'Smtp' }
-            @{ Column = 'InterimPrimarySmtp'; Kind = 'Smtp' }
-            @{ Column = 'TargetMailNickname'; Kind = 'MailNickname' }
-        )
-
         $invalidReason = ''
-        foreach ($check in $validationChecks) {
+        foreach ($check in @(
+                @{ Column = 'TargetUserPrincipalName'; Kind = 'Upn' }
+                @{ Column = 'InterimUserPrincipalName'; Kind = 'Upn' }
+                @{ Column = 'TargetPrimarySmtp'; Kind = 'Smtp' }
+                @{ Column = 'InterimPrimarySmtp'; Kind = 'Smtp' }
+                @{ Column = 'TargetMailNickname'; Kind = 'MailNickname' })) {
             $value = [string]$row.($check.Column)
             if (-not $value) { continue }
             $verdict = Test-MigrationAddress -Address $value -Kind $check.Kind
@@ -1402,7 +1050,7 @@ try {
         }
     }
 
-    # --- Summary ---------------------------------------------------------------------------------
+    # --- Summary and write ------------------------------------------------------------------------
     $planRows = @($items | ForEach-Object { $_.Row })
 
     Write-MigrationLog -Message '--- Plan summary ---' -Level SUCCESS
@@ -1419,14 +1067,12 @@ try {
         foreach ($row in $attention) {
             $identity = @($row.SourceUserPrincipalName, $row.SourcePrimarySmtp, $row.DisplayName) |
                 Where-Object { $_ } | Select-Object -First 1
-            Write-MigrationLog -Message ("  [{0}] {1} - {2}" -f $row.PlanStatus, $identity, $row.PlanDetail) -Level WARNING
+            Write-MigrationLog -Message ('  [{0}] {1} - {2}' -f $row.PlanStatus, $identity, $row.PlanDetail) -Level WARNING
         }
     }
 
-    # --- Write --------------------------------------------------------------------------------------
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $planPath = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}IdentityPlan_$timestamp.csv"
+    $planPath = Join-Path -Path $run.OutputDirectory -ChildPath ("${leader}IdentityPlan_{0}.csv" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
     if ($PSCmdlet.ShouldProcess($planPath, "Write $($planRows.Count) identity plan row(s)")) {
         Invoke-MigrationAction -Description "Write the identity plan to $planPath" -Action {

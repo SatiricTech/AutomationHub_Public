@@ -121,11 +121,11 @@ AfterAll {
     }
 }
 
-Describe 'Get-PlanAddressMap' {
+Describe 'Get-MigrationPlanAddressMap - permissions plan fixture' {
 
     BeforeAll {
         $script:PlanRows = @(Import-MigrationPlan -Path $script:PlanFixture)
-        $script:Map = Get-PlanAddressMap -Rows $script:PlanRows
+        $script:Map = Get-MigrationPlanAddressMap -Rows $script:PlanRows
     }
 
     It 'Maps the source UPN, primary SMTP and every alias onto the same destination address' {
@@ -159,29 +159,29 @@ Describe 'Get-PlanAddressMap' {
     It 'Ignores a row with no destination address at all' {
         $row = New-MigrationPlanRow
         $row.SourceUserPrincipalName = 'nobody@contoso.com'
-        (Get-PlanAddressMap -Rows @($row)).Count | Should -Be 0
+        (Get-MigrationPlanAddressMap -Rows @($row)).Count | Should -Be 0
     }
 }
 
-Describe 'Resolve-MappedAddress' {
+Describe 'Resolve-MigrationPlanAddress - permissions plan fixture' {
 
     BeforeAll {
-        $script:Map2 = Get-PlanAddressMap -Rows @(Import-MigrationPlan -Path $script:PlanFixture)
+        $script:Map2 = Get-MigrationPlanAddressMap -Rows @(Import-MigrationPlan -Path $script:PlanFixture)
     }
 
     It 'Translates a mapped address' {
-        $resolved = Resolve-MappedAddress -Map $script:Map2 -Address 'jsmith@contoso.com' -Role 'trustee'
+        $resolved = Resolve-MigrationPlanAddress -Map $script:Map2 -Address 'jsmith@contoso.com' -Role 'trustee'
         $resolved.IsMapped | Should -BeTrue
         $resolved.Address | Should -BeExactly 'john.smith@newco.com'
     }
 
     It 'Strips an smtp: prefix before looking up' {
-        (Resolve-MappedAddress -Map $script:Map2 -Address 'smtp:jsmith@contoso.com').Address |
+        (Resolve-MigrationPlanAddress -Map $script:Map2 -Address 'smtp:jsmith@contoso.com').Address |
             Should -BeExactly 'john.smith@newco.com'
     }
 
     It 'Reports an unmapped trustee by name rather than guessing' {
-        $resolved = Resolve-MappedAddress -Map $script:Map2 -Address 'departed@contoso.com' -Role 'trustee'
+        $resolved = Resolve-MigrationPlanAddress -Map $script:Map2 -Address 'departed@contoso.com' -Role 'trustee'
         $resolved.IsMapped | Should -BeFalse
         $resolved.Address | Should -BeNullOrEmpty
         $resolved.Detail | Should -Match 'departed@contoso.com'
@@ -189,13 +189,13 @@ Describe 'Resolve-MappedAddress' {
     }
 
     It 'Reports an empty address' {
-        $resolved = Resolve-MappedAddress -Map $script:Map2 -Address '' -Role 'mailbox'
+        $resolved = Resolve-MigrationPlanAddress -Map $script:Map2 -Address '' -Role 'mailbox'
         $resolved.IsMapped | Should -BeFalse
         $resolved.Detail | Should -Match 'no mailbox address'
     }
 
     It 'Produces a Skipped result row when the trustee cannot be mapped' {
-        $resolved = Resolve-MappedAddress -Map $script:Map2 -Address 'departed@contoso.com' -Role 'trustee'
+        $resolved = Resolve-MigrationPlanAddress -Map $script:Map2 -Address 'departed@contoso.com' -Role 'trustee'
         $row = New-PermissionResult -Identity 'reception@newco.com' -Action 'FullAccess' -Status 'Skipped' `
             -Detail $resolved.Detail -SourceMailbox 'reception@contoso.com' -SourceTrustee 'departed@contoso.com'
 
@@ -306,7 +306,7 @@ Describe 'Get-PermissionDiff' {
 Describe 'The permissions inventory maps end to end' {
 
     It 'Resolves both sides of every mappable row and reports the one it cannot' {
-        $map = Get-PlanAddressMap -Rows @(Import-MigrationPlan -Path $script:PlanFixture)
+        $map = Get-MigrationPlanAddressMap -Rows @(Import-MigrationPlan -Path $script:PlanFixture)
         $rows = @(Import-MigrationCsv -Path $script:PermissionFixture `
             -RequiredColumns @('MailboxPrimarySmtp', 'Trustee', 'Permission'))
 
@@ -317,7 +317,7 @@ Describe 'The permissions inventory maps end to end' {
         $usable.Count | Should -Be 5
 
         $unmapped = @($usable | Where-Object {
-            -not (Resolve-MappedAddress -Map $map -Address $_.Trustee -Role 'trustee').IsMapped
+            -not (Resolve-MigrationPlanAddress -Map $map -Address $_.Trustee -Role 'trustee').IsMapped
         })
         $unmapped.Count | Should -Be 1
         $unmapped[0].Trustee | Should -BeExactly 'departed@contoso.com'

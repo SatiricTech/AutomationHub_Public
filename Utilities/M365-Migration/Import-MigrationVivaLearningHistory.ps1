@@ -10,52 +10,41 @@
     Replays exported learner history into a destination tenant through the Graph
     employee learning API, in three steps:
 
-      1. Provider  - registers (or reuses) a custom learning provider that the
-                     imported records will live under, with course-activity sync
-                     enabled. Records can only be attached to content owned by
-                     your own provider registration - they cannot be written into
-                     built-in providers such as LinkedIn Learning.
-      2. Content   - upserts one learning catalog item per distinct course in
-                     the CSV (keyed by CourseExternalId / LearningContentId /
-                     CourseWebUrl, in that order of preference).
-      3. Activities - creates one learningCourseActivity per CSV row against the
-                     matching catalog item and target user. Re-runs are safe:
-                     rows whose activity already exists (matched by external
-                     activity ID) are skipped, not duplicated. That idempotency
-                     holds only while the key columns are unchanged between runs
-                     (CourseExternalId / LearningContentId / CourseWebUrl,
-                     ExternalCourseActivityId / ActivityId,
-                     TargetUserPrincipalName) - editing them re-keys the rows
-                     and a re-run creates new records instead of skipping.
+      1. Provider   - registers (or reuses) a custom learning provider with
+                      course-activity sync enabled. Records can only attach to
+                      content owned by your own registration - never to built-in
+                      providers such as LinkedIn Learning.
+      2. Content    - upserts one catalog item per distinct course in the CSV
+                      (keyed by CourseExternalId / LearningContentId /
+                      CourseWebUrl, in that order of preference).
+      3. Activities - creates one learningCourseActivity per CSV row. Re-runs are
+                      safe: rows whose activity already exists (matched by
+                      external activity ID) are skipped, not duplicated. That
+                      idempotency holds only while the key columns are unchanged
+                      between runs - editing them re-keys the rows and a re-run
+                      creates new records instead of skipping.
 
     The employee learning API forces a split authentication model, so the script
-    uses TWO sign-ins in sequence:
+    signs in TWICE in sequence: provider registration is DELEGATED-ONLY (an
+    interactive sign-in by a Viva-licensed Knowledge Administrator; skipped
+    entirely by passing -LearningProviderId), while content upsert and activity
+    creation are APPLICATION-ONLY (client-credential auth with the admin-consented
+    application permissions in .NOTES). Client-credential sign-in is outside
+    Connect-MigrationGraph's remit, so that phase calls Connect-MgGraph directly.
 
-      - Provider registration is DELEGATED-ONLY: an interactive sign-in by a user
-        holding a Viva Learning (or Viva Suite) license and the Knowledge
-        Administrator role (least privileged). Skip this sign-in entirely by
-        passing -LearningProviderId for an already-registered provider.
-      - Content upsert and activity creation are APPLICATION-ONLY: an app
-        registration with client-credential auth (secret or certificate) and
-        admin-consented application permissions (see .NOTES). Client-credential
-        sign-in is not something Connect-MigrationGraph can express, so this
-        phase calls Connect-MgGraph directly.
-
-    Source users are mapped to destination users by UPN, in this order:
-
-      1. a TargetUserPrincipalName column on the CSV row (always wins),
-      2. the identity plan supplied with -PlanPath (matched on the plan's
-         SourceUserPrincipalName, then SourcePrimarySmtp),
-      3. the UPN's local part combined with -TargetDomain, or the CSV UPN
-         unchanged with -KeepCsvDomains.
+    Source users are mapped to destination users by UPN, in this order: a
+    TargetUserPrincipalName column on the row (always wins), then the identity
+    plan supplied with -PlanPath (matched on SourceUserPrincipalName, then
+    SourcePrimarySmtp), then the UPN's local part combined with -TargetDomain, or
+    the CSV UPN unchanged with -KeepCsvDomains.
 
     Every row's outcome lands in a results CSV with the standard
     Identity / Action / Status / Detail columns, and is written to the run log as
-    it happens so the audit trail survives a lost session mid-import. Note that
-    each target learner needs a Viva Learning premium license - rows for
-    unlicensed users fail with a licensing 403 and are recorded as such. Imported
-    records surface on the users' My Learning tab; catalog content can take up to
-    24 hours to appear in Viva Learning search/browse.
+    it happens so the audit trail survives a lost session mid-import. Each target
+    learner needs a Viva Learning premium license - rows for unlicensed users fail
+    with a licensing 403 and are recorded as such. Imported records surface on the
+    users' My Learning tab; catalog content can take up to 24 hours to appear in
+    Viva Learning search/browse.
 
 .PARAMETER CsvPath
     Path to the learner history CSV. Expected columns match the export script's
@@ -187,9 +176,7 @@
     GDAP         : the delegated provider step honours -TenantId under an active
                    GDAP relationship. The app-only phase does NOT: cross-tenant
                    client-credential auth needs the app registered multitenant
-                   with per-tenant admin consent. There is no
-                   -DelegatedOrganization here because no Exchange connection is
-                   made.
+                   with per-tenant admin consent.
     Cloud        : Global cloud only. The employee learning API is not available
                    in US Government (GCC High/DoD) or 21Vianet clouds.
     Written with assistance from Claude (Anthropic).
@@ -272,74 +259,13 @@ $script:UserIdByUpn = @{}
 
 #region Functions --------------------------------------------------------------
 
-function Get-VivaGraphStatusCode {
-    <#
-        Best-effort HTTP status code from a failed Graph request. The SDK doesn't
-        expose the response object consistently, so the Graph error body's code
-        string and the exception text are both consulted. The module has an
-        equivalent private helper but does not export it.
-    #>
-    [CmdletBinding()]
-    [OutputType([int])]
-    param([Parameter(Mandatory)]$ErrorRecord)
-
-    $response = $ErrorRecord.Exception.PSObject.Properties['Response']
-    if ($response -and $response.Value) {
-        $status = $response.Value.PSObject.Properties['StatusCode']
-        if ($status -and $status.Value) { return [int]$status.Value }
-    }
-
-    # ErrorDetails is null on many SDK failures and strict mode makes a blind read
-    # on it fatal, so it is checked before being dereferenced.
-    $detail = ''
-    if ($ErrorRecord.ErrorDetails) { $detail = [string]$ErrorRecord.ErrorDetails.Message }
-    if ($detail) {
-        # A non-JSON body (or none) just means we fall through to the message text.
-        $code = [string]$(try { (ConvertFrom-Json $detail -ErrorAction Stop).error.code } catch { $null })
-        switch -Regex ($code) {
-            '^(notFound|ResourceNotFound|Request_ResourceNotFound)$' { return 404 }
-            '^tooManyRequests$' { return 429 }
-            '^serviceUnavailable$' { return 503 }
-            '^(forbidden|accessDenied|Authorization_RequestDenied)$' { return 403 }
-            '^badRequest$' { return 400 }
-            '^(unauthorized|InvalidAuthenticationToken)$' { return 401 }
-        }
-    }
-
-    $message = [string]$ErrorRecord.Exception.Message
-    if ($message -match 'HTTP/[\d.]+\s+(\d{3})' -or $message -match '\b([45]\d{2})\s*\(' -or
-        $message -match '\b(40[0-9]|429|50[0-9])\b') {
-        return [int]$Matches[1]
-    }
-    return 0
-}
-
-function Get-VivaProperty {
-    <#
-        Strict-mode-safe read of an optional property on a Graph object. Graph
-        omits absent properties entirely and a missing property is a fatal error
-        under Set-StrictMode.
-    #>
-    [CmdletBinding()]
-    param(
-        [AllowNull()]$InputObject,
-        [Parameter(Mandatory)][string]$Name,
-        $Default = $null
-    )
-
-    if ($null -eq $InputObject) { return $Default }
-    $property = $InputObject.PSObject.Properties[$Name]
-    if (-not $property -or $null -eq $property.Value) { return $Default }
-    return $property.Value
-}
-
 function Resolve-ColumnName {
     <#
-        Returns the actual header matching one of $Candidates. This stays local
-        rather than deferring to Import-MigrationCsv: the toolkit's alias
-        vocabulary maps 'Title' to JobTitle and 'Type' to ObjectType, which are
-        the wrong columns for a learner-history CSV, where they mean CourseTitle
-        and ActivityType.
+        Returns the actual header matching one of $Candidates. The CSV is read with a
+        plain Import-Csv and resolved here rather than through Import-MigrationCsv: the
+        toolkit's shared vocabulary maps 'Title' to JobTitle and 'Email'/'Mail' to
+        PrimarySmtpAddress, which are the wrong columns for a learner-history CSV where
+        they mean CourseTitle and the learner's UPN.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -431,13 +357,13 @@ function Resolve-TargetUserId {
     try {
         $escaped = [uri]::EscapeDataString($Upn)
         $resolved = Invoke-MigrationGraphRequest -Method GET -Uri "/v1.0/users/$escaped`?`$select=id"
-        $script:UserIdByUpn[$Upn] = [string](Get-VivaProperty -InputObject $resolved -Name 'id')
+        $script:UserIdByUpn[$Upn] = [string](Get-MigrationProperty -InputObject $resolved -Name 'id')
     }
     catch {
         # Only a real 404 means "user not found". A 403 (User.Read.All missing),
         # 401 or exhausted throttle must surface as itself, not be cached as a
         # phantom missing user for the rest of the run.
-        if ((Get-VivaGraphStatusCode -ErrorRecord $_) -ne 404) { throw }
+        if ((Get-MigrationGraphErrorStatusCode -ErrorRecord $_) -ne 404) { throw }
         $script:UserIdByUpn[$Upn] = $false
     }
     return $script:UserIdByUpn[$Upn]
@@ -468,7 +394,6 @@ try {
 
     Initialize-MigrationModule -Name 'Microsoft.Graph.Authentication'
 
-    #region Load and validate the CSV ------------------------------------------
     $csvRows = @(Import-Csv -LiteralPath $CsvPath)
     if ($csvRows.Count -eq 0) { throw "CSV '$CsvPath' contains no rows." }
 
@@ -514,9 +439,8 @@ try {
 
     Write-MigrationLog -Message "CSV rows: $($csvRows.Count)" -Level INFO
 
-    # Source -> target lookup from the identity plan. Both the plan's source UPN
-    # and its source primary SMTP are indexed, because a hand-built history CSV
-    # may be keyed on either.
+    # Both the plan's source UPN and its source primary SMTP are indexed: a
+    # hand-built history CSV may be keyed on either.
     $planUpnMap = $null
     if ($PlanPath) {
         $planUpnMap = @{}
@@ -533,19 +457,15 @@ try {
         Write-MigrationLog -Message "Identity plan supplies $($planUpnMap.Count) source-to-target address mapping(s)." -Level INFO
     }
 
-    # Ask for the mapping domain once when neither -TargetDomain, -KeepCsvDomains
-    # nor -PlanPath was chosen, so hand-off runs don't silently import
+    # Asked once when no mapping was chosen, so hand-off runs don't silently import
     # source-domain UPNs. A TargetUserPrincipalName column doesn't suppress the
-    # prompt - it may only cover some rows, and blank cells fall back to this
-    # mapping.
+    # prompt: it may cover only some rows, and blank cells fall back to this mapping.
     if (-not $TargetDomain -and -not $KeepCsvDomains -and -not $PlanPath) {
         $answer = ((Read-Host 'Destination UPN domain to map users to (blank = keep the CSV domains)') ?? '').Trim()
         if ($answer) { $TargetDomain = $answer.TrimStart('@') }
         else { $KeepCsvDomains = $true }
     }
-    #endregion -----------------------------------------------------------------
 
-    #region Step 1 - resolve or register the learning provider -----------------
     $providerId = $LearningProviderId
 
     if ($providerId) {
@@ -559,14 +479,14 @@ try {
 
         $providers = @(Invoke-MigrationGraphRequest -Method GET -All -Uri '/v1.0/employeeExperience/learningProviders')
         $existing = $providers |
-            Where-Object { [string](Get-VivaProperty -InputObject $_ -Name 'displayName') -ieq $ProviderDisplayName } |
+            Where-Object { [string](Get-MigrationProperty -InputObject $_ -Name 'displayName') -ieq $ProviderDisplayName } |
             Select-Object -First 1
 
         if ($existing) {
-            $providerId = [string](Get-VivaProperty -InputObject $existing -Name 'id')
+            $providerId = [string](Get-MigrationProperty -InputObject $existing -Name 'id')
             Write-MigrationLog -Message "Reusing existing provider '$ProviderDisplayName' [$providerId]" -Level SUCCESS
 
-            if (-not (Get-VivaProperty -InputObject $existing -Name 'isCourseActivitySyncEnabled' -Default $false)) {
+            if (-not (Get-MigrationProperty -InputObject $existing -Name 'isCourseActivitySyncEnabled' -Default $false)) {
                 # Course activity writes are rejected while sync is disabled on the provider.
                 if ($PSCmdlet.ShouldProcess($ProviderDisplayName, 'Enable course-activity sync on the learning provider')) {
                     Invoke-MigrationAction -Description "Enable course-activity sync on provider '$ProviderDisplayName'" -Action {
@@ -610,7 +530,7 @@ try {
                     }
                 }
                 if ($created) {
-                    $providerId = [string](Get-VivaProperty -InputObject $created -Name 'id')
+                    $providerId = [string](Get-MigrationProperty -InputObject $created -Name 'id')
                     Write-MigrationLog -Message "Registered provider '$ProviderDisplayName' [$providerId]" -Level SUCCESS
                 }
             }
@@ -618,9 +538,7 @@ try {
 
         try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { $null = $_ }
     }
-    #endregion -----------------------------------------------------------------
 
-    #region Connect app-only for content + activities --------------------------
     # Client-credential auth is outside Connect-MigrationGraph's remit (it owns
     # the interactive/GDAP path), so this phase calls Connect-MgGraph directly.
     Write-MigrationLog -Message 'Connecting to Microsoft Graph with application credentials...' -Level INFO
@@ -642,12 +560,9 @@ try {
     # The API only accepts activity writes for real, licensed provider registrations;
     # a DryRun with a placeholder provider id skips every call that would need it.
     $providerIsReal = $providerId -and $providerId -ne $newProviderPlaceholder
-    #endregion -----------------------------------------------------------------
 
-    #region Step 2 - build and upsert the course catalog -----------------------
-    # One catalog item per distinct course. Preference order for the upsert key:
-    # the source catalog's own external ID, then the source content GUID, then the
-    # course URL as a last resort (hand-built CSVs may only have URLs).
+    # One catalog item per distinct course, keyed by the source catalog's own
+    # external ID, then the source content GUID, then the URL (hand-built CSVs).
     $catalog = [ordered]@{}
     foreach ($row in $csvRows) {
         $key = (Get-CsvValue -Record $row -Column $columns.ContentExtId) ??
@@ -729,12 +644,12 @@ try {
                     -Uri "/v1.0/employeeExperience/learningProviders/$providerId/learningContents(externalId='$keyLiteral')" `
                     -Body $body
             }
-            $contentId = [string](Get-VivaProperty -InputObject $upserted -Name 'id')
+            $contentId = [string](Get-MigrationProperty -InputObject $upserted -Name 'id')
             if (-not $contentId) {
                 # 202 is asynchronous - fall back to reading the item if the body had no id.
                 $readBack = Invoke-MigrationGraphRequest -Method GET `
                     -Uri "/v1.0/employeeExperience/learningProviders/$providerId/learningContents(externalId='$keyLiteral')"
-                $contentId = [string](Get-VivaProperty -InputObject $readBack -Name 'id')
+                $contentId = [string](Get-MigrationProperty -InputObject $readBack -Name 'id')
             }
             $contentIdByKey[$course.Key] = $contentId
         }
@@ -745,9 +660,7 @@ try {
 
     Write-Progress -Activity 'Upserting learning content' -Completed
     Write-MigrationLog -Message "Catalog items ready: $($contentIdByKey.Count)   Failed: $($contentFailures.Count)" -Level INFO
-    #endregion -----------------------------------------------------------------
 
-    #region Step 3 - create the course activities ------------------------------
     $rowIndex = 0
 
     foreach ($row in $csvRows) {
@@ -821,7 +734,7 @@ try {
                         -Uri "/v1.0/employeeExperience/learningProviders/$providerId/learningCourseActivities(externalCourseActivityId='$activityKeyLiteral')"
                 }
                 catch {
-                    if ((Get-VivaGraphStatusCode -ErrorRecord $_) -ne 404) { throw }
+                    if ((Get-MigrationGraphErrorStatusCode -ErrorRecord $_) -ne 404) { throw }
                 }
 
                 if ($existingActivity) {
@@ -941,9 +854,8 @@ try {
             'Skipped' { 'WARNING' }
             default { 'WARNING' }
         }
-        # Written per row rather than only in the summary: Write-MigrationLog appends
-        # to the log file as it goes, so activities already created in the destination
-        # tenant stay accounted for even if the session is lost mid-import.
+        # Per row rather than only in the summary: the log file is appended as the run
+        # goes, so records already created survive a session lost mid-import.
         Write-MigrationLog -Message ('  [{0}] {1} -> {2} - {3}' -f $rowStatus, $sourceUpn, $targetUpn, $detail) -Level $level
 
         $results.Add([pscustomobject][ordered]@{
@@ -959,7 +871,6 @@ try {
     }
 
     Write-Progress -Activity 'Importing course activities' -Completed
-    #endregion -----------------------------------------------------------------
 
     if (-not $DryRun) {
         Write-MigrationLog -Message ("Imported records appear on each user's My Learning tab; catalog content can take up to " +

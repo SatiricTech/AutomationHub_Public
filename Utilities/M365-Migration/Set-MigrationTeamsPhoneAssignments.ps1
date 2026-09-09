@@ -11,26 +11,18 @@
     source (Remove-MigrationTeamsPhoneAssignments.ps1) and land in the destination tenant,
     this script assigns them back to users.
 
-    The work is supplied one of three ways (choose exactly one):
-      -User + -PhoneNumber   Assign one number to one user. Handy for rehearsing the flow
-                             before running the batch.
-      -CsvPath               A CSV pairing users (UPN) with phone numbers. The export from
-                             Get-MigrationTeamsPhoneAssignments.ps1 and the results CSV from
-                             Remove-MigrationTeamsPhoneAssignments.ps1 both work directly, so
-                             "all users" is simply the full export CSV.
-      -ListUnassigned        No changes - list every telephone number in the tenant inventory
-                             that is NOT assigned to anyone and export it to a CSV whose name
-                             matches the one Get-MigrationTeamsPhoneAssignments.ps1 writes.
+    The work is supplied one of three ways (choose exactly one): -User + -PhoneNumber (one
+    number to one user, to rehearse the flow), -CsvPath (a CSV pairing users with numbers -
+    both the Get- export and the Remove- results file work directly, so "all users" is simply
+    the full export CSV), or -ListUnassigned (no changes; lists every free number in the
+    tenant inventory into the same CSV name the Get- script writes).
 
     Phone numbers are normalised automatically (a leading 'tel:', spaces, dashes and
     parentheses are stripped; a missing leading '+' is added), and ';ext=' extensions are
-    preserved.
-
-    The number type (CallingPlan / OperatorConnect / DirectRouting) is auto-detected from the
-    tenant's number inventory when the CSV or parameters do not provide one: numbers found in
-    the inventory use their real type, numbers not in the inventory are assumed to be Direct
-    Routing. A number already assigned to a DIFFERENT user is reported as Failed rather than
-    stolen from its current owner.
+    preserved. The number type (CallingPlan / OperatorConnect / DirectRouting) is
+    auto-detected from the tenant's inventory when nothing supplies one - numbers absent from
+    the inventory are assumed to be Direct Routing. A number already assigned to a DIFFERENT
+    user is reported as Failed rather than stolen from its current owner.
 
     If the CSV has an OnlineVoiceRoutingPolicy column (or -VoiceRoutingPolicy is passed), the
     policy is granted after a successful assignment - Direct Routing numbers do not place
@@ -129,13 +121,10 @@
     Permissions : Teams Administrator, or Teams Communications Administrator. No Graph scopes
                   are used.
     GDAP        : supported through -TenantId, which Connect-MigrationTeams passes to
-                  Connect-MicrosoftTeams. -DelegatedOrganization is an Exchange Online
-                  concept and does not apply - this script never connects to Exchange.
-
+                  Connect-MicrosoftTeams. This script never connects to Exchange.
     Licensing   : users must hold a Teams Phone license (e.g. Teams Phone Standard) before a
                   number can be assigned. Unlicensed users are reported as Failed by the
                   service, and the row's Detail says so.
-
     Exit codes  : 0 success, 1 fatal error, 2 completed with one or more failed rows.
 
     Written with assistance from Claude (Anthropic).
@@ -189,146 +178,17 @@ Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Fo
 
 #region Configuration ----------------------------------------------------------
 
-# Get-CsPhoneNumberAssignment caps a response well below a large tenant's inventory, so the
-# inventory is walked in pages of this size.
-$inventoryPageSize = 1000
-
 $validNumberTypes = @('CallingPlan', 'OperatorConnect', 'OCMobile', 'DirectRouting')
 
-# Candidate headers for the columns the toolkit's shared alias vocabulary does not cover.
-# 'Type' and 'Email' are deliberately absent: Import-MigrationCsv claims them for ObjectType
-# and PrimarySmtpAddress, so accepting them here would read the wrong column.
+# Header spellings Import-MigrationCsv's shared vocabulary does not already canonicalise.
+# 'Type' and 'Email' are deliberately absent: the vocabulary claims them for ObjectType and
+# PrimarySmtpAddress, so accepting them here would read the wrong column.
 $phoneColumnCandidates = @{
-    Number    = @('PhoneNumber', 'TelephoneNumber', 'Phone Number', 'Phone', 'Number', 'LineUri')
-    Type      = @('PhoneNumberType', 'NumberType')
-    Location  = @('LocationId', 'Location Id', 'EmergencyLocationId')
-    Policy    = @('OnlineVoiceRoutingPolicy', 'VoiceRoutingPolicy')
+    Number    = @('PhoneNumber', 'TelephoneNumber', 'Phone Number', 'Phone')
+    Type      = @('PhoneNumberType')
+    Location  = @('LocationId', 'Location Id')
+    Policy    = @('OnlineVoiceRoutingPolicy')
     Extension = @('Extension', 'Ext')
-}
-
-#endregion ---------------------------------------------------------------------
-
-#region Functions --------------------------------------------------------------
-
-function Format-MigrationE164 {
-    <#
-        Normalises a phone number to E.164, preserving any ';ext=' suffix: strips 'tel:', spaces,
-        dashes, dots and brackets, then adds a leading '+'. Returns $null rather than a guess when
-        the remainder is not all digits - a malformed number must fail its row, not be silently
-        assigned to the wrong person.
-
-        Verbatim copy of the M365Migration module's private helper of the same name;
-        the module does not export it, so this script cannot call it. Delete this copy
-        once the module promotes it to Public/ - the code is identical.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Value
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-
-    $number = $Value.Trim() -replace '^(?i)tel:', ''
-    $extension = $null
-    if ($number -match '^(?<num>[^;]+);(?i)ext=(?<ext>.+)$') {
-        $number = $Matches['num']
-        $extension = $Matches['ext'].Trim()
-    }
-
-    $number = $number -replace '[\s\-\.\(\)]', ''
-    if ($number -match '^\+?\d+$') {
-        if (-not $number.StartsWith('+')) { $number = "+$number" }
-    }
-    else {
-        return $null
-    }
-
-    if ($extension) { return "$number;ext=$extension" }
-    return $number
-}
-
-function Resolve-MigrationTeamsUser {
-    <#
-        Resolves a UPN or object ID to a Teams user, returning $null instead of throwing when the
-        identity is unknown, so a per-row loop records the miss and carries on rather than
-        aborting the whole wave. Requires an active MicrosoftTeams session.
-
-        Verbatim copy of the M365Migration module's private helper of the same name;
-        the module does not export it, so this script cannot call it. Delete this copy
-        once the module promotes it to Public/ - the code is identical.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Identity
-    )
-
-    try {
-        return Get-CsOnlineUser -Identity $Identity -ErrorAction Stop
-    }
-    catch {
-        Write-MigrationLog -Message "Teams user '$Identity' could not be resolved: $($_.Exception.Message)" -Level DEBUG
-        return $null
-    }
-}
-
-function Get-MigrationPhoneNumberInventory {
-    <#
-        Returns the tenant's telephone number inventory, walking -Skip until a short page comes
-        back: Get-CsPhoneNumberAssignment returns a bounded page, so a large tenant silently loses
-        the tail unless the caller pages itself. -Filter splats extra named arguments onto the
-        cmdlet, e.g. @{ PstnAssignmentStatus = 'Unassigned' }.
-
-        Not present in the M365Migration module at all - all three Teams Phone scripts carry an
-        identical copy. Flagged for promotion.
-    #>
-    [CmdletBinding()]
-    [OutputType([object[]])]
-    param(
-        [hashtable]$Filter = @{}
-    )
-
-    $all = [System.Collections.Generic.List[object]]::new()
-    $skip = 0
-    while ($true) {
-        $page = @(Get-CsPhoneNumberAssignment @Filter -Top $inventoryPageSize -Skip $skip -ErrorAction Stop)
-        if ($page.Count -gt 0) { $all.AddRange($page) }
-        if ($page.Count -lt $inventoryPageSize) { break }
-        $skip += $inventoryPageSize
-    }
-    return $all.ToArray()
-}
-
-function Resolve-MigrationColumnName {
-    <#
-        Returns the first candidate header actually present in a CSV's column list (case-
-        insensitive, candidate order wins). Import-MigrationCsv canonicalises only the columns the
-        toolkit's shared vocabulary knows and passes the rest through untouched, so the Teams Phone
-        columns still need a tolerant lookup.
-
-        Not in the module - the better fix is extending Import-MigrationCsv's alias vocabulary.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [string[]]$Headers,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string[]]$Candidates
-    )
-
-    foreach ($candidate in $Candidates) {
-        $hit = $Headers | Where-Object { $_ -ieq $candidate } | Select-Object -First 1
-        if ($hit) { return $hit }
-    }
-    return $null
 }
 
 #endregion ---------------------------------------------------------------------
@@ -349,8 +209,6 @@ try {
 
     $null = Connect-MigrationTeams -TenantId $TenantId
 
-    #region List unassigned numbers (read-only mode) ---------------------------
-
     if ($PSCmdlet.ParameterSetName -eq 'Unassigned') {
         Write-MigrationLog -Message 'Retrieving unassigned telephone numbers...' -Level INFO
         $unassigned = @(Get-MigrationPhoneNumberInventory -Filter @{ PstnAssignmentStatus = 'Unassigned' })
@@ -369,7 +227,6 @@ try {
                     LocationId         = [string]$number.LocationId
                     ActivationState    = [string]$number.ActivationState
                 })
-
             $listResults.Add([pscustomobject][ordered]@{
                     Identity        = [string]$number.TelephoneNumber
                     Action          = 'List unassigned number'
@@ -409,10 +266,6 @@ try {
         exit $exitCode
     }
 
-    #endregion -----------------------------------------------------------------
-
-    #region Build the work list ------------------------------------------------
-
     # Each item: Identity (as supplied), PhoneNumber (raw), PhoneNumberType, LocationId,
     # VoiceRoutingPolicy - resolved and validated in the assignment loop.
     $workItems = [System.Collections.Generic.List[object]]::new()
@@ -432,22 +285,32 @@ try {
             $rows = @(Import-MigrationCsv -Path $CsvPath)
             $headers = @($rows[0].PSObject.Properties.Name)
 
+            # -contains and the PSObject property indexer are both case-insensitive, so the
+            # candidate spelling can be handed straight to Get-MigrationCsvValue.
+            $pickColumn = {
+                param([string[]]$Candidates)
+                foreach ($candidate in $Candidates) {
+                    if ($headers -contains $candidate) { return $candidate }
+                }
+                return $null
+            }
+
             # Import-MigrationCsv maps a bare Email/Mail column to PrimarySmtpAddress rather
             # than UserPrincipalName, so fall back to it before giving up on the file.
-            $userColumn = Resolve-MigrationColumnName -Headers $headers -Candidates 'UserPrincipalName', 'PrimarySmtpAddress'
+            $userColumn = & $pickColumn @('UserPrincipalName', 'PrimarySmtpAddress')
             if (-not $userColumn) {
                 throw "Could not find a user column in '$CsvPath'. Headers: $($headers -join ', ')"
             }
 
-            $numberColumn = Resolve-MigrationColumnName -Headers $headers -Candidates $phoneColumnCandidates.Number
+            $numberColumn = & $pickColumn $phoneColumnCandidates.Number
             if (-not $numberColumn) {
                 throw "Could not find a PhoneNumber/TelephoneNumber/LineUri column in '$CsvPath'. Headers: $($headers -join ', ')"
             }
 
-            $typeColumn = Resolve-MigrationColumnName -Headers $headers -Candidates $phoneColumnCandidates.Type
-            $locationColumn = Resolve-MigrationColumnName -Headers $headers -Candidates $phoneColumnCandidates.Location
-            $policyColumn = Resolve-MigrationColumnName -Headers $headers -Candidates $phoneColumnCandidates.Policy
-            $extensionColumn = Resolve-MigrationColumnName -Headers $headers -Candidates $phoneColumnCandidates.Extension
+            $typeColumn = & $pickColumn $phoneColumnCandidates.Type
+            $locationColumn = & $pickColumn $phoneColumnCandidates.Location
+            $policyColumn = & $pickColumn $phoneColumnCandidates.Policy
+            $extensionColumn = & $pickColumn $phoneColumnCandidates.Extension
 
             foreach ($row in $rows) {
                 $identity = [string](Get-MigrationCsvValue -Row $row -Name $userColumn -Default '')
@@ -485,10 +348,6 @@ try {
             $numbersByTelephone[[string]$number.TelephoneNumber] = $number
         }
     }
-
-    #endregion -----------------------------------------------------------------
-
-    #region Assignment loop ----------------------------------------------------
 
     $results = [System.Collections.Generic.List[object]]::new()
     $index = 0
@@ -617,8 +476,6 @@ try {
     }
 
     Write-Progress -Activity 'Assigning phone numbers' -Completed
-
-    #endregion -----------------------------------------------------------------
 
     $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Set-TeamsPhoneAssignments'
 }

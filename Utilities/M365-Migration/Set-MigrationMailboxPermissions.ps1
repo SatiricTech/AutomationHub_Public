@@ -202,126 +202,6 @@ $calendarFolderHint = 'The calendar folder could not be addressed as <mailbox>:\
 
 #region Functions -------------------------------------------------------------------------------
 
-function Get-PlanAddressMap {
-    <#
-    .SYNOPSIS
-        Builds the Source-to-Target address lookup used for both mailboxes and trustees.
-
-    .DESCRIPTION
-        A permission row from the source tenant names its mailbox and trustee by whatever address
-        Exchange happened to return - the primary SMTP most of the time, but an alias, a UPN or a
-        display name often enough to matter. Every one of those is registered as a key pointing at
-        the row's destination address, so a lookup succeeds regardless of which form the inventory
-        captured.
-
-        The destination address is the first non-empty of TargetPrimarySmtp,
-        TargetUserPrincipalName, InterimPrimarySmtp and InterimUserPrincipalName, which lets the
-        script run before or after the vanity domain has been cut over.
-
-        Pure function - no tenant calls.
-
-    .PARAMETER Rows
-        Plan rows from Import-MigrationPlan.
-
-    .EXAMPLE
-        $map = Get-PlanAddressMap -Rows $planRows
-        $map['jsmith@contoso.com']
-
-        Returns john.smith@newco.com for a plan row whose source primary SMTP was jsmith@contoso.com.
-    #>
-    [CmdletBinding()]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
-        Justification = 'The parameter is a set of rows and the plural reads correctly.')]
-    [OutputType([hashtable])]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$Rows
-    )
-
-    $map = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
-
-    foreach ($row in @($Rows)) {
-        $target = ''
-        foreach ($column in @('TargetPrimarySmtp', 'TargetUserPrincipalName', 'InterimPrimarySmtp',
-                'InterimUserPrincipalName')) {
-            $candidate = ([string](Get-MigrationCsvValue -Row $row -Name $column -Default '')).Trim()
-            if ($candidate) { $target = $candidate -replace '^(?i)smtp:', ''; break }
-        }
-        if (-not $target) { continue }
-
-        $keys = [System.Collections.Generic.List[string]]::new()
-        foreach ($column in @('SourceObjectId', 'SourceUserPrincipalName', 'SourcePrimarySmtp', 'DisplayName')) {
-            $value = ([string](Get-MigrationCsvValue -Row $row -Name $column -Default '')).Trim()
-            if ($value) { $keys.Add($value) }
-        }
-        foreach ($alias in (Split-MigrationList -Value (Get-MigrationCsvValue -Row $row -Name 'SourceAliases' -Default ''))) {
-            $value = ([string]$alias).Trim() -replace '^(?i)smtp:', ''
-            if ($value) { $keys.Add($value) }
-        }
-
-        # First row wins. A duplicate key means two source objects claim the same address, which the
-        # planning phase already flagged - overwriting here would just hide it.
-        foreach ($key in $keys) {
-            if (-not $map.ContainsKey($key)) { $map[$key] = $target }
-        }
-    }
-
-    return $map
-}
-
-function Resolve-MappedAddress {
-    <#
-    .SYNOPSIS
-        Translates one source address into its destination address.
-
-    .DESCRIPTION
-        Returns a verdict rather than throwing, because an unmapped trustee is an ordinary and
-        expected outcome - a departed employee, a service account that was never in scope, a group
-        the plan does not cover - and each one has to be reported on its own result row rather than
-        aborting the run.
-
-    .PARAMETER Map
-        The hashtable from Get-PlanAddressMap.
-
-    .PARAMETER Address
-        The source address or display name to translate.
-
-    .PARAMETER Role
-        'mailbox' or 'trustee' - used only to word the skip reason.
-
-    .EXAMPLE
-        Resolve-MappedAddress -Map $map -Address 'jsmith@contoso.com' -Role trustee
-
-        Returns IsMapped $true and the destination address for a trustee the plan covers.
-    #>
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory)][ValidateNotNull()][hashtable]$Map,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Address,
-        [Parameter(Mandatory = $false)][string]$Role = 'object'
-    )
-
-    $source = ([string]$Address).Trim() -replace '^(?i)smtp:', ''
-
-    if ([string]::IsNullOrWhiteSpace($source)) {
-        return [pscustomobject]@{
-            Source = ''; Address = ''; IsMapped = $false
-            Detail = "The permission row has no $Role address."
-        }
-    }
-
-    if ($Map.ContainsKey($source)) {
-        return [pscustomobject]@{ Source = $source; Address = [string]$Map[$source]; IsMapped = $true; Detail = '' }
-    }
-
-    [pscustomobject]@{
-        Source = $source; Address = ''; IsMapped = $false
-        Detail = "The plan has no destination address for the $Role '$source'."
-    }
-}
-
 function ConvertFrom-PermissionEntry {
     <#
     .SYNOPSIS
@@ -332,9 +212,6 @@ function ConvertFrom-PermissionEntry {
         carry both the mailbox-level grants and the folder-level ones. Everything else is a bare
         kind with no rights of its own.
 
-    .PARAMETER Permission
-        The Permission cell, e.g. 'FullAccess' or 'Calendar:Editor'.
-
     .EXAMPLE
         ConvertFrom-PermissionEntry -Permission 'Calendar:LimitedDetails'
 
@@ -343,9 +220,7 @@ function ConvertFrom-PermissionEntry {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string]$Permission
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Permission
     )
 
     $text = ([string]$Permission).Trim()
@@ -385,9 +260,6 @@ function ConvertTo-PermissionPrincipal {
         Rather than special-casing each shape at the comparison site, every plausible identifier is
         flattened into one list here and the comparison becomes a set intersection.
 
-    .PARAMETER Entry
-        An existing permission object, or a plain string.
-
     .EXAMPLE
         ConvertTo-PermissionPrincipal -Entry $folderPermission
 
@@ -396,9 +268,7 @@ function ConvertTo-PermissionPrincipal {
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
-        [Parameter(Mandatory)]
-        [AllowNull()]
-        $Entry
+        [Parameter(Mandatory)][AllowNull()]$Entry
     )
 
     $values = [System.Collections.Generic.List[string]]::new()
@@ -456,18 +326,6 @@ function Get-PermissionDiff {
 
         A trustee is considered present when any of its known identifiers matches any identifier on
         an existing entry, because the two sides are rarely expressed the same way.
-
-    .PARAMETER Existing
-        The permissions already on the destination mailbox, as returned by the relevant Get- cmdlet.
-
-    .PARAMETER TrusteeIdentifier
-        Every identifier the wanted trustee is known by - destination address and display name.
-
-    .PARAMETER Kind
-        FullAccess, SendAs, SendOnBehalf or Calendar.
-
-    .PARAMETER AccessRights
-        The wanted calendar access rights. Ignored for the other kinds.
 
     .EXAMPLE
         Get-PermissionDiff -Existing $current -TrusteeIdentifier 'john.smith@newco.com' -Kind FullAccess
@@ -531,30 +389,6 @@ function New-PermissionResult {
     .SYNOPSIS
         Builds one result row for a permission the script considered.
 
-    .PARAMETER Identity
-        The destination mailbox, or the source mailbox when it could not be mapped.
-
-    .PARAMETER Action
-        FullAccess, SendAs, SendOnBehalf, Calendar or Forwarding.
-
-    .PARAMETER Status
-        Planned, Succeeded, Skipped or Failed.
-
-    .PARAMETER Detail
-        Human-readable outcome.
-
-    .PARAMETER SourceMailbox
-        The mailbox address as it appeared in the source inventory.
-
-    .PARAMETER SourceTrustee
-        The trustee as it appeared in the source inventory.
-
-    .PARAMETER Trustee
-        The destination trustee address.
-
-    .PARAMETER AccessRights
-        The access rights involved, where the kind has any.
-
     .EXAMPLE
         New-PermissionResult -Identity 'reception@newco.com' -Action FullAccess -Status Succeeded `
             -Detail 'Granted.' -SourceMailbox 'reception@contoso.com' -SourceTrustee 'jsmith@contoso.com'
@@ -597,18 +431,6 @@ function Add-MailboxAccessRight {
         One call site per permission kind, so the DryRun guarantee has a single place to hold.
         Invoke-MigrationAction short-circuits in DryRun mode and the Add-/Set- cmdlet is never
         reached.
-
-    .PARAMETER Mailbox
-        The destination mailbox.
-
-    .PARAMETER Trustee
-        The destination trustee.
-
-    .PARAMETER Kind
-        FullAccess, SendAs or SendOnBehalf.
-
-    .PARAMETER AutoMapping
-        Whether a FullAccess grant is auto-mapped into the delegate's Outlook profile.
 
     .EXAMPLE
         Add-MailboxAccessRight -Mailbox 'reception@newco.com' -Trustee 'john.smith@newco.com' -Kind FullAccess
@@ -654,18 +476,6 @@ function Set-MailboxCalendarPermission {
         have none, so the caller's diff decides which one to use rather than the script catching an
         error and guessing.
 
-    .PARAMETER Mailbox
-        The destination mailbox. The folder is addressed as <mailbox>:\Calendar.
-
-    .PARAMETER Trustee
-        The destination trustee.
-
-    .PARAMETER AccessRights
-        The calendar access rights, e.g. Editor, Reviewer or LimitedDetails.
-
-    .PARAMETER Mode
-        Add for a trustee with no existing right, Update to change an existing one.
-
     .EXAMPLE
         Set-MailboxCalendarPermission -Mailbox 'jane@newco.com' -Trustee 'john.smith@newco.com' `
             -AccessRights 'Editor' -Mode Add
@@ -706,18 +516,6 @@ function Set-MailboxForwarding {
         ForwardingAddress points at an internal recipient and is mapped through the plan;
         ForwardingSmtpAddress is a literal SMTP address that may well be external, so it is mapped
         when the plan knows it and passed through untouched when it does not.
-
-    .PARAMETER Mailbox
-        The destination mailbox.
-
-    .PARAMETER ForwardingAddress
-        The internal recipient to forward to, or an empty string to leave it alone.
-
-    .PARAMETER ForwardingSmtpAddress
-        The SMTP address to forward to, or an empty string to leave it alone.
-
-    .PARAMETER DeliverToMailboxAndForward
-        Whether a copy stays in the mailbox.
 
     .EXAMPLE
         Set-MailboxForwarding -Mailbox 'jane@newco.com' -ForwardingSmtpAddress 'team@fabrikam.com' `
@@ -769,12 +567,6 @@ function Get-DestinationPermissionState {
 
         Only the kinds actually requested are read, so a Calendar-only run never touches
         Get-EXOMailboxPermission.
-
-    .PARAMETER Mailbox
-        The destination mailbox.
-
-    .PARAMETER Kind
-        Which permission kinds to read.
 
     .EXAMPLE
         Get-DestinationPermissionState -Mailbox 'reception@newco.com' -Kind FullAccess,Calendar
@@ -853,17 +645,15 @@ try {
     }
     Write-MigrationLog -Message "Permission kinds: $($requestedKinds -join ', ')" -Level INFO
 
-    $actionableStatuses = @('Planned', 'ManualOverride', 'UpnSmtpDiverge')
-    if ($IncludeCollisions) { $actionableStatuses += 'Collision' }
-
     # The map spans every wave on purpose: delegation crosses waves, and a trustee who moved in an
     # earlier wave must still resolve while a later wave is being processed.
     $allPlanRows = @(Import-MigrationPlan -Path $PlanPath)
-    $addressMap = Get-PlanAddressMap -Rows $allPlanRows
+    $addressMap = Get-MigrationPlanAddressMap -Rows $allPlanRows
     Write-MigrationLog -Message "Address map holds $($addressMap.Count) source identifier(s)." -Level INFO
 
     # Mailboxes are restricted to the selected wave and to actionable plan statuses.
-    $selectedRows = @(Select-MigrationPlanRows -Rows $allPlanRows -Wave $Wave -PlanStatus $actionableStatuses)
+    $selectedRows = @(Select-MigrationPlanRows -Rows $allPlanRows -Wave $Wave |
+        Where-Object { (Test-MigrationPlanRowActionable -Row $_ -IncludeCollisions:$IncludeCollisions -AllowSynced).Actionable })
     $selectedMailbox = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($row in $selectedRows) {
         foreach ($column in @('SourceUserPrincipalName', 'SourcePrimarySmtp')) {
@@ -968,7 +758,7 @@ try {
             continue
         }
 
-        $mailboxMap = Resolve-MappedAddress -Map $addressMap -Address $item.SourceMailbox -Role 'mailbox'
+        $mailboxMap = Resolve-MigrationPlanAddress -Map $addressMap -Address $item.SourceMailbox -Role 'mailbox'
         if (-not $mailboxMap.IsMapped) {
             $results.Add((New-PermissionResult -Identity $item.SourceMailbox -Action $item.Kind -Status 'Skipped' `
                 -Detail $mailboxMap.Detail -SourceMailbox $item.SourceMailbox -SourceTrustee $item.SourceTrustee `
@@ -979,7 +769,7 @@ try {
 
         # Forwarding to an address outside the plan is legitimate - it is usually an external
         # partner - so an unmapped forwarding target is passed through rather than skipped.
-        $trusteeMap = Resolve-MappedAddress -Map $addressMap -Address $item.SourceTrustee -Role 'trustee'
+        $trusteeMap = Resolve-MigrationPlanAddress -Map $addressMap -Address $item.SourceTrustee -Role 'trustee'
         if (-not $trusteeMap.IsMapped -and $item.Kind -ne 'Forwarding') {
             $results.Add((New-PermissionResult -Identity $mailbox -Action $item.Kind -Status 'Skipped' `
                 -Detail $trusteeMap.Detail -SourceMailbox $item.SourceMailbox -SourceTrustee $item.SourceTrustee `

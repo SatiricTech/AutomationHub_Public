@@ -8,28 +8,19 @@
 
 .DESCRIPTION
     At cutover you often need to reset every migrating user to a known credential so it can
-    be handed out, then force the user to set their own on first sign-in. This script does
-    that for a batch of users described by an identity plan, a CSV, an Entra security group,
-    or a single rehearsal account.
+    be handed out, then force the user to set their own on first sign-in.
 
-    The target users are supplied one of four ways (choose exactly one):
-      -PlanPath  An IdentityPlan.csv. Rows are filtered with -Wave and, per the toolkit
-                 contract, only PlanStatus Planned / ManualOverride / UpnSmtpDiverge are
-                 acted on (add -IncludeCollisions to take Collision rows too). Each row is
-                 reset by its TargetUserPrincipalName, falling back to
-                 InterimUserPrincipalName when the target UPN has not been assigned yet.
-      -CsvPath   A CSV of users. The UserPrincipalName / UPN / Email column is resolved
-                 through the toolkit's shared column-alias vocabulary. One reset per row.
-      -Group     An Entra security group, given by its object ID (GUID) or its display name
-                 (NOT the group's email address). Every user member is reset.
-      -TestUser  A single user (UPN, email or object ID) so you can rehearse the whole flow
-                 against one account before running the batch.
+    The target users are supplied one of four ways (choose exactly one): -PlanPath (an
+    IdentityPlan.csv, filtered by -Wave, acting only on PlanStatus Planned /
+    ManualOverride / UpnSmtpDiverge, plus Collision with -IncludeCollisions, and reset by
+    TargetUserPrincipalName falling back to InterimUserPrincipalName), -CsvPath (a CSV of
+    users), -Group (an Entra security group, all user members) or -TestUser (one account,
+    to rehearse the flow).
 
-    Each user is assigned a UNIQUE passphrase (not a password): hyphenated dictionary words
-    plus a two-digit number and a symbol, reading like "silver-copper-Lantern74!". All four
-    character classes are present, so it clears the default Entra complexity rules while
-    staying dictatable over the phone. Every reset account is set to "change password at
-    next sign-in".
+    Each user is assigned a UNIQUE passphrase: hyphenated dictionary words plus a two-digit
+    number and a symbol, reading like "silver-copper-Lantern74!". All four character classes
+    are present, so it clears the default Entra complexity rules while staying dictatable
+    over the phone. Every reset account is set to "change password at next sign-in".
 
     Generated credentials are written ONLY to the results CSV - never to the run log, and
     never to the console. Store that file securely and delete it once the credentials have
@@ -40,8 +31,7 @@
     all - a credential is never emitted for a reset that did not happen.
 
 .PARAMETER PlanPath
-    Path to the IdentityPlan.csv produced by the planning phase. Rows are read through
-    Import-MigrationPlan, so the schema is validated before anything is touched.
+    Path to the IdentityPlan.csv produced by the planning phase.
 
 .PARAMETER Wave
     One or more wave labels to restrict the plan to. Omit to take every non-excluded row.
@@ -74,9 +64,8 @@
     Overrides the auto-derived log file path.
 
 .PARAMETER TenantId
-    Tenant ID (GUID) to sign in to. Useful for MSP / multi-tenant admins so the interactive
-    sign-in lands in the intended tenant, and for partner access under an active GDAP
-    relationship.
+    Tenant ID (GUID) to sign in to. Useful for MSP / multi-tenant admins, and for partner
+    access under an active GDAP relationship.
 
 .PARAMETER WordCount
     Number of words in each generated passphrase. Minimum (and default) 3.
@@ -96,8 +85,7 @@
 .EXAMPLE
     .\Reset-MigrationCutoverPasswords.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -Prefix Contoso -DryRun
 
-    Resolves every wave 1 plan row in the destination tenant and reports which accounts would
-    be reset, writing Contoso\Contoso_Reset-CutoverPasswords-DryRun_<timestamp>.csv.
+    Reports which wave 1 accounts would be reset, writing a -DryRun_ results file.
 
 .EXAMPLE
     .\Reset-MigrationCutoverPasswords.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -Prefix Contoso
@@ -110,11 +98,6 @@
     Resets every user named in a CSV to a four-word passphrase.
 
 .EXAMPLE
-    .\Reset-MigrationCutoverPasswords.ps1 -Group 'Migration Wave 1' -TenantId contoso.onmicrosoft.com
-
-    Resets every user member of an Entra group in a specific tenant.
-
-.EXAMPLE
     .\Reset-MigrationCutoverPasswords.ps1 -TestUser john.smith@contoso.com -Verbosity High
 
     Rehearses the whole flow against one account with full console tracing.
@@ -124,23 +107,12 @@
     Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
                   Microsoft.Graph.Authentication / .Users / .Groups (installed on demand).
     Graph scopes: User.ReadWrite.All, User-PasswordProfile.ReadWrite.All,
-                  Directory.ReadWrite.All, Group.Read.All.
-
-                  Resetting a password writes user.passwordProfile, which is gated behind
-                  the dedicated User-PasswordProfile.ReadWrite.All scope -
-                  User.ReadWrite.All alone returns 403 Authorization_RequestDenied
-                  regardless of the signed-in admin's role. Group.Read.All covers the
-                  group-member lookup.
-
-    Directory role: the signed-in account also needs a role that can reset the target users
-                  (e.g. User Administrator). Resetting another ADMINISTRATOR's password
-                  requires Privileged Authentication Administrator or Global Administrator.
-
-    GDAP        : supported through -TenantId. Connect-MgGraph -TenantId <customer> works for
-                  a partner user under an active GDAP relationship, scoped to the roles that
-                  relationship granted. -DelegatedOrganization is an Exchange Online concept
-                  and does not apply here - this script never connects to Exchange.
-
+                  Directory.ReadWrite.All, Group.Read.All. The password profile write is
+                  gated behind User-PasswordProfile.ReadWrite.All specifically -
+                  User.ReadWrite.All alone returns 403 whatever the admin's role.
+    Roles       : the signed-in account needs a role that can reset the target users (e.g.
+                  User Administrator); resetting another ADMINISTRATOR requires Privileged
+                  Authentication Administrator. GDAP works through -TenantId.
     Exit codes  : 0 success, 1 fatal error, 2 completed with one or more failed rows.
 
     Written with assistance from Claude (Anthropic).
@@ -197,10 +169,9 @@ Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Fo
 
 #region Configuration ----------------------------------------------------------
 
-# Resetting a password writes user.passwordProfile, which is gated behind the dedicated
-# User-PasswordProfile.ReadWrite.All permission - User.ReadWrite.All alone returns 403
-# Authorization_RequestDenied. Connect-MigrationGraph drops a cached session that lacks any
-# of these and verifies every one was actually granted, so a declined consent fails once
+# Resetting a password writes user.passwordProfile, gated behind the dedicated
+# User-PasswordProfile.ReadWrite.All permission - User.ReadWrite.All alone returns 403.
+# Connect-MigrationGraph verifies every scope was granted, so a declined consent fails once
 # here rather than 403-ing on every single user.
 $requiredGraphScopes = @(
     'User.ReadWrite.All'
@@ -209,8 +180,6 @@ $requiredGraphScopes = @(
     'Group.Read.All'
 )
 
-# Plan statuses a writer may act on, per the toolkit contract. Collision is opt-in because a
-# contested address usually needs an operator decision before anything is changed.
 $actionablePlanStatuses = @('Planned', 'ManualOverride', 'UpnSmtpDiverge')
 if ($IncludeCollisions) { $actionablePlanStatuses += 'Collision' }
 
@@ -221,77 +190,14 @@ $graphUserProperties = @('Id', 'UserPrincipalName', 'DisplayName')
 
 #region Functions --------------------------------------------------------------
 
-function New-MigrationPassphrase {
-    <#
-        Builds a cutover passphrase: hyphenated dictionary words plus a two-digit number and a
-        symbol, e.g. 'silver-copper-Lantern74!'. Readable over the phone, and all four character
-        classes clear the default Entra complexity floor. Get-Random -Count returns distinct
-        items, so a phrase never repeats a word.
-
-        Verbatim copy of the M365Migration module's private helper of the same name;
-        the module does not export it, so this script cannot call it. Delete this copy
-        once the module promotes it to Public/ - the code is identical.
-    #>
-    [CmdletBinding()]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
-        Justification = 'Generates an in-memory value; changes no system state.')]
-    [OutputType([string])]
-    param(
-        [ValidateRange(3, 8)]
-        [int]$WordCount = 3
-    )
-
-    # Short, unambiguous words - no easily confused look-alikes.
-    $words = @(
-        'apple', 'anchor', 'amber', 'basil', 'birch', 'brave', 'bronze', 'cactus',
-        'candle', 'cedar', 'cobalt', 'copper', 'coral', 'cotton', 'cricket', 'crimson',
-        'delta', 'ember', 'falcon', 'fern', 'flint', 'forest', 'garnet', 'ginger',
-        'granite', 'harbor', 'hazel', 'indigo', 'ivory', 'jasper', 'juniper', 'kettle',
-        'lantern', 'laurel', 'lemon', 'lily', 'lotus', 'maple', 'marble', 'meadow',
-        'mint', 'mocha', 'nectar', 'nimbus', 'oak', 'olive', 'onyx', 'orchid',
-        'pepper', 'pewter', 'pine', 'plum', 'quartz', 'raven', 'river', 'rustic',
-        'saffron', 'sage', 'silver', 'slate', 'spruce', 'stone', 'sunset', 'thistle',
-        'timber', 'topaz', 'tulip', 'velvet', 'willow', 'winter', 'zephyr'
-    )
-
-    $picked = @(Get-Random -InputObject $words -Count $WordCount)
-
-    # Capitalise one randomly chosen word to satisfy the mixed-case requirement.
-    $capIndex = Get-Random -Maximum $picked.Count
-    $word = $picked[$capIndex]
-    $picked[$capIndex] = $word.Substring(0, 1).ToUpperInvariant() + $word.Substring(1)
-
-    $number = Get-Random -Minimum 10 -Maximum 100
-    $symbols = '!@#$%^*-_=+?'
-    $symbol = $symbols[(Get-Random -Maximum $symbols.Length)]
-
-    return ('{0}{1}{2}' -f ($picked -join '-'), $number, $symbol)
-}
-
 function Resolve-CutoverPlanIdentity {
     <#
-    .SYNOPSIS
-        Picks the account a plan row should be reset by.
-
-    .DESCRIPTION
-        A cutover reset happens in the destination tenant, so the row's target UPN is the
-        right identity. Early in a migration the target vanity domain may not be verified
-        yet and the user only exists under the interim .onmicrosoft.com name, so an empty
-        TargetUserPrincipalName falls back to InterimUserPrincipalName. A row carrying
-        neither cannot be resolved and must be reported rather than guessed at.
-
-        Pure function: it reads the row and returns a decision, touching nothing else.
-
-    .PARAMETER Row
-        A plan row as returned by Import-MigrationPlan.
-
-    .EXAMPLE
-        Resolve-CutoverPlanIdentity -Row $planRow
-
-        Returns Identity, Source ('Target', 'Interim' or 'None') and Reason.
-
-    .NOTES
-        Author: AutomationHub
+        Picks the account a plan row should be reset by, returning Identity, Source
+        ('Target', 'Interim' or 'None') and Reason. A cutover reset happens in the
+        destination tenant, so the target UPN is the right identity; early in a migration
+        the vanity domain may not be verified yet and the user only exists under the
+        interim .onmicrosoft.com name, so an empty TargetUserPrincipalName falls back to
+        InterimUserPrincipalName. A row carrying neither is reported, never guessed at.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -303,11 +209,7 @@ function Resolve-CutoverPlanIdentity {
 
     $target = [string](Get-MigrationCsvValue -Row $Row -Name 'TargetUserPrincipalName' -Default '')
     if (-not [string]::IsNullOrWhiteSpace($target)) {
-        return [pscustomobject]@{
-            Identity = $target.Trim()
-            Source   = 'Target'
-            Reason   = ''
-        }
+        return [pscustomobject]@{ Identity = $target.Trim(); Source = 'Target'; Reason = '' }
     }
 
     $interim = [string](Get-MigrationCsvValue -Row $Row -Name 'InterimUserPrincipalName' -Default '')
@@ -319,7 +221,7 @@ function Resolve-CutoverPlanIdentity {
         }
     }
 
-    return [pscustomobject]@{
+    [pscustomobject]@{
         Identity = $null
         Source   = 'None'
         Reason   = 'Plan row has neither TargetUserPrincipalName nor InterimUserPrincipalName.'
@@ -328,7 +230,7 @@ function Resolve-CutoverPlanIdentity {
 
 function Resolve-CutoverUser {
     <#
-        Resolves a UPN, email or object ID to a Graph user object, returning $null rather than
+        Resolves a UPN, email or object ID to a Graph user, returning $null rather than
         throwing when the identity is unknown so a per-row loop can record the miss and carry on.
     #>
     [CmdletBinding()]
@@ -384,7 +286,7 @@ function Resolve-CutoverGroup {
     if ($hits.Count -gt 1) {
         throw "Multiple groups match display name '$Identity'. Re-run with the group's object ID to disambiguate."
     }
-    return $hits[0]
+    $hits[0]
 }
 
 #endregion ---------------------------------------------------------------------
@@ -400,22 +302,20 @@ try {
 
     # Fail on bad input paths before a sign-in prompt is put in front of the operator.
     switch ($PSCmdlet.ParameterSetName) {
-        'Csv' {
-            if (-not (Test-Path -LiteralPath $CsvPath)) { throw "CSV not found: $CsvPath" }
-        }
-        'Plan' {
-            if (-not (Test-Path -LiteralPath $PlanPath)) { throw "Identity plan not found: $PlanPath" }
-        }
+        'Csv' { if (-not (Test-Path -LiteralPath $CsvPath)) { throw "CSV not found: $CsvPath" } }
+        'Plan' { if (-not (Test-Path -LiteralPath $PlanPath)) { throw "Identity plan not found: $PlanPath" } }
     }
 
     Initialize-MigrationModule -Name 'Microsoft.Graph.Users', 'Microsoft.Graph.Groups'
     $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
 
-    #region Build the target list ----------------------------------------------
-
     # Each entry pairs the Graph user (or $null when unresolved) with the identity the
     # operator supplied, so an unresolved row still reports something recognisable.
     $targets = [System.Collections.Generic.List[object]]::new()
+    $addTarget = {
+        param([string]$Supplied, $User, [string]$Note)
+        $targets.Add([pscustomobject]@{ Supplied = $Supplied; User = $User; Note = $Note })
+    }
 
     switch ($PSCmdlet.ParameterSetName) {
         'Plan' {
@@ -426,17 +326,13 @@ try {
                 $choice = Resolve-CutoverPlanIdentity -Row $row
                 if ([string]::IsNullOrWhiteSpace($choice.Identity)) {
                     $sourceUpn = [string](Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default '(unknown source row)')
-                    $targets.Add([pscustomobject]@{ Supplied = $sourceUpn; User = $null; Note = $choice.Reason })
+                    & $addTarget $sourceUpn $null $choice.Reason
                     continue
                 }
                 if ($choice.Source -eq 'Interim') {
                     Write-MigrationLog -Message "$($choice.Identity): $($choice.Reason)" -Level WARNING
                 }
-                $targets.Add([pscustomobject]@{
-                        Supplied = $choice.Identity
-                        User     = Resolve-CutoverUser -Identity $choice.Identity
-                        Note     = $choice.Reason
-                    })
+                & $addTarget $choice.Identity (Resolve-CutoverUser -Identity $choice.Identity) $choice.Reason
             }
         }
 
@@ -457,11 +353,7 @@ try {
             foreach ($row in $rows) {
                 $identity = [string](Get-MigrationCsvValue -Row $row -Name $userColumn -Default '')
                 if ([string]::IsNullOrWhiteSpace($identity)) { continue }
-                $targets.Add([pscustomobject]@{
-                        Supplied = $identity
-                        User     = Resolve-CutoverUser -Identity $identity
-                        Note     = ''
-                    })
+                & $addTarget $identity (Resolve-CutoverUser -Identity $identity) ''
             }
         }
 
@@ -471,19 +363,14 @@ try {
 
             # Group members arrive as directory objects; only #microsoft.graph.user entries
             # can hold a password profile, so nested groups and service principals are dropped.
-            $members = @(Get-MgGroupMember -GroupId $resolvedGroup.Id -All -ErrorAction Stop)
-            foreach ($member in $members) {
+            foreach ($member in @(Get-MgGroupMember -GroupId $resolvedGroup.Id -All -ErrorAction Stop)) {
                 if ($member.AdditionalProperties['@odata.type'] -ne '#microsoft.graph.user') { continue }
                 $memberUpn = [string]$member.AdditionalProperties['userPrincipalName']
-                $targets.Add([pscustomobject]@{
-                        Supplied = $memberUpn
-                        User     = [pscustomobject]@{
-                            Id                = $member.Id
-                            UserPrincipalName = $memberUpn
-                            DisplayName       = [string]$member.AdditionalProperties['displayName']
-                        }
-                        Note     = ''
-                    })
+                & $addTarget $memberUpn ([pscustomobject]@{
+                        Id                = $member.Id
+                        UserPrincipalName = $memberUpn
+                        DisplayName       = [string]$member.AdditionalProperties['displayName']
+                    }) ''
             }
             if ($targets.Count -eq 0) {
                 Write-MigrationLog -Message 'Group has no user members to reset.' -Level WARNING
@@ -492,19 +379,11 @@ try {
 
         'TestUser' {
             Write-MigrationLog -Message "Resolving single test user '$TestUser'..." -Level INFO
-            $targets.Add([pscustomobject]@{
-                    Supplied = $TestUser
-                    User     = Resolve-CutoverUser -Identity $TestUser
-                    Note     = ''
-                })
+            & $addTarget $TestUser (Resolve-CutoverUser -Identity $TestUser) ''
         }
     }
 
     Write-MigrationLog -Message "Users to process: $($targets.Count)" -Level INFO
-
-    #endregion -----------------------------------------------------------------
-
-    #region Reset loop ---------------------------------------------------------
 
     $results = [System.Collections.Generic.List[object]]::new()
     $index = 0
@@ -547,9 +426,9 @@ try {
                         Password                      = $generated
                         ForceChangePasswordNextSignIn = $ForceChangePassword
                     }
-                    # -ErrorAction Stop makes the Graph call terminating so a failed reset
-                    # (e.g. 403 Authorization_RequestDenied) lands in catch and is recorded as
-                    # Failed - never reported as a success with a credential never actually set.
+                    # -ErrorAction Stop makes the Graph call terminating so a failed reset lands
+                    # in catch and is recorded as Failed - never reported as a success with a
+                    # credential that was never actually set.
                     $null = Invoke-MigrationAction -Description "Reset the password for $identity" -Action {
                         Update-MgUser -UserId $user.Id -PasswordProfile $passwordProfile -ErrorAction Stop
                     }
@@ -598,8 +477,6 @@ try {
     }
 
     Write-Progress -Activity 'Resetting cutover passwords' -Completed
-
-    #endregion -----------------------------------------------------------------
 
     $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Reset-CutoverPasswords'
     if (-not $isDryRun -and @($results | Where-Object { $_.Status -eq 'Succeeded' }).Count -gt 0) {

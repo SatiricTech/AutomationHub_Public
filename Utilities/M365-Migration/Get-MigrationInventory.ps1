@@ -30,12 +30,12 @@
 
     Performance is a first-class concern because the tenants this runs against routinely
     hold a couple of thousand mailboxes. Users come from a single paged Graph call with
-    $select and $expand=manager rather than a call per user; mailboxes come from
-    Get-EXOMailbox with property sets rather than the slower Get-Mailbox; permissions use
-    the REST-based Get-EXOMailboxPermission / Get-EXORecipientPermission cmdlets, which
-    Microsoft recommends over the remote-PowerShell equivalents that fail with a 500MB
-    session limit on large orgs. The two genuinely per-object passes - mailbox statistics
-    and mailbox permissions - each have a switch to turn them off.
+    $select and $expand=manager; mailboxes come from Get-EXOMailbox with property sets
+    rather than the slower Get-Mailbox; permissions use the REST-based
+    Get-EXOMailboxPermission / Get-EXORecipientPermission cmdlets, which Microsoft
+    recommends over the remote-PowerShell equivalents that fail with a 500MB session limit
+    on large orgs. The two genuinely per-object passes - mailbox statistics and mailbox
+    permissions - each have a switch to turn them off.
 
     The script is read-only against the tenant. -DryRun still connects and counts every
     object so the run is a true rehearsal, but writes nothing except the log.
@@ -56,8 +56,7 @@
     has access to several tenants.
 
 .PARAMETER DelegatedOrganization
-    The customer tenant domain for delegated (GDAP) Exchange Online access, for example
-    'contoso.onmicrosoft.com'. Omit when signing in to your own tenant.
+    The customer tenant domain for delegated (GDAP) Exchange Online access.
 
 .PARAMETER DomainFilter
     One or more domains. Only objects whose UPN or primary SMTP address is on one of them
@@ -70,8 +69,7 @@
     Also inventory accounts where sign-in is blocked. Enabled accounts only by default.
 
 .PARAMETER IncludeOneDrive
-    Adds OneDriveUrl and OneDriveUsedGB to the Users tab. This is one Graph call per user,
-    so it is opt-in.
+    Adds OneDriveUrl and OneDriveUsedGB to the Users tab. One Graph call per user, so opt-in.
 
 .PARAMETER IncludeAuthMethods
     Adds MfaRegistered and MfaMethods to the Users tab from the authentication methods
@@ -195,8 +193,8 @@ Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Fo
 
 #region Configuration ----------------------------------------------------------------------------
 
-# Scopes are declared up front so Connect-MigrationGraph can fail fast on a shortfall rather
-# than letting a missing consent surface as a 403 halfway through the users pass.
+# Declared up front so Connect-MigrationGraph fails fast on a shortfall rather than letting a
+# missing consent surface as a 403 halfway through the users pass.
 $requiredGraphScopes = @(
     'User.Read.All'
     'Group.Read.All'
@@ -233,6 +231,10 @@ $permissionTrusteeExclusions = '^(NT AUTHORITY\\SELF|S-1-5-)'
 # Calendar folder permissions are only interesting for named delegates.
 $calendarBuiltInTrustees = @('Default', 'Anonymous')
 
+# The $select every Graph directory-object read shares, and the page size Graph documents.
+$principalSelect = 'id,displayName,userPrincipalName,mail'
+$graphPageSize = 999
+
 $script:RecipientIndex = @{}
 $script:RowFailureCount = 0
 
@@ -242,69 +244,34 @@ $script:RowFailureCount = 0
 
 function Get-InventoryValue {
     <#
-    .SYNOPSIS
-        Reads a property that may not exist on the object, returning a default instead of throwing.
-
-    .DESCRIPTION
-        Exchange Online returns different property bags depending on which property sets were
-        requested, and Graph omits properties that were not $select-ed. Under
-        Set-StrictMode -Version Latest a plain $object.Missing is a terminating error, so every
-        read of a tenant object goes through here. Empty strings collapse to the default too,
-        which is what keeps blank cells out of the CSVs as literal ' '.
-
-    .PARAMETER InputObject
-        The object to read from.
-
-    .PARAMETER Name
-        The property name.
-
-    .PARAMETER Default
-        Returned when the property is absent, null or an empty string.
+        Get-MigrationProperty plus the one thing the CSV writers rely on: a property that exists
+        but holds only whitespace also falls back to the default, so a blank cell never reaches
+        the file as a literal ' ' and an absent PrimarySmtpAddress can fall back to the address
+        parsed out of EmailAddresses.
     #>
     [CmdletBinding()]
     param(
-        [AllowNull()]
-        $InputObject,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name,
-
-        [AllowNull()]
-        $Default = $null
+        [AllowNull()]$InputObject,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
+        [AllowNull()]$Default = $null
     )
 
-    if ($null -eq $InputObject) { return $Default }
-
-    $property = $InputObject.PSObject.Properties[$Name]
-    if (-not $property) { return $Default }
-
-    $value = $property.Value
-    if ($null -eq $value) { return $Default }
+    $value = Get-MigrationProperty -InputObject $InputObject -Name $Name -Default $Default
     if ($value -is [string] -and [string]::IsNullOrWhiteSpace($value)) { return $Default }
-
     return $value
 }
 
 function ConvertTo-InventoryByteCount {
     <#
-    .SYNOPSIS
-        Parses an Exchange ByteQuantifiedSize into a byte count.
-
-    .DESCRIPTION
-        Exchange sizes render as '1.5 GB (1,610,612,736 bytes)'. The parenthesised byte count is
-        the exact figure and the one worth keeping - the leading value is rounded and locale
-        dependent. When the string does not carry a byte count the object's own ToBytes() is
-        tried before giving up.
-
-    .PARAMETER Size
-        The size value from Exchange, as an object or a string.
+        Parses an Exchange ByteQuantifiedSize into a byte count. Sizes render as
+        '1.5 GB (1,610,612,736 bytes)'; the parenthesised figure is the exact one and the
+        leading value is rounded and locale dependent. When the string carries no byte count the
+        object's own ToBytes() is tried before giving up.
     #>
     [CmdletBinding()]
     [OutputType([System.Nullable[System.Int64]])]
     param(
-        [AllowNull()]
-        $Size
+        [AllowNull()]$Size
     )
 
     if ($null -eq $Size) { return $null }
@@ -325,18 +292,11 @@ function ConvertTo-InventoryByteCount {
 }
 
 function ConvertTo-InventoryGigabyte {
-    <#
-    .SYNOPSIS
-        Converts an Exchange size or raw byte count to GB, rounded to two decimals.
-
-    .PARAMETER Size
-        A byte count, or an Exchange ByteQuantifiedSize value.
-    #>
+    <# An Exchange size or raw byte count as GB, rounded to two decimals. #>
     [CmdletBinding()]
     [OutputType([System.Nullable[System.Double]])]
     param(
-        [AllowNull()]
-        $Size
+        [AllowNull()]$Size
     )
 
     $bytes = ConvertTo-InventoryByteCount -Size $Size
@@ -346,19 +306,11 @@ function ConvertTo-InventoryGigabyte {
 }
 
 function ConvertTo-InventoryDomainList {
-    <#
-    .SYNOPSIS
-        Normalises the -DomainFilter values to bare lower-case domains.
-
-    .PARAMETER Domain
-        The raw filter values, with or without a leading '@'.
-    #>
+    <# The -DomainFilter values as bare lower-case domains. #>
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$Domain
+        [AllowNull()][AllowEmptyCollection()][string[]]$Domain
     )
 
     if (-not $Domain) { return @() }
@@ -371,31 +323,17 @@ function ConvertTo-InventoryDomainList {
 
 function Test-InventoryDomainMatch {
     <#
-    .SYNOPSIS
-        True when any of the supplied addresses is on one of the filtered domains.
-
-    .DESCRIPTION
-        An empty filter matches everything, which is what makes the caller's code a plain
-        Where-Object with no special case for 'no filter supplied'. A guest whose UPN is
+        True when any of the supplied addresses is on one of the filtered domains. An empty
+        filter matches everything, which is what keeps the callers a plain Where-Object with no
+        special case for 'no filter supplied'. A guest whose UPN is
         alice_fabrikam.com#EXT#@contoso.onmicrosoft.com matches on its mail address rather than
         its UPN, so both are passed in and any one hit is enough.
-
-    .PARAMETER Address
-        The addresses to test - typically UPN and primary SMTP.
-
-    .PARAMETER Domain
-        The normalised domain list from ConvertTo-InventoryDomainList.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
     param(
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$Address,
-
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$Domain
+        [AllowNull()][AllowEmptyCollection()][string[]]$Address,
+        [AllowNull()][AllowEmptyCollection()][string[]]$Domain
     )
 
     if (-not $Domain -or $Domain.Count -eq 0) { return $true }
@@ -404,8 +342,7 @@ function Test-InventoryDomainMatch {
     foreach ($candidate in $Address) {
         if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
         if ($candidate -notmatch '@') { continue }
-        $suffix = ($candidate -split '@')[-1].Trim().ToLowerInvariant()
-        if ($Domain -contains $suffix) { return $true }
+        if ($Domain -contains ($candidate -split '@')[-1].Trim().ToLowerInvariant()) { return $true }
     }
 
     return $false
@@ -413,24 +350,15 @@ function Test-InventoryDomainMatch {
 
 function Select-InventoryAddress {
     <#
-    .SYNOPSIS
-        Splits an Exchange EmailAddresses collection into its typed parts.
-
-    .DESCRIPTION
-        Returns the entries verbatim plus the pieces the plan needs separately: the primary
-        SMTP address (the entry prefixed with an upper-case 'SMTP:'), the secondary smtp
-        aliases, and the X500 addresses. X500 entries keep their 'X500:' prefix because that is
-        the form Set-Mailbox -EmailAddresses expects when they are re-added in the destination.
-
-    .PARAMETER EmailAddress
-        The EmailAddresses / proxyAddresses collection.
+        Splits an Exchange EmailAddresses collection into the pieces the plan needs separately:
+        the entries verbatim, the primary SMTP address, the secondary smtp aliases and the X500
+        addresses. X500 entries keep their prefix because that is the form
+        Set-Mailbox -EmailAddresses expects when they are re-added in the destination.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$EmailAddress
+        [AllowNull()][AllowEmptyCollection()][string[]]$EmailAddress
     )
 
     $all = @()
@@ -441,53 +369,50 @@ function Select-InventoryAddress {
     $x500 = [System.Collections.Generic.List[string]]::new()
 
     foreach ($entry in $all) {
-        $value = $entry.Trim()
-        if ($value -cmatch '^SMTP:') {
-            if (-not $primary) { $primary = $value.Substring(5) }
+        $parsed = Split-MigrationProxyAddress -Entry $entry
+        if ($parsed.IsPrimary) {
+            if (-not $primary) { $primary = $parsed.Address }
         }
-        elseif ($value -cmatch '^smtp:') {
-            $aliases.Add($value.Substring(5))
-        }
-        elseif ($value -match '^X500:') {
-            $x500.Add('X500:' + $value.Substring(5))
-        }
+        elseif ($parsed.Prefix -ceq 'smtp') { $aliases.Add($parsed.Address) }
+        elseif ($parsed.Kind -eq 'X500') { $x500.Add('X500:' + $parsed.Address) }
     }
 
     return [pscustomobject]@{
-        All          = $all
-        PrimarySmtp  = $primary
-        SmtpAliases  = $aliases.ToArray()
+        All           = $all
+        PrimarySmtp   = $primary
+        SmtpAliases   = $aliases.ToArray()
         X500Addresses = $x500.ToArray()
     }
 }
 
+function Select-InventoryPrincipalName {
+    <# The best address for a Graph directory object: UPN, then mail, then display name. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]$Principal
+    )
+
+    foreach ($name in @('userPrincipalName', 'mail', 'displayName')) {
+        $value = [string](Get-InventoryValue $Principal $name '')
+        if ($value) { return $value }
+    }
+
+    return ''
+}
+
 function Add-InventoryRecipientIndexEntry {
     <#
-    .SYNOPSIS
-        Registers a recipient under every key Exchange might refer to it by.
-
-    .DESCRIPTION
-        Exchange returns delegate and moderator lists as whatever identity string the directory
-        happened to store - a display name, an alias, a canonical name or a GUID. Resolving those
-        to a primary SMTP address makes the Groups and Mailboxes tabs joinable against the Users
-        tab, which is the whole point of the inventory. The index is built from objects already
-        in memory, so resolution costs no extra calls.
-
-    .PARAMETER Key
-        The identity strings to register.
-
-    .PARAMETER PrimarySmtpAddress
-        The address those identities resolve to.
+        Registers a recipient under every key Exchange might refer to it by. Delegate and
+        moderator lists come back as whatever identity string the directory happened to store -
+        a display name, an alias, a canonical name or a GUID - and resolving those to a primary
+        SMTP address is what makes the Groups and Mailboxes tabs joinable against the Users tab.
+        The index is built from objects already in memory, so resolution costs no extra calls.
     #>
     [CmdletBinding()]
     param(
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$Key,
-
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$PrimarySmtpAddress
+        [AllowNull()][AllowEmptyCollection()][string[]]$Key,
+        [AllowNull()][AllowEmptyString()][string]$PrimarySmtpAddress
     )
 
     if ([string]::IsNullOrWhiteSpace($PrimarySmtpAddress)) { return }
@@ -504,23 +429,15 @@ function Add-InventoryRecipientIndexEntry {
 
 function Resolve-InventoryRecipient {
     <#
-    .SYNOPSIS
-        Turns an Exchange identity string into a primary SMTP address where one is known.
-
-    .DESCRIPTION
-        Falls back to the identity's last path segment (canonical names arrive as
-        'contoso.com/Users/Jane Doe') and finally to the value verbatim. An unresolved value is
-        still worth writing out: an operator can act on 'Jane Doe' where they can do nothing
-        with a blank cell.
-
-    .PARAMETER Identity
-        The identity string, or an object that stringifies to one.
+        An Exchange identity string as a primary SMTP address where one is known, falling back to
+        the identity's last path segment (canonical names arrive as 'contoso.com/Users/Jane Doe')
+        and finally to the value verbatim - an operator can act on 'Jane Doe' where they can do
+        nothing with a blank cell.
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [AllowNull()]
-        $Identity
+        [AllowNull()]$Identity
     )
 
     if ($null -eq $Identity) { return '' }
@@ -541,65 +458,36 @@ function Resolve-InventoryRecipient {
 }
 
 function Join-InventoryRecipientList {
-    <#
-    .SYNOPSIS
-        Resolves a multi-valued Exchange recipient property to a ';'-joined address list.
-
-    .PARAMETER Value
-        The raw multi-valued property.
-    #>
+    <# A multi-valued Exchange recipient property as a ';'-joined address list. #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [AllowNull()]
-        $Value
+        [AllowNull()]$Value
     )
 
     if ($null -eq $Value) { return '' }
 
-    $resolved = @(@($Value) | ForEach-Object { Resolve-InventoryRecipient -Identity $_ })
-    return (Join-MigrationList -Values $resolved)
+    return (Join-MigrationList -Values @(@($Value) | ForEach-Object { Resolve-InventoryRecipient -Identity $_ }))
 }
 
 function ConvertTo-InventoryMailboxRow {
     <#
-    .SYNOPSIS
-        Shapes one Exchange mailbox into the UserMailboxes / SharedMailboxes CSV row.
-
-    .DESCRIPTION
-        The column names here are a published interface: New-MigrationIdentityPlan reads this
-        CSV by column name, so renaming one breaks the planner rather than just the spreadsheet.
-        Statistics are optional because -SkipMailboxStats leaves them out, and every read goes
-        through Get-InventoryValue so a narrower property set only blanks cells instead
-        of failing the run.
-
-    .PARAMETER Mailbox
-        The mailbox object from Get-EXOMailbox.
-
-    .PARAMETER Statistics
-        The primary mailbox statistics, or $null.
-
-    .PARAMETER ArchiveStatistics
-        The archive mailbox statistics, or $null.
+        One Exchange mailbox as the UserMailboxes / SharedMailboxes CSV row. The column names are
+        a published interface: New-MigrationIdentityPlan reads this CSV by column name, so
+        renaming one breaks the planner rather than just the spreadsheet. Statistics are optional
+        (-SkipMailboxStats) and every read goes through Get-InventoryValue, so a narrower
+        property set only blanks cells instead of failing the run.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        $Mailbox,
-
-        [AllowNull()]
-        $Statistics,
-
-        [AllowNull()]
-        $ArchiveStatistics
+        [Parameter(Mandatory)][ValidateNotNull()]$Mailbox,
+        [AllowNull()]$Statistics,
+        [AllowNull()]$ArchiveStatistics
     )
 
     $addresses = Select-InventoryAddress -EmailAddress (@(Get-InventoryValue $Mailbox 'EmailAddresses' @()))
     $primary = Get-InventoryValue $Mailbox 'PrimarySmtpAddress' $addresses.PrimarySmtp
-
-    $inPlaceHolds = @(Get-InventoryValue $Mailbox 'InPlaceHolds' @())
 
     return [pscustomobject][ordered]@{
         UserPrincipalName             = [string](Get-InventoryValue $Mailbox 'UserPrincipalName' '')
@@ -612,7 +500,7 @@ function ConvertTo-InventoryMailboxRow {
         X500Addresses                 = Join-MigrationList -Values $addresses.X500Addresses
         ArchiveStatus                 = [string](Get-InventoryValue $Mailbox 'ArchiveStatus' '')
         LitigationHoldEnabled         = [bool](Get-InventoryValue $Mailbox 'LitigationHoldEnabled' $false)
-        InPlaceHolds                  = $inPlaceHolds.Count
+        InPlaceHolds                  = @(Get-InventoryValue $Mailbox 'InPlaceHolds' @()).Count
         RetentionPolicy               = [string](Get-InventoryValue $Mailbox 'RetentionPolicy' '')
         HiddenFromAddressListsEnabled = [bool](Get-InventoryValue $Mailbox 'HiddenFromAddressListsEnabled' $false)
         ForwardingAddress             = Resolve-InventoryRecipient -Identity (Get-InventoryValue $Mailbox 'ForwardingAddress' '')
@@ -630,73 +518,33 @@ function ConvertTo-InventoryMailboxRow {
 
 function ConvertTo-InventoryUserRow {
     <#
-    .SYNOPSIS
-        Shapes one Graph user into the Users CSV row.
-
-    .DESCRIPTION
-        The optional columns are added only when their switch was supplied, so a run without
-        -IncludeOneDrive produces a CSV with no OneDrive columns at all rather than a column of
-        blanks - Import-MigrationCsv treats a missing optional column and an empty one the same
-        way, and the narrower file is easier to read.
-
-    .PARAMETER User
-        The Graph user object.
-
-    .PARAMETER SkuNameById
-        SKU id to part number map, used for the Licenses column.
-
-    .PARAMETER DirectoryRole
-        The role display names this user holds.
-
-    .PARAMETER Registration
-        The user's userRegistrationDetails record, or $null.
-
-    .PARAMETER Drive
-        The user's OneDrive object, or $null.
-
-    .PARAMETER IncludeAuthMethodColumn
-        Adds MfaRegistered and MfaMethods.
-
-    .PARAMETER IncludeOneDriveColumn
-        Adds OneDriveUrl and OneDriveUsedGB.
+        One Graph user as the Users CSV row. The optional columns are added only when their
+        switch was supplied, so a run without -IncludeOneDrive produces a CSV with no OneDrive
+        columns at all rather than a column of blanks - Import-MigrationCsv treats a missing
+        optional column and an empty one the same way, and the narrower file is easier to read.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        $User,
-
-        [AllowNull()]
-        [hashtable]$SkuNameById,
-
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$DirectoryRole,
-
-        [AllowNull()]
-        $Registration,
-
-        [AllowNull()]
-        $Drive,
-
+        [Parameter(Mandatory)][ValidateNotNull()]$User,
+        [AllowNull()][hashtable]$SkuNameById,
+        [AllowNull()][AllowEmptyCollection()][string[]]$DirectoryRole,
+        [AllowNull()]$Registration,
+        [AllowNull()]$Drive,
         [switch]$IncludeAuthMethodColumn,
-
         [switch]$IncludeOneDriveColumn
     )
 
-    $proxyAddresses = @(Get-InventoryValue $User 'proxyAddresses' @())
-    $addresses = Select-InventoryAddress -EmailAddress $proxyAddresses
+    $addresses = Select-InventoryAddress -EmailAddress @(Get-InventoryValue $User 'proxyAddresses' @())
 
-    $assigned = @(Get-InventoryValue $User 'assignedLicenses' @())
-    $skuIds = @($assigned | ForEach-Object { [string](Get-InventoryValue $_ 'skuId' '') } |
+    $skuIds = @(@(Get-InventoryValue $User 'assignedLicenses' @()) |
+        ForEach-Object { [string](Get-InventoryValue $_ 'skuId' '') } |
         Where-Object { $_ })
     $skuNames = @($skuIds | ForEach-Object {
         if ($SkuNameById -and $SkuNameById.ContainsKey($_)) { $SkuNameById[$_] } else { $_ }
     } | Sort-Object -Unique)
 
-    $assignmentStates = @(Get-InventoryValue $User 'licenseAssignmentStates' @())
-    $byGroup = [bool]@($assignmentStates |
+    $byGroup = [bool]@(@(Get-InventoryValue $User 'licenseAssignmentStates' @()) |
         Where-Object { (Get-InventoryValue $_ 'assignedByGroup') }).Count
 
     $manager = Get-InventoryValue $User 'manager'
@@ -747,47 +595,20 @@ function ConvertTo-InventoryUserRow {
 
 function Get-InventoryGroupType {
     <#
-    .SYNOPSIS
-        Classifies a group into the plan's GroupType vocabulary.
-
-    .DESCRIPTION
-        The planner branches on this string: Distribution and MailEnabledSecurity groups are
-        recreated by New-MigrationGroups, DynamicDistribution groups carry a RecipientFilter to
-        port, and M365Group / Team / SecurityGroup rows are informational because AvePoint Fly
-        migrates them. Exchange recipient type details win when present because they distinguish
-        a mail-enabled security group from a plain distribution list, which Graph's group types
-        alone do not.
-
-    .PARAMETER RecipientTypeDetails
-        The Exchange RecipientTypeDetails value, when the group came from Exchange.
-
-    .PARAMETER GroupType
-        The Graph groupTypes collection.
-
-    .PARAMETER MailEnabled
-        The Graph mailEnabled flag.
-
-    .PARAMETER SecurityEnabled
-        The Graph securityEnabled flag.
-
-    .PARAMETER IsTeam
-        True when resourceProvisioningOptions contains 'Team'.
+        Classifies a group into the plan's GroupType vocabulary. The planner branches on this
+        string: Distribution and MailEnabledSecurity groups are recreated by New-MigrationGroups,
+        DynamicDistribution groups carry a RecipientFilter to port, and M365Group / Team /
+        SecurityGroup rows are informational because AvePoint Fly migrates them. Exchange
+        recipient type details win when present because they distinguish a mail-enabled security
+        group from a plain distribution list, which Graph's group types alone do not.
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$RecipientTypeDetails,
-
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [string[]]$GroupType,
-
+        [AllowNull()][AllowEmptyString()][string]$RecipientTypeDetails,
+        [AllowNull()][AllowEmptyCollection()][string[]]$GroupType,
         [bool]$MailEnabled,
-
         [bool]$SecurityEnabled,
-
         [bool]$IsTeam
     )
 
@@ -799,42 +620,27 @@ function Get-InventoryGroupType {
         '^RoomList$' { return 'Distribution' }
     }
 
-    $types = @($GroupType)
-    if ($types -contains 'Unified') {
+    if (@($GroupType) -contains 'Unified') {
         if ($IsTeam) { return 'Team' }
         return 'M365Group'
     }
     if ($MailEnabled -and $SecurityEnabled) { return 'MailEnabledSecurity' }
     if ($MailEnabled) { return 'Distribution' }
-    if ($SecurityEnabled) { return 'SecurityGroup' }
 
     return 'SecurityGroup'
 }
 
 function ConvertTo-InventoryContactRow {
     <#
-    .SYNOPSIS
-        Shapes one mail contact into the Contacts CSV row.
-
-    .DESCRIPTION
-        Get-MailContact carries the addressing and Get-Contact carries the name parts, so both
-        are joined here rather than paying for a per-contact lookup.
-
-    .PARAMETER MailContact
-        The Get-MailContact object.
-
-    .PARAMETER Contact
-        The matching Get-Contact object, or $null.
+        One mail contact as the Contacts CSV row. Get-MailContact carries the addressing and
+        Get-Contact the name parts, so both are joined here rather than paying for a per-contact
+        lookup.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        $MailContact,
-
-        [AllowNull()]
-        $Contact
+        [Parameter(Mandatory)][ValidateNotNull()]$MailContact,
+        [AllowNull()]$Contact
     )
 
     $addresses = Select-InventoryAddress -EmailAddress (@(Get-InventoryValue $MailContact 'EmailAddresses' @()))
@@ -853,46 +659,18 @@ function ConvertTo-InventoryContactRow {
 
 function ConvertTo-InventoryPermissionRow {
     <#
-    .SYNOPSIS
-        Shapes one delegation into the MailboxPermissions CSV row.
-
-    .PARAMETER MailboxPrimarySmtp
-        The mailbox the permission is on.
-
-    .PARAMETER MailboxType
-        Its RecipientTypeDetails.
-
-    .PARAMETER Trustee
-        The delegate.
-
-    .PARAMETER Permission
-        FullAccess, SendAs, SendOnBehalf or 'Calendar:<rights>'.
-
-    .PARAMETER AutoMapping
-        Left blank where Exchange does not expose it, which is everywhere except an explicit
-        Add-MailboxPermission call - Get-MailboxPermission has never returned it.
-
-    .PARAMETER IsInherited
-        Whether the ACE is inherited.
+        One delegation as the MailboxPermissions CSV row. AutoMapping is left blank because
+        Get-MailboxPermission has never returned it - only an explicit Add-MailboxPermission
+        call knows.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [AllowEmptyString()]
-        [string]$MailboxPrimarySmtp,
-
-        [AllowEmptyString()]
-        [string]$MailboxType,
-
-        [AllowEmptyString()]
-        [string]$Trustee,
-
-        [AllowEmptyString()]
-        [string]$Permission,
-
-        [AllowEmptyString()]
-        [string]$AutoMapping = '',
-
+        [AllowEmptyString()][string]$MailboxPrimarySmtp,
+        [AllowEmptyString()][string]$MailboxType,
+        [AllowEmptyString()][string]$Trustee,
+        [AllowEmptyString()][string]$Permission,
+        [AllowEmptyString()][string]$AutoMapping = '',
         [bool]$IsInherited
     )
 
@@ -913,26 +691,12 @@ function ConvertTo-InventoryPermissionRow {
 }
 
 function Test-InventoryTrustee {
-    <#
-    .SYNOPSIS
-        False for the trustees every mailbox has and nobody needs to migrate.
-
-    .PARAMETER Trustee
-        The trustee string from Exchange.
-
-    .PARAMETER Pattern
-        The exclusion regex.
-    #>
+    <# False for the trustees every mailbox has and nobody needs to migrate. #>
     [CmdletBinding()]
     [OutputType([bool])]
     param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Trustee,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Pattern
+        [AllowNull()][AllowEmptyString()][string]$Trustee,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Pattern
     )
 
     if ([string]::IsNullOrWhiteSpace($Trustee)) { return $false }
@@ -940,33 +704,12 @@ function Test-InventoryTrustee {
 }
 
 function Write-InventoryProgress {
-    <#
-    .SYNOPSIS
-        Reports progress for one tab.
-
-    .PARAMETER Tab
-        The tab being built.
-
-    .PARAMETER Status
-        The current item.
-
-    .PARAMETER Current
-        Items processed so far.
-
-    .PARAMETER Total
-        Items in total.
-    #>
+    <# Progress for one tab. #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Tab,
-
-        [AllowEmptyString()]
-        [string]$Status = '',
-
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Tab,
+        [AllowEmptyString()][string]$Status = '',
         [int]$Current = 0,
-
         [int]$Total = 0
     )
 
@@ -978,50 +721,23 @@ function Write-InventoryProgress {
 
 function Export-InventoryTab {
     <#
-    .SYNOPSIS
-        Writes one tab to CSV and, when enabled, to a worksheet in the shared workbook.
+        Writes one tab to CSV and, when enabled, to a worksheet in the shared workbook. Not
+        Export-MigrationReport: all nine files and the workbook share one timestamp so the set
+        reads as one inventory, and a report writer has nowhere to put the worksheet.
 
-    .DESCRIPTION
-        An empty tab still produces a file with a single informational row so that the workbook
-        keeps a predictable shape and a downstream Import-Csv does not fall over on a zero-byte
-        file. The write goes through Invoke-MigrationAction, which is what makes -DryRun log the
+        An empty tab still produces a file with a single informational row so the workbook keeps
+        a predictable shape and a downstream Import-Csv does not fall over on a zero-byte file.
+        The write goes through Invoke-MigrationAction, which is what makes -DryRun log the
         planned file list and write nothing.
-
-    .PARAMETER Row
-        The rows to write.
-
-    .PARAMETER Name
-        The tab name; also the worksheet name.
-
-    .PARAMETER CsvPath
-        The CSV destination.
-
-    .PARAMETER ExcelPath
-        The workbook destination.
-
-    .PARAMETER IncludeExcel
-        Adds the worksheet. Off when -SkipExcel was given or ImportExcel is unavailable.
     #>
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
         Justification = 'ExcelPath and IncludeExcel are consumed inside the Invoke-MigrationAction scriptblock, which the analyzer does not follow. The scriptblock is what makes the write DryRun-aware.')]
     param(
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [object[]]$Row,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$CsvPath,
-
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$ExcelPath,
-
+        [AllowNull()][AllowEmptyCollection()][object[]]$Row,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CsvPath,
+        [AllowNull()][AllowEmptyString()][string]$ExcelPath,
         [switch]$IncludeExcel
     )
 
@@ -1041,24 +757,18 @@ function Export-InventoryTab {
 
 function Get-InventoryGraphUser {
     <#
-    .SYNOPSIS
-        Reads every user in one paged Graph call.
-
-    .DESCRIPTION
-        One request with $select and $expand=manager replaces the call-per-user pattern that
-        makes a 2,000-seat inventory take an hour. Two properties are known to be fragile:
-        signInActivity needs AuditLog.Read.All and an Entra ID P1 context, and $expand=manager
-        is occasionally refused alongside it. Rather than making the operator guess which
-        permission they are missing, the call degrades in two documented steps and says in the
-        log which columns went blank.
-
-    .PARAMETER IncludeDisabledUser
-        Drops the accountEnabled filter.
+        Reads every user in one paged Graph call - $select plus $expand=manager replaces the
+        call-per-user pattern that makes a 2,000-seat inventory take an hour. Two properties are
+        fragile: signInActivity needs AuditLog.Read.All and an Entra ID P1 context, and
+        $expand=manager is occasionally refused alongside it. Rather than making the operator
+        guess which permission they are missing, the call degrades in two documented steps and
+        says in the log which columns went blank.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
-        [switch]$IncludeDisabledUser
+        [switch]$IncludeDisabledUser,
+        [ValidateRange(1, 999)][int]$PageSize = 999
     )
 
     $select = @(
@@ -1069,23 +779,22 @@ function Get-InventoryGraphUser {
     )
 
     $filter = if ($IncludeDisabledUser) { '' } else { '&$filter=accountEnabled eq true' }
-
     $expand = "&`$expand=manager(`$select=userPrincipalName)"
     $withActivity = ($select + 'signInActivity') -join ','
     $withoutActivity = $select -join ','
 
     $attempts = @(
         @{
-            Uri     = "/v1.0/users?`$select=$withActivity$expand&`$top=999$filter"
+            Uri     = "/v1.0/users?`$select=$withActivity$expand&`$top=$PageSize$filter"
             Message = ''
         }
         @{
-            Uri     = "/v1.0/users?`$select=$withoutActivity$expand&`$top=999$filter"
+            Uri     = "/v1.0/users?`$select=$withoutActivity$expand&`$top=$PageSize$filter"
             Message = 'signInActivity was refused - LastSignIn will be blank. It needs ' +
                       'AuditLog.Read.All and an Entra ID P1 licence.'
         }
         @{
-            Uri     = "/v1.0/users?`$select=$withoutActivity&`$top=999$filter"
+            Uri     = "/v1.0/users?`$select=$withoutActivity&`$top=$PageSize$filter"
             Message = 'The manager expansion was refused - the ManagerUpn column will be blank.'
         }
     )
@@ -1106,15 +815,31 @@ function Get-InventoryGraphUser {
     throw "Could not read users from Microsoft Graph: $($lastError.Exception.Message)"
 }
 
+function Get-InventoryGraphPrincipalList {
+    <#
+        The members or owners of a Graph group as addresses. One call per relationship, paged,
+        with the same $select every directory read here uses.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$GroupId,
+        [Parameter(Mandatory)][ValidateSet('members', 'owners')][string]$Relationship,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Select,
+        [ValidateRange(1, 999)][int]$PageSize = 999
+    )
+
+    return @(Invoke-MigrationGraphRequest -Method GET -All `
+            -Uri "/v1.0/groups/$GroupId/$Relationship`?`$select=$Select&`$top=$PageSize" |
+        ForEach-Object { Select-InventoryPrincipalName -Principal $_ })
+}
+
 function Get-InventoryDirectoryRoleMap {
     <#
-    .SYNOPSIS
-        Maps user object id to the directory roles they hold.
-
-    .DESCRIPTION
-        One call per activated role beats one call per user by two orders of magnitude, and the
-        result answers the question the migration actually asks: which accounts will need their
-        privileged roles re-created in the destination before the source is decommissioned.
+        Maps user object id to the directory roles they hold. One call per activated role beats
+        one call per user by two orders of magnitude, and answers the question the migration
+        actually asks: which accounts need their privileged roles re-created in the destination
+        before the source is decommissioned.
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -1157,24 +882,20 @@ function Get-InventoryDirectoryRoleMap {
 
 function Get-InventoryAuthMethodMap {
     <#
-    .SYNOPSIS
-        Maps user object id to their MFA registration record.
-
-    .DESCRIPTION
-        The userRegistrationDetails report is a single paged read of the whole tenant, so it
-        costs one call regardless of user count. It needs AuditLog.Read.All rather than
-        UserAuthenticationMethod.Read.All, which is the permission most operators reach for
-        first - both are requested so either configuration works.
+        Maps user object id to their MFA registration record. The userRegistrationDetails report
+        is a single paged read of the whole tenant, so it costs one call regardless of user
+        count. It needs AuditLog.Read.All rather than UserAuthenticationMethod.Read.All, which is
+        the permission most operators reach for first - both are requested so either works.
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
     param()
 
     $map = @{}
-    $uri = '/v1.0/reports/authenticationMethods/userRegistrationDetails'
 
     try {
-        $records = @(Invoke-MigrationGraphRequest -Method GET -Uri $uri -All)
+        $records = @(Invoke-MigrationGraphRequest -Method GET -All `
+                -Uri '/v1.0/reports/authenticationMethods/userRegistrationDetails')
     }
     catch {
         Write-MigrationLog -Message "Could not read the authentication methods report: $($_.Exception.Message)" -Level WARNING
@@ -1194,75 +915,41 @@ function Get-InventoryAuthMethodMap {
 
 function Get-InventoryMailbox {
     <#
-    .SYNOPSIS
-        Reads every mailbox in one Exchange call.
-
-    .DESCRIPTION
-        Get-EXOMailbox is the REST-backed cmdlet and is several times faster than Get-Mailbox on
-        a large tenant, but only returns the properties asked for. The property sets below cover
-        the holds, forwarding, policy and quota columns; if a future service change rejects the
-        combination the call is retried with -PropertySets All, which is slow but always works.
-
-    .PARAMETER PropertySet
-        The property sets to request.
-
-    .PARAMETER Property
-        Individual properties not covered by a set.
-
-    .PARAMETER RecipientTypeDetail
-        The mailbox types to return.
+        Reads every mailbox in one Exchange call. Get-EXOMailbox is REST-backed and several times
+        faster than Get-Mailbox on a large tenant, but only returns the properties asked for. If
+        a future service change rejects the property-set combination the call is retried with
+        -PropertySets All, which is slow but always works.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
-        [Parameter(Mandatory)]
-        [string[]]$PropertySet,
-
-        [Parameter(Mandatory)]
-        [string[]]$Property,
-
-        [Parameter(Mandatory)]
-        [string[]]$RecipientTypeDetail
+        [Parameter(Mandatory)][string[]]$PropertySet,
+        [Parameter(Mandatory)][string[]]$Property,
+        [Parameter(Mandatory)][string[]]$RecipientTypeDetail
     )
 
-    $parameters = @{
-        ResultSize           = 'Unlimited'
-        RecipientTypeDetails = $RecipientTypeDetail
-        PropertySets         = $PropertySet
-        Properties           = $Property
-        ErrorAction          = 'Stop'
-    }
-
     try {
-        return @(Get-EXOMailbox @parameters)
+        return @(Get-EXOMailbox -ResultSize Unlimited -RecipientTypeDetails $RecipientTypeDetail `
+                -PropertySets $PropertySet -Properties $Property -ErrorAction Stop)
     }
     catch {
         Write-MigrationLog -Level WARNING -Message ("Get-EXOMailbox with property sets failed " +
             "($($_.Exception.Message)); retrying with -PropertySets All.")
         return @(Get-EXOMailbox -ResultSize Unlimited -PropertySets All -ErrorAction Stop `
-            -RecipientTypeDetails $RecipientTypeDetail)
+                -RecipientTypeDetails $RecipientTypeDetail)
     }
 }
 
 function Get-InventoryMailboxStatistic {
     <#
-    .SYNOPSIS
-        Collects primary and archive mailbox statistics keyed by ExchangeGuid.
-
-    .DESCRIPTION
-        This is one of only two per-object passes in the script, which is why -SkipMailboxStats
-        exists. The archive call is made only for mailboxes that report an archive, so a tenant
-        with no archives pays nothing for the archive column.
-
-    .PARAMETER Mailbox
-        The mailboxes to measure.
+        Primary and archive mailbox statistics keyed by ExchangeGuid. One of only two per-object
+        passes in the script, which is why -SkipMailboxStats exists. The archive call is made
+        only for mailboxes that report an archive, so a tenant with no archives pays nothing.
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [object[]]$Mailbox
+        [AllowNull()][AllowEmptyCollection()][object[]]$Mailbox
     )
 
     $map = @{}
@@ -1287,9 +974,8 @@ function Get-InventoryMailboxStatistic {
             $script:RowFailureCount++
         }
 
-        $archiveStatus = [string](Get-InventoryValue $item 'ArchiveStatus' '')
         $archiveGuid = [string](Get-InventoryValue $item 'ArchiveGuid' '')
-        $hasArchive = ($archiveStatus -eq 'Active') -or
+        $hasArchive = ([string](Get-InventoryValue $item 'ArchiveStatus' '') -eq 'Active') -or
             ($archiveGuid -and $archiveGuid -ne '00000000-0000-0000-0000-000000000000')
 
         if ($hasArchive) {
@@ -1310,41 +996,21 @@ function Get-InventoryMailboxStatistic {
 
 function Get-InventoryMailboxPermission {
     <#
-    .SYNOPSIS
-        Collects FullAccess, SendAs, SendOnBehalf and explicit Calendar delegations.
-
-    .DESCRIPTION
-        The REST cmdlets are used deliberately: tenant-wide Get-MailboxPermission over remote
-        PowerShell throws 'data exceeded the maximum permitted by the session' on large orgs,
-        and Microsoft's own guidance is to use Get-EXOMailboxPermission instead. Three calls per
-        mailbox is the honest cost of this tab - hence -SkipMailboxPermissions.
+        FullAccess, SendAs, SendOnBehalf and explicit Calendar delegations. The REST cmdlets are
+        used deliberately: tenant-wide Get-MailboxPermission over remote PowerShell throws 'data
+        exceeded the maximum permitted by the session' on large orgs, and Microsoft's own guidance
+        is to use Get-EXOMailboxPermission. Three calls per mailbox is the honest cost of this tab
+        - hence -SkipMailboxPermissions.
 
         Calendar permissions are read for the Calendar folder only. The folder name is localised
-        in some tenants, so a failure there is logged at DEBUG and skipped rather than counted
-        as an error.
-
-    .PARAMETER Mailbox
-        The mailboxes to inspect.
-
-    .PARAMETER ExclusionPattern
-        Trustees to ignore.
-
-    .PARAMETER CalendarBuiltIn
-        Calendar trustees to ignore (Default, Anonymous).
+        in some tenants, so a failure there is logged at DEBUG rather than counted as an error.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [object[]]$Mailbox,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$ExclusionPattern,
-
-        [Parameter(Mandatory)]
-        [string[]]$CalendarBuiltIn
+        [AllowNull()][AllowEmptyCollection()][object[]]$Mailbox,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExclusionPattern,
+        [Parameter(Mandatory)][string[]]$CalendarBuiltIn
     )
 
     $rows = [System.Collections.Generic.List[object]]::new()
@@ -1366,13 +1032,11 @@ function Get-InventoryMailboxPermission {
                 $trustee = [string](Get-InventoryValue $ace 'User' '')
                 if (-not (Test-InventoryTrustee -Trustee $trustee -Pattern $ExclusionPattern)) { continue }
                 if ([bool](Get-InventoryValue $ace 'Deny' $false)) { continue }
-
-                $rights = @(Get-InventoryValue $ace 'AccessRights' @())
-                if ($rights -notcontains 'FullAccess') { continue }
+                if (@(Get-InventoryValue $ace 'AccessRights' @()) -notcontains 'FullAccess') { continue }
 
                 $rows.Add((ConvertTo-InventoryPermissionRow -MailboxPrimarySmtp $smtp -MailboxType $type `
-                    -Trustee $trustee -Permission 'FullAccess' `
-                    -IsInherited ([bool](Get-InventoryValue $ace 'IsInherited' $false))))
+                            -Trustee $trustee -Permission 'FullAccess' `
+                            -IsInherited ([bool](Get-InventoryValue $ace 'IsInherited' $false))))
             }
         }
         catch {
@@ -1387,7 +1051,7 @@ function Get-InventoryMailboxPermission {
                 if ((Get-InventoryValue $ace 'AccessControlType' 'Allow') -ne 'Allow') { continue }
 
                 $rows.Add((ConvertTo-InventoryPermissionRow -MailboxPrimarySmtp $smtp -MailboxType $type `
-                    -Trustee $trustee -Permission 'SendAs' -IsInherited $false))
+                            -Trustee $trustee -Permission 'SendAs' -IsInherited $false))
             }
         }
         catch {
@@ -1399,23 +1063,21 @@ function Get-InventoryMailboxPermission {
             $trustee = [string]$delegate
             if (-not (Test-InventoryTrustee -Trustee $trustee -Pattern $ExclusionPattern)) { continue }
             $rows.Add((ConvertTo-InventoryPermissionRow -MailboxPrimarySmtp $smtp -MailboxType $type `
-                -Trustee $trustee -Permission 'SendOnBehalf' -IsInherited $false))
+                        -Trustee $trustee -Permission 'SendOnBehalf' -IsInherited $false))
         }
 
         try {
-            $folder = '{0}:\Calendar' -f $identity
-            foreach ($ace in @(Get-EXOMailboxFolderPermission -Identity $folder -ErrorAction Stop)) {
+            foreach ($ace in @(Get-EXOMailboxFolderPermission -Identity ('{0}:\Calendar' -f $identity) -ErrorAction Stop)) {
                 $trustee = [string](Get-InventoryValue $ace 'User' '')
                 if (-not (Test-InventoryTrustee -Trustee $trustee -Pattern $ExclusionPattern)) { continue }
                 if ($CalendarBuiltIn -contains $trustee) { continue }
 
                 $rights = @(Get-InventoryValue $ace 'AccessRights' @())
-                if (-not $rights) { continue }
-                if ($rights -contains 'None') { continue }
+                if (-not $rights -or $rights -contains 'None') { continue }
 
                 $rows.Add((ConvertTo-InventoryPermissionRow -MailboxPrimarySmtp $smtp -MailboxType $type `
-                    -Trustee $trustee -Permission ('Calendar:' + (($rights | ForEach-Object { [string]$_ }) -join ',')) `
-                    -IsInherited $false))
+                            -Trustee $trustee -Permission ('Calendar:' + (($rights | ForEach-Object { [string]$_ }) -join ',')) `
+                            -IsInherited $false))
             }
         }
         catch {
@@ -1454,9 +1116,7 @@ try {
     # still a complete inventory, so a failed install warns rather than aborting the run.
     $useExcel = -not $SkipExcel
     if ($useExcel) {
-        try {
-            Initialize-MigrationModule -Name 'ImportExcel'
-        }
+        try { Initialize-MigrationModule -Name 'ImportExcel' }
         catch {
             Write-MigrationLog -Message "ImportExcel is unavailable ($($_.Exception.Message)); writing CSVs only." -Level WARNING
             $useExcel = $false
@@ -1484,22 +1144,20 @@ try {
     Write-MigrationLog -Message 'Reading accepted domains...' -Level INFO
     $domainRows = @()
     try {
-        $graphDomains = @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/domains' -All)
-        $domainRows = @(foreach ($domain in $graphDomains) {
-            $isDefault = [bool](Get-InventoryValue $domain 'isDefault' $false)
-            $name = [string](Get-InventoryValue $domain 'id' '')
-            if ($isDefault) { $defaultDomain = $name }
-            [pscustomobject][ordered]@{
-                DomainName         = $name
-                IsDefault          = $isDefault
-                IsInitial          = [bool](Get-InventoryValue $domain 'isInitial' $false)
-                IsVerified         = [bool](Get-InventoryValue $domain 'isVerified' $false)
-                AuthenticationType = [string](Get-InventoryValue $domain 'authenticationType' '')
-                SupportedServices  = Join-MigrationList -Values @(
-                    @(Get-InventoryValue $domain 'supportedServices' @()) |
-                        ForEach-Object { [string]$_ })
-            }
-        })
+        $domainRows = @(foreach ($domain in @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/domains' -All)) {
+                $isDefault = [bool](Get-InventoryValue $domain 'isDefault' $false)
+                $name = [string](Get-InventoryValue $domain 'id' '')
+                if ($isDefault) { $defaultDomain = $name }
+                [pscustomobject][ordered]@{
+                    DomainName         = $name
+                    IsDefault          = $isDefault
+                    IsInitial          = [bool](Get-InventoryValue $domain 'isInitial' $false)
+                    IsVerified         = [bool](Get-InventoryValue $domain 'isVerified' $false)
+                    AuthenticationType = [string](Get-InventoryValue $domain 'authenticationType' '')
+                    SupportedServices  = Join-MigrationList -Values @(
+                        @(Get-InventoryValue $domain 'supportedServices' @()) | ForEach-Object { [string]$_ })
+                }
+            })
     }
     catch {
         Write-MigrationLog -Message "Could not read domains: $($_.Exception.Message)" -Level WARNING
@@ -1511,41 +1169,34 @@ try {
     Write-MigrationLog -Message 'Reading subscribed SKUs...' -Level INFO
     $skuCatalog = @(Get-MigrationSkuCatalog)
     $skuNameById = @{}
-    foreach ($sku in $skuCatalog) { $skuNameById[$sku.SkuId] = $sku.SkuPartNumber }
-
-    # The catalog exposes service plan names but not their ids, and disabledPlans on a user is a
-    # list of ids - so the raw payload is read once to build the id-to-name map.
     $servicePlanNameById = @{}
-    try {
-        foreach ($raw in @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/subscribedSkus' -All)) {
-            foreach ($plan in @(Get-InventoryValue $raw 'servicePlans' @())) {
-                $planId = [string](Get-InventoryValue $plan 'servicePlanId' '')
-                $planName = [string](Get-InventoryValue $plan 'servicePlanName' '')
-                if ($planId -and -not $servicePlanNameById.ContainsKey($planId)) { $servicePlanNameById[$planId] = $planName }
+    foreach ($sku in $skuCatalog) {
+        $skuNameById[$sku.SkuId] = $sku.SkuPartNumber
+        # disabledPlans on a user is a list of service plan GUIDs; the catalog carries the ids
+        # alongside the names, so no second read of /subscribedSkus is needed to label them.
+        foreach ($plan in @($sku.ServicePlans)) {
+            $planId = [string](Get-InventoryValue $plan 'ServicePlanId' '')
+            if ($planId -and -not $servicePlanNameById.ContainsKey($planId)) {
+                $servicePlanNameById[$planId] = [string](Get-InventoryValue $plan 'ServicePlanName' '')
             }
         }
-    }
-    catch {
-        Write-MigrationLog -Message "Could not map service plan names: $($_.Exception.Message)" -Level WARNING
     }
 
     #-- Users -------------------------------------------------------------------------------------
     Write-MigrationLog -Message 'Reading users from Microsoft Graph...' -Level INFO
-    $graphUsers = @(Get-InventoryGraphUser -IncludeDisabledUser:$IncludeDisabled)
+    $graphUsers = @(Get-InventoryGraphUser -IncludeDisabledUser:$IncludeDisabled -PageSize $graphPageSize)
     Write-MigrationLog -Message "Graph returned $($graphUsers.Count) user(s)." -Level INFO
 
     if (-not $IncludeGuests) {
-        $graphUsers = @($graphUsers | Where-Object {
-            (Get-InventoryValue $_ 'userType' 'Member') -ne 'Guest'
-        })
+        $graphUsers = @($graphUsers | Where-Object { (Get-InventoryValue $_ 'userType' 'Member') -ne 'Guest' })
     }
     if ($domains.Count -gt 0) {
         $graphUsers = @($graphUsers | Where-Object {
-            Test-InventoryDomainMatch -Domain $domains -Address @(
-                [string](Get-InventoryValue $_ 'userPrincipalName' '')
-                [string](Get-InventoryValue $_ 'mail' '')
-            )
-        })
+                Test-InventoryDomainMatch -Domain $domains -Address @(
+                    [string](Get-InventoryValue $_ 'userPrincipalName' '')
+                    [string](Get-InventoryValue $_ 'mail' '')
+                )
+            })
     }
     Write-MigrationLog -Message "Users after filtering: $($graphUsers.Count)" -Level INFO
 
@@ -1556,40 +1207,48 @@ try {
     #-- Mailboxes ---------------------------------------------------------------------------------
     Write-MigrationLog -Message 'Reading Exchange Online mailboxes...' -Level INFO
     $mailboxes = @(Get-InventoryMailbox -PropertySet $mailboxPropertySets -Property $mailboxProperties `
-        -RecipientTypeDetail $mailboxRecipientTypes)
+            -RecipientTypeDetail $mailboxRecipientTypes)
     Write-MigrationLog -Message "Exchange returned $($mailboxes.Count) mailbox(es)." -Level INFO
 
     if ($domains.Count -gt 0) {
         $mailboxes = @($mailboxes | Where-Object {
-            Test-InventoryDomainMatch -Domain $domains -Address @(
-                [string](Get-InventoryValue $_ 'UserPrincipalName' '')
-                [string](Get-InventoryValue $_ 'PrimarySmtpAddress' '')
-            )
-        })
+                Test-InventoryDomainMatch -Domain $domains -Address @(
+                    [string](Get-InventoryValue $_ 'UserPrincipalName' '')
+                    [string](Get-InventoryValue $_ 'PrimarySmtpAddress' '')
+                )
+            })
         Write-MigrationLog -Message "Mailboxes after filtering: $($mailboxes.Count)" -Level INFO
     }
 
     #-- Groups and contacts -----------------------------------------------------------------------
-    Write-MigrationLog -Message 'Reading distribution groups...' -Level INFO
-    $distributionGroups = @()
-    try { $distributionGroups = @(Get-DistributionGroup -ResultSize Unlimited -ErrorAction Stop) }
-    catch {
-        Write-MigrationLog -Message "Could not read distribution groups: $($_.Exception.Message)" -Level WARNING
-        $script:RowFailureCount++
+    # Each Exchange read is optional: a tenant where one of them is denied still produces every
+    # other tab, with the shortfall counted and reported at the end.
+    $exchangeReads = [ordered]@{
+        'distribution groups'          = { Get-DistributionGroup -ResultSize Unlimited -ErrorAction Stop }
+        'dynamic distribution groups'  = { Get-DynamicDistributionGroup -ResultSize Unlimited -ErrorAction Stop }
+        'Microsoft 365 groups'         = { Get-UnifiedGroup -ResultSize Unlimited -ErrorAction Stop }
+        'mail contacts'                = { Get-MailContact -ResultSize Unlimited -ErrorAction Stop }
+        'directory contacts'           = { Get-Contact -ResultSize Unlimited -ErrorAction Stop }
     }
-
-    $dynamicGroups = @()
-    try { $dynamicGroups = @(Get-DynamicDistributionGroup -ResultSize Unlimited -ErrorAction Stop) }
-    catch {
-        Write-MigrationLog -Message "Could not read dynamic distribution groups: $($_.Exception.Message)" -Level WARNING
-        $script:RowFailureCount++
+    $exchangeObjects = @{}
+    foreach ($read in $exchangeReads.GetEnumerator()) {
+        Write-MigrationLog -Message "Reading $($read.Key)..." -Level INFO
+        try { $exchangeObjects[$read.Key] = @(& $read.Value) }
+        catch {
+            Write-MigrationLog -Message "Could not read $($read.Key): $($_.Exception.Message)" -Level WARNING
+            $exchangeObjects[$read.Key] = @()
+            $script:RowFailureCount++
+        }
     }
+    $distributionGroups = $exchangeObjects['distribution groups']
+    $dynamicGroups = $exchangeObjects['dynamic distribution groups']
+    $unifiedGroups = $exchangeObjects['Microsoft 365 groups']
+    $mailContacts = $exchangeObjects['mail contacts']
 
-    $unifiedGroups = @()
-    try { $unifiedGroups = @(Get-UnifiedGroup -ResultSize Unlimited -ErrorAction Stop) }
-    catch {
-        Write-MigrationLog -Message "Could not read Microsoft 365 groups from Exchange: $($_.Exception.Message)" -Level WARNING
-        $script:RowFailureCount++
+    $contactByGuid = @{}
+    foreach ($contact in $exchangeObjects['directory contacts']) {
+        $guid = [string](Get-InventoryValue $contact 'Guid' '')
+        if ($guid) { $contactByGuid[$guid] = $contact }
     }
 
     Write-MigrationLog -Message 'Reading groups from Microsoft Graph...' -Level INFO
@@ -1599,7 +1258,8 @@ try {
             'id', 'displayName', 'mail', 'mailNickname', 'mailEnabled', 'securityEnabled', 'groupTypes',
             'visibility', 'resourceProvisioningOptions', 'proxyAddresses', 'onPremisesSyncEnabled', 'membershipRule'
         ) -join ','
-        $graphGroups = @(Invoke-MigrationGraphRequest -Method GET -Uri "/v1.0/groups?`$select=$groupSelect&`$top=999" -All)
+        $graphGroups = @(Invoke-MigrationGraphRequest -Method GET -All `
+                -Uri "/v1.0/groups?`$select=$groupSelect&`$top=$graphPageSize")
     }
     catch {
         Write-MigrationLog -Message "Could not read groups from Graph: $($_.Exception.Message)" -Level WARNING
@@ -1607,27 +1267,11 @@ try {
     }
     Write-MigrationLog -Message "Graph returned $($graphGroups.Count) group(s)." -Level INFO
 
-    Write-MigrationLog -Message 'Reading mail contacts...' -Level INFO
-    $mailContacts = @()
-    $contactByGuid = @{}
-    try {
-        $mailContacts = @(Get-MailContact -ResultSize Unlimited -ErrorAction Stop)
-        foreach ($contact in @(Get-Contact -ResultSize Unlimited -ErrorAction Stop)) {
-            $guid = [string](Get-InventoryValue $contact 'Guid' '')
-            if ($guid) { $contactByGuid[$guid] = $contact }
-        }
-    }
-    catch {
-        Write-MigrationLog -Message "Could not read mail contacts: $($_.Exception.Message)" -Level WARNING
-        $script:RowFailureCount++
-    }
-
     if ($domains.Count -gt 0) {
         $mailContacts = @($mailContacts | Where-Object {
-            Test-InventoryDomainMatch -Domain $domains -Address @(
-                [string](Get-InventoryValue $_ 'PrimarySmtpAddress' '')
-            )
-        })
+                Test-InventoryDomainMatch -Domain $domains -Address @(
+                    [string](Get-InventoryValue $_ 'PrimarySmtpAddress' ''))
+            })
     }
 
     #-- Recipient index ---------------------------------------------------------------------------
@@ -1671,11 +1315,8 @@ try {
         Write-InventoryProgress -Tab 'Users' -Status $upn -Current $index -Total $graphUsers.Count
 
         $userId = [string](Get-InventoryValue $user 'id' '')
-        $roles = @()
-        if ($userId -and $roleMap.ContainsKey($userId)) { $roles = @($roleMap[$userId]) }
-
-        $registration = $null
-        if ($userId -and $authMap.ContainsKey($userId)) { $registration = $authMap[$userId] }
+        $roles = if ($userId -and $roleMap.ContainsKey($userId)) { @($roleMap[$userId]) } else { @() }
+        $registration = if ($userId -and $authMap.ContainsKey($userId)) { $authMap[$userId] } else { $null }
 
         $drive = $null
         if ($IncludeOneDrive -and $userId) {
@@ -1691,8 +1332,7 @@ try {
 
         foreach ($state in @(Get-InventoryValue $user 'assignedLicenses' @())) {
             foreach ($planId in @(Get-InventoryValue $state 'disabledPlans' @())) {
-                $skuId = [string](Get-InventoryValue $state 'skuId' '')
-                $key = "$skuId|$planId"
+                $key = "$([string](Get-InventoryValue $state 'skuId' ''))|$planId"
                 if (-not $disabledPlanTally.ContainsKey($key)) { $disabledPlanTally[$key] = 0 }
                 $disabledPlanTally[$key]++
             }
@@ -1709,12 +1349,12 @@ try {
 
     #-- Mailbox tabs ------------------------------------------------------------------------------
     $statisticsMap = @{}
-    if (-not $SkipMailboxStats) {
-        Write-MigrationLog -Message "Collecting statistics for $($mailboxes.Count) mailbox(es)..." -Level INFO
-        $statisticsMap = Get-InventoryMailboxStatistic -Mailbox $mailboxes
+    if ($SkipMailboxStats) {
+        Write-MigrationLog -Message 'Skipping mailbox statistics (-SkipMailboxStats).' -Level WARNING
     }
     else {
-        Write-MigrationLog -Message 'Skipping mailbox statistics (-SkipMailboxStats).' -Level WARNING
+        Write-MigrationLog -Message "Collecting statistics for $($mailboxes.Count) mailbox(es)..." -Level INFO
+        $statisticsMap = Get-InventoryMailboxStatistic -Mailbox $mailboxes
     }
 
     Write-MigrationLog -Message 'Building the mailbox tabs...' -Level INFO
@@ -1753,7 +1393,7 @@ try {
         Write-MigrationLog -Level INFO -Message ("Collecting permissions for " +
             "$($mailboxes.Count) mailbox(es) - this is the slowest pass.")
         $permissionRows = @(Get-InventoryMailboxPermission -Mailbox $mailboxes `
-            -ExclusionPattern $permissionTrusteeExclusions -CalendarBuiltIn $calendarBuiltInTrustees)
+                -ExclusionPattern $permissionTrusteeExclusions -CalendarBuiltIn $calendarBuiltInTrustees)
         Write-MigrationLog -Message "Found $($permissionRows.Count) delegation(s)." -Level INFO
     }
 
@@ -1781,30 +1421,20 @@ try {
         $objectId = [string](Get-InventoryValue $group 'ExternalDirectoryObjectId' '')
         if ($objectId) { $null = $seenGroupIds.Add($objectId) }
 
-        $graphGroup = $null
-        if ($objectId -and $graphGroupById.ContainsKey($objectId)) { $graphGroup = $graphGroupById[$objectId] }
-
-        $provisioning = @(Get-InventoryValue $graphGroup 'resourceProvisioningOptions' @())
-        $isTeam = ($provisioning -contains 'Team')
-        $recipientType = [string](Get-InventoryValue $group 'RecipientTypeDetails' '')
-        $groupType = Get-InventoryGroupType -RecipientTypeDetails $recipientType -IsTeam $isTeam `
-            -GroupType @(Get-InventoryValue $graphGroup 'groupTypes' @()) `
-            -MailEnabled $true -SecurityEnabled $false
-
-        # Dynamic groups are defined by their filter, not by a membership list: the filter is
-        # what has to be recreated in the destination, so it is captured verbatim and no
-        # (potentially enormous) preview expansion is run.
-        $recipientFilter = [string](Get-InventoryValue $group 'RecipientFilter' '')
+        $graphGroup = if ($objectId -and $graphGroupById.ContainsKey($objectId)) { $graphGroupById[$objectId] } else { $null }
+        $isTeam = (@(Get-InventoryValue $graphGroup 'resourceProvisioningOptions' @()) -contains 'Team')
+        $groupType = Get-InventoryGroupType -IsTeam $isTeam -MailEnabled $true -SecurityEnabled $false `
+            -RecipientTypeDetails ([string](Get-InventoryValue $group 'RecipientTypeDetails' '')) `
+            -GroupType @(Get-InventoryValue $graphGroup 'groupTypes' @())
 
         $members = @()
         if ($groupType -in @('Distribution', 'MailEnabledSecurity')) {
             try {
                 $members = @(Get-DistributionGroupMember -Identity $objectId -ResultSize Unlimited -ErrorAction Stop |
-                    ForEach-Object {
-                        $memberSmtp = [string](Get-InventoryValue $_ 'PrimarySmtpAddress' '')
-                        if ($memberSmtp) { $memberSmtp }
-                        else { [string](Get-InventoryValue $_ 'DisplayName' '') }
-                    })
+                        ForEach-Object {
+                            $memberSmtp = [string](Get-InventoryValue $_ 'PrimarySmtpAddress' '')
+                            if ($memberSmtp) { $memberSmtp } else { [string](Get-InventoryValue $_ 'DisplayName' '') }
+                        })
             }
             catch {
                 Write-MigrationLog -Message "Could not read members of '$displayName': $($_.Exception.Message)" -Level WARNING
@@ -1813,14 +1443,8 @@ try {
         }
         elseif ($groupType -in @('M365Group', 'Team') -and $objectId) {
             try {
-                $members = @(Invoke-MigrationGraphRequest -Method GET -All `
-                    -Uri "/v1.0/groups/$objectId/members`?`$select=id,displayName,userPrincipalName,mail&`$top=999" |
-                    ForEach-Object {
-                        $value = [string](Get-InventoryValue $_ 'userPrincipalName' '')
-                        if (-not $value) { $value = [string](Get-InventoryValue $_ 'mail' '') }
-                        if (-not $value) { $value = [string](Get-InventoryValue $_ 'displayName' '') }
-                        $value
-                    })
+                $members = @(Get-InventoryGraphPrincipalList -GroupId $objectId -Relationship members `
+                        -Select $principalSelect -PageSize $graphPageSize)
             }
             catch {
                 Write-MigrationLog -Message "Could not read members of '$displayName': $($_.Exception.Message)" -Level WARNING
@@ -1832,31 +1456,34 @@ try {
         $addresses = Select-InventoryAddress -EmailAddress (@(Get-InventoryValue $group 'EmailAddresses' @()))
 
         $groupRows.Add([pscustomobject][ordered]@{
-            ObjectId                            = $objectId
-            DisplayName                         = $displayName
-            PrimarySmtpAddress                  = $primarySmtp
-            GroupType                           = $groupType
-            Alias                               = [string](Get-InventoryValue $group 'Alias' '')
-            EmailAddresses                      = Join-MigrationList -Values $addresses.All
-            LegacyExchangeDN                    = [string](Get-InventoryValue $group 'LegacyExchangeDN' '')
-            ManagedBy                           = $owners
-            Members                             = Join-MigrationList -Values $members
-            MemberCount                         = $members.Count
-            Owners                              = $owners
-            HiddenFromAddressLists              = [bool](Get-InventoryValue $group 'HiddenFromAddressListsEnabled' $false)
-            RequireSenderAuthenticationEnabled  = [bool](Get-InventoryValue $group 'RequireSenderAuthenticationEnabled' $false)
-            AcceptMessagesOnlyFrom              = Join-InventoryRecipientList -Value `
-                (Get-InventoryValue $group 'AcceptMessagesOnlyFromSendersOrMembers')
-            ModerationEnabled                   = [bool](Get-InventoryValue $group 'ModerationEnabled' $false)
-            ModeratedBy                         = Join-InventoryRecipientList -Value (Get-InventoryValue $group 'ModeratedBy')
-            GrantSendOnBehalfTo                 = Join-InventoryRecipientList -Value (Get-InventoryValue $group 'GrantSendOnBehalfTo')
-            MemberJoinRestriction               = [string](Get-InventoryValue $group 'MemberJoinRestriction' '')
-            MemberDepartRestriction             = [string](Get-InventoryValue $group 'MemberDepartRestriction' '')
-            RecipientFilter                     = $recipientFilter
-            IsSynced                            = [bool](Get-InventoryValue $graphGroup 'onPremisesSyncEnabled' $false)
-            Visibility                          = [string](Get-InventoryValue $graphGroup 'visibility' '')
-            TeamEnabled                         = $isTeam
-        })
+                ObjectId                           = $objectId
+                DisplayName                        = $displayName
+                PrimarySmtpAddress                 = $primarySmtp
+                GroupType                          = $groupType
+                Alias                              = [string](Get-InventoryValue $group 'Alias' '')
+                EmailAddresses                     = Join-MigrationList -Values $addresses.All
+                LegacyExchangeDN                   = [string](Get-InventoryValue $group 'LegacyExchangeDN' '')
+                ManagedBy                          = $owners
+                Members                            = Join-MigrationList -Values $members
+                MemberCount                        = $members.Count
+                Owners                             = $owners
+                HiddenFromAddressLists             = [bool](Get-InventoryValue $group 'HiddenFromAddressListsEnabled' $false)
+                RequireSenderAuthenticationEnabled = [bool](Get-InventoryValue $group 'RequireSenderAuthenticationEnabled' $false)
+                AcceptMessagesOnlyFrom             = Join-InventoryRecipientList -Value `
+                    (Get-InventoryValue $group 'AcceptMessagesOnlyFromSendersOrMembers')
+                ModerationEnabled                  = [bool](Get-InventoryValue $group 'ModerationEnabled' $false)
+                ModeratedBy                        = Join-InventoryRecipientList -Value (Get-InventoryValue $group 'ModeratedBy')
+                GrantSendOnBehalfTo                = Join-InventoryRecipientList -Value (Get-InventoryValue $group 'GrantSendOnBehalfTo')
+                MemberJoinRestriction              = [string](Get-InventoryValue $group 'MemberJoinRestriction' '')
+                MemberDepartRestriction            = [string](Get-InventoryValue $group 'MemberDepartRestriction' '')
+                # Dynamic groups are defined by their filter, not a membership list: the filter is
+                # what has to be recreated, so it is captured verbatim and no (potentially
+                # enormous) preview expansion is run.
+                RecipientFilter                    = [string](Get-InventoryValue $group 'RecipientFilter' '')
+                IsSynced                           = [bool](Get-InventoryValue $graphGroup 'onPremisesSyncEnabled' $false)
+                Visibility                         = [string](Get-InventoryValue $graphGroup 'visibility' '')
+                TeamEnabled                        = $isTeam
+            })
     }
 
     # Graph-only groups: security groups that Exchange never sees. They are informational -
@@ -1868,14 +1495,13 @@ try {
         if (-not $objectId -or $seenGroupIds.Contains($objectId)) { continue }
 
         $displayName = [string](Get-InventoryValue $group 'displayName' '')
-        $groupTotal = $exchangeGroups.Count + $graphGroups.Count
-        Write-InventoryProgress -Tab 'Groups' -Status $displayName -Current $index -Total $groupTotal
+        Write-InventoryProgress -Tab 'Groups' -Status $displayName -Current $index `
+            -Total ($exchangeGroups.Count + $graphGroups.Count)
 
         $mail = [string](Get-InventoryValue $group 'mail' '')
         if ($domains.Count -gt 0 -and $mail -and -not (Test-InventoryDomainMatch -Domain $domains -Address @($mail))) { continue }
 
-        $provisioning = @(Get-InventoryValue $group 'resourceProvisioningOptions' @())
-        $isTeam = ($provisioning -contains 'Team')
+        $isTeam = (@(Get-InventoryValue $group 'resourceProvisioningOptions' @()) -contains 'Team')
         $groupType = Get-InventoryGroupType -RecipientTypeDetails '' -IsTeam $isTeam `
             -GroupType @(Get-InventoryValue $group 'groupTypes' @()) `
             -MailEnabled ([bool](Get-InventoryValue $group 'mailEnabled' $false)) `
@@ -1884,22 +1510,10 @@ try {
         $members = @()
         $owners = @()
         try {
-            $members = @(Invoke-MigrationGraphRequest -Method GET -All `
-                -Uri "/v1.0/groups/$objectId/members`?`$select=id,displayName,userPrincipalName,mail&`$top=999" |
-                ForEach-Object {
-                    $value = [string](Get-InventoryValue $_ 'userPrincipalName' '')
-                    if (-not $value) { $value = [string](Get-InventoryValue $_ 'mail' '') }
-                    if (-not $value) { $value = [string](Get-InventoryValue $_ 'displayName' '') }
-                    $value
-                })
-            $owners = @(Invoke-MigrationGraphRequest -Method GET -All `
-                -Uri "/v1.0/groups/$objectId/owners`?`$select=id,displayName,userPrincipalName,mail&`$top=999" |
-                ForEach-Object {
-                    $value = [string](Get-InventoryValue $_ 'userPrincipalName' '')
-                    if (-not $value) { $value = [string](Get-InventoryValue $_ 'mail' '') }
-                    if (-not $value) { $value = [string](Get-InventoryValue $_ 'displayName' '') }
-                    $value
-                })
+            $members = @(Get-InventoryGraphPrincipalList -GroupId $objectId -Relationship members `
+                    -Select $principalSelect -PageSize $graphPageSize)
+            $owners = @(Get-InventoryGraphPrincipalList -GroupId $objectId -Relationship owners `
+                    -Select $principalSelect -PageSize $graphPageSize)
         }
         catch {
             Write-MigrationLog -Message "Could not read membership of '$displayName': $($_.Exception.Message)" -Level WARNING
@@ -1909,30 +1523,30 @@ try {
         $addresses = Select-InventoryAddress -EmailAddress (@(Get-InventoryValue $group 'proxyAddresses' @()))
 
         $groupRows.Add([pscustomobject][ordered]@{
-            ObjectId                            = $objectId
-            DisplayName                         = $displayName
-            PrimarySmtpAddress                  = $mail
-            GroupType                           = $groupType
-            Alias                               = [string](Get-InventoryValue $group 'mailNickname' '')
-            EmailAddresses                      = Join-MigrationList -Values $addresses.All
-            LegacyExchangeDN                    = ''
-            ManagedBy                           = Join-MigrationList -Values $owners
-            Members                             = Join-MigrationList -Values $members
-            MemberCount                         = $members.Count
-            Owners                              = Join-MigrationList -Values $owners
-            HiddenFromAddressLists              = $false
-            RequireSenderAuthenticationEnabled  = $false
-            AcceptMessagesOnlyFrom              = ''
-            ModerationEnabled                   = $false
-            ModeratedBy                         = ''
-            GrantSendOnBehalfTo                 = ''
-            MemberJoinRestriction               = ''
-            MemberDepartRestriction             = ''
-            RecipientFilter                     = [string](Get-InventoryValue $group 'membershipRule' '')
-            IsSynced                            = [bool](Get-InventoryValue $group 'onPremisesSyncEnabled' $false)
-            Visibility                          = [string](Get-InventoryValue $group 'visibility' '')
-            TeamEnabled                         = $isTeam
-        })
+                ObjectId                           = $objectId
+                DisplayName                        = $displayName
+                PrimarySmtpAddress                 = $mail
+                GroupType                          = $groupType
+                Alias                              = [string](Get-InventoryValue $group 'mailNickname' '')
+                EmailAddresses                     = Join-MigrationList -Values $addresses.All
+                LegacyExchangeDN                   = ''
+                ManagedBy                          = Join-MigrationList -Values $owners
+                Members                            = Join-MigrationList -Values $members
+                MemberCount                        = $members.Count
+                Owners                             = Join-MigrationList -Values $owners
+                HiddenFromAddressLists             = $false
+                RequireSenderAuthenticationEnabled = $false
+                AcceptMessagesOnlyFrom             = ''
+                ModerationEnabled                  = $false
+                ModeratedBy                        = ''
+                GrantSendOnBehalfTo                = ''
+                MemberJoinRestriction              = ''
+                MemberDepartRestriction            = ''
+                RecipientFilter                    = [string](Get-InventoryValue $group 'membershipRule' '')
+                IsSynced                           = [bool](Get-InventoryValue $group 'onPremisesSyncEnabled' $false)
+                Visibility                         = [string](Get-InventoryValue $group 'visibility' '')
+                TeamEnabled                        = $isTeam
+            })
     }
     Write-Progress -Activity 'Inventory: Groups' -Completed
     Write-MigrationLog -Message "Groups: $($groupRows.Count)" -Level INFO
@@ -1940,33 +1554,33 @@ try {
     #-- Contacts tab ------------------------------------------------------------------------------
     Write-MigrationLog -Message 'Building the Contacts tab...' -Level INFO
     $contactRows = @(foreach ($mailContact in $mailContacts) {
-        $guid = [string](Get-InventoryValue $mailContact 'Guid' '')
-        $contact = if ($guid -and $contactByGuid.ContainsKey($guid)) { $contactByGuid[$guid] } else { $null }
-        ConvertTo-InventoryContactRow -MailContact $mailContact -Contact $contact
-    })
+            $guid = [string](Get-InventoryValue $mailContact 'Guid' '')
+            $contact = if ($guid -and $contactByGuid.ContainsKey($guid)) { $contactByGuid[$guid] } else { $null }
+            ConvertTo-InventoryContactRow -MailContact $mailContact -Contact $contact
+        })
 
     #-- Licenses tab ------------------------------------------------------------------------------
     $licenseRows = @(foreach ($sku in $skuCatalog) {
-        $common = @($disabledPlanTally.GetEnumerator() |
-            Where-Object { $_.Key.StartsWith("$($sku.SkuId)|", [StringComparison]::OrdinalIgnoreCase) } |
-            Sort-Object -Property Value -Descending |
-            Select-Object -First 3 |
-            ForEach-Object {
-                $planId = ($_.Key -split '\|')[-1]
-                $planName = if ($servicePlanNameById.ContainsKey($planId)) { $servicePlanNameById[$planId] } else { $planId }
-                "$planName ($($_.Value))"
-            })
+            $common = @($disabledPlanTally.GetEnumerator() |
+                    Where-Object { $_.Key.StartsWith("$($sku.SkuId)|", [StringComparison]::OrdinalIgnoreCase) } |
+                    Sort-Object -Property Value -Descending |
+                    Select-Object -First 3 |
+                    ForEach-Object {
+                        $planId = ($_.Key -split '\|')[-1]
+                        $planName = if ($servicePlanNameById.ContainsKey($planId)) { $servicePlanNameById[$planId] } else { $planId }
+                        "$planName ($($_.Value))"
+                    })
 
-        [pscustomobject][ordered]@{
-            SkuPartNumber               = $sku.SkuPartNumber
-            FriendlyName                = $sku.FriendlyName
-            SkuId                       = $sku.SkuId
-            Enabled                     = $sku.Enabled
-            Consumed                    = $sku.Consumed
-            Available                   = $sku.Available
-            ServicePlansDisabledCommon  = Join-MigrationList -Values $common
-        }
-    })
+            [pscustomobject][ordered]@{
+                SkuPartNumber              = $sku.SkuPartNumber
+                FriendlyName               = $sku.FriendlyName
+                SkuId                      = $sku.SkuId
+                Enabled                    = $sku.Enabled
+                Consumed                   = $sku.Consumed
+                Available                  = $sku.Available
+                ServicePlansDisabledCommon = Join-MigrationList -Values $common
+            }
+        })
 
     #-- Summary tab -------------------------------------------------------------------------------
     $mailboxTypeCount = @{}
@@ -2044,12 +1658,10 @@ try {
 
     Write-MigrationLog -Message '--- Inventory summary ---' -Level SUCCESS
     foreach ($tab in $inventoryTabs) {
-        $line = '  {0,-19}{1,6} row(s)  {2}' -f $tab, @($tabData[$tab]).Count, $csvPaths[$tab]
-        Write-MigrationLog -Message $line -Level SUCCESS
+        Write-MigrationLog -Level SUCCESS -Message (
+            '  {0,-19}{1,6} row(s)  {2}' -f $tab, @($tabData[$tab]).Count, $csvPaths[$tab])
     }
-    if ($useExcel) {
-        Write-MigrationLog -Message "  Workbook           $excelPath" -Level SUCCESS
-    }
+    if ($useExcel) { Write-MigrationLog -Message "  Workbook           $excelPath" -Level SUCCESS }
 
     if ($script:RowFailureCount -gt 0) {
         Write-MigrationLog -Level WARNING -Message ("$($script:RowFailureCount) object(s) " +
