@@ -122,8 +122,9 @@
 .EXAMPLE
     .\New-MigrationRecipients.ps1 -PlanPath .\IdentityPlan.csv -Mode UpdateSettings -GroupsCsv .\Contoso_Groups.csv -DelegatedOrganization newco.onmicrosoft.com
 
-    Leaves creation alone and patches owners, members, moderation and delivery restrictions
-    onto groups that already exist in the customer tenant.
+    GDAP alternative: as a partner administering the tenant through GDAP rather than signing in
+    as a Global Admin in it. Leaves creation alone and patches owners, members, moderation and
+    delivery restrictions onto groups that already exist in the customer tenant.
 
 .NOTES
     Author:  AutomationHub

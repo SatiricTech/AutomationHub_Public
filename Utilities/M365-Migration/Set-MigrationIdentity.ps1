@@ -103,14 +103,6 @@
     listing every operation that would run, without touching a single object.
 
 .EXAMPLE
-    .\Set-MigrationIdentity.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -Apply Upn,PrimarySmtp,Aliases,X500 `
-        -DisableEmailAddressPolicy -DelegatedOrganization contoso.onmicrosoft.com -Prefix Contoso
-
-    Cutover for wave 1 in a customer tenant managed through GDAP: switches each user from their
-    interim newco.onmicrosoft.com identity to the vanity domain and stamps the source X500 so old
-    replies keep working.
-
-.EXAMPLE
     .\Set-MigrationIdentity.ps1 -PlanPath .\UpnRedesign.csv -MatchOn Source -Apply Upn,PrimarySmtp `
         -RemoveOldPrimaryAlias -WhatIf
 
@@ -121,6 +113,15 @@
     .\Set-MigrationIdentity.ps1 -PlanPath .\IdentityPlan.csv -Apply GalVisibility -Unhide -Wave 2
 
     Reveals wave 2 in the global address list once their mailboxes are cut over.
+
+.EXAMPLE
+    .\Set-MigrationIdentity.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -Apply Upn,PrimarySmtp,Aliases,X500 `
+        -DisableEmailAddressPolicy -DelegatedOrganization contoso.onmicrosoft.com -Prefix Contoso
+
+    GDAP alternative: the same wave 1 cutover in a customer tenant administered through GDAP
+    rather than with a Global Admin account in it. Switches each user from their interim
+    newco.onmicrosoft.com identity to the vanity domain and stamps the source X500 so old replies
+    keep working.
 
 .NOTES
     Author       : AutomationHub

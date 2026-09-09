@@ -106,16 +106,17 @@
     Inventories only the two named domains and adds MFA registration to the Users tab.
 
 .EXAMPLE
-    .\Get-MigrationInventory.ps1 -Prefix Destination -TenantId 'newco.onmicrosoft.com' `
-        -DelegatedOrganization 'newco.onmicrosoft.com'
-
-    Inventories a customer tenant through GDAP so the planner can use it as the reserved
-    address list for the destination.
-
-.EXAMPLE
     .\Get-MigrationInventory.ps1 -Prefix Source -SkipMailboxStats -SkipMailboxPermissions -DryRun
 
     Rehearses the fastest possible run and prints the file list without writing anything.
+
+.EXAMPLE
+    .\Get-MigrationInventory.ps1 -Prefix Destination -TenantId 'newco.onmicrosoft.com' `
+        -DelegatedOrganization 'newco.onmicrosoft.com'
+
+    GDAP alternative: inventories a customer tenant as a partner through a GDAP relationship,
+    rather than signing in as a Global Admin in that tenant, so the planner can use it as the
+    reserved address list for the destination.
 
 .NOTES
     Author      : AutomationHub

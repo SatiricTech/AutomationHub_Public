@@ -40,9 +40,34 @@ plan** — so no phase has to guess what an earlier phase decided.
 | Exchange roles | Exchange Administrator (recipient management, permissions, address policies). |
 | Teams roles | Teams Administrator or Teams Communications Administrator. |
 | SharePoint | SharePoint Administrator, only if you pre-provision OneDrive with `Request-SPOPersonalSite`. |
-| Service account | The account Fly uses must be licensed and **excluded from MFA / Conditional Access** in both tenants, and needs site-collection-admin grants for SPO/OneDrive. |
+| Fly authorisation | A Global Admin in each tenant grants consent to Fly's app when the tenants are connected in the Fly console. A service account is *optional* — only needed when a specific Fly module asks for one (some Teams chat modes do). If you use one, license it and exclude it from MFA / Conditional Access for the duration of the project. Fly also needs site-collection-admin grants for the SPO/OneDrive sites it touches. |
 
-### GDAP notes
+### Signing in
+
+The normal path is a **dedicated Global Admin account in the source tenant and a second one
+in the destination tenant**, signed in to directly with each. Each account lives in the
+tenant it administers, so nothing has to be delegated.
+
+- **Every script prints the tenant id and display name it actually connected to.** Read that
+  line before you let a writer run.
+- The scripts reuse a cached session when one is open. Switching between the two accounts on
+  one workstation means tearing the old session down first: `Disconnect-MgGraph` and
+  `Disconnect-ExchangeOnline`. The module's `Connect-MigrationGraph` and
+  `Connect-MigrationExchange` also accept `-Reconnect`, which signs out of the cached session
+  before connecting.
+- Pass `-TenantId <tenant>.onmicrosoft.com` where a script offers it. It pins the sign-in, so
+  a leftover session from the other tenant fails loudly instead of being reused silently.
+
+**Landing in the wrong tenant is the expensive mistake.** A stale cached session, or a GDAP
+connection made without `-DelegatedOrganization`, connects you somewhere you did not intend:
+at best every mailbox lookup fails with "No mailbox found", at worst a cleanup script runs
+against the wrong estate.
+
+#### GDAP alternative
+
+Where you administer a customer tenant as a partner through a GDAP relationship rather than
+holding an account in it, sign in with your own partner credentials and point each connection
+at the customer tenant.
 
 - `Connect-MgGraph -TenantId <customer>` works for a partner user under an active GDAP
   relationship, scoped to whatever roles GDAP granted.
@@ -52,13 +77,10 @@ plan** — so no phase has to guess what an earlier phase decided.
   `-Organization`, not `-DelegatedOrganization`.
 - Known bug: WAM can drop GDAP claims. Add `-DisableWAM` to the EXO connect if a delegated
   session lands in your own tenant.
-- **Every script prints the tenant it actually connected to.** Read that line before you let
-  a writer run. Without `-DelegatedOrganization` you connect to *your own* tenant and every
-  mailbox lookup fails with "No mailbox found" — or worse, succeeds against the wrong estate.
 
 ### Auth matrix
 
-| Script | Graph (`-TenantId`) | EXO (`-DelegatedOrganization`) | Teams (`-TenantId`) | App-only |
+| Script | Graph (supports `-TenantId`) | EXO (supports GDAP `-DelegatedOrganization`) | Teams (supports `-TenantId`) | App-only |
 |---|---|---|---|---|
 | `Get-MigrationInventory` | Yes | Yes | — | — |
 | `Get-MigrationTeamsPhoneAssignments` | — | — | Yes | — |
@@ -77,6 +99,11 @@ plan** — so no phase has to guess what an earlier phase decided.
 | `Set-MigrationTeamsPhoneAssignments` | — | — | Yes | — |
 | `Remove-MigrationTeamsPhoneAssignments` | — | — | Yes | — |
 | `Import-MigrationVivaLearningHistory` | Yes (provider registration) | — | — | Yes (`-ClientId` + secret/cert for content and activity writes) |
+
+"Yes" means the script connects to that service and accepts the parameter — it is a
+capability column, not an instruction to sign in that way. With a dedicated Global Admin in
+the tenant you need neither `-DelegatedOrganization` nor, strictly, `-TenantId`; pass
+`-TenantId` anyway as the pin against a cached session.
 
 Graph scopes are declared at the top of each script's Configuration region and verified
 after sign-in; a missing scope throws by name rather than failing on the first call.
@@ -213,7 +240,7 @@ Each step is one command. Dry-run everything first.
 **1. Inventory the source tenant** (read-only)
 
 ```powershell
-.\Get-MigrationInventory.ps1 -Prefix Source -DelegatedOrganization contoso.onmicrosoft.com -IncludeAuthMethods
+.\Get-MigrationInventory.ps1 -Prefix Source -TenantId contoso.onmicrosoft.com -IncludeAuthMethods
 ```
 
 Nine tabs as CSVs plus one workbook: `Users`, `UserMailboxes`, `SharedMailboxes`,
@@ -222,7 +249,7 @@ Nine tabs as CSVs plus one workbook: `Users`, `UserMailboxes`, `SharedMailboxes`
 **2. Inventory the destination tenant** (read-only)
 
 ```powershell
-.\Get-MigrationInventory.ps1 -Prefix Destination -DelegatedOrganization newco.onmicrosoft.com
+.\Get-MigrationInventory.ps1 -Prefix Destination -TenantId newco.onmicrosoft.com
 ```
 
 **3. Build the identity plan** (offline)
@@ -248,7 +275,7 @@ Review the plan with the client. Fix `NeedsReview`, `Collision` and `Invalid` ro
 
 ```powershell
 .\Test-MigrationReadiness.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -Stage Pre `
-    -TenantId newco.onmicrosoft.com -DelegatedOrganization newco.onmicrosoft.com -Prefix Contoso
+    -TenantId newco.onmicrosoft.com -Prefix Contoso
 ```
 
 Must exit 0 before you provision anything.
@@ -276,7 +303,7 @@ the first write if the tenant is short.
 ```powershell
 .\New-MigrationRecipients.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -Wave 1 -Mode CreateAndUpdate `
     -GroupsCsv .\Source_Groups_*.csv -ContactsCsv .\Source_Contacts_*.csv `
-    -SharedMailboxesCsv .\Source_SharedMailboxes_*.csv -DelegatedOrganization newco.onmicrosoft.com -Prefix Contoso
+    -SharedMailboxesCsv .\Source_SharedMailboxes_*.csv -Prefix Contoso
 ```
 
 Use `-Mode UpdateSettings` alone to patch settings onto groups Fly already created.
@@ -286,7 +313,7 @@ Use `-Mode UpdateSettings` alone to patch settings onto groups Fly already creat
 ```powershell
 .\Test-MigrationReadiness.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -Stage Provisioned `
     -SourceMailboxesCsv .\Source_UserMailboxes_*.csv -TenantId newco.onmicrosoft.com `
-    -DelegatedOrganization newco.onmicrosoft.com -Prefix Contoso
+    -Prefix Contoso
 ```
 
 Writes `MailboxProvisioned` / `OneDriveProvisioned` back to the plan.
@@ -300,11 +327,11 @@ passes finish and re-run deltas until the deltas are small.
 ```powershell
 # Report first - always
 .\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -ReportOnly `
-    -TenantId contoso.onmicrosoft.com -DelegatedOrganization contoso.onmicrosoft.com -Prefix Contoso
+    -TenantId contoso.onmicrosoft.com -Prefix Contoso
 
 # Then remediate, with the acknowledgement
 .\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -AcknowledgeSourceTenant `
-    -TenantId contoso.onmicrosoft.com -DelegatedOrganization contoso.onmicrosoft.com -Prefix Contoso
+    -TenantId contoso.onmicrosoft.com -Prefix Contoso
 ```
 
 Then remove the domain from the source tenant and verify it in the destination.
@@ -315,7 +342,7 @@ Then remove the domain from the source tenant and verify it in the destination.
 .\Set-MigrationIdentity.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -Wave 1 `
     -Apply Upn,PrimarySmtp,Aliases,X500,MailNickname,GalVisibility -Unhide `
     -MatchOn TargetObjectId -DisableEmailAddressPolicy `
-    -TenantId newco.onmicrosoft.com -DelegatedOrganization newco.onmicrosoft.com -Prefix Contoso
+    -TenantId newco.onmicrosoft.com -Prefix Contoso
 ```
 
 **13. Mailbox delegation**
@@ -357,13 +384,13 @@ Credentials go to the results CSV only. Distribute them out of band.
 
 ```powershell
 .\Test-MigrationReadiness.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -Stage Post `
-    -TenantId newco.onmicrosoft.com -DelegatedOrganization newco.onmicrosoft.com -Prefix Contoso
+    -TenantId newco.onmicrosoft.com -Prefix Contoso
 ```
 
 **18. Compare** — inventory the destination again and diff it against the plan.
 
 ```powershell
-.\Get-MigrationInventory.ps1 -Prefix Post -DelegatedOrganization newco.onmicrosoft.com
+.\Get-MigrationInventory.ps1 -Prefix Post -TenantId newco.onmicrosoft.com
 .\Compare-MigrationUserData.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -DifferenceCsv .\Post_Users_*.csv -Prefix Contoso
 ```
 
@@ -374,14 +401,14 @@ Credentials go to the results CSV only. Distribute them out of band.
 No second tenant, no Fly — just standardising an existing tenant's addressing.
 
 ```powershell
-.\Get-MigrationInventory.ps1 -Prefix Fabrikam -DelegatedOrganization fabrikam.onmicrosoft.com
+.\Get-MigrationInventory.ps1 -Prefix Fabrikam -TenantId fabrikam.onmicrosoft.com
 .\New-MigrationIdentityPlan.ps1 -UsersCsv .\Fabrikam_Users_*.csv `
     -UserMailboxesCsv .\Fabrikam_UserMailboxes_*.csv `
     -TargetDomain fabrikam.com -UpnFormat First.Last -Prefix Fabrikam
 # review and edit the plan, then apply against the CURRENT addresses
 .\Set-MigrationIdentity.ps1 -PlanPath .\Fabrikam_IdentityPlan_*.csv `
     -Apply Upn,PrimarySmtp,Aliases -MatchOn Source -DisableEmailAddressPolicy `
-    -DelegatedOrganization fabrikam.onmicrosoft.com -Prefix Fabrikam -DryRun
+    -Prefix Fabrikam -DryRun
 ```
 
 `-MatchOn Source` is the whole trick: the objects already exist, so the plan's `Source*`
@@ -461,7 +488,7 @@ inside `InModuleScope`. The analyzer run must come back clean.
 | Renaming an admin's UPN | 403 `Authorization_RequestDenied` with only User Administrator | Use Privileged Authentication Administrator (or Global Admin) for admin accounts |
 | Directory-synced objects | EXO and Entra are read-only for UPN and `proxyAddresses`; "out of the current user's write scope" | Change on-premises and let AAD Connect sync. Those rows report `Failed`, not `Skipped` |
 | GAL hiding before a mailbox exists | `Set-Mailbox` has nothing to act on; Graph `showInAddressList` is a documented known issue and Exchange wins once a mailbox exists | Use `New-MigrationUsers -HideFromAddressLists` as a stopgap, then re-apply with `Set-MigrationIdentity -Apply GalVisibility` after licensing |
-| Fly service account under MFA/CA | Content jobs fail to authenticate mid-run | Exclude it from MFA and Conditional Access in both tenants, and license it |
+| Fly authorisation lapses mid-run | Content jobs fail to authenticate part-way through: the app consent was revoked or expired, or an optional service account hit MFA / Conditional Access | Re-authorise Fly in the console as the Global Admin in the affected tenant. If a Fly module required a service account, license it and exclude it from MFA and Conditional Access for the duration of the project |
 | Fly auto-licensing | Only works when there are **both** spare seats and a usage location | Run `Set-MigrationLicenses` first rather than relying on it |
 | Teams chat migration | Mode-dependent and lossy — no reactions, no external chats, authorship shifts | Agree the chat mode with the client in writing before the job runs |
 | Exchange Web Services retirement, 1 Oct 2026 | Any EWS-based mover path stops working | Confirm Fly is on its Graph-based path before scheduling a cutover near that date |

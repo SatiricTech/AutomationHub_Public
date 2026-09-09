@@ -93,19 +93,20 @@
 
 .EXAMPLE
     .\Set-MigrationMailboxPermissions.ps1 -PlanPath .\IdentityPlan.csv `
-        -MailboxPermissionsCsv .\Contoso_MailboxPermissions.csv -Wave 1 -AutoMapping $false `
-        -DelegatedOrganization newco.onmicrosoft.com -Prefix Contoso
-
-    Re-applies wave 1's delegation in a customer tenant managed through GDAP, without auto-mapping
-    the shared mailboxes into everybody's Outlook profile.
-
-.EXAMPLE
-    .\Set-MigrationMailboxPermissions.ps1 -PlanPath .\IdentityPlan.csv `
         -MailboxPermissionsCsv .\Contoso_MailboxPermissions.csv `
         -UserMailboxesCsv .\Contoso_UserMailboxes.csv -Apply Calendar,Forwarding -Wave 2
 
     Restores calendar sharing and mailbox forwarding for wave 2 after the mailboxes have finished
     syncing.
+
+.EXAMPLE
+    .\Set-MigrationMailboxPermissions.ps1 -PlanPath .\IdentityPlan.csv `
+        -MailboxPermissionsCsv .\Contoso_MailboxPermissions.csv -Wave 1 -AutoMapping $false `
+        -DelegatedOrganization newco.onmicrosoft.com -Prefix Contoso
+
+    GDAP alternative: re-applies wave 1's delegation in a customer tenant administered through
+    GDAP rather than with a Global Admin account in it, without auto-mapping the shared mailboxes
+    into everybody's Outlook profile.
 
 .NOTES
     Author       : AutomationHub

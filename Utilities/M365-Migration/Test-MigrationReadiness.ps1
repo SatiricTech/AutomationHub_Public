@@ -79,14 +79,15 @@
     records MailboxProvisioned / OneDriveProvisioned back into the plan.
 
 .EXAMPLE
-    .\Test-MigrationReadiness.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -Stage Post -DelegatedOrganization newco.onmicrosoft.com
-
-    Verifies wave 1 landed on its planned addresses in a GDAP-delegated destination tenant.
-
-.EXAMPLE
     .\Test-MigrationReadiness.ps1 -PlanPath .\IdentityPlan.csv -Stage Provisioned -DryRun
 
     Runs every Provisioned check and reports them without touching the plan file.
+
+.EXAMPLE
+    .\Test-MigrationReadiness.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -Stage Post -DelegatedOrganization newco.onmicrosoft.com
+
+    GDAP alternative: verifies wave 1 landed on its planned addresses in a destination tenant
+    administered through GDAP rather than with a Global Admin account in it.
 
 .NOTES
     Author: AutomationHub

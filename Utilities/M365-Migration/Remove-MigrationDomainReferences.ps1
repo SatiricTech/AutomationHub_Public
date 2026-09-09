@@ -92,7 +92,8 @@
     .\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -FallbackDomain newco.onmicrosoft.com `
         -DelegatedOrganization contoso.onmicrosoft.com -AcknowledgeSourceTenant -Verbosity High
 
-    A GDAP run against a customer tenant with an explicit fallback domain.
+    GDAP alternative: a partner-delegated run against a customer tenant, with an explicit
+    fallback domain, instead of signing in as a Global Admin in the source tenant.
 
 .NOTES
     Author: AutomationHub
