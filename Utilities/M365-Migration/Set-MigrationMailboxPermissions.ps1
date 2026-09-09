@@ -639,6 +639,12 @@ try {
         -Prefix $Prefix -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
     $isDryRun = [bool]$run.DryRun
 
+    # A declined ShouldProcess is not a rehearsal: -WhatIf, or answering No at the prompt, means the
+    # call was never made and the row must not read as Planned (which the contract reserves for
+    # -DryRun) or as Succeeded. Both of those would put a change in the results file that the tenant
+    # never saw.
+    $declinedDetail = 'Declined at the confirmation prompt.'
+
     $requestedKinds = @($permissionOrder | Where-Object { $Apply -contains $_ })
     if ($requestedKinds.Count -eq 0) {
         throw 'No permission kinds were requested. Pass at least one value to -Apply.'
@@ -813,7 +819,8 @@ try {
                     $status = 'Skipped'; $detail = "Forwarding to $trustee is already configured."
                 }
                 elseif (-not $PSCmdlet.ShouldProcess($mailbox, "Forward to $trustee")) {
-                    $status = 'Planned'; $detail = "Would forward to $trustee."
+                    if ($isDryRun) { $detail = "Would forward to $trustee." }
+                    else { $status = 'Skipped'; $detail = $declinedDetail }
                 }
                 else {
                     # ForwardingSmtpAddress covers both cases: it accepts an internal address too,
@@ -843,7 +850,8 @@ try {
                     $status = 'Skipped'; $detail = $diff.Detail
                 }
                 elseif (-not $PSCmdlet.ShouldProcess($mailbox, "Grant $($item.Kind) to $trustee")) {
-                    $status = 'Planned'; $detail = "Would grant $($item.Kind) to $trustee."
+                    if ($isDryRun) { $detail = "Would grant $($item.Kind) to $trustee." }
+                    else { $status = 'Skipped'; $detail = $declinedDetail }
                 }
                 elseif ($item.Kind -eq 'Calendar') {
                     if ([string]::IsNullOrWhiteSpace($item.AccessRights)) {

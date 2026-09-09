@@ -269,8 +269,10 @@ try {
                     $detail = "Removed $phoneNumber ($numberType)."
                 }
                 else {
-                    $status = 'Planned'
-                    $detail = "Skipped by -WhatIf; would have removed $phoneNumber ($numberType)."
+                    # Not a rehearsal: -WhatIf or a declined prompt means nothing was attempted,
+                    # so the row is a skip. 'Planned' is reserved for -DryRun.
+                    $status = 'Skipped'
+                    $detail = 'Declined at the confirmation prompt.'
                 }
             }
         }

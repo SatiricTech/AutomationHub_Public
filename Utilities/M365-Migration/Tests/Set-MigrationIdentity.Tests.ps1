@@ -21,6 +21,10 @@
     -DryRun run takes.
 #>
 
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+    Justification = 'The stubs must accept every parameter the script under test binds, including ones a particular test does not read; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
+param()
+
 BeforeAll {
     $script:MigrationRoot = Join-Path -Path $PSScriptRoot -ChildPath '..'
     Import-Module (Join-Path -Path $script:MigrationRoot -ChildPath 'M365Migration/M365Migration.psd1') -Force
@@ -249,5 +253,71 @@ Describe 'DryRun makes no changes' {
 
         @($rows | Where-Object { $_.Status -ne 'Planned' }) | Should -BeNullOrEmpty
         $rows[0].TargetValue | Should -BeExactly 'john.smith@newco.com'
+    }
+}
+
+Describe 'A declined confirmation is a Skip, not a Plan' {
+
+    <#
+        Same technique as the DryRun tests above, one step further out: the script itself is invoked
+        with the call operator while plain functions declared in this block's BeforeAll shadow every
+        command that would reach a tenant. PowerShell resolves commands innermost-scope-first, so
+        those win for anything the script calls, while the real module still supplies the run
+        context, the logger and the results export. 'exit' inside a script run with '&' ends that
+        script only, so Pester carries on and $LASTEXITCODE is readable.
+
+        -Apply Upn keeps the run on Graph alone, so no Exchange session is opened.
+    #>
+
+    BeforeAll {
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = 'newco.onmicrosoft.com'; Account = 'tech@newco.onmicrosoft.com' }
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Method -ne 'GET') { throw "The run reached a $Method call, which -WhatIf must have prevented." }
+            return [pscustomobject]@{
+                id                    = 'bbbbbbbb-0000-0000-0000-000000000001'
+                userPrincipalName     = 'jsmith@contoso.com'
+                mail                  = 'jsmith@contoso.com'
+                mailNickname          = 'jsmith'
+                displayName           = 'John Q. Smith'
+                onPremisesSyncEnabled = $false
+                proxyAddresses        = @('SMTP:jsmith@contoso.com')
+            }
+        }
+
+        $script:WhatIfWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "SetIdentity-WhatIf-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:WhatIfWorkspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath (Join-Path -Path $script:FixtureRoot -ChildPath 'IdentityPlan.csv') `
+            -Wave '1' -Apply 'Upn' -OutputPath $script:WhatIfWorkspace -Verbosity Low -WhatIf
+
+        $file = @(Get-ChildItem -LiteralPath $script:WhatIfWorkspace -Filter 'Set-Identity-Results_*.csv')
+        $script:WhatIfRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+    }
+
+    AfterAll {
+        if ($script:WhatIfWorkspace -and (Test-Path -LiteralPath $script:WhatIfWorkspace)) {
+            Remove-Item -LiteralPath $script:WhatIfWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Writes a Results file, not a DryRun file, because -WhatIf is not a rehearsal' {
+        $script:WhatIfRows.Count | Should -BeGreaterThan 0
+    }
+
+    It 'Reports the declined UPN change as Skipped rather than Planned or Succeeded' {
+        $declined = @($script:WhatIfRows |
+            Where-Object { $_.Action -eq 'Upn' -and $_.TargetValue -eq 'john.smith@newco.com' })
+        $declined.Count | Should -Be 1
+        $declined[0].Status | Should -BeExactly 'Skipped'
+        $declined[0].Detail | Should -BeExactly 'Declined at the confirmation prompt.'
+    }
+
+    It 'Leaves no row claiming an outcome the tenant never saw' {
+        @($script:WhatIfRows | Where-Object { $_.Status -in @('Planned', 'Succeeded') }).Count | Should -Be 0
     }
 }

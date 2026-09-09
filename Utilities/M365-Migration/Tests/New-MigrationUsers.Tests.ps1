@@ -69,8 +69,11 @@ BeforeAll {
         return $null
     }
 
+    # The counter is what proves the catalogue is only read when -AssignLicenses asks for it.
+    $global:usersSkuCatalogCalls = 0
     function Get-MigrationSkuCatalog {
         param([switch]$Refresh)
+        $global:usersSkuCatalogCalls++
         return @([pscustomobject]@{ SkuId = '00000000-0000-0000-0000-0000000000e3'; SkuPartNumber = 'SPE_E3' })
     }
 
@@ -103,7 +106,7 @@ BeforeAll {
 }
 
 AfterAll {
-    Remove-Variable -Name usersGraphCalls, usersMutations -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name usersGraphCalls, usersMutations, usersSkuCatalogCalls -Scope Global -ErrorAction SilentlyContinue
 }
 
 Describe 'New-MigrationUsers - Resolve-RowIdentity' {
@@ -376,5 +379,185 @@ Describe 'New-MigrationUsers - DryRun end to end' {
         $row = @($script:rows | Where-Object { $_.Action -eq 'SetManager' })
         $row.Count | Should -Be 1
         $row[0].Status | Should -BeExactly 'Planned'
+    }
+}
+
+Describe 'New-MigrationUsers - a declined confirmation is a Skip, not a Plan' {
+
+    BeforeAll {
+        $script:whatIfWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Users-WhatIf-$([guid]::NewGuid())"
+        New-Item -Path $script:whatIfWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:whatIfPlan = Join-Path $script:whatIfWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:whatIfPlan
+
+        $global:usersGraphCalls.Clear()
+        $global:usersMutations.Clear()
+        $global:usersSkuCatalogCalls = 0
+
+        # No -AssignLicenses: the SKU catalogue must not be fetched when nothing will be licensed.
+        & $script:scriptPath -PlanPath $script:whatIfPlan -Wave '1' -SetManagers `
+            -DefaultUsageLocation 'US' -OutputPath $script:whatIfWorkspace -Verbosity Low -WhatIf
+        $script:whatIfExitCode = $LASTEXITCODE
+
+        $script:whatIfFile = @(Get-ChildItem -LiteralPath $script:whatIfWorkspace -Filter 'New-Users-Results_*.csv')
+        $script:whatIfRows = if ($script:whatIfFile.Count -eq 1) {
+            @(Import-Csv -LiteralPath $script:whatIfFile[0].FullName)
+        }
+        else { @() }
+    }
+
+    AfterAll {
+        if ($script:whatIfWorkspace -and (Test-Path -LiteralPath $script:whatIfWorkspace)) {
+            Remove-Item -LiteralPath $script:whatIfWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Writes a Results file, not a DryRun file, because -WhatIf is not a rehearsal' {
+        $script:whatIfFile.Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $script:whatIfWorkspace -Filter 'New-Users-DryRun_*.csv').Count | Should -Be 0
+    }
+
+    It 'Reports the declined creations as Skipped rather than Planned or Succeeded' {
+        $declined = @($script:whatIfRows |
+            Where-Object { $_.Action -eq 'CreateUser' -and $_.Detail -eq 'Declined at the confirmation prompt.' })
+        $declined.Count | Should -Be 2
+        @($declined | Where-Object { $_.Status -ne 'Skipped' }).Count | Should -Be 0
+    }
+
+    It 'Leaves no row claiming an outcome the tenant never saw' {
+        $script:whatIfRows.Count | Should -BeGreaterThan 0
+        @($script:whatIfRows | Where-Object { $_.Status -in @('Planned', 'Succeeded') }).Count | Should -Be 0
+    }
+
+    It 'Makes no write call of any kind' {
+        $global:usersMutations | Should -BeNullOrEmpty
+    }
+
+    It 'Never reads the SKU catalogue without -AssignLicenses' {
+        $global:usersSkuCatalogCalls | Should -Be 0
+    }
+
+    It 'Exits successfully' {
+        $script:whatIfExitCode | Should -Be 0
+    }
+}
+
+Describe 'New-MigrationUsers - an unreadable SKU catalogue is fatal, not a warning' {
+
+    BeforeAll {
+        # Shadowing inside this block keeps the failure local to it; the file-level stub still
+        # answers for every other Describe.
+        function Get-MigrationSkuCatalog {
+            param([switch]$Refresh)
+            throw 'Graph refused subscribedSkus.'
+        }
+
+        $script:skuWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Users-Sku-$([guid]::NewGuid())"
+        New-Item -Path $script:skuWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:skuPlan = Join-Path $script:skuWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:skuPlan
+
+        $global:usersMutations.Clear()
+
+        & $script:scriptPath -PlanPath $script:skuPlan -Wave '1' -AssignLicenses `
+            -DefaultUsageLocation 'US' -OutputPath $script:skuWorkspace -Verbosity Low -DryRun
+        $script:skuExitCode = $LASTEXITCODE
+    }
+
+    AfterAll {
+        if ($script:skuWorkspace -and (Test-Path -LiteralPath $script:skuWorkspace)) {
+            Remove-Item -LiteralPath $script:skuWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Stops the run instead of blaming the plan for licences it could not resolve' {
+        $script:skuExitCode | Should -Be 1
+    }
+
+    It 'Processes no row and writes no results file' {
+        @(Get-ChildItem -LiteralPath $script:skuWorkspace -Filter 'New-Users-*.csv').Count | Should -Be 0
+        $global:usersMutations | Should -BeNullOrEmpty
+    }
+
+    It 'Names the underlying failure in the log' {
+        $log = @(Get-ChildItem -LiteralPath $script:skuWorkspace -Filter 'New-MigrationUsers_*.log')
+        $log.Count | Should -Be 1
+        (Get-Content -LiteralPath $log[0].FullName -Raw) | Should -Match 'Graph refused subscribedSkus'
+    }
+}
+
+Describe 'New-MigrationUsers - a fatal error still leaves the plan and the results file' {
+
+    BeforeAll {
+        # Test-MigrationPlanRowActionable is called outside the per-row try, so throwing from it is
+        # the cheapest way to reach the script's top-level catch. Shadowing it here keeps the
+        # failure inside this Describe.
+        function Test-MigrationPlanRowActionable {
+            param($Row, [switch]$IncludeCollisions, [switch]$AllowSynced, [string[]]$SupportedObjectType, $IsSynced)
+            if ((Get-MigrationCsvValue -Row $Row -Name 'SourceUserPrincipalName' -Default '') -eq 'adean@contoso.com') {
+                throw 'The Graph session dropped between rows.'
+            }
+            return [pscustomobject]@{ Actionable = $true; Status = 'Planned'; Reason = '' }
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            $global:usersGraphCalls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri })
+            if ($Method -ne 'GET') { $global:usersMutations.Add("$Method $Uri") }
+            if ($Uri -like '*/domains*') { return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true }) }
+            if ($Uri -like '*/users?*') { return @() }
+            if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
+                return [pscustomobject]@{ id = '99999999-9999-9999-9999-999999999999' }
+            }
+            return $null
+        }
+
+        $script:fatalWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Users-Fatal-$([guid]::NewGuid())"
+        New-Item -Path $script:fatalWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:fatalPlan = Join-Path $script:fatalWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:fatalPlan
+
+        $global:usersGraphCalls.Clear()
+        $global:usersMutations.Clear()
+
+        & $script:scriptPath -PlanPath $script:fatalPlan -Wave '1' `
+            -DefaultUsageLocation 'US' -OutputPath $script:fatalWorkspace -Verbosity Low
+        $script:fatalExitCode = $LASTEXITCODE
+
+        $script:fatalFile = @(Get-ChildItem -LiteralPath $script:fatalWorkspace -Filter 'New-Users-Results_*.csv')
+        $script:fatalRows = if ($script:fatalFile.Count -eq 1) {
+            @(Import-Csv -LiteralPath $script:fatalFile[0].FullName)
+        }
+        else { @() }
+    }
+
+    AfterAll {
+        if ($script:fatalWorkspace -and (Test-Path -LiteralPath $script:fatalWorkspace)) {
+            Remove-Item -LiteralPath $script:fatalWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits 1' {
+        $script:fatalExitCode | Should -Be 1
+    }
+
+    It 'Logs the failure as an error' {
+        $log = @(Get-ChildItem -LiteralPath $script:fatalWorkspace -Filter 'New-MigrationUsers_*.log')
+        $log.Count | Should -Be 1
+        $text = Get-Content -LiteralPath $log[0].FullName -Raw
+        $text | Should -Match '\[ERROR\].*The Graph session dropped between rows'
+    }
+
+    It 'Writes exactly one results file, carrying the rows processed before the failure' {
+        $script:fatalFile.Count | Should -Be 1
+        @($script:fatalRows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' -and $_.Status -eq 'Succeeded' }).Count |
+            Should -Be 1
+    }
+
+    It 'Still writes the plan back so the object ID the run earned is not lost' {
+        @($global:usersMutations | Where-Object { $_ -like 'Save-MigrationPlan*' }).Count | Should -Be 1
     }
 }

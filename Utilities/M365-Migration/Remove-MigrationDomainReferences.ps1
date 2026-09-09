@@ -206,6 +206,7 @@ function ConvertTo-DomainReferenceRecord {
         ExternalEmailAddress      = ''
         Addresses                 = @()
         IsSynced                  = $false
+        SyncStateKnown            = $true
         IsGuest                   = $false
         EmailAddressPolicyEnabled = $true
         ReferenceKinds            = @()
@@ -538,6 +539,15 @@ function Resolve-DomainReferenceClass {
         return $result
     }
 
+    # A degraded recipient scan could not read IsDirSynced, so IsSynced here means "not known",
+    # not "not synced". Treating that as fixable would rewrite addresses on an object Exchange
+    # Online is read-only for and report success for writes the tenant rejected.
+    if (-not $Reference.SyncStateKnown) {
+        & $set 'Blocker' 'SyncStateUnknown' `
+            'Sync state unknown (property set unavailable); verify manually' 'None'
+        return $result
+    }
+
     if ($Reference.IsSynced) {
         & $set 'Blocker' 'DirectorySynced' ('Directory-synced object: Entra and Exchange Online are ' +
             'read-only for it. Change the on-premises userPrincipalName or proxyAddresses and let ' +
@@ -686,8 +696,12 @@ function Repair-DomainReference {
     }
 
     if (-not $PSCmdlet.ShouldProcess($identity, "$($Classification.Action) to release the domain")) {
-        $row.Status = 'Skipped'
-        $row.Detail = 'Skipped by -WhatIf or a declined confirmation.'
+        # -DryRun already produced a Planned row above and left it that way; a declined prompt in a
+        # live run is a skip, because nothing was attempted.
+        if (-not $AsPlanned) {
+            $row.Status = 'Skipped'
+            $row.Detail = 'Declined at the confirmation prompt.'
+        }
         return $row
     }
 
@@ -783,14 +797,21 @@ function Get-DomainReferenceSet {
 
     Write-MigrationLog -Message "Enumerating Exchange Online recipients with an address on $Domain" -Level INFO
     $filter = "EmailAddresses -like '*@$escaped'"
+    # The retry drops IsDirSynced and EmailAddressPolicyEnabled from the response, so the sync
+    # state of every recipient it returns is unknown rather than false. The flag carries that fact
+    # to the classifier instead of letting a missing property read as "not synced".
+    $syncStateKnown = $true
     try {
         $recipients = @(Get-EXORecipient -Filter $filter -ResultSize Unlimited -Properties `
                 EmailAddresses, ExternalEmailAddress, EmailAddressPolicyEnabled, IsDirSynced -ErrorAction Stop)
     }
     catch {
         Write-MigrationLog -Message ("Recipient scan with extended properties failed " +
-            "($($_.Exception.Message)); retrying with the default property set.") -Level WARNING
+            "($($_.Exception.Message)); retrying with the default property set. Sync state cannot be " +
+            'read from that set, so every recipient it returns is reported as a blocker to verify ' +
+            'by hand.') -Level WARNING
         $recipients = @(Get-EXORecipient -Filter $filter -ResultSize Unlimited -ErrorAction Stop)
+        $syncStateKnown = $false
     }
     Write-MigrationLog -Message "Exchange Online returned $($recipients.Count) recipient(s)" -Level INFO
 
@@ -812,6 +833,7 @@ function Get-DomainReferenceSet {
                     ExternalEmailAddress      = [string](Get-MigrationProperty $recipient 'ExternalEmailAddress' '')
                     Addresses                 = @(Get-MigrationProperty $recipient 'EmailAddresses' @())
                     IsSynced                  = [bool](Get-MigrationProperty $recipient 'IsDirSynced' $false)
+                    SyncStateKnown            = $syncStateKnown
                     EmailAddressPolicyEnabled = [bool](Get-MigrationProperty $recipient 'EmailAddressPolicyEnabled' $true)
                     ReferenceKinds            = @('Address')
                 }))
@@ -1117,7 +1139,7 @@ try {
         $detail = $item.Classification.Detail
         $reason = $item.Classification.Reason
         if ($item.Classification.Class -eq 'Fixable' -and -not $proceed) {
-            $detail = 'The tenant confirmation was declined; no change was attempted.'
+            $detail = 'Declined at the confirmation prompt; no change was attempted.'
             $reason = 'ConfirmationDeclined'
         }
         $results.Add([pscustomobject]@{

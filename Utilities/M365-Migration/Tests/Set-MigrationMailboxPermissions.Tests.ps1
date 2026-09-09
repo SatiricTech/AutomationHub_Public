@@ -21,6 +21,10 @@
     code path a real -DryRun run takes.
 #>
 
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+    Justification = 'The stubs must accept every parameter the script under test binds, including ones a particular test does not read; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
+param()
+
 BeforeAll {
     $script:MigrationRoot = Join-Path -Path $PSScriptRoot -ChildPath '..'
     Import-Module (Join-Path -Path $script:MigrationRoot -ChildPath 'M365Migration/M365Migration.psd1') -Force
@@ -418,5 +422,74 @@ Describe 'DryRun makes no changes' {
 
         $diff.Action | Should -BeExactly 'Add'
         @($rows | Where-Object { $_.Status -ne 'Planned' }) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'A declined confirmation is a Skip, not a Plan' {
+
+    <#
+        The same stub technique, one step further out: the script itself is invoked with the call
+        operator while plain functions declared in this block's BeforeAll shadow every Exchange
+        Online read and the connection helper. PowerShell resolves commands innermost-scope-first,
+        so those win for anything the script calls, while the real module still supplies the run
+        context, the logger and the results export. The mutating cmdlets keep the file-level stubs,
+        which record nothing - reaching one at all would be the bug this test exists to catch.
+    #>
+
+    BeforeAll {
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = 'newco.onmicrosoft.com' }
+        }
+        function Get-EXOMailboxPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-EXORecipientPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-EXOMailbox {
+            param($Identity, $Properties, $ErrorAction)
+            return [pscustomobject]@{
+                PrimarySmtpAddress    = [string]$Identity
+                GrantSendOnBehalfTo   = @()
+                ForwardingAddress     = ''
+                ForwardingSmtpAddress = ''
+            }
+        }
+        function Get-MailboxFolderPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+
+        $script:WhatIfWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "SetMailboxPermissions-WhatIf-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:WhatIfWorkspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:PlanFixture -MailboxPermissionsCsv $script:PermissionFixture `
+            -OutputPath $script:WhatIfWorkspace -Verbosity Low -WhatIf
+
+        $file = @(Get-ChildItem -LiteralPath $script:WhatIfWorkspace -Filter 'Set-MailboxPermissions-Results_*.csv')
+        $script:WhatIfRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+    }
+
+    AfterAll {
+        if ($script:WhatIfWorkspace -and (Test-Path -LiteralPath $script:WhatIfWorkspace)) {
+            Remove-Item -LiteralPath $script:WhatIfWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Writes a Results file, not a DryRun file, because -WhatIf is not a rehearsal' {
+        $script:WhatIfRows.Count | Should -BeGreaterThan 0
+    }
+
+    It 'Reports every declined grant as Skipped with the standard detail' {
+        $declined = @($script:WhatIfRows | Where-Object { $_.Detail -eq 'Declined at the confirmation prompt.' })
+        $declined.Count | Should -BeGreaterThan 0
+        @($declined | Where-Object { $_.Status -ne 'Skipped' }).Count | Should -Be 0
+    }
+
+    It 'Leaves no row claiming an outcome the tenant never saw' {
+        @($script:WhatIfRows | Where-Object { $_.Status -in @('Planned', 'Succeeded') }).Count | Should -Be 0
     }
 }

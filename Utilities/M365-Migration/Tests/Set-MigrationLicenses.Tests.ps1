@@ -351,6 +351,17 @@ Describe 'Set-PlanRowLicense' {
         Should -Invoke Invoke-MigrationGraphRequest -Times 0 -Exactly
     }
 
+    It 'Reports a declined row as Skipped, not Planned or Succeeded' {
+        # -WhatIf is not a rehearsal: nothing was sent, so the row must not read as a change the
+        # tenant saw. 'Planned' belongs to -DryRun alone.
+        New-TestRun
+        $row = New-TestPlanRow -Property @{ TargetUserPrincipalName = 'john.smith@newco.com'; TargetLicenses = 'SPE_E3'; UsageLocation = 'US' }
+        $result = Set-PlanRowLicense -Row $row -User (New-TestUser) -Catalog $script:catalog -SkuMap $null -WhatIf
+
+        $result.Status | Should -Be 'Skipped'
+        $result.Detail | Should -BeLike '*declined at the confirmation prompt*'
+    }
+
     It 'Includes the removals in the assignLicense body when -RemoveUnplanned is set' {
         New-TestRun
         $state = @([pscustomobject]@{ skuId = $script:emsId; assignedByGroup = $null })

@@ -420,6 +420,49 @@ Describe 'Remove-MigrationDomainReferences' {
             $class.Action | Should -BeExactly 'None'
         }
 
+        It 'Blocks a recipient whose sync state could not be read rather than assuming it is not synced' {
+            # This is the shape Get-DomainReferenceSet produces when the extended-property scan
+            # failed and the default property set came back without IsDirSynced.
+            $record = ConvertTo-DomainReferenceRecord -Properties @{
+                Kind                 = 'RecipientAddress'
+                Identity             = 'sales@contoso.com'
+                ObjectId             = '66666666-6666-6666-6666-666666666666'
+                RecipientTypeDetails = 'MailUniversalDistributionGroup'
+                PrimarySmtpAddress   = 'sales@contoso.com'
+                Addresses            = @('SMTP:sales@contoso.com', 'smtp:sales@newco.onmicrosoft.com')
+                IsSynced             = $false
+                SyncStateKnown       = $false
+                ReferenceKinds       = @('Address')
+            }
+            $plan = Resolve-DomainAddressPlan -Reference $record -Domain $script:domain -FallbackDomain $script:fallback
+
+            $class = Resolve-DomainReferenceClass -Reference $record -Domain $script:domain `
+                -FallbackDomain $script:fallback -AddressPlan $plan
+
+            $class.Class | Should -BeExactly 'Blocker'
+            $class.Reason | Should -BeExactly 'SyncStateUnknown'
+            $class.Detail | Should -BeExactly 'Sync state unknown (property set unavailable); verify manually'
+            $class.Action | Should -BeExactly 'None'
+        }
+
+        It 'Still classifies a recipient as fixable when the sync state is known' {
+            $record = ConvertTo-DomainReferenceRecord -Properties @{
+                Kind                 = 'RecipientAddress'
+                Identity             = 'sales@contoso.com'
+                ObjectId             = '66666666-6666-6666-6666-666666666666'
+                RecipientTypeDetails = 'MailUniversalDistributionGroup'
+                PrimarySmtpAddress   = 'sales@contoso.com'
+                Addresses            = @('SMTP:sales@contoso.com', 'smtp:sales@newco.onmicrosoft.com')
+                ReferenceKinds       = @('Address')
+            }
+            $plan = Resolve-DomainAddressPlan -Reference $record -Domain $script:domain -FallbackDomain $script:fallback
+
+            $class = Resolve-DomainReferenceClass -Reference $record -Domain $script:domain `
+                -FallbackDomain $script:fallback -AddressPlan $plan
+
+            $class.Class | Should -BeExactly 'Fixable'
+        }
+
         It 'Blocks a soft-deleted user still holding the domain' {
             $record = ConvertTo-DomainReferenceRecord -Properties @{
                 Kind              = 'DeletedUser'
@@ -645,8 +688,26 @@ Describe 'Remove-MigrationDomainReferences' {
             $row = Repair-DomainReference -Reference $record -Classification $class -WhatIf
 
             $row.Status | Should -BeExactly 'Skipped'
-            $row.Detail | Should -Match 'WhatIf'
+            $row.Detail | Should -BeExactly 'Declined at the confirmation prompt.'
             Should -Invoke Invoke-MigrationGraphRequest -Times 0 -Exactly
+        }
+
+        It 'Does not report a declined row as Planned, which is reserved for -DryRun' {
+            $record = ConvertTo-DomainReferenceRecord -Properties @{
+                Kind              = 'UserUpn'
+                Identity          = 'sam@contoso.com'
+                ObjectId          = '55555555-5555-5555-5555-555555555555'
+                UserPrincipalName = 'sam@contoso.com'
+                ObjectType        = 'User'
+                ReferenceKinds    = @('Upn')
+            }
+            $class = Resolve-DomainReferenceClass -Reference $record -Domain $script:domain `
+                -FallbackDomain $script:fallback
+
+            $row = Repair-DomainReference -Reference $record -Classification $class -WhatIf
+
+            $row.Status | Should -Not -BeExactly 'Planned'
+            $row.Status | Should -Not -BeExactly 'Succeeded'
         }
     }
 

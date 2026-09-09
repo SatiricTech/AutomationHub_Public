@@ -480,6 +480,12 @@ try {
         -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
     $isDryRun = [bool]$run.DryRun
 
+    # A declined ShouldProcess is not a rehearsal: -WhatIf, or answering No at the prompt, means the
+    # call was never made and the row must not read as Planned (which the contract reserves for
+    # -DryRun) or as Succeeded. Both of those would put a change in the results file that the tenant
+    # never saw.
+    $declinedDetail = 'Declined at the confirmation prompt.'
+
     $requestedActions = @($actionOrder | Where-Object { $Apply -contains $_ })
     if ($requestedActions.Count -eq 0) {
         throw 'No operations were requested. Pass at least one value to -Apply.'
@@ -625,7 +631,8 @@ try {
                         }
 
                         if (-not $PSCmdlet.ShouldProcess($identity, "Set userPrincipalName to $targetValue")) {
-                            $status = 'Planned'; $detail = "Would set userPrincipalName to $targetValue."
+                            if ($isDryRun) { $detail = "Would set userPrincipalName to $targetValue." }
+                            else { $status = 'Skipped'; $detail = $declinedDetail }
                             break
                         }
 
@@ -684,7 +691,8 @@ try {
                                 }
 
                                 if (-not $PSCmdlet.ShouldProcess($identity, "Set primary SMTP to $($changeSet.NewPrimary)")) {
-                                    $status = 'Planned'; $detail = "Would set the primary SMTP to $($changeSet.NewPrimary)."
+                                    if ($isDryRun) { $detail = "Would set the primary SMTP to $($changeSet.NewPrimary)." }
+                                    else { $status = 'Skipped'; $detail = $declinedDetail }
                                     break
                                 }
 
@@ -707,7 +715,8 @@ try {
                                     break
                                 }
                                 if (-not $PSCmdlet.ShouldProcess($identity, "Add alias: $targetValue")) {
-                                    $status = 'Planned'; $detail = "Would add alias: $targetValue."
+                                    if ($isDryRun) { $detail = "Would add alias: $targetValue." }
+                                    else { $status = 'Skipped'; $detail = $declinedDetail }
                                     break
                                 }
 
@@ -729,7 +738,8 @@ try {
                                     break
                                 }
                                 if (-not $PSCmdlet.ShouldProcess($identity, "Add X500: $targetValue")) {
-                                    $status = 'Planned'; $detail = "Would add X500: $targetValue."
+                                    if ($isDryRun) { $detail = "Would add X500: $targetValue." }
+                                    else { $status = 'Skipped'; $detail = $declinedDetail }
                                     break
                                 }
 
@@ -757,7 +767,8 @@ try {
                                     break
                                 }
                                 if (-not $PSCmdlet.ShouldProcess($identity, "Set alias to $targetValue")) {
-                                    $status = 'Planned'; $detail = "Would set the alias to $targetValue."
+                                    if ($isDryRun) { $detail = "Would set the alias to $targetValue." }
+                                    else { $status = 'Skipped'; $detail = $declinedDetail }
                                     break
                                 }
 
@@ -781,7 +792,8 @@ try {
                                     break
                                 }
                                 if (-not $PSCmdlet.ShouldProcess($identity, "Set HiddenFromAddressListsEnabled to $desired")) {
-                                    $status = 'Planned'; $detail = "Would set HiddenFromAddressListsEnabled to $desired."
+                                    if ($isDryRun) { $detail = "Would set HiddenFromAddressListsEnabled to $desired." }
+                                    else { $status = 'Skipped'; $detail = $declinedDetail }
                                     break
                                 }
 

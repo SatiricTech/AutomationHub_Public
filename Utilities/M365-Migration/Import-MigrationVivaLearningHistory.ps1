@@ -818,7 +818,7 @@ try {
                 }
                 else {
                     $rowStatus = 'Skipped'
-                    $detail = 'Skipped by operator (ShouldProcess declined).'
+                    $detail = 'Declined at the confirmation prompt.'
                 }
             }
         }

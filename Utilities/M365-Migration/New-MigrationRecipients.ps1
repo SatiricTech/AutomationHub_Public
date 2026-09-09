@@ -883,392 +883,437 @@ catch {
 
 $planChanged = $false
 $planSaveFailed = $false
+$resultsExported = $false
+$exitCode = 0
 $rowIndex = 0
 
+# Import-MigrationPlan materialises every canonical plan column, so these are normally already
+# present. The guard costs one property lookup per row and removes a whole class of failure:
+# under Set-StrictMode -Version Latest, assigning a property the object does not carry throws,
+# and these write-backs happen inside the per-row catch - where a second exception would hide
+# the error the operator actually has to read.
 foreach ($row in $waveRows) {
-    $rowIndex++
-
-    $objectType = Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default ''
-    $planStatus = Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default ''
-    $displayName = Get-MigrationCsvValue -Row $row -Name 'DisplayName' -Default ''
-
-    $identity = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default ''
-    if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default '' }
-    if (-not $identity) { $identity = $displayName }
-    if (-not $identity) { $identity = "(plan row $rowIndex)" }
-
-    Write-Progress -Activity 'Creating destination recipients' -Status "$rowIndex of $($waveRows.Count): $identity" `
-        -PercentComplete (($rowIndex / [math]::Max($waveRows.Count, 1)) * 100)
-
-    $common = @{ Identity = $identity; ObjectType = $objectType; PlanStatus = $planStatus }
-
-    # -AllowSynced: this script creates fresh destination objects, so the source object's
-    # directory-sync state is not a reason to skip the row.
-    $gate = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions -AllowSynced
-    if (-not $gate.Actionable) {
-        $detail = $gate.Reason
-        if ($planStatus -eq 'Collision') { $detail += ' Re-run with -IncludeCollisions to process it.' }
-        Add-ResultRow @common -Action 'CreateRecipient' -Status $gate.Status -Detail $detail
-        continue
+    foreach ($column in @('TargetObjectId', 'ProvisionStatus', 'ProvisionDetail')) {
+        if (-not $row.PSObject.Properties[$column]) {
+            $row | Add-Member -NotePropertyName $column -NotePropertyValue '' -Force
+        }
     }
+}
 
-    $targetAddress = ''
-    $recipient = $null
-    $targetObjectId = ''
-    # The catch below reports whichever phase was running, so a settings failure is not filed as a
-    # creation failure and re-run as one.
-    $phase = 'CreateRecipient'
+# Everything from here to the finally block is inside one try: an exception outside the per-row
+# catch (a dropped Exchange session, a throttled tenant) must still leave the operator with the
+# plan write-back for the recipients already created and a results file for the rows already
+# processed. Losing either turns a partial run into a manual reconciliation.
+try {
 
-    try {
-        $targetAddress = Get-RowTargetAddress -Row $row -UseInterim:$UseInterim
-        if (-not $targetAddress) { throw 'The plan row has no interim or target primary SMTP address.' }
+    foreach ($row in $waveRows) {
+        $rowIndex++
 
-        $addressCheck = Test-MigrationAddress -Address $targetAddress -Kind 'Smtp'
-        if (-not $addressCheck.IsValid) { throw "'$targetAddress' is not a usable SMTP address: $($addressCheck.Reason)" }
+        $objectType = Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default ''
+        $planStatus = Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default ''
+        $displayName = Get-MigrationCsvValue -Row $row -Name 'DisplayName' -Default ''
 
-        if (-not $displayName) { throw 'The plan row has no DisplayName, which every recipient type requires.' }
+        $identity = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default ''
+        if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default '' }
+        if (-not $identity) { $identity = $displayName }
+        if (-not $identity) { $identity = "(plan row $rowIndex)" }
 
-        $alias = Get-MigrationCsvValue -Row $row -Name 'TargetMailNickname' -Default ''
-        if (-not $alias) { $alias = ($targetAddress -split '@')[0] }
+        Write-Progress -Activity 'Creating destination recipients' -Status "$rowIndex of $($waveRows.Count): $identity" `
+            -PercentComplete (($rowIndex / [math]::Max($waveRows.Count, 1)) * 100)
 
-        #-- Does it already exist? --------------------------------------------------------
-        foreach ($candidate in @($targetAddress, $alias)) {
-            if ($recipient) { break }
-            try {
-                $found = @(Get-Recipient -Identity $candidate -ErrorAction Stop)
-                if ($found.Count -gt 0) { $recipient = $found[0] }
-            }
-            catch {
-                # 'Not found' is the expected answer for a recipient that does not exist yet.
-                # Anything else - throttling, a dropped session, a permission problem - must not be
-                # read as 'does not exist', because the next step would then create a duplicate.
-                $lookupError = [string]$_.Exception.Message
-                $isNotFound = $lookupError -match "(?i)couldn't be found|could not be found|wasn't found|was not found|not found on"
-                if (-not $isNotFound) {
-                    throw ("Could not determine whether '$candidate' already exists in the destination " +
-                        "tenant, so nothing was created: $lookupError")
+        $common = @{ Identity = $identity; ObjectType = $objectType; PlanStatus = $planStatus }
+
+        # -AllowSynced: this script creates fresh destination objects, so the source object's
+        # directory-sync state is not a reason to skip the row.
+        $gate = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions -AllowSynced
+        if (-not $gate.Actionable) {
+            $detail = $gate.Reason
+            if ($planStatus -eq 'Collision') { $detail += ' Re-run with -IncludeCollisions to process it.' }
+            Add-ResultRow @common -Action 'CreateRecipient' -Status $gate.Status -Detail $detail
+            continue
+        }
+
+        $targetAddress = ''
+        $recipient = $null
+        $targetObjectId = ''
+        # The catch below reports whichever phase was running, so a settings failure is not filed as a
+        # creation failure and re-run as one.
+        $phase = 'CreateRecipient'
+
+        try {
+            $targetAddress = Get-RowTargetAddress -Row $row -UseInterim:$UseInterim
+            if (-not $targetAddress) { throw 'The plan row has no interim or target primary SMTP address.' }
+
+            $addressCheck = Test-MigrationAddress -Address $targetAddress -Kind 'Smtp'
+            if (-not $addressCheck.IsValid) { throw "'$targetAddress' is not a usable SMTP address: $($addressCheck.Reason)" }
+
+            if (-not $displayName) { throw 'The plan row has no DisplayName, which every recipient type requires.' }
+
+            $alias = Get-MigrationCsvValue -Row $row -Name 'TargetMailNickname' -Default ''
+            if (-not $alias) { $alias = ($targetAddress -split '@')[0] }
+
+            #-- Does it already exist? --------------------------------------------------------
+            foreach ($candidate in @($targetAddress, $alias)) {
+                if ($recipient) { break }
+                try {
+                    $found = @(Get-Recipient -Identity $candidate -ErrorAction Stop)
+                    if ($found.Count -gt 0) { $recipient = $found[0] }
                 }
-                Write-MigrationLog -Message "No destination recipient matches '$candidate'." -Level DEBUG
+                catch {
+                    # 'Not found' is the expected answer for a recipient that does not exist yet.
+                    # Anything else - throttling, a dropped session, a permission problem - must not be
+                    # read as 'does not exist', because the next step would then create a duplicate.
+                    $lookupError = [string]$_.Exception.Message
+                    $isNotFound = $lookupError -match "(?i)couldn't be found|could not be found|wasn't found|was not found|not found on"
+                    if (-not $isNotFound) {
+                        throw ("Could not determine whether '$candidate' already exists in the destination " +
+                            "tenant, so nothing was created: $lookupError")
+                    }
+                    Write-MigrationLog -Message "No destination recipient matches '$candidate'." -Level DEBUG
+                }
             }
-        }
 
-        if ($recipient) {
-            $targetObjectId = Get-MigrationCsvValue -Row $recipient -Name 'ExternalDirectoryObjectId' -Default ''
-            if (-not $targetObjectId) { $targetObjectId = Get-MigrationCsvValue -Row $recipient -Name 'Guid' -Default '' }
-        }
+            if ($recipient) {
+                $targetObjectId = Get-MigrationCsvValue -Row $recipient -Name 'ExternalDirectoryObjectId' -Default ''
+                if (-not $targetObjectId) { $targetObjectId = Get-MigrationCsvValue -Row $recipient -Name 'Guid' -Default '' }
+            }
 
-        #-- Create ------------------------------------------------------------------------
-        if ($doCreate -and -not $recipient) {
-            if (-not $PSCmdlet.ShouldProcess($targetAddress, "Create $objectType recipient")) {
-                Add-ResultRow @common -Action 'CreateRecipient' -Status 'Skipped' -Detail 'Declined at the confirmation prompt.' `
-                    -TargetAddress $targetAddress
+            #-- Create ------------------------------------------------------------------------
+            if ($doCreate -and -not $recipient) {
+                if (-not $PSCmdlet.ShouldProcess($targetAddress, "Create $objectType recipient")) {
+                    Add-ResultRow @common -Action 'CreateRecipient' -Status 'Skipped' -Detail 'Declined at the confirmation prompt.' `
+                        -TargetAddress $targetAddress
+                    continue
+                }
+
+                $createParameters = @{ Name = $displayName; DisplayName = $displayName; Alias = $alias; ErrorAction = 'Stop' }
+                $createDescription = "Create $objectType recipient $targetAddress"
+
+                switch ($objectType) {
+                    { $_ -in @('Shared', 'Room', 'Equipment') } {
+                        $createParameters['PrimarySmtpAddress'] = $targetAddress
+                        $createParameters[$objectType] = $true
+                        $created = Invoke-MigrationAction -Description $createDescription -PassThru -Action {
+                            New-Mailbox @createParameters
+                        }
+                    }
+                    { $_ -in @('Distribution', 'MailEnabledSecurity') } {
+                        $createParameters['PrimarySmtpAddress'] = $targetAddress
+                        $createParameters['Type'] = if ($objectType -eq 'MailEnabledSecurity') { 'Security' } else { 'Distribution' }
+                        $created = Invoke-MigrationAction -Description $createDescription -PassThru -Action {
+                            New-DistributionGroup @createParameters
+                        }
+                    }
+                    'DynamicDistribution' {
+                        $inventoryRow = Find-IndexedRow -Row $row -Index $groupIndex
+                        $recipientFilter = if ($inventoryRow) { Get-MigrationCsvValue -Row $inventoryRow -Name 'RecipientFilter' -Default '' } else { '' }
+                        if (-not $recipientFilter) {
+                            throw ('A dynamic distribution group needs its RecipientFilter, which is only in the Groups ' +
+                                'inventory. Supply -GroupsCsv, or create this group by hand.')
+                        }
+                        $createParameters['PrimarySmtpAddress'] = $targetAddress
+                        $createParameters['RecipientFilter'] = $recipientFilter
+                        $created = Invoke-MigrationAction -Description $createDescription -PassThru -Action {
+                            New-DynamicDistributionGroup @createParameters
+                        }
+                    }
+                    'Contact' {
+                        $inventoryRow = Find-IndexedRow -Row $row -Index $contactIndex
+                        $externalAddress = Resolve-ContactExternalAddress -PlanRow $row -InventoryRow $inventoryRow
+                        if (-not $externalAddress) {
+                            throw ('A mail contact needs an ExternalEmailAddress. Supply -ContactsCsv, or put the ' +
+                                'external address in the plan row SourceUserPrincipalName column.')
+                        }
+                        # Deliberately not mapped: a contact points at someone outside both tenants.
+                        $createParameters['ExternalEmailAddress'] = $externalAddress
+                        $created = Invoke-MigrationAction -Description $createDescription -PassThru -Action {
+                            New-MailContact @createParameters
+                        }
+                    }
+                    default {
+                        throw "ObjectType '$objectType' is not created by this script."
+                    }
+                }
+
+                if ($DryRun) {
+                    Add-ResultRow @common -Action 'CreateRecipient' -Status 'Planned' -TargetAddress $targetAddress `
+                        -Detail "Would create a $objectType recipient named '$displayName' with alias '$alias'."
+                }
+                else {
+                    # The created object becomes the 'current' state for the settings diff, so a
+                    # brand-new group is compared against what Exchange actually gave it rather
+                    # than against nothing - which would resend defaults Exchange already applied.
+                    $recipient = $created
+                    $targetObjectId = Get-MigrationCsvValue -Row $created -Name 'ExternalDirectoryObjectId' -Default ''
+                    if (-not $targetObjectId) { $targetObjectId = Get-MigrationCsvValue -Row $created -Name 'Guid' -Default '' }
+
+                    $row.TargetObjectId = $targetObjectId
+                    $row.ProvisionStatus = 'Created'
+                    $row.ProvisionDetail = "Created as a $objectType recipient on $targetAddress."
+                    $planChanged = $true
+
+                    Add-ResultRow @common -Action 'CreateRecipient' -Status 'Succeeded' -TargetAddress $targetAddress `
+                        -TargetObjectId $targetObjectId -Detail "Created a $objectType recipient named '$displayName'."
+                }
+            }
+            elseif ($doCreate) {
+                $row.TargetObjectId = $targetObjectId
+                $row.ProvisionStatus = 'Exists'
+                $row.ProvisionDetail = "Already present in the destination tenant as $targetAddress."
+                $planChanged = $true
+                Add-ResultRow @common -Action 'CreateRecipient' -Status 'Skipped' -TargetAddress $targetAddress `
+                    -TargetObjectId $targetObjectId -Detail 'Already exists in the destination tenant; recorded its object ID.'
+            }
+
+            #-- Update settings ---------------------------------------------------------------
+            if (-not $doUpdate) { continue }
+            $phase = 'UpdateSettings'
+
+            if (-not $recipient -and -not $doCreate) {
+                Add-ResultRow @common -Action 'UpdateSettings' -Status 'Skipped' -TargetAddress $targetAddress `
+                    -Detail "No recipient matches '$targetAddress' in the destination tenant. Run with -Mode CreateAndUpdate first."
                 continue
             }
 
-            $createParameters = @{ Name = $displayName; DisplayName = $displayName; Alias = $alias; ErrorAction = 'Stop' }
-            $createDescription = "Create $objectType recipient $targetAddress"
+            if (-not $recipient -and $DryRun) {
+                Add-ResultRow @common -Action 'UpdateSettings' -Status 'Planned' -TargetAddress $targetAddress `
+                    -Detail 'Settings would be applied after the recipient is created.'
+                continue
+            }
 
-            switch ($objectType) {
-                { $_ -in @('Shared', 'Room', 'Equipment') } {
-                    $createParameters['PrimarySmtpAddress'] = $targetAddress
-                    $createParameters[$objectType] = $true
-                    $created = Invoke-MigrationAction -Description $createDescription -PassThru -Action {
-                        New-Mailbox @createParameters
-                    }
+            $updateDetail = [System.Collections.Generic.List[string]]::new()
+            $unmappable = [System.Collections.Generic.List[string]]::new()
+            $settingsChanged = [System.Collections.Generic.List[string]]::new()
+            $membersAdded = 0
+            # Set by any settings step that caught an exception. Those steps continue so the rest of the
+            # row is still applied, but the row is reported Failed rather than Succeeded-with-a-note.
+            $rowFailed = $false
+
+            $setCmdlet = switch ($objectType) {
+                { $_ -in @('Shared', 'Room', 'Equipment') } { 'Set-Mailbox' }
+                { $_ -in @('Distribution', 'MailEnabledSecurity') } { 'Set-DistributionGroup' }
+                'DynamicDistribution' { 'Set-DynamicDistributionGroup' }
+                'Contact' { 'Set-MailContact' }
+                default { '' }
+            }
+
+            #-- Aliases and the X500 address --------------------------------------------------
+            $aliasAddresses = @(Get-PlanAliasAddress -Row $row -PrimaryAddress $targetAddress)
+            if ($aliasAddresses.Count -gt 0 -and $setCmdlet) {
+                $aliasParameters = @{ Identity = $targetAddress; EmailAddresses = @{ Add = $aliasAddresses }; ErrorAction = 'Stop' }
+                $null = Invoke-MigrationAction -Description "Add $($aliasAddresses.Count) proxy address(es) to $targetAddress" -Action {
+                    & $setCmdlet @aliasParameters
                 }
-                { $_ -in @('Distribution', 'MailEnabledSecurity') } {
-                    $createParameters['PrimarySmtpAddress'] = $targetAddress
-                    $createParameters['Type'] = if ($objectType -eq 'MailEnabledSecurity') { 'Security' } else { 'Distribution' }
-                    $created = Invoke-MigrationAction -Description $createDescription -PassThru -Action {
-                        New-DistributionGroup @createParameters
-                    }
+                $settingsChanged.Add('EmailAddresses')
+                $updateDetail.Add("Proxy addresses added: $($aliasAddresses -join ', ').")
+            }
+
+            #-- Settings from the inventory ---------------------------------------------------
+            if ($objectType -in @('Distribution', 'MailEnabledSecurity', 'DynamicDistribution')) {
+                $inventoryRow = Find-IndexedRow -Row $row -Index $groupIndex
+                if (-not $inventoryRow) {
+                    if ($GroupsCsv) { $updateDetail.Add('No matching row in the Groups inventory; settings left alone.') }
                 }
-                'DynamicDistribution' {
-                    $inventoryRow = Find-IndexedRow -Row $row -Index $groupIndex
-                    $recipientFilter = if ($inventoryRow) { Get-MigrationCsvValue -Row $inventoryRow -Name 'RecipientFilter' -Default '' } else { '' }
-                    if (-not $recipientFilter) {
-                        throw ('A dynamic distribution group needs its RecipientFilter, which is only in the Groups ' +
-                            'inventory. Supply -GroupsCsv, or create this group by hand.')
+                else {
+                    $desired = ConvertTo-GroupSettingState -InputObject $inventoryRow -BooleanSetting $booleanGroupSetting `
+                        -TextSetting $textGroupSetting -AddressSetting $addressGroupSetting -Map $addressMap
+                    foreach ($miss in $desired.Unmapped) { $unmappable.Add($miss) }
+
+                    # A dynamic group has no membership to restrict, so those two settings are
+                    # dropped rather than sent and rejected.
+                    if ($objectType -eq 'DynamicDistribution') {
+                        foreach ($name in @('MemberJoinRestriction', 'MemberDepartRestriction')) {
+                            if ($desired.Settings.Contains($name)) { $desired.Settings.Remove($name) }
+                        }
                     }
-                    $createParameters['PrimarySmtpAddress'] = $targetAddress
-                    $createParameters['RecipientFilter'] = $recipientFilter
-                    $created = Invoke-MigrationAction -Description $createDescription -PassThru -Action {
-                        New-DynamicDistributionGroup @createParameters
+
+                    $current = ConvertTo-GroupSettingState -InputObject $recipient -BooleanSetting $booleanGroupSetting `
+                        -TextSetting $textGroupSetting -AddressSetting $addressGroupSetting
+                    $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
+
+                    if ($changes.Count -gt 0 -and $setCmdlet) {
+                        foreach ($name in (Invoke-SettingChange -Cmdlet $setCmdlet -Identity $targetAddress -Change $changes)) {
+                            $settingsChanged.Add($name)
+                        }
                     }
-                }
-                'Contact' {
-                    $inventoryRow = Find-IndexedRow -Row $row -Index $contactIndex
-                    $externalAddress = Resolve-ContactExternalAddress -PlanRow $row -InventoryRow $inventoryRow
-                    if (-not $externalAddress) {
-                        throw ('A mail contact needs an ExternalEmailAddress. Supply -ContactsCsv, or put the ' +
-                            'external address in the plan row SourceUserPrincipalName column.')
+                    elseif ($changes.Count -eq 0) {
+                        $updateDetail.Add('Settings already match the source.')
                     }
-                    # Deliberately not mapped: a contact points at someone outside both tenants.
-                    $createParameters['ExternalEmailAddress'] = $externalAddress
-                    $created = Invoke-MigrationAction -Description $createDescription -PassThru -Action {
-                        New-MailContact @createParameters
+
+                    #-- Members ---------------------------------------------------------------
+                    if ($objectType -in @('Distribution', 'MailEnabledSecurity')) {
+                        $members = Resolve-MappedAddressList -Value (Get-MigrationCsvValue -Row $inventoryRow -Name 'Members' -Default '') -Map $addressMap
+                        foreach ($miss in $members.Unmapped) { $unmappable.Add("Members: $miss") }
+
+                        $existingMembers = @()
+                        try {
+                            $existingMembers = @(Get-DistributionGroupMember -Identity $targetAddress -ResultSize Unlimited -ErrorAction Stop |
+                                    ForEach-Object { [string](Get-MigrationCsvValue -Row $_ -Name 'PrimarySmtpAddress' -Default '') } |
+                                    Where-Object { $_ })
+                        }
+                        catch {
+                            $updateDetail.Add("Could not read the current membership: $($_.Exception.Message)")
+                            $rowFailed = $true
+                        }
+
+                        foreach ($member in $members.Mapped) {
+                            if ($existingMembers -contains $member) { continue }
+                            try {
+                                $null = Invoke-MigrationAction -Description "Add $member to $targetAddress" -Action {
+                                    Add-DistributionGroupMember -Identity $targetAddress -Member $member -BypassSecurityGroupManagerCheck -ErrorAction Stop
+                                }
+                                $membersAdded++
+                            }
+                            catch {
+                                $updateDetail.Add("Member '$member' not added: $($_.Exception.Message)")
+                                $rowFailed = $true
+                            }
+                        }
                     }
-                }
-                default {
-                    throw "ObjectType '$objectType' is not created by this script."
                 }
             }
 
-            if ($DryRun) {
-                Add-ResultRow @common -Action 'CreateRecipient' -Status 'Planned' -TargetAddress $targetAddress `
-                    -Detail "Would create a $objectType recipient named '$displayName' with alias '$alias'."
-            }
-            else {
-                # The created object becomes the 'current' state for the settings diff, so a
-                # brand-new group is compared against what Exchange actually gave it rather
-                # than against nothing - which would resend defaults Exchange already applied.
-                $recipient = $created
-                $targetObjectId = Get-MigrationCsvValue -Row $created -Name 'ExternalDirectoryObjectId' -Default ''
-                if (-not $targetObjectId) { $targetObjectId = Get-MigrationCsvValue -Row $created -Name 'Guid' -Default '' }
+            #-- Shared and resource mailbox settings ------------------------------------------
+            if ($objectType -in @('Shared', 'Room', 'Equipment')) {
+                $inventoryRow = Find-IndexedRow -Row $row -Index $mailboxIndex
+                if ($inventoryRow) {
+                    $desired = ConvertTo-GroupSettingState -InputObject $inventoryRow `
+                        -BooleanSetting @('HiddenFromAddressListsEnabled') -AddressSetting @('GrantSendOnBehalfTo') -Map $addressMap
+                    foreach ($miss in $desired.Unmapped) { $unmappable.Add($miss) }
 
-                $row.TargetObjectId = $targetObjectId
-                $row.ProvisionStatus = 'Created'
-                $row.ProvisionDetail = "Created as a $objectType recipient on $targetAddress."
-                $planChanged = $true
+                    $current = ConvertTo-GroupSettingState -InputObject $recipient `
+                        -BooleanSetting @('HiddenFromAddressListsEnabled') -AddressSetting @('GrantSendOnBehalfTo')
+                    $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
 
-                Add-ResultRow @common -Action 'CreateRecipient' -Status 'Succeeded' -TargetAddress $targetAddress `
-                    -TargetObjectId $targetObjectId -Detail "Created a $objectType recipient named '$displayName'."
-            }
-        }
-        elseif ($doCreate) {
-            $row.TargetObjectId = $targetObjectId
-            $row.ProvisionStatus = 'Exists'
-            $row.ProvisionDetail = "Already present in the destination tenant as $targetAddress."
-            $planChanged = $true
-            Add-ResultRow @common -Action 'CreateRecipient' -Status 'Skipped' -TargetAddress $targetAddress `
-                -TargetObjectId $targetObjectId -Detail 'Already exists in the destination tenant; recorded its object ID.'
-        }
-
-        #-- Update settings ---------------------------------------------------------------
-        if (-not $doUpdate) { continue }
-        $phase = 'UpdateSettings'
-
-        if (-not $recipient -and -not $doCreate) {
-            Add-ResultRow @common -Action 'UpdateSettings' -Status 'Skipped' -TargetAddress $targetAddress `
-                -Detail "No recipient matches '$targetAddress' in the destination tenant. Run with -Mode CreateAndUpdate first."
-            continue
-        }
-
-        if (-not $recipient -and $DryRun) {
-            Add-ResultRow @common -Action 'UpdateSettings' -Status 'Planned' -TargetAddress $targetAddress `
-                -Detail 'Settings would be applied after the recipient is created.'
-            continue
-        }
-
-        $updateDetail = [System.Collections.Generic.List[string]]::new()
-        $unmappable = [System.Collections.Generic.List[string]]::new()
-        $settingsChanged = [System.Collections.Generic.List[string]]::new()
-        $membersAdded = 0
-        # Set by any settings step that caught an exception. Those steps continue so the rest of the
-        # row is still applied, but the row is reported Failed rather than Succeeded-with-a-note.
-        $rowFailed = $false
-
-        $setCmdlet = switch ($objectType) {
-            { $_ -in @('Shared', 'Room', 'Equipment') } { 'Set-Mailbox' }
-            { $_ -in @('Distribution', 'MailEnabledSecurity') } { 'Set-DistributionGroup' }
-            'DynamicDistribution' { 'Set-DynamicDistributionGroup' }
-            'Contact' { 'Set-MailContact' }
-            default { '' }
-        }
-
-        #-- Aliases and the X500 address --------------------------------------------------
-        $aliasAddresses = @(Get-PlanAliasAddress -Row $row -PrimaryAddress $targetAddress)
-        if ($aliasAddresses.Count -gt 0 -and $setCmdlet) {
-            $aliasParameters = @{ Identity = $targetAddress; EmailAddresses = @{ Add = $aliasAddresses }; ErrorAction = 'Stop' }
-            $null = Invoke-MigrationAction -Description "Add $($aliasAddresses.Count) proxy address(es) to $targetAddress" -Action {
-                & $setCmdlet @aliasParameters
-            }
-            $settingsChanged.Add('EmailAddresses')
-            $updateDetail.Add("Proxy addresses added: $($aliasAddresses -join ', ').")
-        }
-
-        #-- Settings from the inventory ---------------------------------------------------
-        if ($objectType -in @('Distribution', 'MailEnabledSecurity', 'DynamicDistribution')) {
-            $inventoryRow = Find-IndexedRow -Row $row -Index $groupIndex
-            if (-not $inventoryRow) {
-                if ($GroupsCsv) { $updateDetail.Add('No matching row in the Groups inventory; settings left alone.') }
-            }
-            else {
-                $desired = ConvertTo-GroupSettingState -InputObject $inventoryRow -BooleanSetting $booleanGroupSetting `
-                    -TextSetting $textGroupSetting -AddressSetting $addressGroupSetting -Map $addressMap
-                foreach ($miss in $desired.Unmapped) { $unmappable.Add($miss) }
-
-                # A dynamic group has no membership to restrict, so those two settings are
-                # dropped rather than sent and rejected.
-                if ($objectType -eq 'DynamicDistribution') {
-                    foreach ($name in @('MemberJoinRestriction', 'MemberDepartRestriction')) {
-                        if ($desired.Settings.Contains($name)) { $desired.Settings.Remove($name) }
-                    }
-                }
-
-                $current = ConvertTo-GroupSettingState -InputObject $recipient -BooleanSetting $booleanGroupSetting `
-                    -TextSetting $textGroupSetting -AddressSetting $addressGroupSetting
-                $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
-
-                if ($changes.Count -gt 0 -and $setCmdlet) {
-                    foreach ($name in (Invoke-SettingChange -Cmdlet $setCmdlet -Identity $targetAddress -Change $changes)) {
+                    foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-Mailbox' -Identity $targetAddress -Change $changes)) {
                         $settingsChanged.Add($name)
                     }
                 }
-                elseif ($changes.Count -eq 0) {
-                    $updateDetail.Add('Settings already match the source.')
-                }
 
-                #-- Members ---------------------------------------------------------------
-                if ($objectType -in @('Distribution', 'MailEnabledSecurity')) {
-                    $members = Resolve-MappedAddressList -Value (Get-MigrationCsvValue -Row $inventoryRow -Name 'Members' -Default '') -Map $addressMap
-                    foreach ($miss in $members.Unmapped) { $unmappable.Add("Members: $miss") }
+                #-- FullAccess and SendAs ------------------------------------------------------
+                $sourceAddress = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default ''
+                $sourceLookup = if ($sourceAddress) { $sourceAddress.ToLowerInvariant() } else { '' }
+                if ($sourceLookup -and $permissionsBySource.ContainsKey($sourceLookup)) {
+                    foreach ($permission in $permissionsBySource[$sourceLookup]) {
+                        $right = Get-MigrationCsvValue -Row $permission -Name 'Permission' -Default ''
+                        if ($right -notin @('FullAccess', 'SendAs')) { continue }
 
-                    $existingMembers = @()
-                    try {
-                        $existingMembers = @(Get-DistributionGroupMember -Identity $targetAddress -ResultSize Unlimited -ErrorAction Stop |
-                                ForEach-Object { [string](Get-MigrationCsvValue -Row $_ -Name 'PrimarySmtpAddress' -Default '') } |
-                                Where-Object { $_ })
-                    }
-                    catch {
-                        $updateDetail.Add("Could not read the current membership: $($_.Exception.Message)")
-                        $rowFailed = $true
-                    }
+                        $trustee = (Resolve-MigrationPlanAddress -Map $addressMap `
+                                -Address (Get-MigrationCsvValue -Row $permission -Name 'Trustee' -Default '')).Address
+                        if (-not $trustee) {
+                            $rawTrustee = Get-MigrationCsvValue -Row $permission -Name 'Trustee' -Default '(blank)'
+                            $unmappable.Add("${right}: $rawTrustee")
+                            continue
+                        }
 
-                    foreach ($member in $members.Mapped) {
-                        if ($existingMembers -contains $member) { continue }
                         try {
-                            $null = Invoke-MigrationAction -Description "Add $member to $targetAddress" -Action {
-                                Add-DistributionGroupMember -Identity $targetAddress -Member $member -BypassSecurityGroupManagerCheck -ErrorAction Stop
+                            if ($right -eq 'FullAccess') {
+                                $null = Invoke-MigrationAction -Description "Grant FullAccess on $targetAddress to $trustee" -Action {
+                                    Add-MailboxPermission -Identity $targetAddress -User $trustee -AccessRights FullAccess `
+                                        -AutoMapping $true -ErrorAction Stop
+                                }
                             }
-                            $membersAdded++
+                            else {
+                                $null = Invoke-MigrationAction -Description "Grant SendAs on $targetAddress to $trustee" -Action {
+                                    Add-RecipientPermission -Identity $targetAddress -Trustee $trustee -AccessRights SendAs `
+                                        -Confirm:$false -ErrorAction Stop
+                                }
+                            }
+                            $settingsChanged.Add($right)
                         }
                         catch {
-                            $updateDetail.Add("Member '$member' not added: $($_.Exception.Message)")
+                            $updateDetail.Add("$right for '$trustee' failed: $($_.Exception.Message)")
                             $rowFailed = $true
                         }
                     }
                 }
             }
-        }
 
-        #-- Shared and resource mailbox settings ------------------------------------------
-        if ($objectType -in @('Shared', 'Room', 'Equipment')) {
-            $inventoryRow = Find-IndexedRow -Row $row -Index $mailboxIndex
-            if ($inventoryRow) {
-                $desired = ConvertTo-GroupSettingState -InputObject $inventoryRow `
-                    -BooleanSetting @('HiddenFromAddressListsEnabled') -AddressSetting @('GrantSendOnBehalfTo') -Map $addressMap
-                foreach ($miss in $desired.Unmapped) { $unmappable.Add($miss) }
-
-                $current = ConvertTo-GroupSettingState -InputObject $recipient `
-                    -BooleanSetting @('HiddenFromAddressListsEnabled') -AddressSetting @('GrantSendOnBehalfTo')
-                $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
-
-                foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-Mailbox' -Identity $targetAddress -Change $changes)) {
-                    $settingsChanged.Add($name)
-                }
-            }
-
-            #-- FullAccess and SendAs ------------------------------------------------------
-            $sourceAddress = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default ''
-            $sourceLookup = if ($sourceAddress) { $sourceAddress.ToLowerInvariant() } else { '' }
-            if ($sourceLookup -and $permissionsBySource.ContainsKey($sourceLookup)) {
-                foreach ($permission in $permissionsBySource[$sourceLookup]) {
-                    $right = Get-MigrationCsvValue -Row $permission -Name 'Permission' -Default ''
-                    if ($right -notin @('FullAccess', 'SendAs')) { continue }
-
-                    $trustee = (Resolve-MigrationPlanAddress -Map $addressMap `
-                            -Address (Get-MigrationCsvValue -Row $permission -Name 'Trustee' -Default '')).Address
-                    if (-not $trustee) {
-                        $rawTrustee = Get-MigrationCsvValue -Row $permission -Name 'Trustee' -Default '(blank)'
-                        $unmappable.Add("${right}: $rawTrustee")
-                        continue
-                    }
-
-                    try {
-                        if ($right -eq 'FullAccess') {
-                            $null = Invoke-MigrationAction -Description "Grant FullAccess on $targetAddress to $trustee" -Action {
-                                Add-MailboxPermission -Identity $targetAddress -User $trustee -AccessRights FullAccess `
-                                    -AutoMapping $true -ErrorAction Stop
-                            }
-                        }
-                        else {
-                            $null = Invoke-MigrationAction -Description "Grant SendAs on $targetAddress to $trustee" -Action {
-                                Add-RecipientPermission -Identity $targetAddress -Trustee $trustee -AccessRights SendAs `
-                                    -Confirm:$false -ErrorAction Stop
-                            }
-                        }
-                        $settingsChanged.Add($right)
-                    }
-                    catch {
-                        $updateDetail.Add("$right for '$trustee' failed: $($_.Exception.Message)")
-                        $rowFailed = $true
+            #-- Contact settings --------------------------------------------------------------
+            if ($objectType -eq 'Contact') {
+                $inventoryRow = Find-IndexedRow -Row $row -Index $contactIndex
+                if ($inventoryRow) {
+                    $desired = ConvertTo-GroupSettingState -InputObject $inventoryRow -BooleanSetting @('HiddenFromAddressListsEnabled')
+                    $current = ConvertTo-GroupSettingState -InputObject $recipient -BooleanSetting @('HiddenFromAddressListsEnabled')
+                    $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
+                    foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-MailContact' -Identity $targetAddress -Change $changes)) {
+                        $settingsChanged.Add($name)
                     }
                 }
             }
-        }
 
-        #-- Contact settings --------------------------------------------------------------
-        if ($objectType -eq 'Contact') {
-            $inventoryRow = Find-IndexedRow -Row $row -Index $contactIndex
-            if ($inventoryRow) {
-                $desired = ConvertTo-GroupSettingState -InputObject $inventoryRow -BooleanSetting @('HiddenFromAddressListsEnabled')
-                $current = ConvertTo-GroupSettingState -InputObject $recipient -BooleanSetting @('HiddenFromAddressListsEnabled')
-                $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
-                foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-MailContact' -Identity $targetAddress -Change $changes)) {
-                    $settingsChanged.Add($name)
-                }
+            if ($unmappable.Count -gt 0) {
+                $updateDetail.Add("Not in the plan, so left off: $($unmappable.Count) address(es).")
             }
-        }
+            if ($settingsChanged.Count -eq 0 -and $membersAdded -eq 0 -and $updateDetail.Count -eq 0) {
+                $updateDetail.Add('Nothing to change.')
+            }
 
-        if ($unmappable.Count -gt 0) {
-            $updateDetail.Add("Not in the plan, so left off: $($unmappable.Count) address(es).")
+            $status = if ($rowFailed) { 'Failed' } elseif ($DryRun) { 'Planned' } else { 'Succeeded' }
+            Add-ResultRow @common -Action 'UpdateSettings' -Status $status -TargetAddress $targetAddress `
+                -TargetObjectId $targetObjectId -Detail ($updateDetail -join ' ') `
+                -SettingsChanged (Join-MigrationList -Values $settingsChanged.ToArray()) `
+                -MembersAdded ([string]$membersAdded) `
+                -Unmappable (Join-MigrationList -Values $unmappable.ToArray())
         }
-        if ($settingsChanged.Count -eq 0 -and $membersAdded -eq 0 -and $updateDetail.Count -eq 0) {
-            $updateDetail.Add('Nothing to change.')
+        catch {
+            $message = $_.Exception.Message
+            $row.ProvisionStatus = 'Failed'
+            $row.ProvisionDetail = $message
+            $planChanged = $true
+            Write-MigrationLog -Message "$identity - $message" -Level ERROR
+            Add-ResultRow @common -Action $phase -Status 'Failed' -Detail $message -TargetAddress $targetAddress
         }
-
-        $status = if ($rowFailed) { 'Failed' } elseif ($DryRun) { 'Planned' } else { 'Succeeded' }
-        Add-ResultRow @common -Action 'UpdateSettings' -Status $status -TargetAddress $targetAddress `
-            -TargetObjectId $targetObjectId -Detail ($updateDetail -join ' ') `
-            -SettingsChanged (Join-MigrationList -Values $settingsChanged.ToArray()) `
-            -MembersAdded ([string]$membersAdded) `
-            -Unmappable (Join-MigrationList -Values $unmappable.ToArray())
-    }
-    catch {
-        $message = $_.Exception.Message
-        $row.ProvisionStatus = 'Failed'
-        $row.ProvisionDetail = $message
-        $planChanged = $true
-        Write-MigrationLog -Message "$identity - $message" -Level ERROR
-        Add-ResultRow @common -Action $phase -Status 'Failed' -Detail $message -TargetAddress $targetAddress
     }
 }
+catch {
+    # Anything that escapes the per-row catch ends the run, but not before the two artefacts it
+    # has already earned are written by the finally block below.
+    Write-MigrationLog -Message "Fatal error: $($_.Exception.Message)" -Level ERROR
+    Write-MigrationLog -Message $_.ScriptStackTrace -Level DEBUG
+    $exitCode = 1
+}
+finally {
+    Write-Progress -Activity 'Creating destination recipients' -Completed
 
-Write-Progress -Activity 'Creating destination recipients' -Completed
+    if ($planChanged) {
+        try {
+            $null = Invoke-MigrationAction -Description "Write provisioning results back to $PlanPath" -Action {
+                Save-MigrationPlan -Path $PlanPath -Rows $planRows
+            }
+        }
+        catch {
+            # Losing the write-back loses the TargetObjectIds this run just earned, so it is a failed
+            # run even when every row succeeded.
+            Write-MigrationLog -Message ("Could not write the plan back to $PlanPath, so the object IDs " +
+                "recorded by this run are only in the results file: $($_.Exception.Message)") -Level ERROR
+            $planSaveFailed = $true
+        }
+    }
+
+    # The flag is what keeps a fatal run from producing two results files for one run: whoever
+    # exports first sets it, and this block then leaves the file alone.
+    if (-not $resultsExported) {
+        try {
+            $null = Export-MigrationResult -Rows $script:results.ToArray() -Name 'New-Recipients'
+            $resultsExported = $true
+        }
+        catch {
+            # The run is already ending; a results file that cannot be written must not mask the
+            # reason it ended, so the failure is logged and the exit code stands.
+            Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
+        }
+    }
+}
 
 #endregion Main -----------------------------------------------------------------------
 
 #region Cleanup -----------------------------------------------------------------------
 
-if ($planChanged) {
-    try {
-        $null = Invoke-MigrationAction -Description "Write provisioning results back to $PlanPath" -Action {
-            Save-MigrationPlan -Path $PlanPath -Rows $planRows
-        }
-    }
-    catch {
-        # Losing the write-back loses the TargetObjectIds this run just earned, so it is a failed
-        # run even when every row succeeded.
-        Write-MigrationLog -Message ("Could not write the plan back to $PlanPath, so the object IDs " +
-            "recorded by this run are only in the results file: $($_.Exception.Message)") -Level ERROR
-        $planSaveFailed = $true
-    }
+# A fatal error already set 1; row failures and a lost write-back are the softer exit 2.
+if ($exitCode -eq 0 -and ($planSaveFailed -or @($script:results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0)) {
+    $exitCode = 2
 }
-
-$null = Export-MigrationResult -Rows $script:results.ToArray() -Name 'New-Recipients'
-
-$exitCode = if ($planSaveFailed -or @($script:results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { 2 } else { 0 }
 exit (Complete-MigrationRun -ExitCode $exitCode)
 
 #endregion Cleanup --------------------------------------------------------------------

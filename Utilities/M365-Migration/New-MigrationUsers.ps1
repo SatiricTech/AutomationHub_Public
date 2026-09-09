@@ -561,6 +561,10 @@ if (-not $UseInterim) {
     }
 }
 
+# Only read when licences are actually being assigned - the catalogue is not needed otherwise -
+# and a failure to read it is fatal rather than a warning. Carrying on with an empty catalogue
+# would report every part number as "not in the tenant SKU catalogue", which blames the plan for
+# a tenant read that never succeeded, and would leave brand-new accounts unlicensed.
 $skuCatalog = @()
 if ($AssignLicenses) {
     try {
@@ -568,261 +572,324 @@ if ($AssignLicenses) {
         Write-MigrationLog -Message "Loaded $($skuCatalog.Count) subscribed SKU(s)." -Level INFO
     }
     catch {
-        Write-MigrationLog -Message "Could not read the tenant SKU catalogue; licences will be reported as unassignable. $($_.Exception.Message)" -Level WARNING
+        Write-MigrationLog -Message ('Could not read the tenant SKU catalogue, so -AssignLicenses cannot be ' +
+            "honoured: $($_.Exception.Message)") -Level ERROR
+        exit (Complete-MigrationRun -ExitCode 1)
     }
 }
 
 $planChanged = $false
 $planSaveFailed = $false
+$resultsExported = $false
+$exitCode = 0
 $rowIndex = 0
 
+# Import-MigrationPlan materialises every canonical plan column, so these are normally already
+# present. The guard costs one property lookup per row and removes a whole class of failure:
+# under Set-StrictMode -Version Latest, assigning a property the object does not carry throws,
+# and these write-backs happen inside the per-row catch - where a second exception would hide
+# the error the operator actually has to read.
 foreach ($row in $waveRows) {
-    $rowIndex++
-
-    $objectType = Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default ''
-    $planStatus = Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default ''
-
-    $identity = Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default ''
-    if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default '' }
-    if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'DisplayName' -Default "(plan row $rowIndex)" }
-
-    Write-Progress -Activity 'Creating destination accounts' -Status "$rowIndex of $($waveRows.Count): $identity" `
-        -PercentComplete (($rowIndex / [math]::Max($waveRows.Count, 1)) * 100)
-
-    $common = @{ Identity = $identity; ObjectType = $objectType; PlanStatus = $planStatus }
-
-    if ($objectType -eq 'Guest') {
-        Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail ('Guest accounts are not created here. ' +
-            'Re-invite the guest in the destination tenant so the invitation redemption stays with the guest, ' +
-            'then record the new object ID in the plan.')
-        continue
-    }
-
-    if ($objectType -ne 'User') {
-        Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' `
-            -Detail "ObjectType '$objectType' is not created by this script; New-MigrationRecipients handles mail recipients."
-        continue
-    }
-
-    # -AllowSynced: a directory-synced source object is no reason not to create a fresh
-    # cloud account in the destination tenant. The gate's sync check belongs to the scripts
-    # that write back to an existing object.
-    $gate = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions -AllowSynced
-    if (-not $gate.Actionable) {
-        $detail = $gate.Reason
-        if ($planStatus -eq 'Collision') { $detail += ' Re-run with -IncludeCollisions to process it.' }
-        Add-ResultRow @common -Action 'CreateUser' -Status $gate.Status -Detail $detail
-        continue
-    }
-
-    $alreadyProvisioned = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
-    if ($alreadyProvisioned) {
-        Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail 'Already provisioned; the plan row carries a TargetObjectId.' `
-            -TargetObjectId $alreadyProvisioned
-        continue
-    }
-
-    $generatedPassword = ''
-    $usageLocation = ''
-    $upn = ''
-
-    try {
-        $chosen = Resolve-RowIdentity -Row $row -VerifiedDomain $verifiedDomains -UseInterim:$UseInterim
-        $upn = $chosen.UserPrincipalName
-        if (-not $upn) { throw $chosen.Warning }
-        if (-not $chosen.MailNickname) { throw 'The plan row has no TargetMailNickname and the chosen UPN has no local part to fall back on.' }
-
-        $upnCheck = Test-MigrationAddress -Address $upn -Kind 'Upn'
-        if (-not $upnCheck.IsValid) { throw "'$upn' is not a usable UPN: $($upnCheck.Reason)" }
-
-        $usageLocation = Get-MigrationCsvValue -Row $row -Name 'UsageLocation' -Default ''
-        if (-not $usageLocation) { $usageLocation = $DefaultUsageLocation }
-
-        # Existing-object check before the create, so a re-run after a partial failure
-        # adopts what is already there instead of failing every row with a conflict.
-        $filterValue = ConvertTo-MigrationODataString -Value $upn
-        $existing = @(Invoke-MigrationGraphRequest -Method GET `
-                -Uri "/v1.0/users?`$filter=userPrincipalName eq '$filterValue'&`$select=id,userPrincipalName")
-
-        if ($existing.Count -gt 0) {
-            $existingId = [string](Get-MigrationProperty -InputObject $existing[0] -Name 'id' -Default '')
-            $row.TargetObjectId = $existingId
-            $row.ProvisionStatus = 'Exists'
-            $row.ProvisionDetail = "Account already present in the destination tenant as $upn."
-            $planChanged = $true
-            Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail 'Account already exists in the destination tenant; recorded its object ID.' `
-                -TargetUserPrincipalName $upn -TargetObjectId $existingId -UsageLocation $usageLocation
-            continue
+    foreach ($column in @('TargetObjectId', 'ProvisionStatus', 'ProvisionDetail')) {
+        if (-not $row.PSObject.Properties[$column]) {
+            $row | Add-Member -NotePropertyName $column -NotePropertyValue '' -Force
         }
-
-        if (-not $PSCmdlet.ShouldProcess($upn, 'Create Microsoft 365 user')) {
-            Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail 'Declined at the confirmation prompt.' `
-                -TargetUserPrincipalName $upn -UsageLocation $usageLocation
-            continue
-        }
-
-        # A password is only minted for a run that will actually create something, so a
-        # rehearsal never leaves a live credential in a DryRun results file.
-        $password = if ($DryRun) { '' } else { New-MigrationRandomPassword -Length $PasswordLength }
-
-        $body = ConvertTo-UserRequestBody -Row $row -UserPrincipalName $upn -MailNickname $chosen.MailNickname `
-            -UsageLocation $usageLocation -Password $password -ForceChangePassword $ForceChangePassword `
-            -HideFromAddressLists:$HideFromAddressLists
-
-        $created = Invoke-MigrationAction -Description "Create user $upn" -PassThru -Action {
-            Invoke-MigrationGraphRequest -Method POST -Uri '/v1.0/users' -Body $body
-        }
-
-        $detail = [System.Collections.Generic.List[string]]::new()
-        if ($chosen.Warning) { $detail.Add($chosen.Warning) }
-        if ($HideFromAddressLists) {
-            $detail.Add('showInAddressList set to false; re-apply the GAL hide with Set-MigrationIdentity once the mailbox exists.')
-        }
-
-        if ($DryRun) {
-            $detail.Insert(0, "Would create $upn on the $($chosen.AddressSource.ToLowerInvariant()) address.")
-            if ($AssignLicenses) {
-                $planned = @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $row -Name 'TargetLicenses' -Default ''))
-                if ($planned.Count -gt 0) { $detail.Add("Would assign: $($planned -join ', ').") }
-            }
-            Add-ResultRow @common -Action 'CreateUser' -Status 'Planned' -Detail ($detail -join ' ') `
-                -TargetUserPrincipalName $upn -UsageLocation $usageLocation
-            continue
-        }
-
-        $generatedPassword = $password
-        $newObjectId = [string](Get-MigrationProperty -InputObject $created -Name 'id' -Default '')
-        if (-not $newObjectId) {
-            throw ("The account may have been created, but Graph returned no object ID for $upn, so " +
-                'the plan cannot record it. Check the destination tenant for the account and fill in ' +
-                'TargetObjectId by hand before running the next phase.')
-        }
-        $detail.Insert(0, "Account created on the $($chosen.AddressSource.ToLowerInvariant()) address.")
-
-        $row.TargetObjectId = $newObjectId
-        $row.ProvisionStatus = 'Created'
-        $planChanged = $true
-
-        $licensesAssigned = ''
-        if ($AssignLicenses) {
-            $planned = @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $row -Name 'TargetLicenses' -Default ''))
-            if ($planned.Count -eq 0) {
-                $detail.Add('No TargetLicenses on the plan row; nothing assigned.')
-            }
-            elseif (-not $usageLocation) {
-                $detail.Add('Licences skipped: assignLicense requires a usage location. Set UsageLocation on the row or pass -DefaultUsageLocation.')
-            }
-            elseif (-not $newObjectId) {
-                $detail.Add('Licences skipped: the create call returned no object ID.')
-            }
-            else {
-                try {
-                    $licenceResult = Invoke-LicenseAssignment -UserId $newObjectId -SkuPartNumber $planned `
-                        -Catalog $skuCatalog -Identity $upn
-                    $licensesAssigned = Join-MigrationList -Values $licenceResult.Assigned
-                    if ($licenceResult.Unknown.Count -gt 0) {
-                        $detail.Add("Not in the tenant SKU catalogue: $($licenceResult.Unknown -join ', ').")
-                    }
-                }
-                catch {
-                    $detail.Add("Licence assignment failed: $($_.Exception.Message)")
-                }
-            }
-        }
-
-        $row.ProvisionDetail = ($detail -join ' ')
-        Add-ResultRow @common -Action 'CreateUser' -Status 'Succeeded' -Detail ($detail -join ' ') `
-            -TargetUserPrincipalName $upn -TargetObjectId $newObjectId -UsageLocation $usageLocation `
-            -LicensesAssigned $licensesAssigned -GeneratedPassword $generatedPassword
-    }
-    catch {
-        $mapped = ConvertTo-FailureDetail -Message $_.Exception.Message -UserPrincipalName $upn
-        $row.ProvisionStatus = 'Failed'
-        $row.ProvisionDetail = $mapped
-        $planChanged = $true
-        Write-MigrationLog -Message "$identity - $mapped" -Level ERROR
-        Add-ResultRow @common -Action 'CreateUser' -Status 'Failed' -Detail $mapped `
-            -TargetUserPrincipalName $upn -UsageLocation $usageLocation
     }
 }
 
-Write-Progress -Activity 'Creating destination accounts' -Completed
-
-if ($SetManagers) {
-    Write-MigrationLog -Message 'Second pass: setting managers.' -Level INFO
-
-    # Built from the whole plan, not the wave: a manager is frequently in an earlier wave
-    # that this run is not touching, and their object ID is already recorded there. This is
-    # an address -> object ID index, which is not what Get-MigrationPlanAddressMap returns.
-    $objectIdByAddress = @{}
-    foreach ($planRow in $planRows) {
-        $planRowObjectId = Get-MigrationCsvValue -Row $planRow -Name 'TargetObjectId' -Default ''
-        if (-not $planRowObjectId) { continue }
-        foreach ($column in @('SourceUserPrincipalName', 'SourcePrimarySmtp', 'TargetUserPrincipalName', 'InterimUserPrincipalName')) {
-            $address = Get-MigrationCsvValue -Row $planRow -Name $column -Default ''
-            if ($address) { $objectIdByAddress[$address.ToLowerInvariant()] = $planRowObjectId }
-        }
-    }
+# Everything from here to the finally block is inside one try: an exception outside the per-row
+# catch (a dropped connection between passes, a Graph outage) must still leave the operator with
+# the plan write-back for the accounts already created and a results file for the rows already
+# processed. Losing either turns a partial run into a manual reconciliation.
+try {
 
     foreach ($row in $waveRows) {
-        $objectType = Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default ''
-        if ($objectType -ne 'User') { continue }
+        $rowIndex++
 
-        $managerUpn = Get-MigrationCsvValue -Row $row -Name 'ManagerUpn' -Default ''
-        if (-not $managerUpn) { continue }
+        $objectType = Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default ''
+        $planStatus = Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default ''
 
         $identity = Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default ''
-        if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default '(unnamed row)' }
+        if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default '' }
+        if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'DisplayName' -Default "(plan row $rowIndex)" }
 
-        $common = @{
-            Identity   = $identity
-            ObjectType = $objectType
-            PlanStatus = (Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default '')
-        }
+        Write-Progress -Activity 'Creating destination accounts' -Status "$rowIndex of $($waveRows.Count): $identity" `
+            -PercentComplete (($rowIndex / [math]::Max($waveRows.Count, 1)) * 100)
 
-        $userObjectId = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
-        if (-not $userObjectId) {
-            $status = if ($DryRun) { 'Planned' } else { 'Skipped' }
-            Add-ResultRow @common -Action 'SetManager' -Status $status `
-                -Detail "The account has no target object ID yet, so manager '$managerUpn' cannot be set on this pass."
+        $common = @{ Identity = $identity; ObjectType = $objectType; PlanStatus = $planStatus }
+
+        if ($objectType -eq 'Guest') {
+            Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail ('Guest accounts are not created here. ' +
+                'Re-invite the guest in the destination tenant so the invitation redemption stays with the guest, ' +
+                'then record the new object ID in the plan.')
             continue
         }
 
-        $managerObjectId = ''
-        if ($objectIdByAddress.ContainsKey($managerUpn.ToLowerInvariant())) {
-            $managerObjectId = $objectIdByAddress[$managerUpn.ToLowerInvariant()]
-        }
-
-        if (-not $managerObjectId) {
-            Add-ResultRow @common -Action 'SetManager' -Status 'Skipped' -TargetObjectId $userObjectId `
-                -Detail ("Manager '$managerUpn' has no provisioned account in the plan. Provision the manager first, " +
-                    'or set the relationship by hand if the manager is outside the migration.')
+        if ($objectType -ne 'User') {
+            Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' `
+                -Detail "ObjectType '$objectType' is not created by this script; New-MigrationRecipients handles mail recipients."
             continue
         }
+
+        # -AllowSynced: a directory-synced source object is no reason not to create a fresh
+        # cloud account in the destination tenant. The gate's sync check belongs to the scripts
+        # that write back to an existing object.
+        $gate = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions -AllowSynced
+        if (-not $gate.Actionable) {
+            $detail = $gate.Reason
+            if ($planStatus -eq 'Collision') { $detail += ' Re-run with -IncludeCollisions to process it.' }
+            Add-ResultRow @common -Action 'CreateUser' -Status $gate.Status -Detail $detail
+            continue
+        }
+
+        $alreadyProvisioned = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
+        if ($alreadyProvisioned) {
+            Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail 'Already provisioned; the plan row carries a TargetObjectId.' `
+                -TargetObjectId $alreadyProvisioned
+            continue
+        }
+
+        $generatedPassword = ''
+        $usageLocation = ''
+        $upn = ''
 
         try {
-            if (-not $PSCmdlet.ShouldProcess($identity, "Set manager to $managerUpn")) {
-                Add-ResultRow @common -Action 'SetManager' -Status 'Skipped' -Detail 'Declined at the confirmation prompt.' `
-                    -TargetObjectId $userObjectId
+            $chosen = Resolve-RowIdentity -Row $row -VerifiedDomain $verifiedDomains -UseInterim:$UseInterim
+            $upn = $chosen.UserPrincipalName
+            if (-not $upn) { throw $chosen.Warning }
+            if (-not $chosen.MailNickname) { throw 'The plan row has no TargetMailNickname and the chosen UPN has no local part to fall back on.' }
+
+            $upnCheck = Test-MigrationAddress -Address $upn -Kind 'Upn'
+            if (-not $upnCheck.IsValid) { throw "'$upn' is not a usable UPN: $($upnCheck.Reason)" }
+
+            $usageLocation = Get-MigrationCsvValue -Row $row -Name 'UsageLocation' -Default ''
+            if (-not $usageLocation) { $usageLocation = $DefaultUsageLocation }
+
+            # Existing-object check before the create, so a re-run after a partial failure
+            # adopts what is already there instead of failing every row with a conflict.
+            $filterValue = ConvertTo-MigrationODataString -Value $upn
+            $existing = @(Invoke-MigrationGraphRequest -Method GET `
+                    -Uri "/v1.0/users?`$filter=userPrincipalName eq '$filterValue'&`$select=id,userPrincipalName")
+
+            if ($existing.Count -gt 0) {
+                $existingId = [string](Get-MigrationProperty -InputObject $existing[0] -Name 'id' -Default '')
+                $row.TargetObjectId = $existingId
+                $row.ProvisionStatus = 'Exists'
+                $row.ProvisionDetail = "Account already present in the destination tenant as $upn."
+                $planChanged = $true
+                Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail 'Account already exists in the destination tenant; recorded its object ID.' `
+                    -TargetUserPrincipalName $upn -TargetObjectId $existingId -UsageLocation $usageLocation
                 continue
             }
 
-            $managerReference = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/users/$managerObjectId" }
-            $managerUri = "/v1.0/users/$userObjectId/manager/`$ref"
-
-            $null = Invoke-MigrationAction -Description "Set manager of $identity to $managerUpn" -Action {
-                Invoke-MigrationGraphRequest -Method PUT -Uri $managerUri -Body $managerReference
+            if (-not $PSCmdlet.ShouldProcess($upn, 'Create Microsoft 365 user')) {
+                Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail 'Declined at the confirmation prompt.' `
+                    -TargetUserPrincipalName $upn -UsageLocation $usageLocation
+                continue
             }
 
-            $status = if ($DryRun) { 'Planned' } else { 'Succeeded' }
-            $verb = if ($DryRun) { 'Would set' } else { 'Set' }
-            Add-ResultRow @common -Action 'SetManager' -Status $status -Detail "$verb manager to $managerUpn." `
-                -TargetObjectId $userObjectId
+            # A password is only minted for a run that will actually create something, so a
+            # rehearsal never leaves a live credential in a DryRun results file.
+            $password = if ($DryRun) { '' } else { New-MigrationRandomPassword -Length $PasswordLength }
+
+            $body = ConvertTo-UserRequestBody -Row $row -UserPrincipalName $upn -MailNickname $chosen.MailNickname `
+                -UsageLocation $usageLocation -Password $password -ForceChangePassword $ForceChangePassword `
+                -HideFromAddressLists:$HideFromAddressLists
+
+            $created = Invoke-MigrationAction -Description "Create user $upn" -PassThru -Action {
+                Invoke-MigrationGraphRequest -Method POST -Uri '/v1.0/users' -Body $body
+            }
+
+            $detail = [System.Collections.Generic.List[string]]::new()
+            if ($chosen.Warning) { $detail.Add($chosen.Warning) }
+            if ($HideFromAddressLists) {
+                $detail.Add('showInAddressList set to false; re-apply the GAL hide with Set-MigrationIdentity once the mailbox exists.')
+            }
+
+            if ($DryRun) {
+                $detail.Insert(0, "Would create $upn on the $($chosen.AddressSource.ToLowerInvariant()) address.")
+                if ($AssignLicenses) {
+                    $planned = @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $row -Name 'TargetLicenses' -Default ''))
+                    if ($planned.Count -gt 0) { $detail.Add("Would assign: $($planned -join ', ').") }
+                }
+                Add-ResultRow @common -Action 'CreateUser' -Status 'Planned' -Detail ($detail -join ' ') `
+                    -TargetUserPrincipalName $upn -UsageLocation $usageLocation
+                continue
+            }
+
+            $generatedPassword = $password
+            $newObjectId = [string](Get-MigrationProperty -InputObject $created -Name 'id' -Default '')
+            if (-not $newObjectId) {
+                throw ("The account may have been created, but Graph returned no object ID for $upn, so " +
+                    'the plan cannot record it. Check the destination tenant for the account and fill in ' +
+                    'TargetObjectId by hand before running the next phase.')
+            }
+            $detail.Insert(0, "Account created on the $($chosen.AddressSource.ToLowerInvariant()) address.")
+
+            $row.TargetObjectId = $newObjectId
+            $row.ProvisionStatus = 'Created'
+            $planChanged = $true
+
+            $licensesAssigned = ''
+            if ($AssignLicenses) {
+                $planned = @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $row -Name 'TargetLicenses' -Default ''))
+                if ($planned.Count -eq 0) {
+                    $detail.Add('No TargetLicenses on the plan row; nothing assigned.')
+                }
+                elseif (-not $usageLocation) {
+                    $detail.Add('Licences skipped: assignLicense requires a usage location. Set UsageLocation on the row or pass -DefaultUsageLocation.')
+                }
+                elseif (-not $newObjectId) {
+                    $detail.Add('Licences skipped: the create call returned no object ID.')
+                }
+                else {
+                    try {
+                        $licenceResult = Invoke-LicenseAssignment -UserId $newObjectId -SkuPartNumber $planned `
+                            -Catalog $skuCatalog -Identity $upn
+                        $licensesAssigned = Join-MigrationList -Values $licenceResult.Assigned
+                        if ($licenceResult.Unknown.Count -gt 0) {
+                            $detail.Add("Not in the tenant SKU catalogue: $($licenceResult.Unknown -join ', ').")
+                        }
+                    }
+                    catch {
+                        $detail.Add("Licence assignment failed: $($_.Exception.Message)")
+                    }
+                }
+            }
+
+            $row.ProvisionDetail = ($detail -join ' ')
+            Add-ResultRow @common -Action 'CreateUser' -Status 'Succeeded' -Detail ($detail -join ' ') `
+                -TargetUserPrincipalName $upn -TargetObjectId $newObjectId -UsageLocation $usageLocation `
+                -LicensesAssigned $licensesAssigned -GeneratedPassword $generatedPassword
         }
         catch {
-            $mapped = ConvertTo-FailureDetail -Message $_.Exception.Message -UserPrincipalName $identity
-            Write-MigrationLog -Message "$identity - manager not set: $mapped" -Level ERROR
-            Add-ResultRow @common -Action 'SetManager' -Status 'Failed' -Detail $mapped -TargetObjectId $userObjectId
+            $mapped = ConvertTo-FailureDetail -Message $_.Exception.Message -UserPrincipalName $upn
+            $row.ProvisionStatus = 'Failed'
+            $row.ProvisionDetail = $mapped
+            $planChanged = $true
+            Write-MigrationLog -Message "$identity - $mapped" -Level ERROR
+            Add-ResultRow @common -Action 'CreateUser' -Status 'Failed' -Detail $mapped `
+                -TargetUserPrincipalName $upn -UsageLocation $usageLocation
+        }
+    }
+
+    Write-Progress -Activity 'Creating destination accounts' -Completed
+
+    if ($SetManagers) {
+        Write-MigrationLog -Message 'Second pass: setting managers.' -Level INFO
+
+        # Built from the whole plan, not the wave: a manager is frequently in an earlier wave
+        # that this run is not touching, and their object ID is already recorded there. This is
+        # an address -> object ID index, which is not what Get-MigrationPlanAddressMap returns.
+        $objectIdByAddress = @{}
+        foreach ($planRow in $planRows) {
+            $planRowObjectId = Get-MigrationCsvValue -Row $planRow -Name 'TargetObjectId' -Default ''
+            if (-not $planRowObjectId) { continue }
+            foreach ($column in @('SourceUserPrincipalName', 'SourcePrimarySmtp', 'TargetUserPrincipalName', 'InterimUserPrincipalName')) {
+                $address = Get-MigrationCsvValue -Row $planRow -Name $column -Default ''
+                if ($address) { $objectIdByAddress[$address.ToLowerInvariant()] = $planRowObjectId }
+            }
+        }
+
+        foreach ($row in $waveRows) {
+            $objectType = Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default ''
+            if ($objectType -ne 'User') { continue }
+
+            $managerUpn = Get-MigrationCsvValue -Row $row -Name 'ManagerUpn' -Default ''
+            if (-not $managerUpn) { continue }
+
+            $identity = Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default ''
+            if (-not $identity) { $identity = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default '(unnamed row)' }
+
+            $common = @{
+                Identity   = $identity
+                ObjectType = $objectType
+                PlanStatus = (Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default '')
+            }
+
+            $userObjectId = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
+            if (-not $userObjectId) {
+                $status = if ($DryRun) { 'Planned' } else { 'Skipped' }
+                Add-ResultRow @common -Action 'SetManager' -Status $status `
+                    -Detail "The account has no target object ID yet, so manager '$managerUpn' cannot be set on this pass."
+                continue
+            }
+
+            $managerObjectId = ''
+            if ($objectIdByAddress.ContainsKey($managerUpn.ToLowerInvariant())) {
+                $managerObjectId = $objectIdByAddress[$managerUpn.ToLowerInvariant()]
+            }
+
+            if (-not $managerObjectId) {
+                Add-ResultRow @common -Action 'SetManager' -Status 'Skipped' -TargetObjectId $userObjectId `
+                    -Detail ("Manager '$managerUpn' has no provisioned account in the plan. Provision the manager first, " +
+                        'or set the relationship by hand if the manager is outside the migration.')
+                continue
+            }
+
+            try {
+                if (-not $PSCmdlet.ShouldProcess($identity, "Set manager to $managerUpn")) {
+                    Add-ResultRow @common -Action 'SetManager' -Status 'Skipped' -Detail 'Declined at the confirmation prompt.' `
+                        -TargetObjectId $userObjectId
+                    continue
+                }
+
+                $managerReference = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/users/$managerObjectId" }
+                $managerUri = "/v1.0/users/$userObjectId/manager/`$ref"
+
+                $null = Invoke-MigrationAction -Description "Set manager of $identity to $managerUpn" -Action {
+                    Invoke-MigrationGraphRequest -Method PUT -Uri $managerUri -Body $managerReference
+                }
+
+                $status = if ($DryRun) { 'Planned' } else { 'Succeeded' }
+                $verb = if ($DryRun) { 'Would set' } else { 'Set' }
+                Add-ResultRow @common -Action 'SetManager' -Status $status -Detail "$verb manager to $managerUpn." `
+                    -TargetObjectId $userObjectId
+            }
+            catch {
+                $mapped = ConvertTo-FailureDetail -Message $_.Exception.Message -UserPrincipalName $identity
+                Write-MigrationLog -Message "$identity - manager not set: $mapped" -Level ERROR
+                Add-ResultRow @common -Action 'SetManager' -Status 'Failed' -Detail $mapped -TargetObjectId $userObjectId
+            }
+        }
+    }
+}
+catch {
+    # Anything that escapes the per-row catch ends the run, but not before the two artefacts it
+    # has already earned are written by the finally block below.
+    Write-MigrationLog -Message "Fatal error: $($_.Exception.Message)" -Level ERROR
+    Write-MigrationLog -Message $_.ScriptStackTrace -Level DEBUG
+    $exitCode = 1
+}
+finally {
+    Write-Progress -Activity 'Creating destination accounts' -Completed
+
+    if ($planChanged) {
+        try {
+            $null = Invoke-MigrationAction -Description "Write provisioning results back to $PlanPath" -Action {
+                Save-MigrationPlan -Path $PlanPath -Rows $planRows
+            }
+        }
+        catch {
+            # Losing the write-back loses the TargetObjectIds this run just earned, so it is a failed
+            # run even when every row succeeded.
+            Write-MigrationLog -Message ("Could not write the plan back to $PlanPath, so the object IDs " +
+                "recorded by this run are only in the results file: $($_.Exception.Message)") -Level ERROR
+            $planSaveFailed = $true
+        }
+    }
+
+    # The flag is what keeps a fatal run from producing two results files for one run: whoever
+    # exports first sets it, and this block then leaves the file alone.
+    if (-not $resultsExported) {
+        try {
+            $null = Export-MigrationResult -Rows $script:results.ToArray() -Name 'New-Users'
+            $resultsExported = $true
+        }
+        catch {
+            # The run is already ending; a results file that cannot be written must not mask the
+            # reason it ended, so the failure is logged and the exit code stands.
+            Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
         }
     }
 }
@@ -831,28 +898,14 @@ if ($SetManagers) {
 
 #region Cleanup -----------------------------------------------------------------------
 
-if ($planChanged) {
-    try {
-        $null = Invoke-MigrationAction -Description "Write provisioning results back to $PlanPath" -Action {
-            Save-MigrationPlan -Path $PlanPath -Rows $planRows
-        }
-    }
-    catch {
-        # Losing the write-back loses the TargetObjectIds this run just earned, so it is a failed
-        # run even when every row succeeded.
-        Write-MigrationLog -Message ("Could not write the plan back to $PlanPath, so the object IDs " +
-            "recorded by this run are only in the results file: $($_.Exception.Message)") -Level ERROR
-        $planSaveFailed = $true
-    }
-}
-
-$null = Export-MigrationResult -Rows $script:results.ToArray() -Name 'New-Users'
-
 if (@($script:results | Where-Object { $_.Status -eq 'Succeeded' -and $_.GeneratedPassword }).Count -gt 0) {
     Write-MigrationLog -Message 'Initial passwords were written to the results file. Store it as you would any password list.' -Level WARNING
 }
 
-$exitCode = if ($planSaveFailed -or @($script:results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { 2 } else { 0 }
+# A fatal error already set 1; row failures and a lost write-back are the softer exit 2.
+if ($exitCode -eq 0 -and ($planSaveFailed -or @($script:results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0)) {
+    $exitCode = 2
+}
 exit (Complete-MigrationRun -ExitCode $exitCode)
 
 #endregion Cleanup --------------------------------------------------------------------

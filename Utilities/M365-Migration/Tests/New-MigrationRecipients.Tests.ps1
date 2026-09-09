@@ -437,3 +437,116 @@ Describe 'New-MigrationRecipients - DryRun end to end' {
         @($script:rows | Where-Object { $_.Action -eq 'UpdateSettings' -and $_.Status -eq 'Planned' }).Count | Should -Be 2
     }
 }
+
+Describe 'New-MigrationRecipients - a declined confirmation is a Skip, not a Plan' {
+
+    BeforeAll {
+        $script:whatIfWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Recipients-WhatIf-$([guid]::NewGuid())"
+        New-Item -Path $script:whatIfWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:whatIfPlan = Join-Path $script:whatIfWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:whatIfPlan
+
+        $global:recipientMutations.Clear()
+        $global:recipientReads.Clear()
+
+        & $script:scriptPath -PlanPath $script:whatIfPlan -Wave '1' `
+            -GroupsCsv (Join-Path $script:fixtureRoot 'Groups.csv') `
+            -OutputPath $script:whatIfWorkspace -Verbosity Low -WhatIf
+        $script:whatIfExitCode = $LASTEXITCODE
+
+        $script:whatIfFile = @(Get-ChildItem -LiteralPath $script:whatIfWorkspace -Filter 'New-Recipients-Results_*.csv')
+        $script:whatIfRows = if ($script:whatIfFile.Count -eq 1) {
+            @(Import-Csv -LiteralPath $script:whatIfFile[0].FullName)
+        }
+        else { @() }
+    }
+
+    AfterAll {
+        if ($script:whatIfWorkspace -and (Test-Path -LiteralPath $script:whatIfWorkspace)) {
+            Remove-Item -LiteralPath $script:whatIfWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Writes a Results file, not a DryRun file, because -WhatIf is not a rehearsal' {
+        $script:whatIfFile.Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $script:whatIfWorkspace -Filter 'New-Recipients-DryRun_*.csv').Count | Should -Be 0
+    }
+
+    It 'Reports the declined creations as Skipped rather than Planned or Succeeded' {
+        $declined = @($script:whatIfRows |
+            Where-Object { $_.Action -eq 'CreateRecipient' -and $_.Detail -eq 'Declined at the confirmation prompt.' })
+        $declined.Count | Should -BeGreaterThan 0
+        @($declined | Where-Object { $_.Status -ne 'Skipped' }).Count | Should -Be 0
+    }
+
+    It 'Leaves no row claiming an outcome the tenant never saw' {
+        @($script:whatIfRows | Where-Object { $_.Status -in @('Planned', 'Succeeded') }).Count | Should -Be 0
+    }
+
+    It 'Creates nothing' {
+        $global:recipientMutations | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'New-MigrationRecipients - a fatal error still leaves the plan and the results file' {
+
+    BeforeAll {
+        # Test-MigrationPlanRowActionable is called outside the per-row try, so throwing from it is
+        # the cheapest way to reach the script's top-level catch. Shadowing it here keeps the
+        # failure inside this Describe.
+        function Test-MigrationPlanRowActionable {
+            param($Row, [switch]$IncludeCollisions, [switch]$AllowSynced, [string[]]$SupportedObjectType, $IsSynced)
+            if ((Get-MigrationCsvValue -Row $Row -Name 'SourcePrimarySmtp' -Default '') -eq 'allstaff@contoso.com') {
+                throw 'The Exchange Online session dropped between rows.'
+            }
+            return [pscustomobject]@{ Actionable = $true; Status = 'Planned'; Reason = '' }
+        }
+
+        $script:fatalWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Recipients-Fatal-$([guid]::NewGuid())"
+        New-Item -Path $script:fatalWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:fatalPlan = Join-Path $script:fatalWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:fatalPlan
+
+        $global:recipientMutations.Clear()
+        $global:recipientReads.Clear()
+
+        & $script:scriptPath -PlanPath $script:fatalPlan -Wave '1' `
+            -GroupsCsv (Join-Path $script:fixtureRoot 'Groups.csv') `
+            -OutputPath $script:fatalWorkspace -Verbosity Low
+        $script:fatalExitCode = $LASTEXITCODE
+
+        $script:fatalFile = @(Get-ChildItem -LiteralPath $script:fatalWorkspace -Filter 'New-Recipients-Results_*.csv')
+        $script:fatalRows = if ($script:fatalFile.Count -eq 1) {
+            @(Import-Csv -LiteralPath $script:fatalFile[0].FullName)
+        }
+        else { @() }
+    }
+
+    AfterAll {
+        if ($script:fatalWorkspace -and (Test-Path -LiteralPath $script:fatalWorkspace)) {
+            Remove-Item -LiteralPath $script:fatalWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits 1' {
+        $script:fatalExitCode | Should -Be 1
+    }
+
+    It 'Logs the failure as an error' {
+        $log = @(Get-ChildItem -LiteralPath $script:fatalWorkspace -Filter 'New-MigrationRecipients_*.log')
+        $log.Count | Should -Be 1
+        (Get-Content -LiteralPath $log[0].FullName -Raw) |
+            Should -Match '\[ERROR\].*The Exchange Online session dropped between rows'
+    }
+
+    It 'Writes exactly one results file, carrying the rows processed before the failure' {
+        $script:fatalFile.Count | Should -Be 1
+        $script:fatalRows.Count | Should -BeGreaterThan 0
+    }
+
+    It 'Still writes the plan back so nothing the run recorded is lost' {
+        @($global:recipientMutations | Where-Object { $_ -like 'Save-MigrationPlan*' }).Count | Should -Be 1
+    }
+}

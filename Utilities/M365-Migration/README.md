@@ -106,7 +106,7 @@ Copy the whole folder to run it; the scripts are no longer individually standalo
 | Output root | `%LOCALAPPDATA%\Migration-Automations` on Windows, `~/Migration-Automations` elsewhere. Override with `-OutputPath`. |
 | `-Prefix` | Names the client or run. Output lands in `<root>\<Prefix>\` and every filename starts with `<Prefix>_`. Use `Source` and `Destination` for the two inventories. |
 | Logging | `Initialize-MigrationRun` opens `<ScriptName>_<yyyyMMdd-HHmmss>.log` in the output directory and records the parameters (never secrets). `-LogPath` overrides. `-Verbosity Low\|Medium\|High` controls the console only — the log always gets everything. |
-| DryRun | One semantic everywhere: connect read-only, compute everything, write the results file with Status `Planned`, change nothing. `-WhatIf` is honoured independently at the row level on every writer. |
+| DryRun | One semantic everywhere: connect read-only, compute everything, write the results file with Status `Planned`, change nothing. `-WhatIf` is honoured independently at the row level on every writer, and a declined row is reported as `Skipped` with the detail `Declined at the confirmation prompt.` - `Planned` is reserved for `-DryRun`. |
 | Results CSV | `<Prefix>_<Name>-Results_<ts>.csv`, or `-DryRun_` in place of `-Results_`. Columns always begin `Identity, Action, Status, Detail`; script-specific columns follow. Status ∈ `Planned \| Succeeded \| Skipped \| Failed`. |
 | Exit codes | `0` clean, `1` fatal error, `2` completed with row failures (or, for `Test-MigrationReadiness`, failed checks). |
 | Waves | Every writer takes `-Wave <label[]>` and processes only matching plan rows. Waves are labels, not numbers — `1`, `Pilot`, `Finance` all work. |

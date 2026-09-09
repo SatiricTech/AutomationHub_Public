@@ -436,8 +436,10 @@ try {
                     $detail = 'Password reset; change required at next sign-in.'
                 }
                 else {
-                    $status = 'Planned'
-                    $detail = 'Skipped by -WhatIf; no change was made.'
+                    # Not a rehearsal: -WhatIf or a declined prompt means the reset was never
+                    # attempted, so the row is a skip. 'Planned' is reserved for -DryRun.
+                    $status = 'Skipped'
+                    $detail = 'Declined at the confirmation prompt.'
                 }
             }
         }
