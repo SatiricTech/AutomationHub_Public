@@ -39,5 +39,12 @@ function ConvertTo-MigrationTokenText {
     # Apostrophes and spaces vanish outright; the catch-all below then removes any
     # remaining punctuation or non-Latin character.
     $lowered = $lowered -replace "['\u2019\s]", ''
-    return ($lowered -replace '[^a-z0-9-]', '')
+    $cleaned = $lowered -replace '[^a-z0-9-]', ''
+
+    # A component left holding nothing but separators - a surname recorded as '-' - carries no
+    # name at all. Returning it would quietly shorten the address to 'john@' instead of telling
+    # the caller the surname is missing, so it is treated as empty.
+    if ($cleaned -notmatch '[a-z0-9]') { return '' }
+
+    return $cleaned
 }

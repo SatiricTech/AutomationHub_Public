@@ -1,0 +1,2 @@
+"Pattern","MatchOn","Reason","MatchType"
+"svc-[a-z","UserPrincipalName","Unterminated character class","Regex"

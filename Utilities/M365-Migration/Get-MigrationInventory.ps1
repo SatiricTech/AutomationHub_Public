@@ -1473,6 +1473,7 @@ try {
                     (Get-InventoryValue $group 'AcceptMessagesOnlyFromSendersOrMembers')
                 ModerationEnabled                  = [bool](Get-InventoryValue $group 'ModerationEnabled' $false)
                 ModeratedBy                        = Join-InventoryRecipientList -Value (Get-InventoryValue $group 'ModeratedBy')
+                ReportToManagerEnabled             = [bool](Get-InventoryValue $group 'ReportToManagerEnabled' $false)
                 GrantSendOnBehalfTo                = Join-InventoryRecipientList -Value (Get-InventoryValue $group 'GrantSendOnBehalfTo')
                 MemberJoinRestriction              = [string](Get-InventoryValue $group 'MemberJoinRestriction' '')
                 MemberDepartRestriction            = [string](Get-InventoryValue $group 'MemberDepartRestriction' '')
@@ -1539,6 +1540,7 @@ try {
                 AcceptMessagesOnlyFrom             = ''
                 ModerationEnabled                  = $false
                 ModeratedBy                        = ''
+                ReportToManagerEnabled             = $false
                 GrantSendOnBehalfTo                = ''
                 MemberJoinRestriction              = ''
                 MemberDepartRestriction            = ''

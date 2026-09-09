@@ -227,10 +227,10 @@ Describe 'New-MigrationRecipients - group settings diff' {
         $script:desired.Settings['MemberJoinRestriction'] | Should -BeExactly 'Closed'
         $script:desired.Settings['AcceptMessagesOnlyFromSendersOrMembers'] | Should -Be @('alice.dean@newco.com')
         $script:desired.Settings['ManagedBy'] | Should -Be @('john.smith@newco.com')
+        $script:desired.Settings['ReportToManagerEnabled'] | Should -BeFalse
     }
 
     It 'Leaves a setting the inventory says nothing about out of the desired state' {
-        $script:desired.Settings.Contains('ReportToManagerEnabled') | Should -BeFalse
         $script:desired.Settings.Contains('ModeratedBy') | Should -BeFalse
         $script:desired.Settings.Contains('GrantSendOnBehalfTo') | Should -BeFalse
     }
@@ -238,7 +238,8 @@ Describe 'New-MigrationRecipients - group settings diff' {
     It 'Treats everything as a change against a group that does not exist yet' {
         $changes = Get-GroupSettingChange -Desired $script:desired.Settings -Current @{}
         @($changes.Keys | Sort-Object) | Should -Be @('AcceptMessagesOnlyFromSendersOrMembers', 'HiddenFromAddressListsEnabled',
-            'ManagedBy', 'MemberDepartRestriction', 'MemberJoinRestriction', 'ModerationEnabled', 'RequireSenderAuthenticationEnabled')
+            'ManagedBy', 'MemberDepartRestriction', 'MemberJoinRestriction', 'ModerationEnabled', 'ReportToManagerEnabled',
+            'RequireSenderAuthenticationEnabled')
     }
 
     It 'Returns only what actually differs from the destination group' {
@@ -246,6 +247,7 @@ Describe 'New-MigrationRecipients - group settings diff' {
                 HiddenFromAddressListsEnabled          = $false
                 RequireSenderAuthenticationEnabled     = $false
                 ModerationEnabled                      = $false
+                ReportToManagerEnabled                 = $false
                 MemberJoinRestriction                  = 'Closed'
                 MemberDepartRestriction                = 'Open'
                 ManagedBy                              = @('john.smith@newco.com')
@@ -322,6 +324,37 @@ Describe 'New-MigrationRecipients - inventory lookup' {
         $index = Get-CsvIndex -Rows $script:groupRows -KeyColumn 'PrimarySmtpAddress'
         $planRow = @($script:planRows | Where-Object { $_.ObjectType -eq 'Shared' })[0]
         Find-IndexedRow -Row $planRow -Index $index | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'New-MigrationRecipients - Resolve-ContactExternalAddress' {
+
+    It 'Prefers the ExternalEmailAddress from the Contacts inventory' {
+        $planRow = [pscustomobject]@{
+            SourceUserPrincipalName = 'plan@fabrikam.com'; SourcePrimarySmtp = 'auditor@contoso.com'
+        }
+        $inventoryRow = [pscustomobject]@{ ExternalEmailAddress = 'auditor@fabrikam.com' }
+        Resolve-ContactExternalAddress -PlanRow $planRow -InventoryRow $inventoryRow |
+            Should -BeExactly 'auditor@fabrikam.com'
+    }
+
+    It 'Falls back to the plan column the planner parks the external address in' {
+        $planRow = [pscustomobject]@{
+            SourceUserPrincipalName = 'auditor@fabrikam.com'; SourcePrimarySmtp = 'auditor@contoso.com'
+        }
+        Resolve-ContactExternalAddress -PlanRow $planRow -InventoryRow $null |
+            Should -BeExactly 'auditor@fabrikam.com'
+    }
+
+    It 'Falls back to SourcePrimarySmtp for a hand-built plan row' {
+        $planRow = [pscustomobject]@{ SourceUserPrincipalName = ''; SourcePrimarySmtp = 'auditor@fabrikam.com' }
+        Resolve-ContactExternalAddress -PlanRow $planRow -InventoryRow $null |
+            Should -BeExactly 'auditor@fabrikam.com'
+    }
+
+    It 'Returns nothing when no source names an address' {
+        $planRow = [pscustomobject]@{ SourceUserPrincipalName = ''; SourcePrimarySmtp = '' }
+        Resolve-ContactExternalAddress -PlanRow $planRow -InventoryRow $null | Should -BeNullOrEmpty
     }
 }
 

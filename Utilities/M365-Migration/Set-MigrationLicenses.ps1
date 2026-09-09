@@ -597,12 +597,23 @@ function Set-PlanRowLicense {
         return $result
     }
 
+    # Tracked separately from the intent, because a declined ShouldProcess means the call was never
+    # made: reporting the row as Succeeded would put a licence change in the results file that the
+    # tenant never saw.
+    $locationApplied = $false
+    $assignApplied = $false
+    $declined = [System.Collections.Generic.List[string]]::new()
+
     try {
-        if ($locationToSet -and $PSCmdlet.ShouldProcess($identity, "Set usageLocation to '$locationToSet'")) {
-            $locationBody = @{ usageLocation = $locationToSet }
-            Invoke-MigrationAction -Description "Set usageLocation '$locationToSet' on $identity" -Action {
-                $null = Invoke-MigrationGraphRequest -Method PATCH -Uri "/v1.0/users/$userId" -Body $locationBody
+        if ($locationToSet) {
+            if ($PSCmdlet.ShouldProcess($identity, "Set usageLocation to '$locationToSet'")) {
+                $locationBody = @{ usageLocation = $locationToSet }
+                Invoke-MigrationAction -Description "Set usageLocation '$locationToSet' on $identity" -Action {
+                    $null = Invoke-MigrationGraphRequest -Method PATCH -Uri "/v1.0/users/$userId" -Body $locationBody
+                }
+                $locationApplied = $true
             }
+            else { $declined.Add('usage location') }
         }
 
         if ($needsAssign) {
@@ -616,7 +627,9 @@ function Set-PlanRowLicense {
                 Invoke-MigrationAction -Description "Assign licences for $identity ($summary)" -Action {
                     $null = Invoke-MigrationGraphRequest -Method POST -Uri "/v1.0/users/$userId/assignLicense" -Body $assignBody
                 }
+                $assignApplied = $true
             }
+            else { $declined.Add('licence assignment') }
         }
     }
     catch {
@@ -625,12 +638,15 @@ function Set-PlanRowLicense {
     }
 
     $summaryParts = [System.Collections.Generic.List[string]]::new()
-    if ($locationToSet) { $summaryParts.Add("usageLocation=$locationToSet") }
-    if (@($change.AddSkuPartNumber).Count -gt 0) { $summaryParts.Add("added $(Join-MigrationList -Values $change.AddSkuPartNumber)") }
-    if (@($change.RemoveSkuPartNumber).Count -gt 0) { $summaryParts.Add("removed $(Join-MigrationList -Values $change.RemoveSkuPartNumber)") }
+    if ($locationApplied) { $summaryParts.Add("usageLocation=$locationToSet") }
+    if ($assignApplied -and @($change.AddSkuPartNumber).Count -gt 0) { $summaryParts.Add("added $(Join-MigrationList -Values $change.AddSkuPartNumber)") }
+    if ($assignApplied -and @($change.RemoveSkuPartNumber).Count -gt 0) { $summaryParts.Add("removed $(Join-MigrationList -Values $change.RemoveSkuPartNumber)") }
     foreach ($item in $note) { $summaryParts.Add($item) }
+    if ($declined.Count -gt 0) { $summaryParts.Add("declined at the confirmation prompt: $($declined -join ', ')") }
 
-    $result.Status = if ($DryRun) { 'Planned' } else { 'Succeeded' }
+    $result.Status = if (-not $locationApplied -and -not $assignApplied) { 'Skipped' }
+    elseif ($DryRun) { 'Planned' }
+    else { 'Succeeded' }
     $result.Detail = ($summaryParts -join '; ')
     return $result
 }

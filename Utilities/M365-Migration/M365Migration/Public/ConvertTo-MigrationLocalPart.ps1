@@ -25,6 +25,9 @@
         one exception: they are optional by nature and simply disappear along with their
         adjacent separator.
 
+        A token the engine does not know - '{nick}' - is a typo, not a literal, and is
+        refused with an error naming it rather than written into the address.
+
         {source} is passed through rather than sanitised, because it is already a valid
         local part. That is what makes the 'Keep' preset lossless and lets guest '#EXT#'
         addresses survive untouched.
@@ -105,6 +108,18 @@
         }
     }
 
+    $tokenPattern = '\{(?<name>first|last|middle|display|source|f|m|l)(?::(?<len>\d+))?\}'
+
+    # A token nobody recognises would otherwise pass through as literal '{nick}' text and only
+    # surface as an unusable address several steps later, so a typo is refused here by name.
+    $residue = [regex]::Replace($pattern, $tokenPattern, '', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($residue -match '[{}]') {
+        $offending = @([regex]::Matches($residue, '\{[^{}]*\}?|\}') | ForEach-Object { $_.Value } | Select-Object -Unique)
+        throw ("The template '$Template' contains unknown token(s) " + ($offending -join ', ') +
+            '. Known tokens: {first} {last} {middle} {f} {m} {l} {source} {display}, each with an ' +
+            'optional truncation such as {last:5}.')
+    }
+
     $first = ConvertTo-MigrationTokenText -Value $FirstName
     $middle = ConvertTo-MigrationTokenText -Value $MiddleName
     $last = ConvertTo-MigrationTokenText -Value $LastName
@@ -134,7 +149,6 @@
 
     $missing = [System.Collections.Generic.List[string]]::new()
     $builder = [System.Text.StringBuilder]::new()
-    $tokenPattern = '\{(?<name>first|last|middle|display|source|f|m|l)(?::(?<len>\d+))?\}'
     $cursor = 0
 
     foreach ($match in [regex]::Matches($pattern, $tokenPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {

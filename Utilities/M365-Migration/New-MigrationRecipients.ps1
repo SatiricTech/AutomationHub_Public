@@ -621,6 +621,54 @@ function Find-IndexedRow {
     return $null
 }
 
+function Resolve-ContactExternalAddress {
+    <#
+    .SYNOPSIS
+        Returns the address a mail contact should point at.
+
+    .DESCRIPTION
+        A mail contact is defined by the address outside both tenants that it forwards to,
+        and that address lives in three places of decreasing authority.
+
+        The Contacts inventory row is authoritative: ExternalEmailAddress is what the source
+        tenant actually had. Failing that, the plan row carries it in SourceUserPrincipalName -
+        a contact has no user principal name, so New-MigrationIdentityPlan parks the external
+        address in that column, which keeps it out of SourcePrimarySmtp where the destination
+        address is derived from. SourcePrimarySmtp is the last resort: it is the contact's
+        address inside the source tenant, which is being decommissioned, so it is only ever
+        right for a plan an operator hand-built without an inventory.
+
+    .PARAMETER PlanRow
+        The plan row for the contact.
+
+    .PARAMETER InventoryRow
+        The matching Contacts inventory row, or $null when no -ContactsCsv was supplied.
+
+    .EXAMPLE
+        Resolve-ContactExternalAddress -PlanRow $row -InventoryRow $inventoryRow
+
+        Returns 'auditor@fabrikam.com' for a contact the Contacts inventory covers.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]$PlanRow,
+        [AllowNull()]$InventoryRow
+    )
+
+    if ($InventoryRow) {
+        $address = Get-MigrationCsvValue -Row $InventoryRow -Name 'ExternalEmailAddress' -Default ''
+        if ($address) { return [string]$address }
+    }
+
+    foreach ($column in @('SourceUserPrincipalName', 'SourcePrimarySmtp')) {
+        $address = Get-MigrationCsvValue -Row $PlanRow -Name $column -Default ''
+        if ($address) { return [string]$address }
+    }
+
+    return ''
+}
+
 function Get-PlanAliasAddress {
     <#
     .SYNOPSIS
@@ -834,6 +882,7 @@ catch {
 }
 
 $planChanged = $false
+$planSaveFailed = $false
 $rowIndex = 0
 
 foreach ($row in $waveRows) {
@@ -866,6 +915,9 @@ foreach ($row in $waveRows) {
     $targetAddress = ''
     $recipient = $null
     $targetObjectId = ''
+    # The catch below reports whichever phase was running, so a settings failure is not filed as a
+    # creation failure and re-run as one.
+    $phase = 'CreateRecipient'
 
     try {
         $targetAddress = Get-RowTargetAddress -Row $row -UseInterim:$UseInterim
@@ -887,6 +939,15 @@ foreach ($row in $waveRows) {
                 if ($found.Count -gt 0) { $recipient = $found[0] }
             }
             catch {
+                # 'Not found' is the expected answer for a recipient that does not exist yet.
+                # Anything else - throttling, a dropped session, a permission problem - must not be
+                # read as 'does not exist', because the next step would then create a duplicate.
+                $lookupError = [string]$_.Exception.Message
+                $isNotFound = $lookupError -match "(?i)couldn't be found|could not be found|wasn't found|was not found|not found on"
+                if (-not $isNotFound) {
+                    throw ("Could not determine whether '$candidate' already exists in the destination " +
+                        "tenant, so nothing was created: $lookupError")
+                }
                 Write-MigrationLog -Message "No destination recipient matches '$candidate'." -Level DEBUG
             }
         }
@@ -937,10 +998,10 @@ foreach ($row in $waveRows) {
                 }
                 'Contact' {
                     $inventoryRow = Find-IndexedRow -Row $row -Index $contactIndex
-                    $externalAddress = if ($inventoryRow) { Get-MigrationCsvValue -Row $inventoryRow -Name 'ExternalEmailAddress' -Default '' } else { '' }
-                    if (-not $externalAddress) { $externalAddress = Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default '' }
+                    $externalAddress = Resolve-ContactExternalAddress -PlanRow $row -InventoryRow $inventoryRow
                     if (-not $externalAddress) {
-                        throw 'A mail contact needs an ExternalEmailAddress. Supply -ContactsCsv or set SourcePrimarySmtp on the plan row.'
+                        throw ('A mail contact needs an ExternalEmailAddress. Supply -ContactsCsv, or put the ' +
+                            'external address in the plan row SourceUserPrincipalName column.')
                     }
                     # Deliberately not mapped: a contact points at someone outside both tenants.
                     $createParameters['ExternalEmailAddress'] = $externalAddress
@@ -985,6 +1046,7 @@ foreach ($row in $waveRows) {
 
         #-- Update settings ---------------------------------------------------------------
         if (-not $doUpdate) { continue }
+        $phase = 'UpdateSettings'
 
         if (-not $recipient -and -not $doCreate) {
             Add-ResultRow @common -Action 'UpdateSettings' -Status 'Skipped' -TargetAddress $targetAddress `
@@ -1002,6 +1064,9 @@ foreach ($row in $waveRows) {
         $unmappable = [System.Collections.Generic.List[string]]::new()
         $settingsChanged = [System.Collections.Generic.List[string]]::new()
         $membersAdded = 0
+        # Set by any settings step that caught an exception. Those steps continue so the rest of the
+        # row is still applied, but the row is reported Failed rather than Succeeded-with-a-note.
+        $rowFailed = $false
 
         $setCmdlet = switch ($objectType) {
             { $_ -in @('Shared', 'Room', 'Equipment') } { 'Set-Mailbox' }
@@ -1067,6 +1132,7 @@ foreach ($row in $waveRows) {
                     }
                     catch {
                         $updateDetail.Add("Could not read the current membership: $($_.Exception.Message)")
+                        $rowFailed = $true
                     }
 
                     foreach ($member in $members.Mapped) {
@@ -1079,6 +1145,7 @@ foreach ($row in $waveRows) {
                         }
                         catch {
                             $updateDetail.Add("Member '$member' not added: $($_.Exception.Message)")
+                            $rowFailed = $true
                         }
                     }
                 }
@@ -1135,6 +1202,7 @@ foreach ($row in $waveRows) {
                     }
                     catch {
                         $updateDetail.Add("$right for '$trustee' failed: $($_.Exception.Message)")
+                        $rowFailed = $true
                     }
                 }
             }
@@ -1160,7 +1228,7 @@ foreach ($row in $waveRows) {
             $updateDetail.Add('Nothing to change.')
         }
 
-        $status = if ($DryRun) { 'Planned' } else { 'Succeeded' }
+        $status = if ($rowFailed) { 'Failed' } elseif ($DryRun) { 'Planned' } else { 'Succeeded' }
         Add-ResultRow @common -Action 'UpdateSettings' -Status $status -TargetAddress $targetAddress `
             -TargetObjectId $targetObjectId -Detail ($updateDetail -join ' ') `
             -SettingsChanged (Join-MigrationList -Values $settingsChanged.ToArray()) `
@@ -1173,7 +1241,7 @@ foreach ($row in $waveRows) {
         $row.ProvisionDetail = $message
         $planChanged = $true
         Write-MigrationLog -Message "$identity - $message" -Level ERROR
-        Add-ResultRow @common -Action 'CreateRecipient' -Status 'Failed' -Detail $message -TargetAddress $targetAddress
+        Add-ResultRow @common -Action $phase -Status 'Failed' -Detail $message -TargetAddress $targetAddress
     }
 }
 
@@ -1190,13 +1258,17 @@ if ($planChanged) {
         }
     }
     catch {
-        Write-MigrationLog -Message "Could not write the plan back: $($_.Exception.Message)" -Level ERROR
+        # Losing the write-back loses the TargetObjectIds this run just earned, so it is a failed
+        # run even when every row succeeded.
+        Write-MigrationLog -Message ("Could not write the plan back to $PlanPath, so the object IDs " +
+            "recorded by this run are only in the results file: $($_.Exception.Message)") -Level ERROR
+        $planSaveFailed = $true
     }
 }
 
 $null = Export-MigrationResult -Rows $script:results.ToArray() -Name 'New-Recipients'
 
-$exitCode = if (@($script:results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { 2 } else { 0 }
+$exitCode = if ($planSaveFailed -or @($script:results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { 2 } else { 0 }
 exit (Complete-MigrationRun -ExitCode $exitCode)
 
 #endregion Cleanup --------------------------------------------------------------------

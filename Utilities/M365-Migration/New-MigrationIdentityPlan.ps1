@@ -68,7 +68,8 @@
 
 .PARAMETER MailNicknameFormat
     Template for the mail nickname. When omitted the resolved SMTP local part is used, which
-    survives collision resolution.
+    survives collision resolution. A template that gives two people the same nickname leaves
+    the second of them Collision, because Entra ID keeps one mail nickname per tenant.
 
 .PARAMETER SkuMapPath
     CSV of SourceSkuPartNumber,TargetSkuPartNumber. A ';' separated target maps one licence to
@@ -441,7 +442,12 @@ function Import-PlanExclusionRule {
         }
         if ($matchType -eq 'Regex') {
             try { $null = [regex]::new($pattern) }
-            catch { throw "The exclusion rules file '$Path' has an invalid regular expression on line ${lineNumber}: $($_.Exception.Message)" }
+            catch {
+                # The method-invocation wrapper adds nothing an operator can act on; the inner
+                # exception is the one that says which bracket is unterminated.
+                $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                throw "The exclusion rules file '$Path' has an invalid regular expression '$pattern' on line ${lineNumber}: $reason"
+            }
         }
 
         $rules.Add([pscustomobject]@{
@@ -613,6 +619,18 @@ try {
     $smtpTemplate = if ($PSBoundParameters.ContainsKey('SmtpFormat')) { $SmtpFormat } else { $UpnFormat }
     $nicknameTemplate = if ($PSBoundParameters.ContainsKey('MailNicknameFormat')) { $MailNicknameFormat } else { '' }
 
+    # An interim domain that is not a routing domain is legal - some tenants cut over inside a
+    # subdomain they already own - but it is unusual enough to say out loud, because an address
+    # in a domain the destination has not verified cannot be provisioned.
+    if ($interimDomainName -eq $targetDomainName -and $interimDomainName) {
+        Write-MigrationLog -Message ('-InterimDomain is the same as -TargetDomain, so the Interim columns ' +
+            'only mirror the Target columns.') -Level WARNING
+    }
+    elseif ($interimDomainName -and $interimDomainName -notlike '*.onmicrosoft.com') {
+        Write-MigrationLog -Message ("-InterimDomain '$interimDomainName' is not an onmicrosoft.com routing domain. " +
+            'It is used as given; make sure it is verified in the destination tenant before cutover.') -Level WARNING
+    }
+
     if ($PreserveAliases -and (-not $AliasDomainMap -or $AliasDomainMap.Count -eq 0)) {
         Write-MigrationLog -Message ('-PreserveAliases was supplied without -AliasDomainMap, so no source alias can ' +
             'be re-domained. Only X500 addresses will be carried across.') -Level WARNING
@@ -632,6 +650,7 @@ try {
     $exclusionRules = @(if ($ExclusionRulesPath) { Import-PlanExclusionRule -Path $ExclusionRulesPath })
 
     $waveMap = @{}
+    $waveMapHits = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if ($WaveMapPath) {
         foreach ($row in @(Import-MigrationCsv -Path $WaveMapPath -RequiredColumns @('UserPrincipalName', 'Wave'))) {
             $identity = Get-MigrationCsvValue -Row $row -Name 'UserPrincipalName' -Default ''
@@ -768,8 +787,10 @@ try {
                 -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
             $row.ObjectType = 'Contact'
             $row.MailboxType = 'MailContact'
-            # What a contact actually points at, recorded as the manager-free equivalent of a
-            # source UPN for traceability.
+            # What a contact actually points at. A contact has no user principal name, so the
+            # external address is parked in that column rather than in SourcePrimarySmtp, which
+            # has to keep the source-tenant address the destination address is derived from.
+            # New-MigrationRecipients reads it back from here when no -ContactsCsv is supplied.
             $row.SourceUserPrincipalName = Get-MigrationCsvValue -Row $source -Name 'ExternalEmailAddress' -Default ''
 
             $items.Add(@{
@@ -782,6 +803,19 @@ try {
     Write-MigrationLog -Message "Prepared $($items.Count) source object(s) for planning." -Level INFO
     if ($items.Count -eq 0) { throw 'No source objects were loaded - check the inventory CSVs.' }
 
+    # Two source rows carrying the same object ID would share one collision result, and with it
+    # one destination address - the second row would silently be handed the first row's name.
+    # Keys are made unique so every row is planned on its own merits.
+    $keysSeen = @{}
+    foreach ($item in $items) {
+        $key = [string]$item.Key
+        if (-not $keysSeen.ContainsKey($key)) { $keysSeen[$key] = 1; continue }
+        $keysSeen[$key]++
+        $item.Key = "$key#$($keysSeen[$key])"
+        Write-MigrationLog -Message ("Two source objects share the identifier '$key'; the later one is planned " +
+            "separately as '$($item.Key)'. Check the inventory for a duplicated row.") -Level WARNING
+    }
+
     # --- Exclusions, preservation and waves -----------------------------------------------------
     foreach ($item in $items) {
         $row = $item.Row
@@ -790,6 +824,7 @@ try {
         foreach ($waveKey in @($row.SourceUserPrincipalName, $row.SourcePrimarySmtp)) {
             if ($waveKey -and $waveMap.ContainsKey($waveKey.ToLowerInvariant())) {
                 $row.Wave = $waveMap[$waveKey.ToLowerInvariant()]
+                [void]$waveMapHits.Add($waveKey.ToLowerInvariant())
                 break
             }
         }
@@ -805,6 +840,14 @@ try {
         $item['IsPreserved'] = [bool]$preserved
         if ($preserved) {
             foreach ($field in $script:PreservedFields) { $row.$field = Get-MigrationCsvValue -Row $preserved -Name $field -Default '' }
+
+            # Every writer reads a blank PlanStatus as 'not mine', so a preserved row that lost
+            # its status in a spreadsheet would drop out of the migration without saying so.
+            if (-not $row.PlanStatus) {
+                $row.PlanStatus = 'NeedsReview'
+                $row.PlanDetail = (@($row.PlanDetail, ('The row kept from the existing plan carries no PlanStatus; ' +
+                        'confirm the destination identity and set one.')) | Where-Object { $_ }) -join ' '
+            }
             continue
         }
 
@@ -821,6 +864,14 @@ try {
             $row.PlanStatus = 'Excluded'
             $row.ExcludeReason = $excludeReason
         }
+    }
+
+    # A wave map is usually pasted together by hand from an old spreadsheet, so the entries that
+    # matched nobody are named rather than silently ignored - they are normally typos.
+    $unmatchedWaves = @($waveMap.Keys | Where-Object { -not $waveMapHits.Contains($_) } | Sort-Object)
+    if ($unmatchedWaves.Count -gt 0) {
+        Write-MigrationLog -Message ("The wave map names $($unmatchedWaves.Count) identity(ies) that are not in the " +
+            'inventory; they were ignored: ' + ($unmatchedWaves -join ', ')) -Level WARNING
     }
 
     # --- Naming ---------------------------------------------------------------------------------
@@ -916,6 +967,7 @@ try {
     foreach ($item in $namedItems) {
         $key = [string]$item.Key
         $details = [System.Collections.Generic.List[string]]::new()
+        $unresolved = $false
 
         foreach ($set in $collisionSets) {
             if (-not $set.ByKey.ContainsKey($key)) { continue }
@@ -929,6 +981,7 @@ try {
 
             if ($resolved.Resolution -eq 'Unresolved') {
                 $item[$set.Slot] = ''
+                $unresolved = $true
                 $details.Add("$($set.Kind) ${wanted}@$targetDomainName is $taken and no free alternative was found - assign one by hand.")
             }
             else {
@@ -937,7 +990,9 @@ try {
         }
 
         if ($details.Count -gt 0) {
-            $item.Row.PlanStatus = 'Collision'
+            # A row the resolver could not name at all has no address to accept, so -IncludeCollisions
+            # must not sweep it into a provisioning run; it needs a name typed in by hand.
+            $item.Row.PlanStatus = if ($unresolved) { 'NeedsReview' } else { 'Collision' }
             $item.Row.PlanDetail = ($details -join ' ')
         }
     }
@@ -1048,6 +1103,26 @@ try {
         if ($licenseNotes.Count -gt 0) {
             $row.PlanDetail = (@($row.PlanDetail) + $licenseNotes.ToArray() | Where-Object { $_ }) -join ' '
         }
+    }
+
+    # --- Mail nickname uniqueness -------------------------------------------------------------------
+    # Entra ID keeps one mail nickname per tenant. A nickname taken from the resolved SMTP local
+    # part is unique by construction, but -MailNicknameFormat can hand two people the same alias,
+    # and that only fails on the day the second mailbox is created. The plan says so now instead.
+    $nicknameOwners = @{}
+    foreach ($item in (@($planned) | Sort-Object -Property @{ Expression = { [string]$_.Key } })) {
+        $row = $item.Row
+        if (-not $row.TargetMailNickname -or $row.PlanStatus -in @('NeedsReview', 'Invalid')) { continue }
+
+        $nickname = $row.TargetMailNickname.ToLowerInvariant()
+        if (-not $nicknameOwners.ContainsKey($nickname)) { $nicknameOwners[$nickname] = $item; continue }
+
+        $owner = $nicknameOwners[$nickname].Row
+        $ownerName = @($owner.SourceUserPrincipalName, $owner.SourcePrimarySmtp, $owner.DisplayName) |
+            Where-Object { $_ } | Select-Object -First 1
+        $row.PlanStatus = 'Collision'
+        $row.PlanDetail = (@($row.PlanDetail, ("Mail nickname '$($row.TargetMailNickname)' is already used by " +
+                "$ownerName; give one of them a different nickname.")) | Where-Object { $_ }) -join ' '
     }
 
     # --- Summary and write ------------------------------------------------------------------------

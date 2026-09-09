@@ -916,6 +916,7 @@ function Get-DomainReferenceSet {
     catch {
         Write-MigrationLog -Message ('Could not enumerate soft-deleted users: ' +
             "$($_.Exception.Message). A deleted user holding the domain would still block the removal.") -Level WARNING
+        $script:domainScanIncomplete = $true
     }
 
     Write-MigrationLog -Message 'Reading domainNameReferences from Microsoft Graph' -Level INFO
@@ -942,6 +943,7 @@ function Get-DomainReferenceSet {
     catch {
         Write-MigrationLog -Message ("Could not read domainNameReferences: $($_.Exception.Message). " +
             'The enumeration below may be incomplete.') -Level WARNING
+        $script:domainScanIncomplete = $true
     }
 
     return $records.ToArray()
@@ -989,6 +991,12 @@ function Get-DomainReferenceAssessment {
 #region Main
 
 $exitCode = 0
+# Declared out here so the fatal handler can still write whatever the run got through.
+$results = [System.Collections.Generic.List[object]]::new()
+$resultsExported = $false
+# Set by Get-DomainReferenceSet when one of its passes fails; the run may then be looking at a
+# partial picture and must not report the domain as clear.
+$script:domainScanIncomplete = $false
 
 try {
     # ReportOnly, DryRun and a missing acknowledgement all mean the same thing to the run context:
@@ -1091,8 +1099,6 @@ try {
         "$($blocked.Count) blocking") -Level INFO
 
     # --- Pass 2: remediate. ----------------------------------------------------------------------
-    $results = [System.Collections.Generic.List[object]]::new()
-
     $proceed = $true
     if (-not $effectiveDryRun -and $fixable.Count -gt 0) {
         $proceed = $PSCmdlet.ShouldProcess($tenantLabel,
@@ -1130,6 +1136,7 @@ try {
     }
 
     $null = Export-MigrationResult -Rows @($results) -Name 'Remove-DomainReferences'
+    $resultsExported = $true
 
     # --- Re-enumerate so the operator is told the truth about what is left. ----------------------
     $remaining = @($blocked)
@@ -1153,7 +1160,15 @@ try {
         $null = Export-MigrationReport -Rows @($recheckRows) -Name 'DomainBlockers' -Suffix 'Recheck'
     }
 
-    if (@($remaining).Count -eq 0) {
+    if (@($remaining).Count -eq 0 -and $script:domainScanIncomplete) {
+        # Telling an operator the domain is clear on the strength of a scan that partly failed is
+        # how a domain removal fails at the portal with no explanation.
+        Write-MigrationLog -Level ERROR -Message (
+            "No remaining references to $Domain were found, but part of the enumeration failed - see " +
+            'the warnings above. Re-run once the failing pass succeeds before trying to remove the domain.')
+        $exitCode = 2
+    }
+    elseif (@($remaining).Count -eq 0) {
         Write-MigrationLog -Level SUCCESS -Message (
             "Nothing references $Domain any more; it can be removed from the tenant.")
     }
@@ -1172,6 +1187,16 @@ try {
 catch {
     Write-MigrationLog -Message "Fatal: $($_.Exception.Message)" -Level ERROR
     Write-MigrationLog -Message $_.ScriptStackTrace -Level DEBUG
+    if (-not $resultsExported -and $results.Count -gt 0) {
+        try {
+            $null = Export-MigrationResult -Rows @($results) -Name 'Remove-DomainReferences'
+        }
+        catch {
+            # The run is already failing; a results file that cannot be written must not mask the
+            # original error, so the reason is logged and the fatal exit code stands.
+            Write-MigrationLog -Message "Could not write the partial results file: $($_.Exception.Message)" -Level ERROR
+        }
+    }
     $exitCode = 1
 }
 

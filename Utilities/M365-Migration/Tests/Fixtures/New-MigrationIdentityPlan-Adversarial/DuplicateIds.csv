@@ -1,0 +1,3 @@
+"ObjectId","UserPrincipalName","DisplayName","FirstName","MiddleName","LastName","Mail","UsageLocation","AccountEnabled","UserType","IsSynced","Licenses","ProxyAddresses"
+"c0000000-0000-0000-0000-00000000000c","dup.one@contoso.com","Dup One","Dup","","One","dup.one@contoso.com","IE","True","Member","False","","SMTP:dup.one@contoso.com"
+"c0000000-0000-0000-0000-00000000000c","dup.two@contoso.com","Dup Two","Dup","","Two","dup.two@contoso.com","IE","True","Member","False","","SMTP:dup.two@contoso.com"

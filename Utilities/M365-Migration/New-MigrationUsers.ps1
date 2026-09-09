@@ -573,6 +573,7 @@ if ($AssignLicenses) {
 }
 
 $planChanged = $false
+$planSaveFailed = $false
 $rowIndex = 0
 
 foreach ($row in $waveRows) {
@@ -691,6 +692,11 @@ foreach ($row in $waveRows) {
 
         $generatedPassword = $password
         $newObjectId = [string](Get-MigrationProperty -InputObject $created -Name 'id' -Default '')
+        if (-not $newObjectId) {
+            throw ("The account may have been created, but Graph returned no object ID for $upn, so " +
+                'the plan cannot record it. Check the destination tenant for the account and fill in ' +
+                'TargetObjectId by hand before running the next phase.')
+        }
         $detail.Insert(0, "Account created on the $($chosen.AddressSource.ToLowerInvariant()) address.")
 
         $row.TargetObjectId = $newObjectId
@@ -832,7 +838,11 @@ if ($planChanged) {
         }
     }
     catch {
-        Write-MigrationLog -Message "Could not write the plan back: $($_.Exception.Message)" -Level ERROR
+        # Losing the write-back loses the TargetObjectIds this run just earned, so it is a failed
+        # run even when every row succeeded.
+        Write-MigrationLog -Message ("Could not write the plan back to $PlanPath, so the object IDs " +
+            "recorded by this run are only in the results file: $($_.Exception.Message)") -Level ERROR
+        $planSaveFailed = $true
     }
 }
 
@@ -842,7 +852,7 @@ if (@($script:results | Where-Object { $_.Status -eq 'Succeeded' -and $_.Generat
     Write-MigrationLog -Message 'Initial passwords were written to the results file. Store it as you would any password list.' -Level WARNING
 }
 
-$exitCode = if (@($script:results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { 2 } else { 0 }
+$exitCode = if ($planSaveFailed -or @($script:results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { 2 } else { 0 }
 exit (Complete-MigrationRun -ExitCode $exitCode)
 
 #endregion Cleanup --------------------------------------------------------------------
