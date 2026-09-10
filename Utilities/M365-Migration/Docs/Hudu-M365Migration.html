@@ -42,15 +42,23 @@ parameter reference, auth matrix and plan schema.</p>
 
 <h2>The runbook</h2>
 
-<p><code>&lt;ts&gt;</code> below stands for the run's timestamp. <code>-PlanPath</code>
-resolves a wildcard when it matches exactly one file (error otherwise); every other CSV
-path is read literally — substitute the real file name for those.</p>
+<p>Every script writes into <code>~/Migration-Automations/&lt;Prefix&gt;/</code>
+(<code>%LOCALAPPDATA%\Migration-Automations\&lt;Prefix&gt;\</code> on Windows) and stamps
+each file with the run's timestamp as <code>yyyyMMdd-HHmmss</code>. Wherever a command below
+shows <code>&lt;ts&gt;</code>, substitute that stamp — <code>Source_Users_&lt;ts&gt;.csv</code>
+is really something like <code>Source_Users_20260909-101500.csv</code>. Only
+<code>-PlanPath</code> accepts a wildcard, and only when it matches exactly one file; every
+other CSV parameter needs the exact file name, so tab-complete it. The examples write
+<code>.\</code> for brevity, but the Source and Destination inventories land in two different
+folders — pass full paths, or run from a folder you have copied the CSVs into.</p>
 
 <ol>
   <li><strong>Inventory both tenants</strong> — read-only.
     <pre><code>.\Get-MigrationInventory.ps1 -Prefix Source -TenantId contoso.onmicrosoft.com -IncludeAuthMethods
 .\Get-MigrationInventory.ps1 -Prefix Destination -TenantId newco.onmicrosoft.com</code></pre>
-    <p><em>Check:</em> nine CSVs per tenant, Summary counts match the admin center.
+    <p><em>Check:</em> nine CSVs per tenant — the Source set in
+    <code>Migration-Automations/Source/</code>, the Destination set in
+    <code>Migration-Automations/Destination/</code>; Summary counts match the admin center.
     Count <code>MfaRegistered = True</code> in the Users tab.</p></li>
 
   <li><strong>Build the identity plan</strong> — offline, no tenant connection.
@@ -60,6 +68,26 @@ path is read literally — substitute the real file name for those.</p>
     -GroupsCsv .\Source_Groups_&lt;ts&gt;.csv -ContactsCsv .\Source_Contacts_&lt;ts&gt;.csv `
     -TargetDomain newco.com -InterimDomain newco.onmicrosoft.com -UpnFormat First.Last `
     -ReservedAddressesPath .\Destination_Users_&lt;ts&gt;.csv -Prefix Contoso</code></pre>
+    <p>What the parameters mean:</p>
+    <ul>
+      <li>The five <code>-*Csv</code> inputs are tabs from the <strong>Source</strong>
+      inventory in step 1. Only <code>-UsersCsv</code> is required; the others add shared
+      mailboxes, groups and contacts to the plan.</li>
+      <li><code>-TargetDomain</code> is the vanity domain users end up on.
+      <code>-UpnFormat</code> is the naming preset for the new UPNs and primary SMTP
+      addresses — <code>First.Last</code>, <code>FLast</code>, <code>F.Last</code>,
+      <code>Keep</code> and others are listed in the README.</li>
+      <li><code>-InterimDomain</code> is the destination tenant's onmicrosoft.com domain.
+      Accounts are provisioned there first because the vanity domain cannot be verified in
+      the destination until the source tenant releases it. Omit it if the domain has
+      already moved.</li>
+      <li><code>-ReservedAddressesPath</code> is the <strong>Destination</strong>
+      inventory's Users tab, so addresses already in use there are flagged
+      <code>ExistsInDestination</code> instead of colliding.</li>
+      <li><code>-Prefix</code> names the client. The output is one
+      <code>Contoso_IdentityPlan_&lt;ts&gt;.csv</code> in
+      <code>Migration-Automations/Contoso/</code>, which every later step reads.</li>
+    </ul>
     <p><em>Check:</em> zero <code>Invalid</code> rows; every <code>NeedsReview</code>/
     <code>Collision</code> row fixed and marked <code>ManualOverride</code>. Send the
     plan for client sign-off.</p></li>
@@ -297,6 +325,9 @@ stays as an alias unless <code>-RemoveOldPrimaryAlias</code>; add
     <tr><th>Date</th><th>By</th><th>Change</th></tr>
   </thead>
   <tbody>
+    <tr><td>2026-09-09</td>
+        <td>Sentinel Cyber</td>
+        <td>Runbook: explained the <code>&lt;ts&gt;</code> timestamp placeholder, where each run's files land, and what every <code>New-MigrationIdentityPlan</code> parameter is.</td></tr>
     <tr><td>2026-09-09</td>
         <td>Sentinel Cyber</td>
         <td>Rewritten to match the scripts exactly — removed parameters and examples the code no longer has. <code>New-MigrationUsers</code> now also carries the extended Entra profile onto the destination account.</td></tr>
