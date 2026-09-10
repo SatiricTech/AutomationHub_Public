@@ -1,0 +1,2 @@
+"UserPrincipalName","DisplayName","PrimarySmtpAddress","Alias","RecipientTypeDetails","EmailAddresses","LegacyExchangeDN","X500Addresses","ArchiveStatus","LitigationHoldEnabled","HiddenFromAddressListsEnabled","ForwardingSmtpAddress","EmailAddressPolicyEnabled","TotalItemSizeGB","ItemCount"
+"ap.desk@contoso.com","AP Desk Shared","ap.desk@contoso.com","apdesk","SharedMailbox","SMTP:ap.desk@contoso.com","/o=ExchangeLabs/ou=Exchange Administrative Group (FYDIBOHF23SPDLT)/cn=Recipients/cn=1122334455667788990011223344556-apdesk","","None","False","False","","True","1.2","4400"

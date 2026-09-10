@@ -1,0 +1,21 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#employeeExperience/learningProviders('00000000-0000-0000-0000-00000000f001')/learningContents",
+  "value": [
+    {
+      "id": "00000000-0000-0000-0000-00000000c001",
+      "externalId": "course-security-101",
+      "title": "Security Awareness 101",
+      "description": "Phishing, passwords and how to report a suspicious message.",
+      "contentWebUrl": "https://learning.contoso.com/courses/security-101",
+      "thumbnailWebUrl": "https://learning.contoso.com/thumbs/security-101.png",
+      "languageTag": "en-us",
+      "duration": "PT1H30M",
+      "format": "Video",
+      "level": "Beginner",
+      "sourceName": "Contoso Academy",
+      "skillTags": ["security", "phishing"],
+      "contributors": ["Contoso Academy"],
+      "isActive": true
+    }
+  ]
+}

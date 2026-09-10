@@ -1,0 +1,3 @@
+UserPrincipalName,DisplayName,PrimarySmtpAddress,RecipientTypeDetails
+accounts@newco.onmicrosoft.com,Accounts Payable,accounts@newco.onmicrosoft.com,SharedMailbox
+projector@newco.onmicrosoft.com,Projector Cart,projector@newco.onmicrosoft.com,EquipmentMailbox

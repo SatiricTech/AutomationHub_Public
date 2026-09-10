@@ -1,46 +1,35 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 
 <#
 .SYNOPSIS
-    Bulk-assigns Microsoft Teams phone numbers - to a single user, or to users
-    listed in a CSV (by UPN). Can also list every unassigned phone number in the
-    tenant so you know what is available before assigning.
+    Bulk-assigns Microsoft Teams phone numbers - to a single user, or to users listed in a CSV
+    (by UPN). Can also list every unassigned phone number in the tenant so you know what is
+    available before assigning.
 
 .DESCRIPTION
-    The destination-tenant half of a Teams Phone migration. After numbers are
-    released in the source (Remove-MigrationTeamsPhoneAssignments.ps1) and land
-    in the destination tenant, this script assigns them back to users.
+    The destination-tenant half of a Teams Phone migration. After numbers are released in the
+    source (Remove-MigrationTeamsPhoneAssignments.ps1) and land in the destination tenant,
+    this script assigns them back to users.
 
-    The work is supplied one of three ways (choose exactly one):
-      -User + -PhoneNumber   Assign one number to one user. Handy for rehearsing
-                             the flow before running the batch.
-      -CsvPath               A CSV pairing users (UPN) with phone numbers. The
-                             export from Get-MigrationTeamsPhoneAssignments.ps1
-                             and the results CSV from
-                             Remove-MigrationTeamsPhoneAssignments.ps1 both work
-                             directly. Every row is processed, so "all users" is
-                             simply the full export CSV.
-      -ListUnassigned        No changes - list every telephone number in the
-                             tenant inventory that is NOT assigned to anyone and
-                             export it to a CSV.
+    The work is supplied one of three ways (choose exactly one): -User + -PhoneNumber (one
+    number to one user, to rehearse the flow), -CsvPath (a CSV pairing users with numbers -
+    both the Get- export and the Remove- results file work directly, so "all users" is simply
+    the full export CSV), or -ListUnassigned (no changes; lists every free number in the
+    tenant inventory into the same CSV name the Get- script writes).
 
-    Phone numbers are normalised automatically (a leading 'tel:', spaces,
-    dashes and parentheses are stripped; a missing leading '+' is added), and
-    ';ext=' extensions are preserved.
+    Phone numbers are normalised automatically (a leading 'tel:', spaces, dashes and
+    parentheses are stripped; a missing leading '+' is added), and ';ext=' extensions are
+    preserved. The number type (CallingPlan / OperatorConnect / DirectRouting) is
+    auto-detected from the tenant's inventory when nothing supplies one - numbers absent from
+    the inventory are assumed to be Direct Routing. A number already assigned to a DIFFERENT
+    user is reported as Failed rather than stolen from its current owner.
 
-    The number type (CallingPlan / OperatorConnect / DirectRouting) is
-    auto-detected from the tenant's number inventory when the CSV / parameters
-    don't provide one: numbers found in the inventory use their real type,
-    numbers not in the inventory are assumed to be Direct Routing. A number that
-    is already assigned to a DIFFERENT user is reported as Failed rather than
-    stolen from its current owner.
+    If the CSV has an OnlineVoiceRoutingPolicy column (or -VoiceRoutingPolicy is passed), the
+    policy is granted after a successful assignment - Direct Routing numbers do not place
+    PSTN calls without one.
 
-    If the CSV has an OnlineVoiceRoutingPolicy column (or -VoiceRoutingPolicy is
-    passed), the policy is granted after a successful assignment - Direct
-    Routing numbers don't work without one.
-
-    Supports -WhatIf / -Confirm and a dedicated -DryRun that resolves and
-    reports exactly what would be assigned without changing anything.
+    DryRun connects read-only, resolves every user and number, writes a -DryRun_ results file
+    whose rows are Status 'Planned', and changes nothing.
 
 .PARAMETER User
     A single user (UPN or object ID) to assign -PhoneNumber to.
@@ -50,485 +39,509 @@
     +15551234567;ext=123). Common formatting is cleaned up automatically.
 
 .PARAMETER PhoneNumberType
-    The number type: CallingPlan, OperatorConnect, OCMobile or DirectRouting.
-    Auto-detected from the tenant number inventory when omitted.
+    The number type: CallingPlan, OperatorConnect, OCMobile or DirectRouting. Auto-detected
+    from the tenant number inventory when omitted.
 
 .PARAMETER LocationId
-    Emergency location ID to associate with the assignment (Calling Plan /
-    Operator Connect). Auto-filled from a LocationId CSV column when present.
+    Emergency location ID to associate with the assignment (Calling Plan / Operator Connect).
+    Auto-filled from a LocationId CSV column when present. The ID is tenant-scoped, so a value
+    carried over from a source-tenant export will not resolve in the destination: with -User
+    an unresolvable -LocationId fails the row; with -CsvPath the assignment still proceeds
+    without a location and the row's Detail says an emergency location must be set manually.
 
 .PARAMETER VoiceRoutingPolicy
-    Online voice routing policy to grant after assignment (required for Direct
-    Routing numbers to place PSTN calls). With -CsvPath, an
-    OnlineVoiceRoutingPolicy / VoiceRoutingPolicy column does the same per row.
+    Online voice routing policy to grant after assignment (required for Direct Routing
+    numbers to place PSTN calls). With -CsvPath, an OnlineVoiceRoutingPolicy /
+    VoiceRoutingPolicy column does the same per row.
 
 .PARAMETER CsvPath
-    Path to a CSV pairing users with numbers. Recognised columns
-    (case-insensitive):
-      UPN         : UserPrincipalName, UPN, User Principal Name, Email,
-                    PrimaryEmail, Mail, UserName            (required)
-      PhoneNumber : PhoneNumber, TelephoneNumber, Phone, Number, LineUri,
-                    Phone Number                            (required)
-      Type        : PhoneNumberType, NumberType, Type       (optional)
-      Location    : LocationId, Location Id                 (optional)
-      Policy      : OnlineVoiceRoutingPolicy, VoiceRoutingPolicy (optional)
+    Path to a CSV pairing users with numbers. The user column is resolved through the
+    toolkit's shared alias vocabulary (UserPrincipalName, UPN, User Principal Name, UserName,
+    User, CurrentUPN, Login), falling back to the primary SMTP column when no UPN column
+    exists. The phone columns are resolved locally:
+      PhoneNumber : PhoneNumber, TelephoneNumber, Phone Number, Phone, Number, LineUri (required)
+      Type        : PhoneNumberType, NumberType                                        (optional)
+      Location    : LocationId, Location Id, EmergencyLocationId                       (optional)
+      Policy      : OnlineVoiceRoutingPolicy, VoiceRoutingPolicy                       (optional)
+      Extension   : Extension, Ext                                                     (optional)
+    A bare 'Type' header is no longer read as the number type: the toolkit's shared
+    vocabulary claims 'Type' for the plan's ObjectType column. Use 'PhoneNumberType'.
 
 .PARAMETER ListUnassigned
-    Read-only. List every unassigned telephone number in the tenant inventory
-    and export it to a CSV. Note: Direct Routing numbers only appear in the
-    inventory if they were uploaded/acquired there - unassigned DR ranges
-    managed purely on your SBC won't show.
+    Read-only. List every unassigned telephone number in the tenant inventory and export it to
+    a CSV. Note: Direct Routing numbers only appear in the inventory if they were uploaded or
+    acquired there - unassigned DR ranges managed purely on your SBC will not show.
 
 .PARAMETER OutputPath
-    Directory where the results CSV (or the unassigned-numbers CSV) is written.
-    Defaults to the current directory.
+    Root directory for the log, the results CSV and the unassigned-numbers CSV. Defaults to
+    the toolkit's standard root: %LOCALAPPDATA%\Migration-Automations on Windows,
+    ~/Migration-Automations elsewhere.
+
+.PARAMETER Prefix
+    Names the client or run. When supplied, output lands in <root>\<Prefix>\ and file names
+    start with <Prefix>_.
+
+.PARAMETER LogPath
+    Overrides the auto-derived log file path.
 
 .PARAMETER TenantId
-    Tenant ID (GUID) to sign in to. Useful for MSP / multi-tenant admins so the
-    interactive sign-in lands in the intended tenant.
+    Tenant ID (GUID) to sign in to. Useful for MSP / multi-tenant admins so the interactive
+    sign-in lands in the intended tenant.
 
 .PARAMETER DryRun
-    Preview only - make no changes. Resolves users and numbers and reports what
-    would be assigned, but changes nothing.
+    Preview only. Connects read-only, reports what would be assigned, writes a -DryRun_
+    results file with Status 'Planned', and changes nothing.
+
+.PARAMETER Verbosity
+    Console noise level: Low (errors and successes), Medium (adds warnings), High
+    (everything). The log file always receives every line regardless of this setting.
 
 .EXAMPLE
-    .\Set-MigrationTeamsPhoneAssignments.ps1 -ListUnassigned
+    .\Set-MigrationTeamsPhoneAssignments.ps1 -ListUnassigned -Prefix Destination
+
+    Writes Destination\Destination_TeamsPhoneNumbers-Unassigned_<timestamp>.csv - the same
+    file name Get-MigrationTeamsPhoneAssignments.ps1 -IncludeUnassignedNumbers produces.
 
 .EXAMPLE
     .\Set-MigrationTeamsPhoneAssignments.ps1 -User john.smith@contoso.com -PhoneNumber +15551234567 -DryRun
 
-.EXAMPLE
-    .\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments.csv -DryRun
+    Rehearses a single assignment and writes only the DryRun results file.
 
 .EXAMPLE
-    .\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\TeamsPhone-Removals_20260705-101500.csv
+    .\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments.csv -TenantId newco.onmicrosoft.com -Prefix Destination
+
+    Reassigns every number from a source-tenant export into the destination tenant. -TenantId
+    is passed explicitly so a Teams session left connected to the source tenant is not reused
+    by mistake.
+
+.EXAMPLE
+    .\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Contoso_Remove-TeamsPhoneAssignments-Results_20260908-101500.csv -TenantId newco.onmicrosoft.com -Prefix Contoso
+
+    Restores the numbers a previous Remove- run released, using its results file as the input.
+    -TenantId again targets the destination tenant explicitly rather than reusing whatever
+    Teams session happens to be live.
 
 .NOTES
     Author      : AutomationHub
-    Requires    : PowerShell 7, MicrosoftTeams module
-    Permissions : Teams Administrator (or Teams Communications Administrator).
-                  Users must hold a Teams Phone license (e.g. Teams Phone
-                  Standard) before a number can be assigned - unlicensed users
-                  are reported as Failed by the service.
+    Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
+                  the MicrosoftTeams module (installed on demand).
+    Permissions : Teams Administrator, or Teams Communications Administrator. No Graph scopes
+                  are used.
+    GDAP        : supported through -TenantId, which Connect-MigrationTeams passes to
+                  Connect-MicrosoftTeams. This script never connects to Exchange.
+    Licensing   : users must hold a Teams Phone license (e.g. Teams Phone Standard) before a
+                  number can be assigned. Unlicensed users are reported as Failed by the
+                  service, and the row's Detail says so.
+    Exit codes  : 0 success, 1 fatal error, 2 completed with one or more failed rows.
+
+    Written with assistance from Claude (Anthropic).
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Csv')]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High', DefaultParameterSetName = 'Csv')]
 param(
-    [Parameter(Mandatory = $true, ParameterSetName = 'User')]
+    [Parameter(Mandatory, ParameterSetName = 'User')]
+    [ValidateNotNullOrEmpty()]
     [string]$User,
 
-    [Parameter(Mandatory = $true, ParameterSetName = 'User')]
+    [Parameter(Mandatory, ParameterSetName = 'User')]
+    [ValidateNotNullOrEmpty()]
     [string]$PhoneNumber,
 
-    [Parameter(Mandatory = $false, ParameterSetName = 'User')]
+    [Parameter(ParameterSetName = 'User')]
     [ValidateSet('CallingPlan', 'OperatorConnect', 'OCMobile', 'DirectRouting')]
     [string]$PhoneNumberType,
 
-    [Parameter(Mandatory = $false, ParameterSetName = 'User')]
+    [Parameter(ParameterSetName = 'User')]
     [string]$LocationId,
 
-    [Parameter(Mandatory = $false, ParameterSetName = 'User')]
+    [Parameter(ParameterSetName = 'User')]
     [string]$VoiceRoutingPolicy,
 
-    [Parameter(Mandatory = $true, ParameterSetName = 'Csv')]
+    [Parameter(Mandatory, ParameterSetName = 'Csv')]
+    [ValidateNotNullOrEmpty()]
     [string]$CsvPath,
 
-    [Parameter(Mandatory = $true, ParameterSetName = 'Unassigned')]
+    [Parameter(Mandatory, ParameterSetName = 'Unassigned')]
     [switch]$ListUnassigned,
 
-    [Parameter(Mandatory = $false)]
     [string]$OutputPath,
 
-    [Parameter(Mandatory = $false)]
+    [string]$Prefix,
+
+    [string]$LogPath,
+
     [string]$TenantId,
 
-    [Parameter(Mandatory = $false)]
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    [ValidateSet('Low', 'Medium', 'High')]
+    [string]$Verbosity = 'Medium'
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# -DryRun makes no changes - read-only checks still run, mutating calls are skipped.
-if ($DryRun) {
-    Write-Host 'DRY RUN enabled - read-only checks run, but no changes will be made.' -ForegroundColor Magenta
-}
+Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Force -ErrorAction Stop
 
-#region Shared helpers ---------------------------------------------------------
+#region Configuration ----------------------------------------------------------
 
-function Resolve-MigrationOutputDirectory {
-    <# Defaults to the current directory for the results CSV. #>
-    [CmdletBinding()]
-    param([string]$Path)
+$validNumberTypes = @('CallingPlan', 'OperatorConnect', 'OCMobile', 'DirectRouting')
 
-    if ($Path) {
-        $resolved = $Path
-    }
-    else {
-        $resolved = (Get-Location).Path
-        Write-Host ''
-        Write-Host "No -OutputPath provided - writing results to the current directory:" -ForegroundColor Cyan
-        Write-Host "  $resolved" -ForegroundColor Cyan
-    }
-
-    if (-not (Test-Path -LiteralPath $resolved)) {
-        New-Item -ItemType Directory -Path $resolved -Force | Out-Null
-        Write-Host "Created output directory: $resolved" -ForegroundColor Green
-    }
-
-    return (Resolve-Path -LiteralPath $resolved).Path
-}
-
-function Initialize-RequiredModule {
-    param([Parameter(Mandatory)][string]$Name)
-    if (Get-Module -ListAvailable -Name $Name) { return }
-    Write-Host "Installing required module '$Name' (CurrentUser scope)..." -ForegroundColor Yellow
-    Install-Module -Name $Name -Scope CurrentUser -Force -AllowClobber
-}
-
-function Resolve-ColumnName {
-    param([string[]]$Headers, [string[]]$Candidates)
-    foreach ($candidate in $Candidates) {
-        $hit = $Headers | Where-Object { $_ -ieq $candidate } | Select-Object -First 1
-        if ($hit) { return $hit }
-    }
-    return $null
-}
-
-function Get-CsvValue {
-    param($Record, [string]$Column)
-    if (-not $Column) { return $null }
-    $value = $Record.$Column
-    if ($null -eq $value) { return $null }
-    $text = ([string]$value).Trim()
-    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
-    return $text
-}
-
-function Format-E164PhoneNumber {
-    <#
-        Normalises a phone number to E.164: strips 'tel:', spaces, dashes,
-        dots and parentheses, keeps a ';ext=' suffix, and adds a leading '+'
-        when the remainder is all digits. Returns $null for unusable input.
-    #>
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-
-    $number = $Value.Trim() -replace '^(?i)tel:', ''
-    $extension = $null
-    if ($number -match '^(?<num>[^;]+);(?i)ext=(?<ext>.+)$') {
-        $number = $Matches['num']
-        $extension = $Matches['ext'].Trim()
-    }
-
-    $number = $number -replace '[\s\-\.\(\)]', ''
-    if ($number -match '^\+?\d+$') {
-        if (-not $number.StartsWith('+')) { $number = "+$number" }
-    }
-    else {
-        return $null
-    }
-
-    if ($extension) { return "$number;ext=$extension" }
-    return $number
-}
-
-function Get-AllPhoneNumberAssignments {
-    <# Pages through the tenant telephone number inventory. #>
-    param([hashtable]$Filter = @{})
-
-    $all = [System.Collections.Generic.List[object]]::new()
-    $pageSize = 1000
-    $skip = 0
-    while ($true) {
-        $page = @(Get-CsPhoneNumberAssignment @Filter -Top $pageSize -Skip $skip)
-        if ($page.Count -gt 0) { $all.AddRange($page) }
-        if ($page.Count -lt $pageSize) { break }
-        $skip += $pageSize
-    }
-    return $all
-}
-
-function Resolve-TeamsUserByIdentity {
-    <# Resolves a UPN or object ID to a Teams user object (or $null). #>
-    param([Parameter(Mandatory)][string]$Identity)
-    try {
-        return Get-CsOnlineUser -Identity $Identity -ErrorAction Stop
-    }
-    catch {
-        return $null
-    }
+# Header spellings Import-MigrationCsv's shared vocabulary does not already canonicalise.
+# 'Type' and 'Email' are deliberately absent: the vocabulary claims them for ObjectType and
+# PrimarySmtpAddress, so accepting them here would read the wrong column.
+$phoneColumnCandidates = @{
+    Number    = @('PhoneNumber', 'TelephoneNumber', 'Phone Number', 'Phone')
+    Type      = @('PhoneNumberType')
+    Location  = @('LocationId', 'Location Id')
+    Policy    = @('OnlineVoiceRoutingPolicy')
+    Extension = @('Extension', 'Ext')
 }
 
 #endregion ---------------------------------------------------------------------
 
-Write-Host '=== M365 Migration - Teams Phone Number Assignment ===' -ForegroundColor Cyan
+#region Main -------------------------------------------------------------------
 
-# Validate inputs that do not need Teams first.
-if ($PSCmdlet.ParameterSetName -eq 'Csv' -and -not (Test-Path -LiteralPath $CsvPath)) {
-    throw "CSV not found: $CsvPath"
-}
+$exitCode = 0
+$run = Initialize-MigrationRun -ScriptName 'Set-MigrationTeamsPhoneAssignments' -OutputPath $OutputPath `
+    -Prefix $Prefix -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
 
-$outputDir = Resolve-MigrationOutputDirectory -Path $OutputPath
-$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+try {
+    $isDryRun = [bool]$run.DryRun
 
-Initialize-RequiredModule -Name 'MicrosoftTeams'
-Import-Module MicrosoftTeams -ErrorAction Stop
-
-Write-Host 'Connecting to Microsoft Teams...' -ForegroundColor Cyan
-$connectParams = @{}
-if ($TenantId) { $connectParams['TenantId'] = $TenantId }
-Connect-MicrosoftTeams @connectParams | Out-Null
-
-$tenant = Get-CsTenant -ErrorAction SilentlyContinue
-if ($tenant) {
-    Write-Host "Connected to tenant: $($tenant.DisplayName) [$($tenant.TenantId)]" -ForegroundColor Green
-}
-
-#region List unassigned numbers (read-only mode) --------------------------------
-
-if ($PSCmdlet.ParameterSetName -eq 'Unassigned') {
-    Write-Host 'Retrieving unassigned telephone numbers...' -ForegroundColor Cyan
-    $unassigned = @(Get-AllPhoneNumberAssignments -Filter @{ PstnAssignmentStatus = 'Unassigned' })
-
-    if ($unassigned.Count -eq 0) {
-        Write-Host 'No unassigned numbers found in the tenant inventory.' -ForegroundColor Yellow
-    }
-    else {
-        $report = $unassigned | ForEach-Object {
-            [pscustomobject][ordered]@{
-                PhoneNumber        = $_.TelephoneNumber
-                PhoneNumberType    = [string]$_.NumberType
-                AssignmentCategory = [string]$_.AssignmentCategory
-                Capability         = ($_.Capability -join ';')
-                IsoCountryCode     = $_.IsoCountryCode
-                LocationId         = [string]$_.LocationId
-                ActivationState    = [string]$_.ActivationState
-            }
-        }
-        $report | Format-Table PhoneNumber, PhoneNumberType, IsoCountryCode, ActivationState -AutoSize | Out-Host
-        Write-Host "Unassigned numbers: $($unassigned.Count)" -ForegroundColor Green
-
-        if (-not $DryRun) {
-            $unassignedCsv = Join-Path -Path $outputDir -ChildPath "TeamsPhoneNumbers-Unassigned_$timestamp.csv"
-            $report | Export-Csv -Path $unassignedCsv -NoTypeInformation -Encoding UTF8
-            Write-Host "Unassigned numbers CSV: $unassignedCsv" -ForegroundColor Cyan
-        }
+    # Fail on a bad input path before a sign-in prompt is put in front of the operator.
+    if ($PSCmdlet.ParameterSetName -eq 'Csv' -and -not (Test-Path -LiteralPath $CsvPath)) {
+        throw "CSV not found: $CsvPath"
     }
 
-    Disconnect-MicrosoftTeams -Confirm:$false | Out-Null
-    Write-Host 'Done.' -ForegroundColor Green
-    return
-}
-
-#endregion ---------------------------------------------------------------------
-
-#region Build the work list -----------------------------------------------------
-
-# Each item: Identity (as supplied), PhoneNumber (raw), PhoneNumberType,
-# LocationId, VoiceRoutingPolicy - resolved/validated in the assignment loop.
-$workItems = [System.Collections.Generic.List[object]]::new()
-
-switch ($PSCmdlet.ParameterSetName) {
-    'User' {
-        $workItems.Add([pscustomobject]@{
-                Identity           = $User
-                PhoneNumber        = $PhoneNumber
-                PhoneNumberType    = $PhoneNumberType
-                LocationId         = $LocationId
-                VoiceRoutingPolicy = $VoiceRoutingPolicy
-            })
+    $teamsTenant = Connect-MigrationTeams -TenantId $TenantId
+    # Connect-MigrationTeams silently reuses whatever Teams session is already live when
+    # -TenantId is omitted, so the connected tenant is surfaced here - before any prompt -
+    # rather than trusting the operator to notice a bare GUID buried in an earlier log line.
+    if ($teamsTenant) {
+        Write-MigrationLog -Message "Connected tenant: $($teamsTenant.DisplayName) ($($teamsTenant.TenantId))." -Level INFO
     }
 
-    'Csv' {
-        $rows = @(Import-Csv -LiteralPath $CsvPath)
-        if ($rows.Count -eq 0) { throw "CSV '$CsvPath' contains no rows." }
+    if ($PSCmdlet.ParameterSetName -eq 'Unassigned') {
+        Write-MigrationLog -Message 'Retrieving unassigned telephone numbers...' -Level INFO
+        $unassigned = @(Get-MigrationPhoneNumberInventory -Filter @{ PstnAssignmentStatus = 'Unassigned' })
+        Write-MigrationLog -Message "Unassigned numbers: $($unassigned.Count)" -Level INFO
 
-        $headers = $rows[0].PSObject.Properties.Name
-        $upnCol = Resolve-ColumnName -Headers $headers -Candidates @(
-            'UserPrincipalName', 'UPN', 'User Principal Name',
-            'Email', 'PrimaryEmail', 'Mail', 'UserName', 'User Name'
-        )
-        $numberCol = Resolve-ColumnName -Headers $headers -Candidates @(
-            'PhoneNumber', 'TelephoneNumber', 'Phone Number', 'Phone', 'Number', 'LineUri', 'LineURI'
-        )
-        $typeCol = Resolve-ColumnName -Headers $headers -Candidates @('PhoneNumberType', 'NumberType', 'Type')
-        $locationCol = Resolve-ColumnName -Headers $headers -Candidates @('LocationId', 'Location Id', 'EmergencyLocationId')
-        $policyCol = Resolve-ColumnName -Headers $headers -Candidates @('OnlineVoiceRoutingPolicy', 'VoiceRoutingPolicy')
-        $extensionCol = Resolve-ColumnName -Headers $headers -Candidates @('Extension', 'Ext')
+        $unassignedReport = [System.Collections.Generic.List[object]]::new()
+        $listResults = [System.Collections.Generic.List[object]]::new()
 
-        if (-not $upnCol) {
-            throw "Could not find a UserPrincipalName/UPN/Email column in '$CsvPath'. Headers: $($headers -join ', ')"
-        }
-        if (-not $numberCol) {
-            throw "Could not find a PhoneNumber/TelephoneNumber/LineUri column in '$CsvPath'. Headers: $($headers -join ', ')"
-        }
-
-        foreach ($row in $rows) {
-            $id = Get-CsvValue -Record $row -Column $upnCol
-            if (-not $id) { continue }
-
-            $number = Get-CsvValue -Record $row -Column $numberCol
-            # Re-attach a separate Extension column when the number itself has none.
-            $extension = Get-CsvValue -Record $row -Column $extensionCol
-            if ($number -and $extension -and $number -notmatch ';(?i)ext=') {
-                $number = "$number;ext=$extension"
-            }
-
-            $workItems.Add([pscustomobject]@{
-                    Identity           = $id
-                    PhoneNumber        = $number
-                    PhoneNumberType    = Get-CsvValue -Record $row -Column $typeCol
-                    LocationId         = Get-CsvValue -Record $row -Column $locationCol
-                    VoiceRoutingPolicy = Get-CsvValue -Record $row -Column $policyCol
+        foreach ($number in $unassigned) {
+            $unassignedReport.Add([pscustomobject][ordered]@{
+                    PhoneNumber        = $number.TelephoneNumber
+                    PhoneNumberType    = [string]$number.NumberType
+                    AssignmentCategory = [string]$number.AssignmentCategory
+                    Capability         = ($number.Capability -join ';')
+                    IsoCountryCode     = $number.IsoCountryCode
+                    LocationId         = [string]$number.LocationId
+                    ActivationState    = [string]$number.ActivationState
+                })
+            $listResults.Add([pscustomobject][ordered]@{
+                    Identity        = [string]$number.TelephoneNumber
+                    Action          = 'List unassigned number'
+                    Status          = if ($isDryRun) { 'Planned' } else { 'Succeeded' }
+                    Detail          = "Free in the inventory ($([string]$number.NumberType), $($number.IsoCountryCode))."
+                    PhoneNumberType = [string]$number.NumberType
+                    IsoCountryCode  = $number.IsoCountryCode
+                    ActivationState = [string]$number.ActivationState
                 })
         }
-    }
-}
 
-if ($workItems.Count -eq 0) {
-    Write-Host 'No rows with a user to process. Nothing to do.' -ForegroundColor Yellow
-    Disconnect-MicrosoftTeams -Confirm:$false | Out-Null
-    return
-}
-
-Write-Host "Assignments to process: $($workItems.Count)" -ForegroundColor Cyan
-
-# One paged pull of the number inventory: used to auto-detect each number's
-# type and to refuse numbers already assigned to someone else.
-Write-Host 'Retrieving telephone number inventory...' -ForegroundColor Cyan
-$numbersByTelephone = @{}
-foreach ($num in (Get-AllPhoneNumberAssignments)) {
-    if (-not [string]::IsNullOrWhiteSpace($num.TelephoneNumber)) {
-        $numbersByTelephone[[string]$num.TelephoneNumber] = $num
-    }
-}
-
-#endregion ---------------------------------------------------------------------
-
-#region Assignment loop ---------------------------------------------------------
-
-$results = [System.Collections.Generic.List[object]]::new()
-$index = 0
-$validTypes = @('CallingPlan', 'OperatorConnect', 'OCMobile', 'DirectRouting')
-
-foreach ($item in $workItems) {
-    $index++
-    Write-Progress -Activity 'Assigning phone numbers' `
-        -Status "$index of $($workItems.Count): $($item.Identity)" `
-        -PercentComplete (($index / [math]::Max($workItems.Count, 1)) * 100)
-
-    $status = 'Assigned'
-    $detail = ''
-    $upn = $item.Identity
-    $displayName = $null
-    $number = Format-E164PhoneNumber -Value $item.PhoneNumber
-    $numberType = $item.PhoneNumberType
-    $policy = $item.VoiceRoutingPolicy
-
-    try {
-        if (-not $number) {
-            $status = 'Skipped'
-            $detail = "No usable phone number ('$($item.PhoneNumber)')."
+        if ($unassigned.Count -eq 0) {
+            Write-MigrationLog -Message 'No unassigned numbers found in the tenant inventory.' -Level WARNING
+        }
+        elseif ($isDryRun) {
+            Write-MigrationLog -Message "[DRYRUN] Would write $($unassigned.Count) unassigned number(s) to the unassigned-numbers CSV." -Level WARNING
         }
         else {
-            $target = Resolve-TeamsUserByIdentity -Identity $item.Identity
-            if (-not $target) { throw "User not found in this tenant." }
-            $upn = $target.UserPrincipalName
-            $displayName = $target.DisplayName
+            # Same file name Get-MigrationTeamsPhoneAssignments.ps1 -IncludeUnassignedNumbers
+            # writes, so the two scripts' output is interchangeable.
+            $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
+            $unassignedCsv = Join-Path -Path $run.OutputDirectory `
+                -ChildPath ("${leader}TeamsPhoneNumbers-Unassigned_" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.csv')
+            try {
+                $unassignedReport | Export-Csv -LiteralPath $unassignedCsv -NoTypeInformation -Encoding utf8 -ErrorAction Stop
+            }
+            catch {
+                throw "Could not write the unassigned-numbers CSV '$unassignedCsv': $($_.Exception.Message)"
+            }
+            Write-MigrationLog -Message "Unassigned numbers CSV: $unassignedCsv" -Level SUCCESS
+        }
 
-            # The inventory is keyed without any extension suffix.
-            $bareNumber = ($number -split ';')[0]
-            $numberInfo = if ($numbersByTelephone.ContainsKey($bareNumber)) { $numbersByTelephone[$bareNumber] } else { $null }
+        $null = Export-MigrationResult -Rows $listResults.ToArray() -Name 'Set-TeamsPhoneNumbers-Unassigned'
 
-            if ($numberInfo -and -not [string]::IsNullOrWhiteSpace($numberInfo.AssignedPstnTargetId) -and
-                [string]$numberInfo.AssignedPstnTargetId -ne [string]$target.Identity) {
-                throw "Number $bareNumber is already assigned to another target ($($numberInfo.AssignedPstnTargetId)). Unassign it first."
+        # The finally block below still runs on exit, so Complete-MigrationRun is called
+        # exactly once and the exit code survives.
+        exit $exitCode
+    }
+
+    # Each item: Identity (as supplied), PhoneNumber (raw), PhoneNumberType, LocationId,
+    # VoiceRoutingPolicy - resolved and validated in the assignment loop.
+    $workItems = [System.Collections.Generic.List[object]]::new()
+
+    switch ($PSCmdlet.ParameterSetName) {
+        'User' {
+            $workItems.Add([pscustomobject]@{
+                    Identity           = $User
+                    PhoneNumber        = $PhoneNumber
+                    PhoneNumberType    = $PhoneNumberType
+                    LocationId         = $LocationId
+                    VoiceRoutingPolicy = $VoiceRoutingPolicy
+                })
+        }
+
+        'Csv' {
+            $rows = @(Import-MigrationCsv -Path $CsvPath)
+            $headers = @($rows[0].PSObject.Properties.Name)
+
+            # -contains and the PSObject property indexer are both case-insensitive, so the
+            # candidate spelling can be handed straight to Get-MigrationCsvValue.
+            $pickColumn = {
+                param([string[]]$Candidates)
+                foreach ($candidate in $Candidates) {
+                    if ($headers -contains $candidate) { return $candidate }
+                }
+                return $null
             }
 
-            if ([string]::IsNullOrWhiteSpace($numberType)) {
-                # Numbers absent from the tenant inventory are Direct Routing -
-                # Calling Plan / Operator Connect numbers always appear there.
-                $numberType = if ($numberInfo) { [string]$numberInfo.NumberType } else { 'DirectRouting' }
+            # Import-MigrationCsv maps a bare Email/Mail column to PrimarySmtpAddress rather
+            # than UserPrincipalName, so fall back to it before giving up on the file.
+            $userColumn = & $pickColumn @('UserPrincipalName', 'PrimarySmtpAddress')
+            if (-not $userColumn) {
+                throw "Could not find a user column in '$CsvPath'. Headers: $($headers -join ', ')"
             }
-            $matchedType = $validTypes | Where-Object { $_ -ieq $numberType } | Select-Object -First 1
-            if (-not $matchedType) {
-                throw "Unknown PhoneNumberType '$numberType'. Expected one of: $($validTypes -join ', ')."
-            }
-            $numberType = $matchedType
 
-            if (-not $DryRun -and $PSCmdlet.ShouldProcess($upn, "Assign phone number $number ($numberType)")) {
-                $assignParams = @{
-                    Identity        = $upn
+            $numberColumn = & $pickColumn $phoneColumnCandidates.Number
+            if (-not $numberColumn) {
+                throw "Could not find a PhoneNumber/TelephoneNumber/LineUri column in '$CsvPath'. Headers: $($headers -join ', ')"
+            }
+
+            $typeColumn = & $pickColumn $phoneColumnCandidates.Type
+            $locationColumn = & $pickColumn $phoneColumnCandidates.Location
+            $policyColumn = & $pickColumn $phoneColumnCandidates.Policy
+            $extensionColumn = & $pickColumn $phoneColumnCandidates.Extension
+
+            foreach ($row in $rows) {
+                $identity = [string](Get-MigrationCsvValue -Row $row -Name $userColumn -Default '')
+                if ([string]::IsNullOrWhiteSpace($identity)) { continue }
+
+                $number = [string](Get-MigrationCsvValue -Row $row -Name $numberColumn -Default '')
+
+                # Re-attach a separate Extension column when the number itself carries none.
+                if ($extensionColumn) {
+                    $extension = [string](Get-MigrationCsvValue -Row $row -Name $extensionColumn -Default '')
+                    if ($number -and $extension -and $number -notmatch ';(?i)ext=') {
+                        $number = "$number;ext=$extension"
+                    }
+                }
+
+                $workItems.Add([pscustomobject]@{
+                        Identity           = $identity
+                        PhoneNumber        = $number
+                        PhoneNumberType    = if ($typeColumn) { [string](Get-MigrationCsvValue -Row $row -Name $typeColumn -Default '') } else { '' }
+                        LocationId         = if ($locationColumn) { [string](Get-MigrationCsvValue -Row $row -Name $locationColumn -Default '') } else { '' }
+                        VoiceRoutingPolicy = if ($policyColumn) { [string](Get-MigrationCsvValue -Row $row -Name $policyColumn -Default '') } else { '' }
+                    })
+            }
+        }
+    }
+
+    Write-MigrationLog -Message "Assignments to process: $($workItems.Count)" -Level INFO
+
+    # One paged pull of the number inventory: used to auto-detect each number's type and to
+    # refuse numbers already assigned to someone else.
+    Write-MigrationLog -Message 'Retrieving telephone number inventory...' -Level INFO
+    $numbersByTelephone = @{}
+    foreach ($number in (Get-MigrationPhoneNumberInventory)) {
+        if (-not [string]::IsNullOrWhiteSpace($number.TelephoneNumber)) {
+            $numbersByTelephone[[string]$number.TelephoneNumber] = $number
+        }
+    }
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $index = 0
+
+    foreach ($item in $workItems) {
+        $index++
+        $identity = $item.Identity
+
+        Write-Progress -Activity 'Assigning phone numbers' `
+            -Status "$index of $($workItems.Count): $identity" `
+            -PercentComplete (($index / [math]::Max($workItems.Count, 1)) * 100)
+
+        $status = 'Failed'
+        $detail = ''
+        $displayName = ''
+        $number = Format-MigrationE164 -Value $item.PhoneNumber
+        $numberType = $item.PhoneNumberType
+        $policy = $item.VoiceRoutingPolicy
+
+        try {
+            if (-not $number) {
+                if ([string]::IsNullOrWhiteSpace($item.PhoneNumber)) {
+                    $status = 'Skipped'
+                    $detail = "No usable phone number ('$($item.PhoneNumber)')."
+                }
+                else {
+                    # Format-MigrationE164 returns $null for blank input AND for a value it
+                    # could not parse; a typo must not read the same as a legitimately blank
+                    # cell, so only an actually-blank source value is a Skip.
+                    throw "Unparseable phone number ('$($item.PhoneNumber)')."
+                }
+            }
+            else {
+                $target = Resolve-MigrationTeamsUser -Identity $identity
+                if ($null -eq $target) { throw 'User not found in this tenant.' }
+                $identity = [string]$target.UserPrincipalName
+                $displayName = [string]$target.DisplayName
+
+                # Teams keys a Direct Routing extension WITH the extension (e.g.
+                # '+12065551000;ext=524' is its own inventory row, distinct from the bare
+                # '+12065551000'), so the ownership check must match on the full number.
+                # The bare number is a fallback for type auto-detection only - never for
+                # deciding whether someone else already holds the number.
+                $bareNumber = ($number -split ';')[0]
+                $numberInfo = if ($numbersByTelephone.ContainsKey($number)) { $numbersByTelephone[$number] } else { $null }
+                $bareNumberInfo = if ($numbersByTelephone.ContainsKey($bareNumber)) { $numbersByTelephone[$bareNumber] } else { $null }
+
+                if ($numberInfo -and -not [string]::IsNullOrWhiteSpace($numberInfo.AssignedPstnTargetId) -and
+                    [string]$numberInfo.AssignedPstnTargetId -ne [string]$target.Identity) {
+                    throw ("Number $number is already assigned to another target " +
+                        "($($numberInfo.AssignedPstnTargetId)). Unassign it first.")
+                }
+
+                if ([string]::IsNullOrWhiteSpace($numberType)) {
+                    # Numbers absent from the tenant inventory are Direct Routing - Calling
+                    # Plan and Operator Connect numbers always appear there.
+                    $typeSource = if ($numberInfo) { $numberInfo } else { $bareNumberInfo }
+                    $numberType = if ($typeSource) { [string]$typeSource.NumberType } else { 'DirectRouting' }
+                }
+                $matchedType = $validNumberTypes | Where-Object { $_ -ieq $numberType } | Select-Object -First 1
+                if (-not $matchedType) {
+                    throw "Unknown PhoneNumberType '$numberType'. Expected one of: $($validNumberTypes -join ', ')."
+                }
+                $numberType = $matchedType
+
+                # LocationId is tenant-scoped (Get-CsOnlineLisLocation), so a value carried
+                # over from a source-tenant export - including the all-zeros placeholder the
+                # Get- export emits for numbers with no location - cannot simply be forwarded.
+                # -User is a single operator-typed value: an unknown ID fails the row. -CsvPath
+                # is bulk source data: an unresolvable ID is dropped and the row still assigns,
+                # with a note that the location must be set manually.
+                $locationId = $item.LocationId
+                $locationNote = ''
+                if ($locationId -eq '00000000-0000-0000-0000-000000000000') { $locationId = $null }
+                if ($locationId) {
+                    try {
+                        $null = Get-CsOnlineLisLocation -LocationId $locationId -ErrorAction Stop
+                    }
+                    catch {
+                        if ($PSCmdlet.ParameterSetName -eq 'User') {
+                            throw "LocationId '$locationId' does not exist in this tenant: $($_.Exception.Message)"
+                        }
+                        $locationId = $null
+                        $locationNote = ' LocationId did not exist in this tenant; assign an emergency location manually.'
+                    }
+                }
+
+                $assignParameters = @{
+                    Identity        = $identity
                     PhoneNumber     = $number
                     PhoneNumberType = $numberType
                     ErrorAction     = 'Stop'
                 }
-                if ($item.LocationId) { $assignParams['LocationId'] = $item.LocationId }
-                Set-CsPhoneNumberAssignment @assignParams
-                $detail = "Assigned $number ($numberType)."
+                if ($locationId) { $assignParameters['LocationId'] = $locationId }
 
-                if ($policy) {
-                    Grant-CsOnlineVoiceRoutingPolicy -Identity $upn -PolicyName $policy -ErrorAction Stop
-                    $detail += " Granted voice routing policy '$policy'."
+                if ($isDryRun) {
+                    $null = Invoke-MigrationAction -Description "Assign $number ($numberType) to $identity" -Action { }
+                    $status = 'Planned'
+                    $detail = "Would assign $number ($numberType).$locationNote"
+                    if ($policy) {
+                        $null = Invoke-MigrationAction -Description "Grant voice routing policy '$policy' to $identity" -Action { }
+                        $detail += " Would grant voice routing policy '$policy'."
+                    }
+                }
+                elseif ($PSCmdlet.ShouldProcess($identity, "Assign phone number $number ($numberType)")) {
+                    $null = Invoke-MigrationAction -Description "Assign $number ($numberType) to $identity" -Action {
+                        Set-CsPhoneNumberAssignment @assignParameters
+                    }
+                    $status = 'Succeeded'
+                    $detail = "Assigned $number ($numberType).$locationNote"
+
+                    if ($policy) {
+                        $null = Invoke-MigrationAction -Description "Grant voice routing policy '$policy' to $identity" -Action {
+                            Grant-CsOnlineVoiceRoutingPolicy -Identity $identity -PolicyName $policy -ErrorAction Stop
+                        }
+                        $detail += " Granted voice routing policy '$policy'."
+                    }
+                }
+                else {
+                    # Not a rehearsal: -WhatIf or a declined prompt means nothing was attempted,
+                    # so the row is a skip. 'Planned' is reserved for -DryRun.
+                    $status = 'Skipped'
+                    $detail = 'Declined at the confirmation prompt.'
                 }
             }
+        }
+        catch {
+            $status = 'Failed'
+            $message = $_.Exception.Message
+            if ($message -match 'license|licence|capability') {
+                $detail = 'The user likely lacks a Teams Phone license (assignment needs e.g. Teams Phone ' +
+                    "Standard). Original error: $message"
+            }
             else {
-                $status = 'WhatIf'
-                $detail = "Would assign $number ($numberType)."
-                if ($policy) { $detail += " Would grant voice routing policy '$policy'." }
+                $detail = $message
             }
         }
-    }
-    catch {
-        $status = 'Failed'
-        $message = $_.Exception.Message
-        if ($message -match 'license|licence|capability') {
-            $detail = "The user likely lacks a Teams Phone license (assignment needs e.g. Teams Phone Standard). Original error: $message"
+
+        if ($status -eq 'Failed') { $exitCode = 2 }
+
+        $level = switch ($status) {
+            'Succeeded' { 'SUCCESS' }
+            'Failed' { 'ERROR' }
+            'Skipped' { 'WARNING' }
+            default { 'INFO' }
         }
-        else {
-            $detail = $message
-        }
+        Write-MigrationLog -Message ("[{0}] {1} - {2}" -f $status, $identity, $detail) -Level $level
+
+        # The columns after the four standard ones are the round-trip contract shared with
+        # Get- and Remove-MigrationTeamsPhoneAssignments.ps1.
+        $results.Add([pscustomobject][ordered]@{
+                Identity                 = $identity
+                Action                   = 'Assign phone number'
+                Status                   = $status
+                Detail                   = $detail
+                UserPrincipalName        = $identity
+                DisplayName              = $displayName
+                PhoneNumber              = $number
+                PhoneNumberType          = $numberType
+                LocationId               = $item.LocationId
+                OnlineVoiceRoutingPolicy = $policy
+            })
     }
 
-    $color = switch ($status) {
-        'Assigned' { 'Green' }
-        'WhatIf'   { 'Cyan' }
-        'Skipped'  { 'Yellow' }
-        default    { 'Red' }
-    }
-    Write-Host ("  [{0}] {1} - {2}" -f $status, $upn, $detail) -ForegroundColor $color
+    Write-Progress -Activity 'Assigning phone numbers' -Completed
 
-    $results.Add([pscustomobject][ordered]@{
-            UserPrincipalName        = $upn
-            DisplayName              = $displayName
-            PhoneNumber              = $number
-            PhoneNumberType          = $numberType
-            LocationId               = $item.LocationId
-            OnlineVoiceRoutingPolicy = $policy
-            Status                   = $status
-            Detail                   = $detail
-        })
+    $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Set-TeamsPhoneAssignments'
+}
+catch {
+    Write-MigrationLog -Message "Fatal: $($_.Exception.Message)" -Level ERROR
+    Write-MigrationLog -Message $_.ScriptStackTrace -Level DEBUG
+    $exitCode = 1
+}
+finally {
+    #region Cleanup ------------------------------------------------------------
+    # The Teams session is deliberately left connected: Connect-MigrationTeams reuses a live
+    # session, so disconnecting here would force a fresh sign-in for the next script in the run.
+    $null = Complete-MigrationRun -ExitCode $exitCode
+    #endregion -----------------------------------------------------------------
 }
 
-Write-Progress -Activity 'Assigning phone numbers' -Completed
+exit $exitCode
 
 #endregion ---------------------------------------------------------------------
-
-$assigned = ($results | Where-Object Status -eq 'Assigned').Count
-$failed = ($results | Where-Object Status -eq 'Failed').Count
-$skipped = ($results | Where-Object Status -eq 'Skipped').Count
-$whatif = ($results | Where-Object Status -eq 'WhatIf').Count
-
-Write-Host ''
-if ($DryRun) {
-    Write-Host "DRY RUN: $whatif number(s) would be assigned, $skipped skipped, $failed error(s). No changes made, no results CSV written." -ForegroundColor Magenta
-}
-else {
-    $resultsCsv = Join-Path -Path $outputDir -ChildPath "TeamsPhone-Assignments_$timestamp.csv"
-    $results | Export-Csv -Path $resultsCsv -NoTypeInformation -Encoding UTF8
-    Write-Host "Assigned: $assigned   Skipped: $skipped   Failed: $failed   WhatIf: $whatif" -ForegroundColor Green
-    Write-Host "Results CSV: $resultsCsv" -ForegroundColor Cyan
-}
-
-Disconnect-MicrosoftTeams -Confirm:$false | Out-Null
-Write-Host 'Done.' -ForegroundColor Green

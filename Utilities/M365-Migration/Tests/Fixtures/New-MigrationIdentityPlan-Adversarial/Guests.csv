@@ -1,0 +1,6 @@
+"ObjectId","UserPrincipalName","DisplayName","FirstName","MiddleName","LastName","Mail","UsageLocation","AccountEnabled","UserType","IsSynced","Licenses","ProxyAddresses"
+"g0000000-0000-0000-0000-000000000001","raj_fabrikam.com#EXT#@contoso.onmicrosoft.com","Raj Patel (Fabrikam)","Raj","","Patel","raj@fabrikam.com","IE","True","Guest","False","","SMTP:raj@fabrikam.com"
+"g0000000-0000-0000-0000-000000000002","sync.user@contoso.com","Sync User","Sync","","User","sync.user@contoso.com","IE","True","Member","True","ENTERPRISEPACK","SMTP:sync.user@contoso.com"
+"g0000000-0000-0000-0000-000000000003","break-glass-01@contoso.com","Break Glass 01","Break","","Glass","break-glass-01@contoso.com","IE","True","Member","False","","SMTP:break-glass-01@contoso.com"
+"g0000000-0000-0000-0000-000000000004","svc-backup@contoso.com","Backup Service Robot","Backup","","Robot","svc-backup@contoso.com","IE","True","Member","False","","SMTP:svc-backup@contoso.com"
+"g0000000-0000-0000-0000-000000000005","norma.albright@contoso.com","Norma Albright","Norma","","Albright","norma.albright@contoso.com","IE","True","Member","False","","SMTP:norma.albright@contoso.com"

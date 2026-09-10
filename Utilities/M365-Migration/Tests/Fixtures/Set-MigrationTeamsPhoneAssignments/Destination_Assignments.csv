@@ -1,0 +1,7 @@
+UserPrincipalName,PhoneNumber,Extension,PhoneNumberType,LocationId,OnlineVoiceRoutingPolicy
+mary.jones@newco.onmicrosoft.com,+15551110000,524,CallingPlan,loc-good,US-East
+other.target@newco.onmicrosoft.com,+15553330000,,DirectRouting,,
+newuser@newco.onmicrosoft.com,+15552220000,,,,
+badloc.user@newco.onmicrosoft.com,+15554440000,,CallingPlan,loc-bad,US-East
+typo.user@newco.onmicrosoft.com,+1555O123,,,,
+blank.user@newco.onmicrosoft.com,,,,,

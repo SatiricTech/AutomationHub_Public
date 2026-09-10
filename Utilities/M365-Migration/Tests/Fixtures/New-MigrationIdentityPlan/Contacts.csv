@@ -1,0 +1,2 @@
+"DisplayName","ExternalEmailAddress","PrimarySmtpAddress","Alias","FirstName","LastName","HiddenFromAddressListsEnabled","EmailAddresses"
+"Marcus Vendor","marcus@fabrikam.com","marcus.vendor@contoso.com","marcusvendor","Marcus","Vendor","False","SMTP:marcus.vendor@contoso.com"

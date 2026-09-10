@@ -1,0 +1,7 @@
+UserPrincipalName,DisplayName,PhoneNumber,Extension,PhoneNumberType,LocationId,OnlineVoiceRoutingPolicy
+john.smith@contoso.com,John Smith,+15551234567,101,CallingPlan,loc-hq,US-East
+hybrid.user@contoso.com,Hybrid User,+15557654321,,DirectRouting,,US-East
+synced.number@contoso.com,Synced Number,+15559990000,,DirectRouting,,US-East
+no.number@contoso.com,No Number,,,,,
+ghost@contoso.com,Ghost User,+15550000000,,CallingPlan,,
+legacy.result@contoso.com,Legacy Result,+15553330000,,DirectRouting,,US-East

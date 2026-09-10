@@ -1,0 +1,335 @@
+<p>The M365 Migration Toolkit is seventeen PowerShell scripts plus a shared module for a
+tenant-to-tenant migration. AvePoint Fly moves mailboxes, archives, OneDrive, SharePoint,
+Teams and M365 Groups; this toolkit designs and provisions destination identities,
+licenses users, recreates mailbox delegation, releases the source domain and verifies the
+result. Code: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Utilities/M365-Migration">github.com/SatiricTech/AutomationHub_Public —
+Utilities/M365-Migration</a> — pull the whole folder (every script imports the
+<code>M365Migration</code> module beside it); see its <code>README.md</code> for the full
+parameter reference, auth matrix and plan schema.</p>
+
+<h2>Prerequisites</h2>
+
+<ul>
+  <li>PowerShell 7.4 or later, Windows or macOS.</li>
+  <li><code>Microsoft.Graph.Authentication</code>, <code>ExchangeOnlineManagement</code>
+  (v3+), <code>MicrosoftTeams</code> (5.7.0+) and <code>ImportExcel</code> — auto-installed
+  for the current user on demand.</li>
+  <li>A dedicated Global Admin signed in directly to each tenant, pinned with
+  <code>-TenantId</code> — User Administrator (Privileged Authentication Administrator for
+  another admin), Exchange Administrator, Teams Administrator, Domain Name Administrator
+  for domain release, SharePoint Administrator only for OneDrive pre-provisioning.</li>
+  <li>Fly is authorised by app consent from a Global Admin in each tenant once the
+  tenants are connected in the Fly console. A service account is optional — only needed
+  if a specific Fly module asks for one.</li>
+  <li>GDAP alternative: a partner administering a tenant through GDAP passes
+  <code>-DelegatedOrganization &lt;customer&gt;.onmicrosoft.com</code> to the
+  Exchange-writing scripts instead of signing in as a Global Admin in it.</li>
+</ul>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Read the tenant line, and dry-run first</div>
+  <p>Every script prints the tenant id and display name it actually connected to —
+  <strong>read that line before you let any writer run.</strong> A stale cached session,
+  or a GDAP connect made without <code>-DelegatedOrganization</code>, lands you in the
+  wrong tenant.</p>
+  <p>Every writer accepts <code>-DryRun</code>: evaluates every row, writes a results
+  file with Status <code>Planned</code>, changes nothing — dry-run everything first.
+  Two exceptions: <code>Get-MigrationInventory -DryRun</code> writes only the log, no
+  results CSV; <code>Test-MigrationReadiness</code>'s checks are already read-only, so
+  <code>-DryRun</code> there just suppresses the Provisioned-stage plan writeback and
+  the OneDrive-provisioning read.</p>
+</div>
+
+<h2>The runbook</h2>
+
+<p>Every script writes into <code>~/Migration-Automations/&lt;Prefix&gt;/</code>
+(<code>%LOCALAPPDATA%\Migration-Automations\&lt;Prefix&gt;\</code> on Windows) and stamps
+each file with the run's timestamp as <code>yyyyMMdd-HHmmss</code>. Wherever a command below
+shows <code>&lt;ts&gt;</code>, substitute that stamp — <code>Source_Users_&lt;ts&gt;.csv</code>
+is really something like <code>Source_Users_20260909-101500.csv</code>. Only
+<code>-PlanPath</code> accepts a wildcard, and only when it matches exactly one file; every
+other CSV parameter needs the exact file name, so tab-complete it. The examples write
+<code>.\</code> for brevity, but the Source and Destination inventories land in two different
+folders — pass full paths, or run from a folder you have copied the CSVs into.</p>
+
+<ol>
+  <li><strong>Inventory both tenants</strong> — read-only.
+    <pre><code>.\Get-MigrationInventory.ps1 -Prefix Source -TenantId contoso.onmicrosoft.com -IncludeAuthMethods
+.\Get-MigrationInventory.ps1 -Prefix Destination -TenantId newco.onmicrosoft.com</code></pre>
+    <p><em>Check:</em> nine CSVs per tenant — the Source set in
+    <code>Migration-Automations/Source/</code>, the Destination set in
+    <code>Migration-Automations/Destination/</code>; Summary counts match the admin center.
+    Count <code>MfaRegistered = True</code> in the Users tab.</p></li>
+
+  <li><strong>Build the identity plan</strong> — offline, no tenant connection.
+    <pre><code>.\New-MigrationIdentityPlan.ps1 -UsersCsv .\Source_Users_&lt;ts&gt;.csv `
+    -UserMailboxesCsv .\Source_UserMailboxes_&lt;ts&gt;.csv `
+    -SharedMailboxesCsv .\Source_SharedMailboxes_&lt;ts&gt;.csv `
+    -GroupsCsv .\Source_Groups_&lt;ts&gt;.csv -ContactsCsv .\Source_Contacts_&lt;ts&gt;.csv `
+    -TargetDomain newco.com -InterimDomain newco.onmicrosoft.com -UpnFormat First.Last `
+    -ReservedAddressesPath .\Destination_Users_&lt;ts&gt;.csv -Prefix Contoso</code></pre>
+    <p>What the parameters mean:</p>
+    <ul>
+      <li>The five <code>-*Csv</code> inputs are tabs from the <strong>Source</strong>
+      inventory in step 1. Only <code>-UsersCsv</code> is required; the others add shared
+      mailboxes, groups and contacts to the plan.</li>
+      <li><code>-TargetDomain</code> is the vanity domain users end up on.
+      <code>-UpnFormat</code> is the naming preset for the new UPNs and primary SMTP
+      addresses — <code>First.Last</code>, <code>FLast</code>, <code>F.Last</code>,
+      <code>Keep</code> and others are listed in the README.</li>
+      <li><code>-InterimDomain</code> is the destination tenant's onmicrosoft.com domain.
+      Accounts are provisioned there first because the vanity domain cannot be verified in
+      the destination until the source tenant releases it. Omit it if the domain has
+      already moved.</li>
+      <li><code>-ReservedAddressesPath</code> is the <strong>Destination</strong>
+      inventory's Users tab, so addresses already in use there are flagged
+      <code>ExistsInDestination</code> instead of colliding.</li>
+      <li><code>-Prefix</code> names the client. The output is one
+      <code>Contoso_IdentityPlan_&lt;ts&gt;.csv</code> in
+      <code>Migration-Automations/Contoso/</code>, which every later step reads.</li>
+    </ul>
+    <p><em>Check:</em> zero <code>Invalid</code> rows; every <code>NeedsReview</code>/
+    <code>Collision</code> row fixed and marked <code>ManualOverride</code>. Send the
+    plan for client sign-off.</p></li>
+
+  <li><strong>Export the Fly mapping file</strong> — offline.
+    <pre><code>.\Export-MigrationMappingFile.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv `
+    -Tool AvePoint -UseInterim -Prefix Contoso</code></pre>
+    <p><em>Check:</em> no unexpected <code>Skipped</code> rows.</p></li>
+
+  <li><strong>Readiness — stage Pre.</strong>
+    <pre><code>.\Test-MigrationReadiness.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv -Stage Pre `
+    -TenantId newco.onmicrosoft.com -Prefix Contoso</code></pre>
+    <p><em>Check:</em> exit code 0 before you provision anything.</p></li>
+
+  <li><strong>Fly console: create the project and connect both tenants.</strong> Grant
+    Fly app consent per tenant, connect them, upload the mapping file from step 3.
+    <p><em>Check:</em> both tenants connected, mapping accepted, no unmatched rows.</p></li>
+
+  <li><strong>Provision the destination users.</strong>
+    <pre><code>.\New-MigrationUsers.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv -Wave 1 -UseInterim `
+    -HideFromAddressLists -SetManagers -TenantId newco.onmicrosoft.com -Prefix Contoso -DryRun</code></pre>
+    <p><em>Check:</em> drop <code>-DryRun</code> once the results file looks right;
+    every row <code>Succeeded</code>, plan now carries <code>TargetObjectId</code>.
+    Passwords are in the results CSV only — secure it immediately.</p></li>
+
+  <li><strong>Licence them.</strong>
+    <pre><code>.\Set-MigrationLicenses.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv -Wave 1 `
+    -DefaultUsageLocation US -TenantId newco.onmicrosoft.com -Prefix Contoso</code></pre>
+    <p><em>Check:</em> seat pre-check shows no shortfall. Group-assigned SKUs are
+    skipped — fix by changing group membership.</p></li>
+
+  <li><strong>Create mail recipients.</strong>
+    <pre><code>.\New-MigrationRecipients.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv -Wave 1 `
+    -Mode CreateAndUpdate -GroupsCsv .\Source_Groups_&lt;ts&gt;.csv `
+    -ContactsCsv .\Source_Contacts_&lt;ts&gt;.csv -SharedMailboxesCsv .\Source_SharedMailboxes_&lt;ts&gt;.csv `
+    -TenantId newco.onmicrosoft.com -Prefix Contoso</code></pre>
+    <p><em>Check:</em> unmapped members/owners (usually ex-employees) reported per row,
+    not fatal. <code>-Mode UpdateSettings</code> alone patches groups Fly already
+    created.</p></li>
+
+  <li><strong>Readiness — stage Provisioned.</strong>
+    <pre><code>.\Test-MigrationReadiness.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv -Stage Provisioned `
+    -SourceMailboxesCsv .\Source_UserMailboxes_&lt;ts&gt;.csv -TenantId newco.onmicrosoft.com `
+    -Prefix Contoso</code></pre>
+    <p><em>Check:</em> mailbox, archive, hold off, OneDrive provisioned, quota not below
+    source. Writes <code>MailboxProvisioned</code>/<code>OneDriveProvisioned</code> back
+    to the plan.</p></li>
+
+  <li><strong>Fly console: run the pre-cutover content jobs.</strong> Mailboxes,
+    archives, OneDrive, SharePoint, Teams, M365 Groups; re-run deltas until each pass
+    is quick.
+    <p><em>Check:</em> delta passes stay small, errors don't grow. Chase recurring
+    per-item failures before cutover.</p></li>
+
+  <li><strong>Release the vanity domain in the source tenant.</strong> Report first.
+    <pre><code>.\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -ReportOnly `
+    -TenantId contoso.onmicrosoft.com -Prefix Contoso
+
+.\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -AcknowledgeSourceTenant `
+    -TenantId contoso.onmicrosoft.com -Prefix Contoso</code></pre>
+    <p><em>Check:</em> the remediation run exits 0 and
+    <code>_DomainBlockers-Recheck_&lt;ts&gt;.csv</code> holds only the "no rows" entry —
+    not a <code>-ReportOnly</code> exit code or an empty pre-remediation Blockers CSV.
+    Then remove the domain and verify it in the destination.</p></li>
+
+  <li><strong>Cutover day: mail flow.</strong> Change MX to the destination tenant;
+    update SPF, DKIM, DMARC and any mail-filter connectors.
+    <p><em>Check:</em> test message in and out before touching identities.</p></li>
+
+  <li><strong>Apply the target identities.</strong>
+    <pre><code>.\Set-MigrationIdentity.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv -Wave 1 `
+    -Apply Upn,PrimarySmtp,Aliases,X500,MailNickname,GalVisibility -Unhide `
+    -MatchOn TargetObjectId -TenantId newco.onmicrosoft.com -Confirm:$false -Prefix Contoso</code></pre>
+    <p><em>Check:</em> <code>-Confirm:$false</code> is needed (High <code>ConfirmImpact</code>
+    prompts per object otherwise). Spot-check three users: UPN, primary SMTP, aliases,
+    X500, unhidden. Directory-synced rows report <code>Failed</code> — fix on-premises.</p></li>
+
+  <li><strong>Re-apply mailbox delegation.</strong>
+    <pre><code>.\Set-MigrationMailboxPermissions.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv `
+    -MailboxPermissionsCsv .\Source_MailboxPermissions_&lt;ts&gt;.csv `
+    -UserMailboxesCsv .\Source_UserMailboxes_&lt;ts&gt;.csv `
+    -SharedMailboxesCsv .\Source_SharedMailboxes_&lt;ts&gt;.csv `
+    -Apply FullAccess,SendAs,SendOnBehalf,Calendar,Forwarding -Wave 1 -Confirm:$false `
+    -Prefix Contoso</code></pre>
+    <p><em>Check:</em> <code>-Confirm:$false</code> again (same High <code>ConfirmImpact</code>).
+    Review <code>Skipped</code> rows — an unmapped trustee means a service-desk call.
+    Safe to re-run; existing grants report already present.</p></li>
+
+  <li><strong>Reset cutover passwords.</strong>
+    <pre><code>.\Reset-MigrationCutoverPasswords.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv -Wave 1 `
+    -TenantId newco.onmicrosoft.com -Confirm:$false -Prefix Contoso</code></pre>
+    <p><em>Check:</em> <code>-Confirm:$false</code> — High <code>ConfirmImpact</code>,
+    per-user prompt. One passphrase per user, flagged to change at next sign-in.
+    Distribute out of band, never by email to that tenant.</p></li>
+
+  <li><strong>Teams Phone.</strong> Release in the source, reassign in the destination
+    once the port completes — start the port weeks ahead, it gates cutover.
+    <pre><code>.\Get-MigrationTeamsPhoneAssignments.ps1 -Prefix Source -TenantId contoso.onmicrosoft.com -IncludeUnassignedNumbers
+.\Remove-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments_&lt;ts&gt;.csv `
+    -TenantId contoso.onmicrosoft.com -Confirm:$false -Prefix Source
+.\Set-MigrationTeamsPhoneAssignments.ps1 -ListUnassigned -TenantId newco.onmicrosoft.com -Prefix Destination
+.\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments_&lt;ts&gt;.csv `
+    -TenantId newco.onmicrosoft.com -Confirm:$false -Prefix Destination</code></pre>
+    <p><em>Check:</em> <code>-ListUnassigned</code> (no changes, no prompt) confirms the
+    numbers arrived before reassigning; the other two live commands need
+    <code>-Confirm:$false</code> (High <code>ConfirmImpact</code>). Users need a Teams
+    Phone licence; hybrid on-prem numbers report <code>Failed</code>.</p></li>
+
+  <li><strong>Viva Learning history</strong> (optional).
+    <pre><code>.\Get-MigrationVivaLearningHistory.ps1 -Prefix Source -TenantId contoso.onmicrosoft.com
+.\Import-MigrationVivaLearningHistory.ps1 -CsvPath .\Source_VivaLearningHistory_&lt;ts&gt;.csv `
+    -TenantId newco.onmicrosoft.com -ClientId &lt;app-id&gt; `
+    -ClientSecret (Read-Host -AsSecureString 'Secret') `
+    -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv -Prefix Contoso -DryRun</code></pre>
+    <p><em>Check:</em> fill blank <code>CourseTitle</code>/<code>CourseWebUrl</code>
+    cells before the real import; catalog content can take 24 hours to appear.</p></li>
+
+  <li><strong>Readiness — stage Post.</strong>
+    <pre><code>.\Test-MigrationReadiness.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv -Stage Post `
+    -TenantId newco.onmicrosoft.com -Prefix Contoso</code></pre>
+    <p><em>Check:</em> exit code 0 — UPN, primary SMTP, every alias, X500, unhidden,
+    enabled.</p></li>
+
+  <li><strong>Compare.</strong> Re-inventory the destination and diff it against the
+    plan.
+    <pre><code>.\Get-MigrationInventory.ps1 -Prefix Post -TenantId newco.onmicrosoft.com
+.\Compare-MigrationUserData.ps1 -PlanPath .\Contoso_IdentityPlan_&lt;ts&gt;.csv `
+    -DifferenceCsv .\Post_Users_&lt;ts&gt;.csv -Prefix Contoso</code></pre>
+    <p><em>Check:</em> every plan row <code>Match</code> — anything else didn't make
+    it, cheaper to find now than in a week.</p></li>
+</ol>
+
+<h2>Fly versus toolkit: who owns what</h2>
+
+<table>
+  <thead>
+    <tr><th>Workstream</th><th>AvePoint Fly</th><th>Toolkit</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Mailboxes, archives, OneDrive, SharePoint, Teams, M365 Groups</td><td>Yes</td><td>—</td></tr>
+    <tr><td>Destination accounts, attributes, manager, GAL hiding</td><td>Partial (no password/manager)</td><td><code>New-MigrationUsers</code></td></tr>
+    <tr><td>Licence assignment, usage location</td><td>Partial (needs seats + location)</td><td><code>Set-MigrationLicenses</code></td></tr>
+    <tr><td>UPN / SMTP design, aliases, interim identities</td><td>No — suffix rewrite only</td><td><code>New-MigrationIdentityPlan</code>, <code>Set-MigrationIdentity</code></td></tr>
+    <tr><td>DLs, security groups, dynamic DLs, mail contacts</td><td>Partial — members/owners only</td><td><code>New-MigrationRecipients</code></td></tr>
+    <tr><td>Shared/room/equipment mailboxes as objects</td><td>Partial — converts a licensed user</td><td><code>New-MigrationRecipients</code></td></tr>
+    <tr><td>FullAccess, SendAs, SendOnBehalf, calendar, forwarding</td><td>Partial per module</td><td><code>Set-MigrationMailboxPermissions</code></td></tr>
+    <tr><td>X500 / LegacyExchangeDN stamping</td><td>No</td><td><code>Set-MigrationIdentity -Apply X500</code>, <code>New-MigrationRecipients</code></td></tr>
+    <tr><td>Releasing the vanity domain from the source tenant</td><td>No</td><td><code>Remove-MigrationDomainReferences</code></td></tr>
+    <tr><td>Cutover credentials</td><td>No</td><td><code>Reset-MigrationCutoverPasswords</code></td></tr>
+    <tr><td>Teams Phone numbers</td><td>No</td><td>Teams Phone Get / Remove / Set</td></tr>
+    <tr><td>Viva Learning history</td><td>No</td><td>Viva Get / Import</td></tr>
+    <tr><td>Destination readiness pre-flight</td><td>Checklist only</td><td><code>Test-MigrationReadiness</code></td></tr>
+  </tbody>
+</table>
+
+<h2>Identity plan decisions</h2>
+
+<p><strong>Interim domain.</strong> The vanity domain can only live in one tenant at a
+time, so provision on <code>newco.onmicrosoft.com</code> first with
+<code>New-MigrationUsers -UseInterim</code>, then apply the real <code>Target*</code> addresses with
+<code>Set-MigrationIdentity</code> once the domain has moved. Omit
+<code>-InterimDomain</code> only when the domain is already in the destination, or for
+an in-place redesign.</p>
+
+<p><strong>UPN is not the primary SMTP.</strong> <code>-SmtpFormat</code> defaults to
+<code>-UpnFormat</code>, so they usually match. Setting it separately produces a user who
+signs in as <code>jsmith@newco.onmicrosoft.com</code> but receives mail as
+<code>john.smith@newco.com</code> — flagged <code>UpnSmtpDiverge</code> deliberately, so
+the service desk knows the sign-in address is not the mailbox address.</p>
+
+<p><strong>In-place UPN redesign.</strong> The same tooling standardises addressing
+inside one tenant, no second tenant: inventory it, run
+<code>New-MigrationIdentityPlan</code> against its own export with its own domain as
+<code>-TargetDomain</code> and no interim domain, review the plan, then apply with
+<code>Set-MigrationIdentity -MatchOn Source</code> — the objects already exist, so
+<code>Source*</code> is today and <code>Target*</code> the new scheme. The old primary
+stays as an alias unless <code>-RemoveOldPrimaryAlias</code>; add
+<code>-Confirm:$false</code> or it prompts per operation.</p>
+
+<h2>Cutover day checklist</h2>
+
+<table>
+  <thead>
+    <tr><th>#</th><th>Task</th><th>Done when</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>Final Fly delta pass complete</td><td>Stable error count</td></tr>
+    <tr><td>2</td><td>Source domain released and removed</td><td>Remediation exits 0, Recheck CSV holds only "no rows"</td></tr>
+    <tr><td>3</td><td>Domain verified in the destination tenant</td><td>Healthy in the admin center</td></tr>
+    <tr><td>4</td><td>MX, SPF, DKIM, DMARC repointed</td><td>Test messages deliver both ways</td></tr>
+    <tr><td>5</td><td>Identities applied</td><td>Results have no <code>Failed</code> rows</td></tr>
+    <tr><td>6</td><td>Mailbox delegation re-applied</td><td>Run complete, skipped trustees triaged</td></tr>
+    <tr><td>7</td><td>Passwords reset and distributed</td><td>Credential CSV vaulted, users notified out of band</td></tr>
+    <tr><td>8</td><td>Teams Phone numbers assigned</td><td>Test call in/out per site</td></tr>
+    <tr><td>9</td><td>Conditional Access / MFA enabled</td><td>Policies on, project exclusions removed</td></tr>
+    <tr><td>10</td><td>Readiness stage Post clean</td><td>Exit code 0</td></tr>
+    <tr><td>11</td><td>Comparison clean</td><td>Every plan row matches</td></tr>
+  </tbody>
+</table>
+
+<h2>Troubleshooting</h2>
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>Fix</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Replies to old mail bounce with an IMCEAEX NDR</td>
+        <td><code>LegacyExchangeDN</code> never stamped as X500 — run <code>Set-MigrationIdentity -Apply X500</code></td></tr>
+    <tr><td><code>assignLicense</code> fails, "invalid usage location"</td>
+        <td>Set <code>UsageLocation</code> in the plan, or pass <code>-DefaultUsageLocation</code></td></tr>
+    <tr><td>A licence will not come off, or comes back doubled</td>
+        <td>Group-assigned. <code>Set-MigrationLicenses</code> skips both directions — change group membership</td></tr>
+    <tr><td>User create or UPN rename returns 409 "already exists"</td>
+        <td>A soft-deleted user holds the address. <code>Test-MigrationReadiness -Stage Pre</code> lists it — purge or restore</td></tr>
+    <tr><td>403 <code>Authorization_RequestDenied</code> on one account</td>
+        <td>Target holds an admin role — use Privileged Authentication Administrator</td></tr>
+    <tr><td>"Out of the current user's write scope"; row reports <code>Failed</code></td>
+        <td>Directory-synced object — change on-premises, let AAD Connect sync</td></tr>
+    <tr><td>Still visible in the GAL despite <code>New-MigrationUsers -HideFromAddressLists</code></td>
+        <td>Graph's <code>showInAddressList</code> loses to Exchange once mailboxed — re-apply <code>Set-MigrationIdentity -Apply GalVisibility</code></td></tr>
+    <tr><td>Domain will not delete from the source tenant</td>
+        <td><code>Remove-MigrationDomainReferences -ReportOnly</code> lists references plus blockers. Guest <code>#EXT#</code> UPNs are informational</td></tr>
+    <tr><td>A Teams number will not release from the source tenant</td>
+        <td>Hybrid, synced on-premises (<code>OnPremLineURI</code>) — clear it there; the script reports <code>Failed</code></td></tr>
+    <tr><td>Script says a CSV or plan file was not found though it exists</td>
+        <td>Only <code>-PlanPath</code> resolves a unique wildcard; every other CSV path is literal — pass the exact file name</td></tr>
+  </tbody>
+</table>
+
+<h2>Change log</h2>
+
+<table>
+  <thead>
+    <tr><th>Date</th><th>By</th><th>Change</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>2026-09-09</td>
+        <td>Sentinel Cyber</td>
+        <td>Runbook: explained the <code>&lt;ts&gt;</code> timestamp placeholder, where each run's files land, and what every <code>New-MigrationIdentityPlan</code> parameter is.</td></tr>
+    <tr><td>2026-09-09</td>
+        <td>Sentinel Cyber</td>
+        <td>Rewritten to match the scripts exactly — removed parameters and examples the code no longer has. <code>New-MigrationUsers</code> now also carries the extended Entra profile onto the destination account.</td></tr>
+  </tbody>
+</table>

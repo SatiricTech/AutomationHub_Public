@@ -1,0 +1,3 @@
+"Pattern","MatchOn","Reason","MatchType"
+"break-glass*","UserPrincipalName","Emergency access account - must never be migrated","Wildcard"
+"^svc-[a-z]+@","UserPrincipalName","Service account - regular expression written as a wildcard","Wildcard"
