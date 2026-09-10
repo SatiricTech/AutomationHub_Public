@@ -1,0 +1,5 @@
+"UserPrincipalName","ActivityType","Status","ExternalCourseActivityId","CourseExternalId","CourseTitle","CourseWebUrl"
+"nobody@contoso.com","SelfInitiated","completed","act-101","course-001","Security Awareness 101","https://learn.contoso.com/courses/security-101"
+"jsmith@contoso.com","Webinar","completed","act-102","course-001","Security Awareness 101","https://learn.contoso.com/courses/security-101"
+"jsmith@contoso.com","SelfInitiated","Done","act-103","course-001","Security Awareness 101","https://learn.contoso.com/courses/security-101"
+"bjones@contoso.com","SelfInitiated","completed","act-104","course-003","",""

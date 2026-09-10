@@ -13,9 +13,11 @@
 
     Both sides of every permission are translated through the identity plan. A row saying
     "reception@contoso.com grants FullAccess to jsmith@contoso.com" only produces a change when the
-    plan knows the destination address for both the mailbox and the trustee; when either side is
-    unmapped the row is reported Skipped with the address that could not be resolved, because
-    guessing at a trustee is how somebody ends up with access to a mailbox they should not see.
+    plan knows the destination address for both the mailbox and the trustee; a mailbox that is not
+    among the selected plan rows is not reported at all, and an unmapped trustee (or an unmapped
+    internal forwarding target) is reported Skipped with the address that could not be resolved,
+    because guessing at a trustee is how somebody ends up with access to a mailbox they should not
+    see.
 
     The trustee map is deliberately built from the whole plan rather than from the selected wave.
     Delegation crosses waves constantly - a wave 2 mailbox is very often delegated to somebody who
@@ -48,7 +50,9 @@
 .PARAMETER Apply
     Which permission kinds to re-apply: FullAccess, SendAs, SendOnBehalf, Calendar, Forwarding.
     Defaults to everything except Forwarding, which is opt-in because re-creating a forward at
-    cutover can loop mail straight back into the source tenant.
+    cutover can loop mail straight back into the source tenant. An unmapped ForwardingAddress
+    (an internal recipient the plan does not cover) or a ForwardingSmtpAddress at a source-tenant
+    domain is reported Skipped rather than re-created, for the same reason.
 
 .PARAMETER Wave
     Only re-apply permissions for mailboxes whose plan row is in one of these waves. Trustees are
@@ -116,9 +120,10 @@
                    (GrantSendOnBehalfTo, forwarding) and Add/Set-MailboxFolderPermission are all
                    covered by that role.
     Graph scopes : None - this script is Exchange Online only.
-    GDAP         : Supported. Pass -DelegatedOrganization <customer>.onmicrosoft.com. Add
-                   -DisableWAM to the Connect-ExchangeOnline call if GDAP claims are dropped on
-                   your workstation.
+    GDAP         : Supported. Pass -DelegatedOrganization <customer>.onmicrosoft.com. If GDAP
+                   claims are dropped, run Connect-ExchangeOnline -DisableWAM
+                   -DelegatedOrganization <customer> yourself first; the script reuses the live
+                   session rather than opening its own.
     Limits       : Exchange Online caps a mailbox at roughly 500 explicit ACEs. Beyond that, grant
                    FullAccess to a mail-enabled security group instead of to individuals.
     Calendars    : The calendar folder is addressed as <mailbox>:\Calendar. A mailbox created in a
@@ -248,6 +253,37 @@ function ConvertFrom-PermissionEntry {
     }
 }
 
+function Get-CanonicalNameLeaf {
+    <#
+    .SYNOPSIS
+        Returns the leaf segment of an Exchange canonical name.
+
+    .DESCRIPTION
+        GrantSendOnBehalfTo returns a canonical name such as contoso.com/Users/Bea Kane rather than
+        an address, and the plan map does not key on that shape. The leaf is the object's Exchange
+        Name attribute, which usually - but not always, since Exchange appends a uniqueness suffix
+        on a Name collision - equals DisplayName, so this is a fallback rather than a guaranteed
+        match. A value that is not canonical-name shaped is returned unchanged.
+
+    .EXAMPLE
+        Get-CanonicalNameLeaf -Value 'contoso.com/Users/Bea Kane'
+
+        Returns 'Bea Kane'.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+
+    $text = ([string]$Value).Trim()
+    if ($text -match '/') {
+        $leaf = $text.Substring($text.LastIndexOf('/') + 1).Trim()
+        if ($leaf) { return $leaf }
+    }
+    return $text
+}
+
 function ConvertTo-PermissionPrincipal {
     <#
     .SYNOPSIS
@@ -283,6 +319,10 @@ function ConvertTo-PermissionPrincipal {
 
     if ($Entry -is [string]) {
         & $addValue $Entry
+        # GrantSendOnBehalfTo reports the trustee as a canonical name (contoso.com/Users/Bea Kane);
+        # the leaf is added too so a comparison against the plan's SMTP address or DisplayName can
+        # still match.
+        & $addValue (Get-CanonicalNameLeaf -Value $Entry)
         return [string[]]$values.ToArray()
     }
 
@@ -363,7 +403,17 @@ function Get-PermissionDiff {
                     return [pscustomobject]@{ Action = 'Skip'; Detail = 'Calendar permission already present.' }
                 }
                 $current = ($rights -join ', ')
-                if (@($rights | Where-Object { $_ -ieq $AccessRights }).Count -gt 0) {
+                # AccessRights can carry more than one right joined with a comma (the inventory
+                # writes 'Calendar:ReadItems,FolderVisible'), so the wanted set is compared against
+                # the existing set as sets rather than as a single string - otherwise a
+                # multi-right entry never matches and is re-applied on every run.
+                $wantedRights = @($AccessRights -split '\s*,\s*' | Where-Object { $_ })
+                $missing = @($wantedRights | Where-Object {
+                    $want = $_; @($rights | Where-Object { $_ -ieq $want }).Count -eq 0
+                })
+                $sameSet = ($wantedRights.Count -gt 0) -and ($wantedRights.Count -eq $rights.Count) -and
+                    ($missing.Count -eq 0)
+                if ($sameSet) {
                     return [pscustomobject]@{ Action = 'Skip'; Detail = "Calendar permission already present ($current)." }
                 }
                 return [pscustomobject]@{
@@ -514,9 +564,15 @@ function Set-MailboxForwarding {
         Re-applies a mailbox's forwarding configuration.
 
     .DESCRIPTION
-        ForwardingAddress points at an internal recipient and is mapped through the plan;
-        ForwardingSmtpAddress is a literal SMTP address that may well be external, so it is mapped
-        when the plan knows it and passed through untouched when it does not.
+        The caller always applies the destination address through this cmdlet's
+        -ForwardingSmtpAddress parameter, whether the source row's forward was originally an
+        internal ForwardingAddress or a literal ForwardingSmtpAddress: once the target has been
+        translated through the plan it is a destination-tenant SMTP address either way, and using
+        -ForwardingSmtpAddress avoids a recipient lookup that can fail mid-cutover. The distinction
+        between the two source columns is made by the caller, before this is reached - an
+        unmapped internal ForwardingAddress is skipped rather than passed through here, and an
+        unmapped ForwardingSmtpAddress is rejected when it sits at a source-tenant domain, because
+        re-creating either verbatim can loop mail straight back into the source tenant.
 
     .EXAMPLE
         Set-MailboxForwarding -Mailbox 'jane@newco.com' -ForwardingSmtpAddress 'team@fabrikam.com' `
@@ -553,6 +609,39 @@ function Set-MailboxForwarding {
     Invoke-MigrationAction -Description $description -Action {
         Set-Mailbox @parameters
     }
+}
+
+function Test-MigrationSourceDomainAddress {
+    <#
+    .SYNOPSIS
+        True when an SMTP address's domain is one the plan lists as a source domain.
+
+    .DESCRIPTION
+        A ForwardingSmtpAddress the plan does not map is normally passed through as-is - it is
+        usually an external partner. But when its domain matches a source domain seen in the
+        plan, passing it through re-creates exactly the loop the -Apply help warns about: the
+        address still lives in the source tenant while migration is under way, and even in a
+        vanity-domain migration where the domain eventually moves to the destination, an address
+        the plan does not map is still wrong once it lands there.
+
+    .EXAMPLE
+        Test-MigrationSourceDomainAddress -Address 'dl@contoso.com' -SourceDomain $domains
+
+        Returns $true when contoso.com is one of the plan's source domains.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Address,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$SourceDomain
+    )
+
+    if ($null -eq $SourceDomain -or $SourceDomain.Count -eq 0) { return $false }
+
+    $at = $Address.LastIndexOf('@')
+    if ($at -lt 0) { return $false }
+
+    return $SourceDomain.Contains($Address.Substring($at + 1))
 }
 
 function Get-DestinationPermissionState {
@@ -658,6 +747,18 @@ try {
     $addressMap = Get-MigrationPlanAddressMap -Rows $allPlanRows
     Write-MigrationLog -Message "Address map holds $($addressMap.Count) source identifier(s)." -Level INFO
 
+    # Domains the plan names as source-tenant domains. Used to catch a ForwardingSmtpAddress the
+    # plan does not map but that still points back at the source tenant - passing that through
+    # would re-create the mail loop the -Apply help warns about.
+    $sourceDomains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in $allPlanRows) {
+        foreach ($column in @('SourcePrimarySmtp', 'SourceUserPrincipalName')) {
+            $value = [string](Get-MigrationCsvValue -Row $row -Name $column -Default '')
+            $at = $value.LastIndexOf('@')
+            if ($at -ge 0) { [void]$sourceDomains.Add($value.Substring($at + 1)) }
+        }
+    }
+
     # Mailboxes are restricted to the selected wave and to actionable plan statuses.
     $selectedRows = @(Select-MigrationPlanRows -Rows $allPlanRows -Wave $Wave |
         Where-Object { (Test-MigrationPlanRowActionable -Row $_ -IncludeCollisions:$IncludeCollisions -AllowSynced).Actionable })
@@ -693,6 +794,13 @@ try {
         if (-not $parsed.IsKnown) { continue }
         if ($requestedKinds -notcontains $parsed.Kind) { continue }
 
+        if ($parsed.Kind -eq 'SendOnBehalf') {
+            # The MailboxPermissions tab writes this trustee straight from GrantSendOnBehalfTo, in
+            # canonical-name form (contoso.com/Users/Bea Kane) - the plan map does not key on that
+            # shape, so the leaf is used instead of leaving every one of these unmapped.
+            $trustee = Get-CanonicalNameLeaf -Value $trustee
+        }
+
         $wanted.Add([pscustomobject]@{
             SourceMailbox = ([string](Get-MigrationCsvValue -Row $row -Name 'MailboxPrimarySmtp' -Default '')).Trim()
             SourceTrustee = $trustee
@@ -718,15 +826,27 @@ try {
 
         if ($requestedKinds -contains 'SendOnBehalf') {
             foreach ($entry in (Split-MigrationList -Value (Get-MigrationCsvValue -Row $row -Name 'GrantSendOnBehalfTo' -Default ''))) {
-                $trustee = ([string]$entry).Trim()
+                $trustee = Get-CanonicalNameLeaf -Value (([string]$entry).Trim())
                 if (-not $trustee -or $trustee -match $ignoredTrusteePattern) { continue }
+
+                # A delegation reported here and on the permissions tab rarely arrives in the same
+                # shape (this column can be a resolved SMTP address, the permissions tab a raw
+                # canonical name), so a raw-string comparison alone misses the duplicate. Falling
+                # back to comparing where both sides resolve in the plan collapses the two onto one
+                # item instead of producing an extra live row.
+                $resolvedTrustee = Resolve-MigrationPlanAddress -Map $addressMap -Address $trustee -Role 'trustee'
                 $duplicate = @($wanted | Where-Object {
-                    $_.Kind -eq 'SendOnBehalf' -and $_.SourceMailbox -ieq $sourceMailbox -and $_.SourceTrustee -ieq $trustee
+                    if ($_.Kind -ne 'SendOnBehalf' -or -not ($_.SourceMailbox -ieq $sourceMailbox)) { return $false }
+                    if ($_.SourceTrustee -ieq $trustee) { return $true }
+                    if (-not $resolvedTrustee.IsMapped) { return $false }
+                    $otherResolved = Resolve-MigrationPlanAddress -Map $addressMap -Address $_.SourceTrustee -Role 'trustee'
+                    return ($otherResolved.IsMapped -and $otherResolved.Address -ieq $resolvedTrustee.Address)
                 })
                 if ($duplicate.Count -gt 0) { continue }
                 $wanted.Add([pscustomobject]@{
                     SourceMailbox = $sourceMailbox; SourceTrustee = $trustee
                     Kind = 'SendOnBehalf'; AccessRights = ''; AutoMapping = ''
+                    ForwardingAddress = ''; ForwardingSmtpAddress = ''
                 })
             }
         }
@@ -737,10 +857,15 @@ try {
             if ($forwardingAddress -or $forwardingSmtp) {
                 $wanted.Add([pscustomobject]@{
                     SourceMailbox = $sourceMailbox
+                    # Kept only for reporting - the two columns are resolved separately below,
+                    # because an unmapped internal ForwardingAddress and an unmapped external
+                    # ForwardingSmtpAddress are not the same risk.
                     SourceTrustee = if ($forwardingSmtp) { $forwardingSmtp } else { $forwardingAddress }
                     Kind          = 'Forwarding'
                     AccessRights  = ([string](Get-MigrationCsvValue -Row $row -Name 'DeliverToMailboxAndForward' -Default 'False')).Trim()
                     AutoMapping   = ''
+                    ForwardingAddress = $forwardingAddress
+                    ForwardingSmtpAddress = $forwardingSmtp
                 })
             }
         }
@@ -748,7 +873,42 @@ try {
 
     Write-MigrationLog -Message "$($wanted.Count) permission(s) to evaluate." -Level INFO
 
-    $null = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+    $connection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+    $connectedOrganization = if ($connection -and $connection.PSObject.Properties['Organization']) {
+        [string]$connection.Organization
+    } else { '' }
+
+    # Connect-MigrationExchange reuses whatever session is already live, which in a chained
+    # cutover shell can be the source tenant's session left open by an earlier script. Confirming
+    # the connected organisation actually accepts a destination domain is a cheap check against
+    # writing into the wrong tenant; it degrades to a warning rather than a hard stop when the
+    # read itself is unavailable, so a permissions gap on Get-AcceptedDomain does not block a run
+    # the operator can see is fine.
+    $targetDomain = ''
+    foreach ($value in $addressMap.Values) {
+        $at = ([string]$value).LastIndexOf('@')
+        if ($at -ge 0) { $targetDomain = ([string]$value).Substring($at + 1); break }
+    }
+    if ($targetDomain) {
+        $acceptedDomains = @()
+        try {
+            $acceptedDomains = @(Get-AcceptedDomain -ErrorAction Stop | ForEach-Object { [string]$_.DomainName })
+        }
+        catch {
+            Write-MigrationLog -Message ("Could not read accepted domains from '$connectedOrganization' to confirm " +
+                "it is the destination tenant: $($_.Exception.Message)") -Level WARNING
+        }
+        if ($acceptedDomains.Count -gt 0 -and -not ($acceptedDomains | Where-Object { $_ -ieq $targetDomain })) {
+            throw ("Connected to '$connectedOrganization', which does not accept mail for '$targetDomain' - is " +
+                'this the destination tenant? Pass -DelegatedOrganization for the customer tenant, or sign in ' +
+                'directly to it.')
+        }
+        Write-MigrationLog -Message "Connected to Exchange Online organisation '$connectedOrganization'." -Level INFO
+    }
+    else {
+        Write-MigrationLog -Message ("Connected to Exchange Online organisation '$connectedOrganization'. No mapped " +
+            'destination address was available to confirm this is the destination tenant.') -Level WARNING
+    }
 
     $stateCache = @{}
     $ordered = @($wanted | Sort-Object -Property SourceMailbox, @{ Expression = { $permissionOrder.IndexOf($_.Kind) } }, SourceTrustee)
@@ -774,16 +934,63 @@ try {
         }
         $mailbox = $mailboxMap.Address
 
-        # Forwarding to an address outside the plan is legitimate - it is usually an external
-        # partner - so an unmapped forwarding target is passed through rather than skipped.
-        $trusteeMap = Resolve-MigrationPlanAddress -Map $addressMap -Address $item.SourceTrustee -Role 'trustee'
-        if (-not $trusteeMap.IsMapped -and $item.Kind -ne 'Forwarding') {
-            $results.Add((New-PermissionResult -Identity $mailbox -Action $item.Kind -Status 'Skipped' `
-                -Detail $trusteeMap.Detail -SourceMailbox $item.SourceMailbox -SourceTrustee $item.SourceTrustee `
-                -AccessRights $item.AccessRights))
-            continue
+        if ($item.Kind -eq 'Forwarding') {
+            # ForwardingAddress names an internal recipient - re-creating it verbatim when the
+            # plan does not map it points the destination mailbox straight back at a source-tenant
+            # object, so it is skipped rather than passed through. ForwardingSmtpAddress may well
+            # be an external partner the plan was never going to know about, so it is passed
+            # through when unmapped - unless its domain is one of the plan's own source domains,
+            # in which case passing it through is the same loop by another name.
+            $forwardTrustee = ''
+            $forwardSkipped = $false
+            $forwardDetail = ''
+
+            if ($item.ForwardingSmtpAddress) {
+                $smtpMap = Resolve-MigrationPlanAddress -Map $addressMap -Address $item.ForwardingSmtpAddress -Role 'trustee'
+                if ($smtpMap.IsMapped) {
+                    $forwardTrustee = $smtpMap.Address
+                }
+                elseif ($item.ForwardingSmtpAddress -notmatch '@') {
+                    $forwardSkipped = $true
+                    $forwardDetail = "The forwarding target '$($item.ForwardingSmtpAddress)' is not a resolvable SMTP address."
+                }
+                elseif (Test-MigrationSourceDomainAddress -Address $item.ForwardingSmtpAddress -SourceDomain $sourceDomains) {
+                    $forwardSkipped = $true
+                    $forwardDetail = "Forward target is a source-domain address the plan does not map: $($item.ForwardingSmtpAddress)."
+                }
+                else {
+                    $forwardTrustee = $item.ForwardingSmtpAddress
+                }
+            }
+            elseif ($item.ForwardingAddress) {
+                $addressResult = Resolve-MigrationPlanAddress -Map $addressMap -Address $item.ForwardingAddress -Role 'trustee'
+                if ($addressResult.IsMapped) {
+                    $forwardTrustee = $addressResult.Address
+                }
+                else {
+                    $forwardSkipped = $true
+                    $forwardDetail = $addressResult.Detail
+                }
+            }
+
+            if ($forwardSkipped) {
+                $results.Add((New-PermissionResult -Identity $mailbox -Action $item.Kind -Status 'Skipped' `
+                    -Detail $forwardDetail -SourceMailbox $item.SourceMailbox -SourceTrustee $item.SourceTrustee `
+                    -AccessRights $item.AccessRights))
+                continue
+            }
+            $trustee = $forwardTrustee
         }
-        $trustee = if ($trusteeMap.IsMapped) { $trusteeMap.Address } else { $item.SourceTrustee }
+        else {
+            $trusteeMap = Resolve-MigrationPlanAddress -Map $addressMap -Address $item.SourceTrustee -Role 'trustee'
+            if (-not $trusteeMap.IsMapped) {
+                $results.Add((New-PermissionResult -Identity $mailbox -Action $item.Kind -Status 'Skipped' `
+                    -Detail $trusteeMap.Detail -SourceMailbox $item.SourceMailbox -SourceTrustee $item.SourceTrustee `
+                    -AccessRights $item.AccessRights))
+                continue
+            }
+            $trustee = $trusteeMap.Address
+        }
 
         if (-not $stateCache.ContainsKey($mailbox)) {
             $stateCache[$mailbox] = Get-DestinationPermissionState -Mailbox $mailbox -Kind $requestedKinds

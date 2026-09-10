@@ -1,0 +1,4 @@
+"PrimarySmtpAddress","ForwardingAddress","ForwardingSmtpAddress","DeliverToMailboxAndForward","GrantSendOnBehalfTo"
+"jsmith@contoso.com","departed@contoso.com","","False",""
+"reception@contoso.com","","dl@contoso.com","False",""
+"adean@contoso.com","","team@fabrikam.com","True",""

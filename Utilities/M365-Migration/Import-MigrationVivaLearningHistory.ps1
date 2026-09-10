@@ -126,7 +126,10 @@
 .PARAMETER DryRun
     Preview - signs in and resolves everything read-only (provider match, user
     mapping, per-row plan), creates and changes nothing, and writes a -DryRun_
-    results file whose rows all carry Status Planned.
+    results file whose rows all carry Status Planned. The delegated provider
+    step requests LearningProvider.Read only and raises no confirmation or
+    logo prompt: a provider that does not exist yet is simply reported as one
+    the live run would register.
 
 .PARAMETER Verbosity
     Console detail: Low (errors and successes), Medium (adds warnings) or High
@@ -163,8 +166,9 @@
     Requires     : PowerShell 7.4, the M365Migration module beside this script,
                    Microsoft.Graph.Authentication (installed on demand)
     Graph scopes : Delegated (interactive, only when registering/reusing a
-                   provider by name): LearningProvider.ReadWrite - the signed-in
-                   user needs a Viva Learning or Viva Suite license and the
+                   provider by name): LearningProvider.ReadWrite, or
+                   LearningProvider.Read under -DryRun - the signed-in user
+                   needs a Viva Learning or Viva Suite license and the
                    Knowledge Administrator role (least privileged).
                    Application (app registration, admin-consented):
                    LearningContent.ReadWrite.All,
@@ -242,14 +246,20 @@ $ErrorActionPreference = 'Stop'
 # Delegated scopes for the provider step only. The content and activity phases
 # run app-only against the application permissions listed in .NOTES; the employee
 # learning API rejects app-only tokens for provider management and rejects
-# delegated tokens for content ingestion, hence the split.
-$requiredGraphScopes = @('LearningProvider.ReadWrite')
+# delegated tokens for content ingestion, hence the split. A DryRun only lists
+# providers, so it asks for the read scope and never raises a ReadWrite consent.
+$requiredGraphScopes = if ($DryRun) { @('LearningProvider.Read') } else { @('LearningProvider.ReadWrite') }
 
-# The sentinel a DryRun (or a declined provider registration) carries in place of
-# a real registration id. Everything downstream tests $providerIsReal instead of
-# comparing against it in more than one place.
+# The sentinel a DryRun carries in place of a real registration id when the
+# provider does not exist yet. Nothing downstream builds a URI from it: every
+# write is gated on $DryRun before the id is used. A declined registration is
+# not a rehearsal - it is tracked by $providerDeclined and reported as Skipped.
 $newProviderPlaceholder = '(new-provider-id)'
 $newContentPlaceholder = '(content-id)'
+
+# Set when the operator (or -WhatIf) declines the provider registration; every
+# catalog item and activity row then reports Skipped, never Planned.
+$providerDeclined = $false
 
 # Destination user id cache shared by Resolve-TargetUserId; $false means the
 # lookup returned a genuine 404 and must not be retried.
@@ -488,7 +498,9 @@ try {
 
             if (-not (Get-MigrationProperty -InputObject $existing -Name 'isCourseActivitySyncEnabled' -Default $false)) {
                 # Course activity writes are rejected while sync is disabled on the provider.
-                if ($PSCmdlet.ShouldProcess($ProviderDisplayName, 'Enable course-activity sync on the learning provider')) {
+                # A DryRun skips the ConfirmImpact=High prompt: Invoke-MigrationAction only
+                # logs the intent, so there is nothing to confirm.
+                if ($DryRun -or $PSCmdlet.ShouldProcess($ProviderDisplayName, 'Enable course-activity sync on the learning provider')) {
                     Invoke-MigrationAction -Description "Enable course-activity sync on provider '$ProviderDisplayName'" -Action {
                         $null = Invoke-MigrationGraphRequest -Method PATCH `
                             -Uri "/v1.0/employeeExperience/learningProviders/$providerId" `
@@ -501,24 +513,37 @@ try {
             }
         }
         else {
-            $square = $SquareLogoUrl ?? $LogoUrl
-            $squareDark = $SquareLogoDarkUrl ?? $LogoUrl
-            $long = $LongLogoUrl ?? $LogoUrl
-            $longDark = $LongLogoDarkUrl ?? $LogoUrl
+            # Explicit if/else rather than ??: an unbound [string] parameter is '' not
+            # $null, so null-coalescing never fell back to -LogoUrl and always prompted.
+            $square = if ($SquareLogoUrl) { $SquareLogoUrl } else { $LogoUrl }
+            $squareDark = if ($SquareLogoDarkUrl) { $SquareLogoDarkUrl } else { $LogoUrl }
+            $long = if ($LongLogoUrl) { $LongLogoUrl } else { $LogoUrl }
+            $longDark = if ($LongLogoDarkUrl) { $LongLogoDarkUrl } else { $LogoUrl }
 
             if (-not ($square -and $squareDark -and $long -and $longDark)) {
-                Write-MigrationLog -Message ("Provider '$ProviderDisplayName' does not exist yet and registering one requires " +
-                    'logo image URLs (publicly reachable - Viva Learning copies the image to its own storage).') -Level WARNING
-                $answer = ((Read-Host 'Image URL to use for all logo slots (e.g. your company logo PNG)') ?? '').Trim()
-                if (-not $answer) { throw 'A logo URL is required to register a learning provider.' }
-                if (-not $square) { $square = $answer }
-                if (-not $squareDark) { $squareDark = $answer }
-                if (-not $long) { $long = $answer }
-                if (-not $longDark) { $longDark = $answer }
+                if ($DryRun) {
+                    # A rehearsal registers nothing, so it must not block on a prompt for a
+                    # value it never sends. Supplied URLs are still carried so the DryRun
+                    # validates the same parameters the live run will use.
+                    Write-MigrationLog -Message ("[DRYRUN] Provider '$ProviderDisplayName' does not exist yet; the live run " +
+                        'needs logo image URLs (-LogoUrl or the prompt) to register it.') -Level WARNING
+                }
+                else {
+                    Write-MigrationLog -Message ("Provider '$ProviderDisplayName' does not exist yet and registering one requires " +
+                        'logo image URLs (publicly reachable - Viva Learning copies the image to its own storage).') -Level WARNING
+                    $answer = ((Read-Host 'Image URL to use for all logo slots (e.g. your company logo PNG)') ?? '').Trim()
+                    if (-not $answer) { throw 'A logo URL is required to register a learning provider.' }
+                    if (-not $square) { $square = $answer }
+                    if (-not $squareDark) { $squareDark = $answer }
+                    if (-not $long) { $long = $answer }
+                    if (-not $longDark) { $longDark = $answer }
+                }
             }
 
+            # Under DryRun the ShouldProcess prompt is bypassed and Invoke-MigrationAction
+            # logs the intent without calling Graph, so the sentinel stays in place.
             $providerId = $newProviderPlaceholder
-            if ($PSCmdlet.ShouldProcess($ProviderDisplayName, 'Register a new Viva Learning provider')) {
+            if ($DryRun -or $PSCmdlet.ShouldProcess($ProviderDisplayName, 'Register a new Viva Learning provider')) {
                 $created = Invoke-MigrationAction -PassThru -Description "Register learning provider '$ProviderDisplayName' with course-activity sync enabled" -Action {
                     Invoke-MigrationGraphRequest -Method POST -Uri '/v1.0/employeeExperience/learningProviders' -Body @{
                         displayName                   = $ProviderDisplayName
@@ -529,10 +554,20 @@ try {
                         isCourseActivitySyncEnabled   = $true
                     }
                 }
-                if ($created) {
-                    $providerId = [string](Get-MigrationProperty -InputObject $created -Name 'id')
+                if (-not $DryRun) {
+                    # Every content and activity URI embeds this id, so a registration that
+                    # came back without one is fatal here - not a run full of Planned rows.
+                    $providerId = [string](Get-MigrationProperty -InputObject $created -Name 'id' -Default '')
+                    if (-not $providerId) {
+                        throw "Registering provider '$ProviderDisplayName' returned no registration id - nothing can be imported under it."
+                    }
                     Write-MigrationLog -Message "Registered provider '$ProviderDisplayName' [$providerId]" -Level SUCCESS
                 }
+            }
+            else {
+                $providerDeclined = $true
+                Write-MigrationLog -Message ("[SKIPPED] Provider registration was declined - every catalog item and " +
+                    'activity row in this run will be reported as Skipped.') -Level WARNING
             }
         }
 
@@ -556,10 +591,6 @@ try {
             'secret/certificate, and that the application permissions listed in the script NOTES have admin consent.')
     }
     Write-MigrationLog -Message "Connected app-only to tenant $((Get-MgContext).TenantId)" -Level SUCCESS
-
-    # The API only accepts activity writes for real, licensed provider registrations;
-    # a DryRun with a placeholder provider id skips every call that would need it.
-    $providerIsReal = $providerId -and $providerId -ne $newProviderPlaceholder
 
     # One catalog item per distinct course, keyed by the source catalog's own
     # external ID, then the source content GUID, then the URL (hand-built CSVs).
@@ -621,9 +652,17 @@ try {
         if ($course.SkillTags.Count -gt 0) { $body['skillTags'] = $course.SkillTags }
         if ($course.Contributors.Count -gt 0) { $body['contributors'] = $course.Contributors }
 
-        if ($DryRun -or -not $providerIsReal) {
+        if ($DryRun) {
             Write-MigrationLog -Message "[DRYRUN] Would upsert catalog item: $($course.Title)" -Level WARNING
             $contentIdByKey[$course.Key] = $newContentPlaceholder
+            continue
+        }
+
+        if ($providerDeclined) {
+            # Not a rehearsal: the operator declined the provider, so the item is a skip
+            # and its rows report Skipped through the same path as a declined upsert.
+            $contentSkipped[$course.Key] = $true
+            Write-MigrationLog -Message "[SKIPPED] Provider registration was declined - catalog item not upserted: $($course.Title)" -Level WARNING
             continue
         }
 
@@ -720,7 +759,7 @@ try {
             (Get-CsvValue -Record $row -Column $columns.ActivityId) ??
             "$contentKey|$targetUpn|$activityType"
 
-            if ($DryRun -or -not $providerIsReal) {
+            if ($DryRun) {
                 $rowStatus = 'Planned'
                 $detail = "Would create $activityType '$courseTitle' for $targetUpn (status $status)."
             }
@@ -750,10 +789,12 @@ try {
                         status                   = $status
                     }
 
+                    # Anything dropped from the record on the way in is appended here so
+                    # the results CSV shows the data loss instead of a bare Succeeded.
+                    $rowNote = ''
+
                     # Tolerate hand-built CSVs: '85', '85%', '87.5' all round and clamp
-                    # to 0-100; a non-numeric value is dropped with a note rather than
-                    # silently, so the operator can see the data loss in the results.
-                    $percentNote = ''
+                    # to 0-100; a non-numeric value is dropped with a note.
                     $percentText = Get-CsvValue -Record $row -Column $columns.Percentage
                     if ($percentText) {
                         $parsedPercent = 0.0
@@ -763,7 +804,7 @@ try {
                             $activityBody['completionPercentage'] = [int][math]::Min([math]::Max([math]::Round($parsedPercent), 0), 100)
                         }
                         else {
-                            $percentNote = " CompletionPercentage '$percentText' was not numeric and was ignored."
+                            $rowNote += " CompletionPercentage '$percentText' was not numeric and was ignored."
                         }
                     }
                     $completed = Get-CsvValue -Record $row -Column $columns.Completed
@@ -780,13 +821,19 @@ try {
                         $assigned = Get-CsvValue -Record $row -Column $columns.Assigned
                         if ($assigned) { $activityBody['assignedDateTime'] = $assigned }
 
+                        # The assigner is optional on the wire, so a lost one is not a row
+                        # failure - but it is recorded, naming which of the two lookups lost it.
                         $assignerUpn = Get-CsvValue -Record $row -Column $columns.AssignerUpn
                         if ($assignerUpn) {
                             $mappedAssigner = ConvertTo-TargetUpn -SourceUpn $assignerUpn -PlanMap $planUpnMap `
                                 -Domain $TargetDomain -KeepDomains $KeepCsvDomains.IsPresent
-                            if ($mappedAssigner) {
+                            if (-not $mappedAssigner) {
+                                $rowNote += " Assigner '$assignerUpn' could not be mapped to the destination and was omitted."
+                            }
+                            else {
                                 $assignerId = Resolve-TargetUserId -Upn $mappedAssigner
                                 if ($assignerId) { $activityBody['assignerUserId'] = $assignerId }
+                                else { $rowNote += " Assigner '$mappedAssigner' was not found in the destination tenant and was omitted." }
                             }
                         }
 
@@ -814,7 +861,7 @@ try {
                             -Body $activityBody
                     }
                     $rowStatus = 'Succeeded'
-                    $detail = "$activityType '$courseTitle' created (status $status).$percentNote"
+                    $detail = "$activityType '$courseTitle' created (status $status).$rowNote"
                 }
                 else {
                     $rowStatus = 'Skipped'
@@ -824,10 +871,14 @@ try {
         }
         catch {
             if ($contentKey -and $contentSkipped.Contains($contentKey)) {
-                # The row only "failed" because its catalog upsert was declined
-                # (-WhatIf / answering No) - report it as a skip, not an error.
+                # The row only "failed" because its catalog upsert - or the provider
+                # registration it depends on - was declined (-WhatIf / answering No):
+                # report it as a skip, not an error.
                 $rowStatus = 'Skipped'
-                $detail = 'Catalog upsert was declined in this run - activity creation not attempted.'
+                $detail = if ($providerDeclined) {
+                    'Provider registration was declined in this run - catalog upsert and activity creation not attempted.'
+                }
+                else { 'Catalog upsert was declined in this run - activity creation not attempted.' }
             }
             else {
                 $rowStatus = 'Failed'

@@ -196,6 +196,38 @@ Describe 'Save-MigrationPlan' {
         ($after | ConvertTo-Json -Depth 3) | Should -BeExactly ($before | ConvertTo-Json -Depth 3)
     }
 
+    It 'Round-trips the extended source profile columns' {
+        $row = New-SamplePlanRow -Id '1' -Upn 'john.smith@contoso.com'
+        $row.City = 'Chicago'
+        $row.State = 'IL'
+        $row.Country = 'US'
+        $row.PostalCode = '60601'
+        $row.StreetAddress = '233 S Wacker Dr'
+        $row.CompanyName = 'Contoso Ltd'
+        $row.EmployeeId = 'E10045'
+        $row.EmployeeType = 'Employee'
+        $row.BusinessPhone = '+13125550100'
+        $row.FaxNumber = '+13125550199'
+        $row.PreferredLanguage = 'en-US'
+
+        $path = New-PlanFile -Name 'roundtrip-attributes.csv' -Rows @($row)
+        $before = Import-MigrationPlan -Path $path
+        Save-MigrationPlan -Path $path -Rows $before
+        $after = Import-MigrationPlan -Path $path
+
+        $after[0].City | Should -BeExactly 'Chicago'
+        $after[0].State | Should -BeExactly 'IL'
+        $after[0].Country | Should -BeExactly 'US'
+        $after[0].PostalCode | Should -BeExactly '60601'
+        $after[0].StreetAddress | Should -BeExactly '233 S Wacker Dr'
+        $after[0].CompanyName | Should -BeExactly 'Contoso Ltd'
+        $after[0].EmployeeId | Should -BeExactly 'E10045'
+        $after[0].EmployeeType | Should -BeExactly 'Employee'
+        $after[0].BusinessPhone | Should -BeExactly '+13125550100'
+        $after[0].FaxNumber | Should -BeExactly '+13125550199'
+        $after[0].PreferredLanguage | Should -BeExactly 'en-US'
+    }
+
     It 'Writes the full canonical column order even when the input omits columns' {
         $path = Join-Path $script:workspace 'restore-columns.csv'
         Save-MigrationPlan -Path $path -Rows @([pscustomobject]@{ SourceObjectId = '1'; PlanStatus = 'Planned' })

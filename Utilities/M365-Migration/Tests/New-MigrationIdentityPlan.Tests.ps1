@@ -140,6 +140,28 @@ Describe 'New-MigrationIdentityPlan' {
             $row.PlanStatus | Should -BeExactly 'Planned'
         }
 
+        It 'Carries the new source profile attributes through from the users inventory' {
+            $row = Get-PlanRow -Result $script:Full -Identity 'jsmith@contoso.com'
+            $row.City | Should -BeExactly 'Chicago'
+            $row.State | Should -BeExactly 'IL'
+            $row.Country | Should -BeExactly 'US'
+            $row.PostalCode | Should -BeExactly '60601'
+            $row.StreetAddress | Should -BeExactly '233 S Wacker Dr'
+            $row.CompanyName | Should -BeExactly 'Contoso Ltd'
+            $row.EmployeeId | Should -BeExactly 'E10045'
+            $row.EmployeeType | Should -BeExactly 'Employee'
+            $row.BusinessPhone | Should -BeExactly '+13125550100'
+            $row.FaxNumber | Should -BeExactly '+13125550199'
+            $row.PreferredLanguage | Should -BeExactly 'en-US'
+        }
+
+        It 'Leaves the new attribute columns empty for a row the inventory did not set them on' {
+            $row = Get-PlanRow -Result $script:Full -Identity 'jqsmith@contoso.com'
+            $row.City | Should -BeExactly ''
+            $row.EmployeeId | Should -BeExactly ''
+            $row.BusinessPhone | Should -BeExactly ''
+        }
+
         It 'Resolves the second John Smith with his middle initial and explains why' {
             $row = Get-PlanRow -Result $script:Full -Identity 'jqsmith@contoso.com'
             $row.TargetUserPrincipalName | Should -BeExactly 'john.q.smith@newco.com'
@@ -433,11 +455,13 @@ Describe 'New-MigrationIdentityPlan' {
             }
         }
 
-        It 'Keeps the guest UPN verbatim rather than templating it' {
+        It 'Keeps the guest external mail but leaves the UPN and nickname for the destination to assign' {
             $row = Get-PlanRow -Result $script:Inclusive -Identity 'dana.lee_fabrikam.com#EXT#@contoso.onmicrosoft.com'
             $row.PlanStatus | Should -Not -BeExactly 'Excluded'
-            $row.TargetUserPrincipalName | Should -BeExactly 'dana.lee_fabrikam.com#EXT#@contoso.onmicrosoft.com'
+            $row.TargetUserPrincipalName | Should -BeExactly ''
+            $row.InterimUserPrincipalName | Should -BeExactly ''
             $row.TargetPrimarySmtp | Should -BeExactly 'dana.lee@fabrikam.com'
+            $row.TargetMailNickname | Should -BeExactly ''
         }
 
         It 'Plans the disabled and the synced user' {
@@ -471,6 +495,35 @@ Describe 'New-MigrationIdentityPlan' {
         It 'Exits 1 when the naming template names an unknown preset' {
             $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'badformat') -Parameter @{ UpnFormat = 'NotAPreset' }
             $result.ExitCode | Should -Be 1
+        }
+    }
+
+    Context 'A users inventory from before the new profile columns existed' {
+
+        BeforeAll {
+            # Simulates a Users.csv produced by an older Get-MigrationInventory build: the new
+            # attribute columns are absent entirely rather than present-and-blank.
+            $script:OldUsersCsv = Join-Path $TestDrive 'old-users.csv'
+            $newColumns = @('City', 'State', 'Country', 'PostalCode', 'StreetAddress', 'CompanyName',
+                'EmployeeId', 'EmployeeType', 'BusinessPhone', 'FaxNumber', 'PreferredLanguage')
+            Import-Csv -LiteralPath (Join-Path $script:Fixtures 'Users.csv') |
+                Select-Object -Property * -ExcludeProperty $newColumns |
+                Export-Csv -LiteralPath $script:OldUsersCsv -NoTypeInformation -Encoding utf8
+        }
+
+        It 'Plans successfully instead of throwing on the missing columns' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'old-inventory') `
+                -Parameter (@{} + $script:FullParameters + @{ UsersCsv = $script:OldUsersCsv })
+            $result.ExitCode | Should -Be 0
+        }
+
+        It 'Leaves the new attribute columns empty rather than erroring' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'old-inventory-2') `
+                -Parameter (@{} + $script:FullParameters + @{ UsersCsv = $script:OldUsersCsv })
+            $row = Get-PlanRow -Result $result -Identity 'jsmith@contoso.com'
+            $row.City | Should -BeExactly ''
+            $row.EmployeeId | Should -BeExactly ''
+            $row.BusinessPhone | Should -BeExactly ''
         }
     }
 }

@@ -18,6 +18,12 @@ BeforeAll {
     $script:targetCsv = Join-Path $script:fixtures 'Target-Users.csv'
     $script:planCsv = Join-Path $script:fixtures 'IdentityPlan.csv'
     $script:destinationCsv = Join-Path $script:fixtures 'Destination-Users.csv'
+    $script:sharedMailboxesCsv = Join-Path $script:fixtures 'Destination-SharedMailboxes.csv'
+    $script:groupsCsv = Join-Path $script:fixtures 'Destination-Groups.csv'
+    $script:noEmailCsv = Join-Path $script:fixtures 'Destination-NoEmail.csv'
+    $script:noIdentityCsv = Join-Path $script:fixtures 'Source-NoIdentity.csv'
+    $script:sourceLookalikeCsv = Join-Path $script:fixtures 'Source-Lookalike.csv'
+    $script:targetLookalikeCsv = Join-Path $script:fixtures 'Target-Lookalike.csv'
 
     $script:workspace = Join-Path ([System.IO.Path]::GetTempPath()) "Compare-MigrationUserData-$([guid]::NewGuid())"
     New-Item -Path $script:workspace -ItemType Directory -Force | Out-Null
@@ -102,6 +108,15 @@ Describe 'Compare-MigrationUserData - CSV mode' {
         $row.MatchedOn | Should -Match 'EmailLocalPart'
     }
 
+    It 'Does not add SimilarName on top of an identical DisplayName' {
+        # Identical names already score as DisplayName; the Levenshtein pass is for
+        # names that differ. Its 1.0 score used to be appended as noise.
+        $row = $script:csvRun.Rows | Where-Object Identity -EQ 'alan.turing@contoso.com'
+        $row.MatchedOn | Should -Match 'DisplayName'
+        $row.MatchedOn | Should -Not -Match 'SimilarName'
+        [int]$row.MatchScore | Should -Be 105
+    }
+
     It 'Uses Levenshtein similarity to match a misspelt display name' {
         $row = $script:csvRun.Rows | Where-Object Identity -EQ 'katherine.johnson@contoso.com'
         $row.Status | Should -Be 'Partial Match'
@@ -127,6 +142,22 @@ Describe 'Compare-MigrationUserData - CSV mode' {
         $row.Status | Should -Be 'No Match'
     }
 
+    It 'Prefers an exact UPN hit over a look-alike that scores higher on name evidence' {
+        # The fabrikam look-alike scores 105 (DisplayName + FirstName+LastName +
+        # EmailLocalPart); the renamed exact counterpart scores only 100 on UPN.
+        # Exactness must outrank the score or the row pairs with the wrong object.
+        $run = Invoke-CompareScript -Arguments @(
+            '-ReferenceCsv', $script:sourceLookalikeCsv
+            '-DifferenceCsv', $script:targetLookalikeCsv
+        ) -ResultPattern 'Compare-UserData-Results_*.csv'
+
+        $run.Rows.Count | Should -Be 1
+        $run.Rows[0].Status | Should -Be 'Exact Match'
+        $run.Rows[0].MatchedOn | Should -Be 'UPN'
+        $run.Rows[0].Target_UPN | Should -Be 'margaret.hamilton@contoso.com'
+        [int]$run.Rows[0].MatchScore | Should -Be 100
+    }
+
     It 'Honours an explicit column override' {
         # 'Display Name' is an alias Import-MigrationCsv folds into DisplayName, so
         # naming it explicitly must still resolve to the same column.
@@ -139,6 +170,46 @@ Describe 'Compare-MigrationUserData - CSV mode' {
         $row = $overridden.Rows | Where-Object Identity -EQ 'katherine.johnson@contoso.com'
         $row.Source_DisplayName | Should -Be 'Katherine Johnson'
     }
+
+    It 'Accepts an override naming the raw header that alias resolution folded away' {
+        # Source-Users.csv's header is 'UPN', which Import-MigrationCsv renames to
+        # UserPrincipalName. Naming the header the operator can see must be honoured
+        # with an INFO line, not warned about as absent.
+        $run = Invoke-CompareScript -Arguments @(
+            '-ReferenceCsv', $script:sourceCsv
+            '-DifferenceCsv', $script:targetCsv
+            '-UpnColumn', 'UPN'
+            '-Verbosity', 'High'
+        ) -ResultPattern 'Compare-UserData-Results_*.csv'
+
+        $run.ExitCode | Should -Be 0
+        $run.Output | Should -Match "Override column 'UPN' in the reference CSV was imported as 'UserPrincipalName'"
+        $run.Output | Should -Not -Match "Override column 'UPN' is not a header of the reference CSV"
+        ($run.Rows | Where-Object Identity -EQ 'ada.lovelace@contoso.com').Source_UPN |
+            Should -Be 'ada.lovelace@contoso.com'
+    }
+
+    It 'Still warns when an override names a header the file never had' {
+        $run = Invoke-CompareScript -Arguments @(
+            '-ReferenceCsv', $script:sourceCsv
+            '-DifferenceCsv', $script:targetCsv
+            '-UpnColumn', 'LoginName'
+        ) -ResultPattern 'Compare-UserData-Results_*.csv'
+
+        $run.ExitCode | Should -Be 0
+        $run.Output | Should -Match "Override column 'LoginName' is not a header of the reference CSV"
+    }
+
+    It 'Exits 1 when a side has neither a UPN nor an email column' {
+        $run = Invoke-CompareScript -Arguments @(
+            '-ReferenceCsv', $script:noIdentityCsv
+            '-DifferenceCsv', $script:targetCsv
+        ) -ResultPattern 'Compare-UserData-Results_*.csv'
+
+        $run.ExitCode | Should -Be 1
+        $run.Output | Should -Match 'neither a UserPrincipalName nor a PrimarySmtpAddress column'
+        $run.ResultFile | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Compare-MigrationUserData - plan mode' {
@@ -150,14 +221,20 @@ Describe 'Compare-MigrationUserData - plan mode' {
         ) -ResultPattern 'Compare-UserData-Plan-Results_*.csv'
     }
 
-    It 'Exits 0 and writes a plan results CSV' {
-        $script:planRun.ExitCode | Should -Be 0
+    It 'Writes a plan results CSV and exits 2 because the comparison is not clean' {
+        # The fixture deliberately holds Mismatch and Missing rows; a pipeline has to
+        # see that in the exit code, not only in the CSV.
         $script:planRun.ResultFile | Should -Not -BeNullOrEmpty
+        $script:planRun.ExitCode | Should -Be 2
+        $script:planRun.Output | Should -Match 'Comparison is not clean: \d+ Missing and \d+ Mismatch'
     }
 
     It 'Reports one row per plan row plus one per unclaimed destination object' {
-        # 6 plan rows + 1 destination object no plan row points at.
-        $script:planRun.Rows.Count | Should -Be 7
+        # 9 plan rows + 1 destination object no plan row points at. The three
+        # recipient rows (Shared, Room, Distribution) report Missing here because a
+        # Users inventory does not hold them - they are checked against their own
+        # inventory files below.
+        $script:planRun.Rows.Count | Should -Be 10
     }
 
     It 'Marks an exact UPN + primary SMTP agreement as Match' {
@@ -197,10 +274,20 @@ Describe 'Compare-MigrationUserData - plan mode' {
         $row.Detail | Should -Match 'Excluded'
     }
 
-    It 'Skips a plan row that has no target UPN yet' {
+    It 'Skips a plan row that has neither a target UPN nor a target SMTP yet' {
         $row = $script:planRun.Rows | Where-Object Identity -EQ 'unmapped@contoso.com'
         $row.Status | Should -Be 'Skipped'
-        $row.Detail | Should -Match 'no TargetUserPrincipalName'
+        $row.Detail | Should -Match 'no TargetUserPrincipalName or TargetPrimarySmtp'
+    }
+
+    It 'Identifies a recipient row by its planned address and carries its source address' {
+        # A shared mailbox has no target UPN, so its Identity is the planned SMTP and
+        # the SourcePrimarySmtp column keeps the row recognisable.
+        $row = $script:planRun.Rows | Where-Object Identity -EQ 'accounts@newco.onmicrosoft.com'
+        $row | Should -Not -BeNullOrEmpty
+        $row.ObjectType | Should -Be 'Shared'
+        $row.PlanTargetUserPrincipalName | Should -BeNullOrEmpty
+        $row.SourcePrimarySmtp | Should -Be 'accounts@contoso.com'
     }
 
     It 'Never uses fuzzy matching in plan mode' {
@@ -226,11 +313,97 @@ Describe 'Compare-MigrationUserData - plan mode' {
         ($waved.Rows | Where-Object Identity -EQ 'ada.lovelace@newco.onmicrosoft.com').Status | Should -Be 'Extra'
         @($waved.Rows | Where-Object Status -EQ 'Extra').Count | Should -Be 3
     }
+
+    It 'Exits 1 when the destination inventory has no primary SMTP column' {
+        # A Match that never checked the address would be hollow, so this is fatal
+        # rather than a file full of Mismatch rows.
+        $run = Invoke-CompareScript -Arguments @(
+            '-PlanPath', $script:planCsv
+            '-DifferenceCsv', $script:noEmailCsv
+        ) -ResultPattern 'Compare-UserData-Plan-Results_*.csv'
+
+        $run.ExitCode | Should -Be 1
+        $run.Output | Should -Match 'no PrimarySmtpAddress column'
+        $run.ResultFile | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Compare-MigrationUserData - plan mode, recipient classes' {
+
+    # pwsh -File hands '-ObjectType Shared,Room' over as one literal string, so each
+    # run below narrows to a single class; together they cover the SMTP-only paths.
+
+    It 'Matches a shared mailbox on primary SMTP alone against the SharedMailboxes inventory' {
+        $run = Invoke-CompareScript -Arguments @(
+            '-PlanPath', $script:planCsv
+            '-DifferenceCsv', $script:sharedMailboxesCsv
+            '-ObjectType', 'Shared'
+        ) -ResultPattern 'Compare-UserData-Plan-Results_*.csv'
+
+        # 1 Shared plan row + the equipment mailbox nothing claims.
+        $run.Rows.Count | Should -Be 2
+
+        $shared = $run.Rows | Where-Object Identity -EQ 'accounts@newco.onmicrosoft.com'
+        $shared.Status | Should -Be 'Match'
+        $shared.Detail | Should -Match 'no target UPN'
+        $shared.DestinationPrimarySmtp | Should -Be 'accounts@newco.onmicrosoft.com'
+        $shared.DestinationUserPrincipalName | Should -Be 'accounts@newco.onmicrosoft.com'
+
+        # The equipment mailbox is in the inventory but not in the compared object
+        # type, so it surfaces as Extra - the same rule -Wave follows.
+        ($run.Rows | Where-Object Identity -EQ 'projector@newco.onmicrosoft.com').Status | Should -Be 'Extra'
+
+        # Nothing is Missing or Mismatch, so the run is clean.
+        $run.ExitCode | Should -Be 0
+    }
+
+    It 'Reports a room whose planned address is absent as Missing and exits 2' {
+        $run = Invoke-CompareScript -Arguments @(
+            '-PlanPath', $script:planCsv
+            '-DifferenceCsv', $script:sharedMailboxesCsv
+            '-ObjectType', 'Room'
+        ) -ResultPattern 'Compare-UserData-Plan-Results_*.csv'
+
+        $room = $run.Rows | Where-Object Identity -EQ 'boardroom@newco.onmicrosoft.com'
+        $room.Status | Should -Be 'Missing'
+        $room.Detail | Should -Match "planned primary SMTP 'boardroom@newco\.onmicrosoft\.com'"
+        $room.PlanTargetUserPrincipalName | Should -BeNullOrEmpty
+
+        @($run.Rows | Where-Object Status -EQ 'Extra').Count | Should -Be 2
+        $run.ExitCode | Should -Be 2
+        $run.Output | Should -Match 'Comparison is not clean: 1 Missing and 0 Mismatch'
+    }
+
+    It 'Compares a distribution group against a Groups inventory that has no UPN column and exits 0 when clean' {
+        $run = Invoke-CompareScript -Arguments @(
+            '-PlanPath', $script:planCsv
+            '-DifferenceCsv', $script:groupsCsv
+            '-ObjectType', 'Distribution'
+        ) -ResultPattern 'Compare-UserData-Plan-Results_*.csv'
+
+        $run.ExitCode | Should -Be 0
+        $run.Rows.Count | Should -Be 1
+        $run.Rows[0].Identity | Should -Be 'allstaff@newco.onmicrosoft.com'
+        $run.Rows[0].Status | Should -Be 'Match'
+        $run.Output | Should -Not -Match 'Comparison is not clean'
+    }
+
+    It 'Exits 1 when user rows are compared against an inventory with no UPN column' {
+        $run = Invoke-CompareScript -Arguments @(
+            '-PlanPath', $script:planCsv
+            '-DifferenceCsv', $script:groupsCsv
+            '-ObjectType', 'User'
+        ) -ResultPattern 'Compare-UserData-Plan-Results_*.csv'
+
+        $run.ExitCode | Should -Be 1
+        $run.Output | Should -Match 'no UserPrincipalName column'
+        $run.Output | Should -Match 'carry a TargetUserPrincipalName'
+    }
 }
 
 Describe 'Compare-MigrationUserData - DryRun' {
 
-    It 'Writes a DryRun file with a single Planned row in CSV mode' {
+    It 'Runs the full comparison and files it as a DryRun file in CSV mode' {
         $run = Invoke-CompareScript -Arguments @(
             '-ReferenceCsv', $script:sourceCsv
             '-DifferenceCsv', $script:targetCsv
@@ -239,25 +412,26 @@ Describe 'Compare-MigrationUserData - DryRun' {
 
         $run.ExitCode | Should -Be 0
         $run.ResultFile | Should -Not -BeNullOrEmpty
-        $run.Rows.Count | Should -Be 1
-        $run.Rows[0].Status | Should -Be 'Planned'
-        $run.Rows[0].Detail | Should -Match 'Would compare 5 reference row\(s\) against 5 difference row\(s\)'
+        $run.Rows.Count | Should -Be 5
+        ($run.Rows | Where-Object Identity -EQ 'ada.lovelace@contoso.com').Status | Should -Be 'Exact Match'
+        ($run.Rows | Where-Object Identity -EQ 'charles.babbage@contoso.com').Status | Should -Be 'No Match'
     }
 
-    It 'Writes a DryRun file with a single Planned row in plan mode' {
+    It 'Runs the full comparison, keeps the real statuses and the exit code in plan mode' {
         $run = Invoke-CompareScript -Arguments @(
             '-PlanPath', $script:planCsv
             '-DifferenceCsv', $script:destinationCsv
             '-DryRun'
         ) -ResultPattern 'Compare-UserData-Plan-DryRun_*.csv'
 
-        $run.ExitCode | Should -Be 0
-        $run.Rows.Count | Should -Be 1
-        $run.Rows[0].Status | Should -Be 'Planned'
-        $run.Rows[0].Detail | Should -Match 'Would compare 6 plan row\(s\) against 4 destination row\(s\)'
+        $run.ResultFile | Should -Not -BeNullOrEmpty
+        $run.Rows.Count | Should -Be 10
+        @($run.Rows.Status | Sort-Object -Unique) | Should -Be @('Extra', 'Match', 'Mismatch', 'Missing', 'Skipped')
+        $run.Rows.Status | Should -Not -Contain 'Planned'
+        $run.ExitCode | Should -Be 2
     }
 
-    It 'Writes no comparison results file when DryRun is set' {
+    It 'Writes no -Results_ file when DryRun is set' {
         $run = Invoke-CompareScript -Arguments @(
             '-ReferenceCsv', $script:sourceCsv
             '-DifferenceCsv', $script:targetCsv
@@ -266,6 +440,23 @@ Describe 'Compare-MigrationUserData - DryRun' {
 
         @(Get-ChildItem -LiteralPath $run.OutputDirectory -Filter 'Compare-UserData-Results_*.csv').Count |
             Should -Be 0
+    }
+}
+
+Describe 'Compare-MigrationUserData - run plumbing' {
+
+    It 'Honours -LogPath' {
+        $logPath = Join-Path $script:workspace "custom-$([guid]::NewGuid().ToString('N')).log"
+        $run = Invoke-CompareScript -Arguments @(
+            '-ReferenceCsv', $script:sourceCsv
+            '-DifferenceCsv', $script:targetCsv
+            '-LogPath', $logPath
+        ) -ResultPattern 'Compare-UserData-Results_*.csv'
+
+        $run.ExitCode | Should -Be 0
+        Test-Path -LiteralPath $logPath | Should -BeTrue
+        Get-Content -LiteralPath $logPath -Raw | Should -Match 'Started Compare-MigrationUserData'
+        @(Get-ChildItem -LiteralPath $run.OutputDirectory -Filter '*.log').Count | Should -Be 0
     }
 }
 

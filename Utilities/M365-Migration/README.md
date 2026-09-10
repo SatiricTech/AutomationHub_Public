@@ -35,7 +35,7 @@ plan** — so no phase has to guess what an earlier phase decided.
 | Item | Detail |
 |---|---|
 | PowerShell | 7.4 or later (`#Requires -Version 7.4`). Tested on 7.6. |
-| Modules | `Microsoft.Graph.Authentication`, `ExchangeOnlineManagement` (v3+), `MicrosoftTeams`, `ImportExcel`. Installed for the current user on demand by `Initialize-MigrationModule`, which logs what it is about to install first. |
+| Modules | `Microsoft.Graph.Authentication`, `ExchangeOnlineManagement` (v3+), `MicrosoftTeams` (5.7.0+), `ImportExcel`. Installed for the current user on demand by `Initialize-MigrationModule`, which logs what it is about to install first. |
 | Entra roles | User Administrator for user create/update; **Privileged Authentication Administrator** to change the UPN of, or reset the password of, another admin; Reports Reader or Global Reader for MFA registration counts; Domain Name Administrator to remove a domain. |
 | Exchange roles | Exchange Administrator (recipient management, permissions, address policies). |
 | Teams roles | Teams Administrator or Teams Communications Administrator. |
@@ -55,8 +55,12 @@ tenant it administers, so nothing has to be delegated.
   `Disconnect-ExchangeOnline`. The module's `Connect-MigrationGraph` and
   `Connect-MigrationExchange` also accept `-Reconnect`, which signs out of the cached session
   before connecting.
-- Pass `-TenantId <tenant>.onmicrosoft.com` where a script offers it. It pins the sign-in, so
-  a leftover session from the other tenant fails loudly instead of being reused silently.
+- Pass `-TenantId <tenant>.onmicrosoft.com` where a script offers it. It pins the Graph
+  sign-in, so a leftover Graph session from the other tenant fails loudly instead of being
+  reused silently. `Get-MigrationInventory` also passes the Graph tenant id to
+  `Connect-MigrationExchange -TenantId`, which drops a cached Exchange session that belongs
+  to a different tenant and reconnects; other EXO-connecting scripts still rely on
+  `Disconnect-ExchangeOnline` or `-DelegatedOrganization` when switching tenants.
 
 **Landing in the wrong tenant is the expensive mistake.** A stale cached session, or a GDAP
 connection made without `-DelegatedOrganization`, connects you somewhere you did not intend:
@@ -133,9 +137,9 @@ Copy the whole folder to run it; the scripts are no longer individually standalo
 | Output root | `%LOCALAPPDATA%\Migration-Automations` on Windows, `~/Migration-Automations` elsewhere. Override with `-OutputPath`. |
 | `-Prefix` | Names the client or run. Output lands in `<root>\<Prefix>\` and every filename starts with `<Prefix>_`. Use `Source` and `Destination` for the two inventories. |
 | Logging | `Initialize-MigrationRun` opens `<ScriptName>_<yyyyMMdd-HHmmss>.log` in the output directory and records the parameters (never secrets). `-LogPath` overrides. `-Verbosity Low\|Medium\|High` controls the console only — the log always gets everything. |
-| DryRun | One semantic everywhere: connect read-only, compute everything, write the results file with Status `Planned`, change nothing. `-WhatIf` is honoured independently at the row level on every writer, and a declined row is reported as `Skipped` with the detail `Declined at the confirmation prompt.` - `Planned` is reserved for `-DryRun`. |
-| Results CSV | `<Prefix>_<Name>-Results_<ts>.csv`, or `-DryRun_` in place of `-Results_`. Columns always begin `Identity, Action, Status, Detail`; script-specific columns follow. Status ∈ `Planned \| Succeeded \| Skipped \| Failed`. |
-| Exit codes | `0` clean, `1` fatal error, `2` completed with row failures (or, for `Test-MigrationReadiness`, failed checks). |
+| DryRun | One semantic on every writer: connect read-only, compute everything, write the results file with Status `Planned`, change nothing. `-WhatIf` is honoured independently at the row level on every writer, and a declined row is reported as `Skipped` with the detail `Declined at the confirmation prompt.` - `Planned` is reserved for `-DryRun`. Two exceptions: `Get-MigrationInventory -DryRun` writes only the log, never a results CSV (discovery, not a writer); `Test-MigrationReadiness`'s checks are already read-only, so `-DryRun` there only suppresses the Provisioned-stage plan writeback and the OneDrive read that would provision a drive — its rows keep their normal Succeeded/Failed/Skipped status. |
+| Results CSV | `<Prefix>_<Name>-Results_<ts>.csv`, or `-DryRun_` in place of `-Results_`. Columns always begin `Identity, Action, Status, Detail`; script-specific columns follow. Status ∈ `Planned \| Succeeded \| Skipped \| Failed`. Exception: `Compare-MigrationUserData` never writes those four — see its Phase 1 table row. |
+| Exit codes | `0` clean, `1` fatal error, `2` completed with row failures (for `Test-MigrationReadiness`, failed checks; for `Compare-MigrationUserData` in plan mode, any `Missing`/`Mismatch` row; CSV mode always exits 0). |
 | Waves | Every writer takes `-Wave <label[]>` and processes only matching plan rows. Waves are labels, not numbers — `1`, `Pilot`, `Finance` all work. |
 | Passwords | Generated credentials go to the results CSV only, never to the log. Store that file the way you would store any other password list. |
 
@@ -151,7 +155,7 @@ Copy the whole folder to run it; the scripts are no longer individually standalo
 |---|---|---|
 | `ObjectType`, `Wave` | Plan / wave map | `User`, `Guest`, `Shared`, `Room`, `Equipment`, `Distribution`, `MailEnabledSecurity`, `DynamicDistribution`, `Contact`, `M365Group` (informational — Fly owns those) |
 | `SourceObjectId`, `SourceUserPrincipalName`, `SourcePrimarySmtp`, `SourceAliases`, `LegacyExchangeDN`, `SourceX500` | Plan | `;`-separated lists; aliases stored as `smtp:alias@domain`, X500 as `X500:/o=...` |
-| `DisplayName`, `FirstName`, `MiddleName`, `LastName`, `JobTitle`, `Department`, `Office`, `MobilePhone`, `UsageLocation`, `ManagerUpn` | Plan | Passthrough. `ManagerUpn` is re-resolved to the target account at provisioning. |
+| `DisplayName`, `FirstName`, `MiddleName`, `LastName`, `JobTitle`, `Department`, `Office`, `MobilePhone`, `City`, `State`, `Country`, `PostalCode`, `StreetAddress`, `CompanyName`, `EmployeeId`, `EmployeeType`, `BusinessPhone`, `FaxNumber`, `PreferredLanguage`, `UsageLocation`, `ManagerUpn` | Plan | Passthrough from the source Entra profile. `ManagerUpn` is re-resolved to the target account at provisioning. `BusinessPhone` is the first entry of the source's `businessPhones`. |
 | `MailboxType`, `AccountEnabled`, `IsSynced`, `SourceLicenses` | Plan | `IsSynced=True` blocks every identity write |
 | `InterimUserPrincipalName`, `InterimPrimarySmtp` | Plan | onmicrosoft addresses used while the vanity domain is still in the source tenant |
 | `TargetUserPrincipalName`, `TargetPrimarySmtp`, `TargetAliases`, `TargetMailNickname` | Plan / **operator** | Operator edits win — mark the row `ManualOverride` |
@@ -166,7 +170,7 @@ Copy the whole folder to run it; the scripts are no longer individually standalo
 | `Planned` | Named, validated, ready | Yes |
 | `ManualOverride` | An operator set the target addresses by hand | Yes — and re-running the planner will not touch them |
 | `UpnSmtpDiverge` | UPN and primary SMTP differ deliberately | Yes |
-| `Collision` | Another object wanted the same address; a suffix or middle initial was applied | Only with `-IncludeCollisions` |
+| `Collision` | Another object wanted the same address (a suffix or middle initial was applied), or two rows would share a `TargetMailNickname` (the later one is renamed with a numeric suffix) | Only with `-IncludeCollisions` |
 | `NeedsReview` | The template could not be completed (no surname, non-Latin script) — target columns left empty | No |
 | `Invalid` | The produced address failed validation (length, characters, dots) | No |
 | `Excluded` | Break-glass, service account, synced, disabled, guest, or a group Fly owns — see `ExcludeReason` | No |
@@ -235,7 +239,13 @@ by hand and mark them `ManualOverride`.
 
 ## Runbook
 
-Each step is one command. Dry-run everything first.
+Each step is one command. Dry-run everything first. `-PlanPath` (`Import-MigrationPlan`)
+resolves a wildcard when it matches exactly one file — zero or more than one match is an
+error. Every other CSV input (`-UsersCsv`, `-CsvPath`, `-DifferenceCsv`,
+`-MailboxPermissionsCsv`, `-SharedMailboxesCsv`, `-GroupsCsv`, `-ContactsCsv`,
+`-SourceMailboxesCsv`, `-ReservedAddressesPath`, etc. — via `Import-MigrationCsv`) is read
+with `-LiteralPath` and does not expand wildcards; substitute the real file name or
+tab-complete it.
 
 **1. Inventory the source tenant** (read-only)
 
@@ -303,7 +313,7 @@ the first write if the tenant is short.
 ```powershell
 .\New-MigrationRecipients.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -Wave 1 -Mode CreateAndUpdate `
     -GroupsCsv .\Source_Groups_*.csv -ContactsCsv .\Source_Contacts_*.csv `
-    -SharedMailboxesCsv .\Source_SharedMailboxes_*.csv -Prefix Contoso
+    -SharedMailboxesCsv .\Source_SharedMailboxes_*.csv -TenantId newco.onmicrosoft.com -Prefix Contoso
 ```
 
 Use `-Mode UpdateSettings` alone to patch settings onto groups Fly already created.
@@ -341,7 +351,7 @@ Then remove the domain from the source tenant and verify it in the destination.
 ```powershell
 .\Set-MigrationIdentity.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -Wave 1 `
     -Apply Upn,PrimarySmtp,Aliases,X500,MailNickname,GalVisibility -Unhide `
-    -MatchOn TargetObjectId -DisableEmailAddressPolicy `
+    -MatchOn TargetObjectId -Confirm:$false `
     -TenantId newco.onmicrosoft.com -Prefix Contoso
 ```
 
@@ -351,32 +361,40 @@ Then remove the domain from the source tenant and verify it in the destination.
 .\Set-MigrationMailboxPermissions.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv `
     -MailboxPermissionsCsv .\Source_MailboxPermissions_*.csv `
     -UserMailboxesCsv .\Source_UserMailboxes_*.csv -SharedMailboxesCsv .\Source_SharedMailboxes_*.csv `
-    -Apply FullAccess,SendAs,SendOnBehalf,Calendar,Forwarding -Wave 1 -Prefix Contoso
+    -Apply FullAccess,SendAs,SendOnBehalf,Calendar,Forwarding -Wave 1 -Confirm:$false -Prefix Contoso
 ```
+
+`-Confirm:$false` is needed here too — same High `ConfirmImpact`, per-object prompts as
+step 12. This script has no `-TenantId`; it reuses whatever Exchange session is already
+connected, so sign in (or pass `-DelegatedOrganization`) before running it.
 
 **14. Cutover passwords**
 
 ```powershell
-.\Reset-MigrationCutoverPasswords.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -Wave 1 -Prefix Contoso
+.\Reset-MigrationCutoverPasswords.ps1 -PlanPath .\Contoso_IdentityPlan_*.csv -Wave 1 -Confirm:$false -Prefix Contoso
 ```
 
-Credentials go to the results CSV only. Distribute them out of band.
+Same `-Confirm:$false` reason as steps 12-13: `ConfirmImpact` is High with a per-user
+prompt. Credentials go to the results CSV only. Distribute them out of band.
 
 **15. Teams Phone** — release in the source, reassign in the destination once numbers port.
 
 ```powershell
 .\Get-MigrationTeamsPhoneAssignments.ps1 -Prefix Source -TenantId contoso.onmicrosoft.com -IncludeUnassignedNumbers
-.\Remove-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments_*.csv -TenantId contoso.onmicrosoft.com
+.\Remove-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments_*.csv -TenantId contoso.onmicrosoft.com -Confirm:$false
 .\Set-MigrationTeamsPhoneAssignments.ps1 -ListUnassigned -TenantId newco.onmicrosoft.com
-.\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments_*.csv -TenantId newco.onmicrosoft.com
+.\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments_*.csv -TenantId newco.onmicrosoft.com -Confirm:$false
 ```
+
+`-ListUnassigned` makes no changes and needs no confirmation; the other two are
+`ConfirmImpact` High with a per-number prompt, hence `-Confirm:$false`.
 
 **16. Viva Learning** — optional.
 
 ```powershell
 .\Get-MigrationVivaLearningHistory.ps1 -Prefix Source -TenantId contoso.onmicrosoft.com
 .\Import-MigrationVivaLearningHistory.ps1 -CsvPath .\Source_VivaLearningHistory_*.csv `
-    -TenantId <destination-tenant-id> -ClientId <app-id> -ClientSecret (Read-Host -AsSecureString 'Secret') `
+    -TenantId newco.onmicrosoft.com -ClientId <app-id> -ClientSecret (Read-Host -AsSecureString 'Secret') `
     -PlanPath .\Contoso_IdentityPlan_*.csv -Prefix Contoso -DryRun
 ```
 
@@ -407,53 +425,55 @@ No second tenant, no Fly — just standardising an existing tenant's addressing.
     -TargetDomain fabrikam.com -UpnFormat First.Last -Prefix Fabrikam
 # review and edit the plan, then apply against the CURRENT addresses
 .\Set-MigrationIdentity.ps1 -PlanPath .\Fabrikam_IdentityPlan_*.csv `
-    -Apply Upn,PrimarySmtp,Aliases -MatchOn Source -DisableEmailAddressPolicy `
+    -Apply Upn,PrimarySmtp,Aliases -MatchOn Source `
     -Prefix Fabrikam -DryRun
 ```
 
 `-MatchOn Source` is the whole trick: the objects already exist, so the plan's `Source*`
 columns describe today and `Target*` describes the new scheme. The old primary is kept as
 an alias unless you pass `-RemoveOldPrimaryAlias`. Directory-synced users are reported
-`Failed` — those have to change in on-premises AD.
+`Failed` — those have to change in on-premises AD. The run still prompts per operation
+(`ConfirmImpact` is High) unless you add `-Confirm:$false`.
 
 ---
 
 ## Script reference
 
-Columns: what it does; the parameters beyond the common `-OutputPath -Prefix -LogPath
--DryRun -Verbosity` set; what it reads; what it writes.
+Columns: what it does; the parameters beyond the common `-OutputPath -Prefix -DryRun
+-Verbosity` set (every script except `Get-MigrationVivaLearningHistory` also takes
+`-LogPath`); what it reads; what it writes.
 
 ### Phase 1 — Discover (read-only)
 
 | Script | Purpose | Key parameters | In → Out |
 |---|---|---|---|
 | `Get-MigrationInventory.ps1` | One read-only pull of a whole tenant | `-TenantId`, `-DelegatedOrganization`, `-DomainFilter`, `-IncludeGuests`, `-IncludeDisabled`, `-IncludeOneDrive`, `-IncludeAuthMethods`, `-SkipMailboxPermissions`, `-SkipMailboxStats`, `-SkipExcel` | Tenant → nine `<Prefix>_<Tab>_<ts>.csv` files plus one `.xlsx` |
-| `Get-MigrationTeamsPhoneAssignments.ps1` | One row per user: number, type (`CallingPlan`/`OperatorConnect`/`DirectRouting`), enterprise voice, voice routing policy, dial plan, calling policy, emergency location | `-TenantId`, `-OnlyUsersWithNumbers`, `-IncludeUnassignedNumbers` | Tenant → `TeamsPhoneAssignments` CSV (+ unassigned-number CSV) |
+| `Get-MigrationTeamsPhoneAssignments.ps1` | One row per user: number, type (`CallingPlan`/`OperatorConnect`/`OCMobile`/`DirectRouting`), enterprise voice, voice routing policy, dial plan, calling policy, emergency location | `-TenantId`, `-OnlyUsersWithNumbers`, `-IncludeUnassignedNumbers` | Tenant → `TeamsPhoneAssignments` CSV (+ unassigned-number CSV) |
 | `Get-MigrationVivaLearningHistory.ps1` | Learner history: assignments and self-initiated courses, with course metadata. Delegated sign-in only | `-TenantId`, `-User`, `-IncludeGuests`, `-SkipCourseMetadata` | Tenant → `VivaLearningHistory` CSV + raw-JSON backup |
-| `Compare-MigrationUserData.ps1` | Two modes: fuzzy CSV-to-CSV match, or destination inventory checked against the plan. Offline either way | `-ReferenceCsv` + `-DifferenceCsv` (+ `-SimilarityThreshold`), or `-PlanPath` + `-DifferenceCsv` (+ `-Wave`, `-ObjectType`) | Two CSVs → comparison CSV with `Status` and `MatchedOn` |
+| `Compare-MigrationUserData.ps1` | Two modes: fuzzy CSV-to-CSV match, or destination inventory checked against the plan. Offline either way | `-ReferenceCsv` + `-DifferenceCsv` (+ `-SimilarityThreshold`), or `-PlanPath` + `-DifferenceCsv` (+ `-Wave`, `-ObjectType`) | CSV mode → comparison CSV, `Status` ∈ `Exact Match \| Partial Match \| No Match`; plan mode → `Status` ∈ `Match \| Mismatch \| Missing \| Extra \| Skipped`, exit 2 on any `Missing`/`Mismatch` |
 
 ### Phase 2 — Plan (offline, no tenant connection)
 
 | Script | Purpose | Key parameters | In → Out |
 |---|---|---|---|
 | `New-MigrationIdentityPlan.ps1` | Decides every destination identity: naming, collisions, validation, SKU map, X500 carry-across, waves | Inputs: `-UsersCsv` (required), `-UserMailboxesCsv`, `-SharedMailboxesCsv`, `-GroupsCsv`, `-ContactsCsv`, `-SkuMapPath`, `-ExclusionRulesPath`, `-WaveMapPath`, `-ReservedAddressesPath`, `-ExistingPlanPath`. Design: `-TargetDomain` (required), `-InterimDomain`, `-UpnFormat`, `-SmtpFormat`, `-MailNicknameFormat`, `-DefaultWave`, `-DefaultUsageLocation`, `-PreserveAliases`, `-AliasDomainMap`, `-IncludeDisabled`, `-IncludeGuests`, `-IncludeSynced` | Inventory CSVs → `<Prefix>_IdentityPlan_<ts>.csv` |
-| `Export-MigrationMappingFile.ps1` | The mover's source→destination mapping file. Unmappable rows are reported `Skipped`, never dropped silently | `-PlanPath` (required), `-Tool` (default `AvePoint`), `-Wave`, `-ObjectType`, `-UseInterim`, `-SkipExcel` | Plan → mapping workbook + CSV twin |
+| `Export-MigrationMappingFile.ps1` | The mover's source→destination mapping file. Maps only `Planned`, `ManualOverride` and `UpnSmtpDiverge` rows (`Collision` too with `-IncludeCollisions`); everything else is reported `Skipped`, never dropped silently | `-PlanPath` (required), `-Tool` (default `AvePoint`), `-Wave`, `-ObjectType`, `-UseInterim`, `-IncludeCollisions`, `-SkipExcel` | Plan → mapping workbook + CSV twin |
 
 ### Phase 3 — Prepare the destination
 
 | Script | Purpose | Key parameters | In → Out |
 |---|---|---|---|
-| `Test-MigrationReadiness.ps1` | `Pre`: domains verified, seats, usage locations, UPN/SMTP/alias/mailNickname clashes including soft-deleted holders, plan cleanliness. `Provisioned`: user, mailbox, archive, litigation hold, OneDrive, quota. `Post`: UPN, primary SMTP, aliases, X500, unhidden, enabled. Exits 2 on any failed check | `-PlanPath` (required), `-Stage Pre\|Provisioned\|Post`, `-Wave`, `-SourceMailboxesCsv`, `-TenantId`, `-DelegatedOrganization` | Plan + tenant → checks CSV; `Provisioned` writes `MailboxProvisioned` / `OneDriveProvisioned` back to the plan |
-| `New-MigrationUsers.ps1` | Creates Entra accounts from the plan's `User` rows | `-PlanPath` (required), `-Wave`, `-UseInterim`, `-HideFromAddressLists`, `-AssignLicenses`, `-SetManagers`, `-ForceChangePassword`, `-PasswordLength`, `-DefaultUsageLocation`, `-IncludeCollisions`, `-TenantId` | Plan → accounts; writes `TargetObjectId` back; passwords to the results CSV only |
+| `Test-MigrationReadiness.ps1` | `Pre`: domains verified, seats, usage locations, UPN/SMTP/alias/mailNickname clashes including soft-deleted holders (UPN and primary address only), plan cleanliness. `Provisioned`: user, mailbox, archive, litigation hold, OneDrive, quota. `Post`: UPN, primary SMTP, aliases, X500, unhidden, enabled. Exits 2 on any failed check | `-PlanPath` (required), `-Stage Pre\|Provisioned\|Post`, `-Wave`, `-SourceMailboxesCsv`, `-TenantId`, `-DelegatedOrganization` | Plan + tenant → checks CSV; `Provisioned` writes `MailboxProvisioned` / `OneDriveProvisioned` back to the plan |
+| `New-MigrationUsers.ps1` | Creates Entra accounts from the plan's `User` rows, carrying over job title, department, office, mobile phone, postal address (city/state/country/postal code/street), company name, employee ID/type, business phone, fax number and preferred language when the plan row has them | `-PlanPath` (required), `-Wave`, `-UseInterim`, `-HideFromAddressLists`, `-AssignLicenses`, `-SetManagers`, `-ForceChangePassword`, `-PasswordLength`, `-DefaultUsageLocation`, `-IncludeCollisions`, `-TenantId` | Plan → accounts; writes `TargetObjectId` back; passwords to the results CSV only |
 | `Set-MigrationLicenses.ps1` | Usage location first, then `assignLicense`. Refuses group-assigned SKUs both ways; seat pre-check stops the run unless `-Force` | `-PlanPath` (required), `-Wave`, `-SkuMapPath` (recomputes from `SourceLicenses` without regenerating the plan), `-RemoveUnplanned`, `-DefaultUsageLocation`, `-Force`, `-IncludeCollisions`, `-TenantId` | Plan (+ SKU map) → licence assignments, results CSV |
-| `New-MigrationRecipients.ps1` | Shared/room/equipment mailboxes, DLs, mail-enabled security groups, dynamic DLs, mail contacts. Members, owners, moderators and delivery restrictions are translated through the plan; unmapped ones are reported, not guessed. Stamps X500 | `-PlanPath` (required), `-Type`, `-Mode Create\|UpdateSettings\|CreateAndUpdate`, `-Wave`, `-UseInterim`, `-GroupsCsv`, `-ContactsCsv`, `-SharedMailboxesCsv`, `-MailboxPermissionsCsv`, `-IncludeCollisions`, `-DelegatedOrganization` | Plan + source inventory → recipients, results CSV |
+| `New-MigrationRecipients.ps1` | Shared/room/equipment mailboxes, DLs, mail-enabled security groups, dynamic DLs, mail contacts. Members, owners, moderators and delivery restrictions are translated through the plan; unmapped ones are reported, not guessed. Stamps X500 | `-PlanPath` (required), `-Type`, `-Mode Create\|UpdateSettings\|CreateAndUpdate`, `-Wave`, `-UseInterim`, `-GroupsCsv`, `-ContactsCsv`, `-SharedMailboxesCsv`, `-MailboxPermissionsCsv`, `-IncludeCollisions`, `-TenantId`, `-DelegatedOrganization` | Plan + source inventory → recipients, results CSV |
 
 ### Phase 4 — Cutover
 
 | Script | Purpose | Key parameters | In → Out |
 |---|---|---|---|
-| `Remove-MigrationDomainReferences.ps1` | Source-side domain release. Always reports first and only remediates with `-AcknowledgeSourceTenant`. Exits 2 while blockers remain | `-Domain` (required), `-FallbackDomain` (default: the tenant's initial onmicrosoft domain), `-Scope Users,Groups,Contacts,Mailboxes`, `-ReportOnly`, `-AcknowledgeSourceTenant`, `-TenantId`, `-DelegatedOrganization` | Source tenant → References CSV + Blockers CSV, then remediation |
-| `Set-MigrationIdentity.ps1` | Applies the plan's target identity. Additive by design: never removes the MOERA routing address, a SIP address or an existing X500. Directory-synced objects are a hard `Failed` | `-PlanPath` (required), `-Apply Upn,PrimarySmtp,Aliases,X500,GalVisibility,MailNickname`, `-MatchOn TargetObjectId\|Interim\|Source`, `-Wave`, `-RemoveOldPrimaryAlias`, `-DisableEmailAddressPolicy`, `-Unhide`, `-IncludeCollisions`, `-TenantId`, `-DelegatedOrganization` | Plan → tenant identities, results CSV |
+| `Remove-MigrationDomainReferences.ps1` | Source-side domain release. Always reports first and only remediates with `-AcknowledgeSourceTenant`. Exits 2 while any reference remains (blockers, or fixable references a report-mode run did not apply) or any row failed | `-Domain` (required), `-FallbackDomain` (default: the tenant's initial onmicrosoft domain — must be verified on the *source* tenant), `-Scope Users,Groups,Contacts,Mailboxes`, `-ReportOnly`, `-AcknowledgeSourceTenant`, `-TenantId`, `-DelegatedOrganization` | Source tenant → References CSV + Blockers CSV, then remediation |
+| `Set-MigrationIdentity.ps1` | Applies the plan's target identity. Additive by design: never removes the MOERA routing address, a SIP address or an existing X500. Directory-synced objects are a hard `Failed` | `-PlanPath` (required), `-Apply Upn,PrimarySmtp,Aliases,X500,GalVisibility,MailNickname`, `-MatchOn TargetObjectId\|Interim\|Source`, `-Wave`, `-RemoveOldPrimaryAlias`, `-Unhide`, `-IncludeCollisions`, `-TenantId`, `-DelegatedOrganization` | Plan → tenant identities, results CSV |
 | `Set-MigrationMailboxPermissions.ps1` | Re-applies delegation. Both sides mapped through the plan; the trustee map is built from the whole plan, not the wave. Idempotent — safe to re-run all weekend | `-PlanPath` and `-MailboxPermissionsCsv` (both required), `-UserMailboxesCsv`, `-SharedMailboxesCsv`, `-Apply FullAccess,SendAs,SendOnBehalf,Calendar,Forwarding`, `-Wave`, `-AutoMapping`, `-IncludeCollisions`, `-DelegatedOrganization` | Plan + source permission inventory → destination ACEs, results CSV |
 | `Reset-MigrationCutoverPasswords.ps1` | Passphrase reset with change-at-next-sign-in | One of `-PlanPath` (+ `-Wave`, `-IncludeCollisions`), `-CsvPath`, `-Group` (object ID or display name, **not** the group's email) or `-TestUser`; plus `-WordCount`, `-ForceChangePassword`, `-TenantId` | Plan/CSV/group → resets; credentials to the results CSV only |
 | `Set-MigrationTeamsPhoneAssignments.ps1` | Assigns numbers. Normalises `tel:`, spaces, dashes, a missing `+`, and preserves `;ext=`. A number already on a different user fails rather than being stolen | One of `-CsvPath`, `-User` + `-PhoneNumber` (+ `-PhoneNumberType`, `-LocationId`, `-VoiceRoutingPolicy`), or `-ListUnassigned`; plus `-TenantId` | CSV → assignments, results CSV |
@@ -480,7 +500,7 @@ inside `InModuleScope`. The analyzer run must come back clean.
 | Gotcha | What happens | What to do |
 |---|---|---|
 | Missing X500 | Replies from cached Outlook entries and old calendar items bounce with an IMCEAEX NDR | Stamp `X500:<LegacyExchangeDN>` on every migrated recipient — `Set-MigrationIdentity -Apply X500`, and `New-MigrationRecipients` does it at creation |
-| Email address policy | The org policy re-asserts the primary SMTP after you set it | Run with `-DisableEmailAddressPolicy`, which sets `EmailAddressPolicyEnabled $false` before the address write |
+| Primary SMTP looks reasserted to the old address | Exchange Online has no per-mailbox email address policy for a user mailbox to reassert it | A reasserted primary means the object is hybrid/directory-synced — `Set-MigrationIdentity` already hard-stops those rows as `Failed`; fix the address on-premises |
 | Graph `PATCH /users {mail}` | Silently cosmetic on a mailbox-enabled user; Exchange owns `proxyAddresses` | Primary SMTP always goes through `Set-Mailbox -EmailAddresses`, never Graph. The toolkit does this for you |
 | Group-based licensing | `assignLicense` cannot remove a group-inherited SKU, and re-adding one quietly doubles the assignment | `Set-MigrationLicenses` detects `assignedByGroup` and skips both directions. Remove the user from the group instead |
 | Missing usage location | `assignLicense` fails, surfacing in the admin center as a vague "invalid usage location" | Set `UsageLocation` in the plan, or pass `-DefaultUsageLocation` |

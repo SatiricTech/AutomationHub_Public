@@ -8,9 +8,9 @@ BeforeAll {
 
 Describe 'M365Migration manifest' {
 
-    It 'Is a valid manifest at version 1.1.0' {
+    It 'Is a valid manifest at version 1.1.1' {
         $manifest = Test-ModuleManifest -Path $script:modulePath -ErrorAction Stop
-        $manifest.Version.ToString() | Should -BeExactly '1.1.0'
+        $manifest.Version.ToString() | Should -BeExactly '1.1.1'
         $manifest.PowerShellVersion.ToString() | Should -BeExactly '7.4'
     }
 
@@ -100,5 +100,13 @@ Describe 'Promoted helpers behave the same as exported functions' {
             -NotePropertyValue ([pscustomobject]@{ StatusCode = 429; Headers = @{} })
         $record = [System.Management.Automation.ErrorRecord]::new($exception, 'GraphError', 'InvalidResult', $null)
         Get-MigrationGraphErrorStatusCode -ErrorRecord $record | Should -Be 429
+    }
+
+    It 'Reads 404 off the SDK cmdlet not-found message shape (no numeric status in the text)' {
+        $exception = [System.Exception]::new(
+            "[Request_ResourceNotFound] : Resource '11111111-1111-1111-1111-111111111111' does not exist " +
+            'or one of its queried reference-property objects are not present.')
+        $record = [System.Management.Automation.ErrorRecord]::new($exception, 'GraphError', 'InvalidResult', $null)
+        Get-MigrationGraphErrorStatusCode -ErrorRecord $record | Should -Be 404
     }
 }

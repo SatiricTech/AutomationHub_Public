@@ -17,15 +17,18 @@
          than at the point of assignment.
       2. Group-assigned SKUs are refused. assignLicense cannot remove what group-based licensing
          handed out - the user has to leave the group - and re-adding one directly quietly doubles
-         up the assignment. Both directions are skipped and reported.
+         up the assignment. Both directions are skipped and reported. An assignment Microsoft 365
+         reports in Error or Disabled state is not a working licence, so it does not count as held:
+         the SKU is sent again and the state is named in the row Detail.
       3. Seats are counted before anything is assigned: the run's new assignments are totalled per
          SKU, compared with the seats the tenant has spare, printed as a table, and the run stops
          before the first write unless -Force says to press on and let individual rows fail.
       4. Only then does the per-row loop run.
 
     -DryRun performs every read, every calculation and the whole seat pre-check, then writes a
-    results file whose rows are Status 'Planned' and changes nothing. -WhatIf is honoured at the
-    row level as well.
+    results file whose rows are Status 'Planned' and changes nothing. A seat shortfall or an
+    unknown SKU is logged and sets exit code 1, but the dry run still writes every row so the
+    operator can see which users need which SKU. -WhatIf is honoured at the row level as well.
 
 .PARAMETER PlanPath
     Path to IdentityPlan.csv. Only ObjectType 'User' rows are considered; rows whose PlanStatus is
@@ -53,12 +56,15 @@
     planned address is not safe to use yet.
 
 .PARAMETER Force
-    Continue past the seat pre-check when the tenant does not have enough spare seats. Individual
-    rows will then fail as Microsoft 365 runs out of licences, which is sometimes the intent when
-    seats are being purchased in parallel.
+    Continue past the seat pre-check when the tenant does not have enough spare seats or the plan
+    names a SKU the tenant does not subscribe to. Rows short of a seat then fail as Microsoft 365
+    runs out of licences, which is sometimes the intent when seats are being purchased in parallel.
+    Rows naming an unknown SKU are reported Failed without any change being sent.
 
 .PARAMETER TenantId
-    Destination tenant id or domain for Connect-MgGraph. Supported under GDAP.
+    Pins the sign-in to the destination tenant (id or domain). Recommended whenever the technician
+    has more than one tenant cached, so a leftover session from the other tenant fails loudly
+    instead of being reused.
 
 .PARAMETER OutputPath
     Overrides the output root (default %LOCALAPPDATA%\Migration-Automations, ~/Migration-Automations
@@ -96,23 +102,28 @@
 .EXAMPLE
     .\Set-MigrationLicenses.ps1 -PlanPath .\IdentityPlan.csv -Wave 2 -TenantId newco.onmicrosoft.com -WhatIf
 
-    Shows the per-user Graph calls that would run against a GDAP-delegated destination tenant.
+    Signed in as the destination tenant's dedicated Global Admin, with the sign-in pinned to
+    newco.onmicrosoft.com, shows the per-user Graph calls wave 2 would make without sending any.
 
 .NOTES
     Author: AutomationHub
     Written with assistance from Claude (Anthropic).
 
     Required Microsoft Graph scopes:
-      User.ReadWrite.All      - PATCH usageLocation and POST assignLicense
+      User.ReadWrite.All      - read users with licenseAssignmentStates, PATCH usageLocation and
+                                POST assignLicense
       Organization.Read.All   - read subscribedSkus for the seat pre-check
-      Directory.Read.All      - read licenseAssignmentStates
 
     Exchange Online is not used by this script, so no EXO role is required.
 
-    GDAP: supported. Pass -TenantId <customer domain or id>; Connect-MgGraph honours an active
-    GDAP relationship and scopes the session to the roles that relationship granted.
+    Sign in as the dedicated Global Admin for the destination tenant and pin it with -TenantId.
+    As a secondary alternative, a partner user under a GDAP relationship can pass the customer
+    tenant in -TenantId, provided the Microsoft Graph PowerShell app has already been consented
+    for these scopes in that customer tenant. There is no -DelegatedOrganization here; that
+    parameter belongs to the Exchange Online scripts.
 
-    Exit codes: 0 success, 1 fatal (connection, plan or seat pre-check), 2 completed with row
+    Exit codes: 0 success, 1 fatal (connection, plan or seat pre-check; under -DryRun the seat
+    pre-check sets this code but the results file is still written), 2 completed with row
     failures.
 #>
 
@@ -163,7 +174,8 @@ $ErrorActionPreference = 'Stop'
 #region Configuration
 
 # Declared here rather than inline so a reviewer can see the blast radius of the script in one place.
-$requiredGraphScopes = @('User.ReadWrite.All', 'Organization.Read.All', 'Directory.Read.All')
+# licenseAssignmentStates is a user property, so User.ReadWrite.All already covers reading it.
+$requiredGraphScopes = @('User.ReadWrite.All', 'Organization.Read.All')
 
 # Graph rejects very long $filter strings, so identifiers are looked up in chunks rather than one
 # request per plan row.
@@ -273,6 +285,13 @@ function Resolve-LicenseChange {
         not re-sent - are all testable offline. A SKU can appear twice in licenseAssignmentStates,
         once direct and once via a group: direct wins the "already assigned" decision, and the group
         entry still blocks removal.
+
+        Each entry also carries a state (Active, ActiveWithError, Disabled, Error) and an error
+        (None, CountViolation, ProhibitedInUsageLocationViolation, ...). An entry in Error or
+        Disabled state is not a working licence, so it does not count as held on the add side - the
+        SKU is sent again and the entry is reported in BrokenAssignment. It still counts on the
+        remove side: a broken direct assignment can be removed with -RemoveUnplanned, and a broken
+        group assignment still cannot. ActiveWithError is treated as held.
     .PARAMETER DesiredSkuPartNumber
         The part numbers the plan wants the user to hold.
     .PARAMETER Catalog
@@ -301,14 +320,37 @@ function Resolve-LicenseChange {
         if ($part -and $id) { $idByPart[$part] = $id; $partById[$id] = $part }
     }
 
+    $addOnce = {
+        param([System.Collections.Generic.List[string]]$List, [string]$Value)
+        if (-not $List.Contains($Value)) { $List.Add($Value) }
+    }
+    $partOf = { param([string]$SkuId) if ($partById.ContainsKey($SkuId)) { $partById[$SkuId] } else { $SkuId } }
+
+    # Every entry lands in $directId or $groupId, which drive the remove side. Only entries in a
+    # working state land in the held sets, which drive the add side: a licence Microsoft 365 could
+    # not apply (seats ran out, usage location was wrong when the group processed) is not one the
+    # user can use, so skipping the row as 'already assigned' would leave them unlicensed.
     $directId = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $groupId = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $heldDirectId = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $heldGroupId = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $desiredId = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $brokenText = [System.Collections.Generic.List[string]]::new()
     foreach ($state in @($AssignmentState)) {
         $skuId = [string](Get-MigrationProperty -InputObject $state -Name 'skuId' -Default '')
         if (-not $skuId) { continue }
         $byGroup = [string](Get-MigrationProperty -InputObject $state -Name 'assignedByGroup' -Default '')
-        if ([string]::IsNullOrWhiteSpace($byGroup)) { [void]$directId.Add($skuId) } else { [void]$groupId.Add($skuId) }
+        $isGroup = -not [string]::IsNullOrWhiteSpace($byGroup)
+        if ($isGroup) { [void]$groupId.Add($skuId) } else { [void]$directId.Add($skuId) }
+
+        $stateName = [string](Get-MigrationProperty -InputObject $state -Name 'state' -Default '')
+        if ($stateName -in @('Error', 'Disabled')) {
+            $errorName = [string](Get-MigrationProperty -InputObject $state -Name 'error' -Default '')
+            $why = if ($errorName -and $errorName -ne 'None') { "$stateName, $errorName" } else { $stateName }
+            & $addOnce $brokenText "$(& $partOf $skuId) ($(if ($isGroup) { 'group' } else { 'direct' }) assignment in state $why)"
+            continue
+        }
+        if ($isGroup) { [void]$heldGroupId.Add($skuId) } else { [void]$heldDirectId.Add($skuId) }
     }
 
     $addId = [System.Collections.Generic.List[string]]::new()
@@ -316,10 +358,6 @@ function Resolve-LicenseChange {
     $alreadyPart = [System.Collections.Generic.List[string]]::new()
     $groupPart = [System.Collections.Generic.List[string]]::new()
     $unknownPart = [System.Collections.Generic.List[string]]::new()
-    $addOnce = {
-        param([System.Collections.Generic.List[string]]$List, [string]$Value)
-        if (-not $List.Contains($Value)) { $List.Add($Value) }
-    }
 
     foreach ($part in @($DesiredSkuPartNumber)) {
         if ([string]::IsNullOrWhiteSpace($part)) { continue }
@@ -328,15 +366,14 @@ function Resolve-LicenseChange {
         $skuId = $idByPart[$part]
         [void]$desiredId.Add($skuId)
 
-        if ($directId.Contains($skuId)) { & $addOnce $alreadyPart $part; continue }
+        if ($heldDirectId.Contains($skuId)) { & $addOnce $alreadyPart $part; continue }
         # Adding it directly on top of the group assignment double-books a seat.
-        if ($groupId.Contains($skuId)) { & $addOnce $groupPart $part; continue }
+        if ($heldGroupId.Contains($skuId)) { & $addOnce $groupPart $part; continue }
         if (-not $addId.Contains($skuId)) { $addId.Add($skuId); $addPart.Add($part) }
     }
 
     $removeId = [System.Collections.Generic.List[string]]::new()
     $removePart = [System.Collections.Generic.List[string]]::new()
-    $partOf = { param([string]$SkuId) if ($partById.ContainsKey($SkuId)) { $partById[$SkuId] } else { $SkuId } }
 
     if ($RemoveUnplanned) {
         foreach ($skuId in $directId) {
@@ -358,6 +395,7 @@ function Resolve-LicenseChange {
         AlreadyAssigned     = $alreadyPart.ToArray()
         GroupAssigned       = $groupPart.ToArray()
         UnknownSku          = $unknownPart.ToArray()
+        BrokenAssignment    = $brokenText.ToArray()
     }
 }
 
@@ -508,6 +546,81 @@ function Get-DestinationUserMap {
     return @{ ById = $byId; ByUpn = $byUpn }
 }
 
+function Get-PlanRowIdentifier {
+    <#
+    .SYNOPSIS
+        Reads every identifier a plan row offers for its destination user.
+    .DESCRIPTION
+        Licensing runs after New-MigrationUsers and before Set-MigrationIdentity, so the user's
+        live UPN is usually the interim one and TargetUserPrincipalName does not exist yet. All
+        three identifiers are returned so a lookup can try them in the order the sibling scripts
+        use: TargetObjectId, then the interim UPN, then the target UPN.
+    .PARAMETER Row
+        The identity plan row.
+    .EXAMPLE
+        (Get-PlanRowIdentifier -Row $planRow).InterimUpn
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory)][AllowNull()]$Row)
+
+    [pscustomobject]@{
+        ObjectId   = [string](Get-MigrationCsvValue -Row $Row -Name 'TargetObjectId' -Default '')
+        InterimUpn = [string](Get-MigrationCsvValue -Row $Row -Name 'InterimUserPrincipalName' -Default '')
+        TargetUpn  = [string](Get-MigrationCsvValue -Row $Row -Name 'TargetUserPrincipalName' -Default '')
+    }
+}
+
+function Find-PlanRowUser {
+    <#
+    .SYNOPSIS
+        Picks a plan row's destination user out of the Get-DestinationUserMap result.
+    .DESCRIPTION
+        TargetObjectId is tried first because it is exact. When it matches nothing - the plan was
+        edited by hand, the user was provisioned outside the toolkit, or was deleted and recreated -
+        the interim UPN and then the target UPN are tried, and the stale id is called out so the
+        operator can correct the plan rather than wonder why the id and the UPN disagree.
+    .PARAMETER Row
+        The identity plan row.
+    .PARAMETER UserMap
+        The hashtable returned by Get-DestinationUserMap (ById and ByUpn).
+    .EXAMPLE
+        $match = Find-PlanRowUser -Row $planRow -UserMap $userMap
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Row,
+        [Parameter(Mandatory)][hashtable]$UserMap
+    )
+
+    $ids = Get-PlanRowIdentifier -Row $Row
+    $user = $null
+    $matchedBy = ''
+
+    if ($ids.ObjectId -and $UserMap.ById.ContainsKey($ids.ObjectId)) {
+        $user = $UserMap.ById[$ids.ObjectId]
+        $matchedBy = 'TargetObjectId'
+    }
+    else {
+        foreach ($candidate in @(
+                @{ Column = 'InterimUserPrincipalName'; Value = $ids.InterimUpn }
+                @{ Column = 'TargetUserPrincipalName'; Value = $ids.TargetUpn })) {
+            if (-not $candidate.Value) { continue }
+            $key = $candidate.Value.ToLowerInvariant()
+            if ($UserMap.ByUpn.ContainsKey($key)) { $user = $UserMap.ByUpn[$key]; $matchedBy = $candidate.Column; break }
+        }
+    }
+
+    $warning = ''
+    if ($null -ne $user -and $ids.ObjectId -and $matchedBy -ne 'TargetObjectId') {
+        $warning = "TargetObjectId $($ids.ObjectId) matched no destination user; matched by $matchedBy instead. " +
+        'The plan row carries a stale TargetObjectId.'
+    }
+
+    [pscustomobject]@{ User = $user; MatchedBy = $matchedBy; Warning = $warning }
+}
+
 function Set-PlanRowLicense {
     <#
     .SYNOPSIS
@@ -550,7 +663,19 @@ function Set-PlanRowLicense {
     $identity = $result.Identity
 
     if ($null -eq $User) {
-        $result.Detail = 'No destination user matched this row - run New-MigrationUsers first.'
+        # Name what was tried, so a stale TargetObjectId or a not-yet-provisioned user is
+        # diagnosable from the results row alone.
+        $ids = Get-PlanRowIdentifier -Row $Row
+        $tried = @(
+            if ($ids.ObjectId) { "TargetObjectId $($ids.ObjectId)" }
+            if ($ids.InterimUpn) { "InterimUserPrincipalName $($ids.InterimUpn)" }
+            if ($ids.TargetUpn) { "TargetUserPrincipalName $($ids.TargetUpn)" }
+        )
+        $result.Detail = if ($tried.Count -gt 0) {
+            "No destination user matched $($tried -join ', '). Check that the user exists in this tenant " +
+            '(New-MigrationUsers creates it and writes TargetObjectId back) and that the plan row is current.'
+        }
+        else { 'No TargetObjectId, InterimUserPrincipalName or TargetUserPrincipalName on the plan row.' }
         return $result
     }
 
@@ -570,9 +695,9 @@ function Set-PlanRowLicense {
     $note = [System.Collections.Generic.List[string]]::new()
     foreach ($item in @(
             @{ Values = $desired.Unmapped; Text = 'source SKU not in map, carried through' }
-            @{ Values = $change.UnknownSku; Text = 'not a SKU in this tenant' }
             @{ Values = $change.GroupAssigned; Text = 'group-assigned, left alone' }
-            @{ Values = $change.AlreadyAssigned; Text = 'already assigned' })) {
+            @{ Values = $change.AlreadyAssigned; Text = 'already assigned' }
+            @{ Values = $change.BrokenAssignment; Text = 'assignment in error state on the user, not counted as held' })) {
         if (@($item.Values).Count -gt 0) { $note.Add("$($item.Text): $(Join-MigrationList -Values $item.Values)") }
     }
 
@@ -582,6 +707,16 @@ function Set-PlanRowLicense {
     $wantedLocation = if ($plannedLocation) { $plannedLocation } elseif ($DefaultUsageLocation) { $DefaultUsageLocation } else { '' }
     $locationToSet = if (-not $currentLocation -or ($wantedLocation -and $wantedLocation -ne $currentLocation)) { $wantedLocation } else { '' }
     $result.UsageLocation = if ($locationToSet) { $locationToSet } else { $currentLocation }
+
+    # A part number the tenant does not subscribe to means the plan or the SKU map is wrong for this
+    # tenant. The row fails before anything is sent - the removals included, so -RemoveUnplanned
+    # cannot strip a user whose replacement licence would never arrive - rather than reading
+    # 'Nothing to do' or 'Succeeded' on the strength of a usageLocation PATCH alone.
+    if (@($change.UnknownSku).Count -gt 0) {
+        $result.Detail = "Not a SKU in this tenant: $(Join-MigrationList -Values $change.UnknownSku). " +
+        'Correct TargetLicenses or the SKU map; no change was sent for this row.'
+        return $result
+    }
 
     $needsAssign = (@($change.AddSkuId).Count -gt 0) -or (@($change.RemoveSkuId).Count -gt 0)
 
@@ -672,14 +807,6 @@ try {
         Write-MigrationLog -Message 'Target SKUs will be recomputed from SourceLicenses through the supplied map.' -Level WARNING
     }
 
-    # A row's UPN, however the plan spells it: the id is preferred when the row has been provisioned.
-    $rowUpn = {
-        param($Row)
-        $upn = Get-MigrationCsvValue -Row $Row -Name 'TargetUserPrincipalName' -Default ''
-        if (-not $upn) { $upn = Get-MigrationCsvValue -Row $Row -Name 'InterimUserPrincipalName' -Default '' }
-        return [string]$upn
-    }
-
     $eligible = [System.Collections.Generic.List[object]]::new()
     foreach ($row in $planRows) {
         # -AllowSynced: a licence is a cloud-only attribute, so directory sync does not block it.
@@ -699,12 +826,15 @@ try {
         $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
         $catalog = @(Get-MigrationSkuCatalog)
 
+        # Every identifier the row offers goes into the lookup: the live UPN is the interim one until
+        # Set-MigrationIdentity runs, and a stale TargetObjectId must still find its user.
+        # Get-DestinationUserMap de-duplicates, so this costs at most one extra batch.
         $upnList = [System.Collections.Generic.List[string]]::new()
         $idList = [System.Collections.Generic.List[string]]::new()
         foreach ($row in $eligible) {
-            $objectId = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
-            if ($objectId) { $idList.Add($objectId) }
-            elseif ((& $rowUpn $row)) { $upnList.Add((& $rowUpn $row)) }
+            $ids = Get-PlanRowIdentifier -Row $row
+            if ($ids.ObjectId) { $idList.Add($ids.ObjectId) }
+            foreach ($upn in @($ids.InterimUpn, $ids.TargetUpn)) { if ($upn) { $upnList.Add($upn) } }
         }
 
         $userMap = Get-DestinationUserMap -UserPrincipalName $upnList.ToArray() -ObjectId $idList.ToArray() `
@@ -713,12 +843,12 @@ try {
         # Pair every eligible row with its user once, so the seat pre-check and the apply loop agree.
         $work = [System.Collections.Generic.List[object]]::new()
         foreach ($row in $eligible) {
-            $objectId = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
-            $upn = & $rowUpn $row
-
-            $user = $null
-            if ($objectId -and $userMap.ById.ContainsKey($objectId)) { $user = $userMap.ById[$objectId] }
-            elseif ($upn -and $userMap.ByUpn.ContainsKey($upn.ToLowerInvariant())) { $user = $userMap.ByUpn[$upn.ToLowerInvariant()] }
+            $match = Find-PlanRowUser -Row $row -UserMap $userMap
+            $user = $match.User
+            if ($match.Warning) {
+                Write-MigrationLog -Level WARNING -Message (
+                    "$((New-LicenseResult -Row $row -Status Skipped).Identity): $($match.Warning)")
+            }
 
             $change = $null
             if ($null -ne $user) {
@@ -735,11 +865,20 @@ try {
         $blocking = @($seat | Where-Object { $_.Status -ne 'Sufficient' })
         if ($blocking.Count -gt 0) {
             $names = ($blocking | ForEach-Object { $_.SkuPartNumber }) -join ', '
-            if (-not $Force) {
-                throw ("The destination tenant cannot cover this run: $names. Buy seats, correct the SKU map, " +
-                    'or re-run with -Force to attempt the assignments anyway.')
+            $message = "The destination tenant cannot cover this run: $names. Buy seats, correct the SKU map, " +
+            'or re-run with -Force to attempt the assignments anyway.'
+            if ($Force) {
+                Write-MigrationLog -Message "-Force set; continuing despite seat problems with: $names" -Level WARNING
             }
-            Write-MigrationLog -Message "-Force set; continuing despite seat problems with: $names" -Level WARNING
+            elseif ($DryRun) {
+                # A dry run promises a results file with every row, so it reports the problem and
+                # carries on; the exit code still says a live run would have stopped here.
+                Write-MigrationLog -Message "$message The dry run continues so the results file still lists every row." -Level ERROR
+                $exitCode = 1
+            }
+            else {
+                throw $message
+            }
         }
 
         foreach ($item in $work) {

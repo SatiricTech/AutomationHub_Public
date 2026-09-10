@@ -7,7 +7,9 @@
 .DESCRIPTION
     The gate between planning and provisioning, and again between provisioning and cutover. It reads
     the destination tenant and answers one question per check: is the plan safe to run right now?
-    Nothing is written to the tenant at any stage.
+    The only tenant-side effect is in the Provisioned stage: with the delegated sign-in this script
+    uses, reading /users/{id}/drive provisions OneDrive for a licensed user who does not have one
+    yet, so that read (and the plan writeback below) is skipped under -DryRun and -WhatIf.
 
       Pre          Before any object exists: are the target and interim domains verified, are there
                    enough seats for the SKUs the plan asks for, does every licensed row have a usage
@@ -19,9 +21,11 @@
       Provisioned  After New-MigrationUsers and Set-MigrationLicenses: does the user exist, does the
                    mailbox exist, is the archive on where the source had one, is litigation hold off
                    (move tools refuse mailboxes that hold), has OneDrive been provisioned (GET
-                   /users/{id}/drive returns 404 until it has) and is the quota at least the size of
-                   the source mailbox? The only stage that writes anything, and it writes only
-                   MailboxProvisioned and OneDriveProvisioned back to the plan.
+                   /users/{id}/drive returns 404 until it has - and provisions it, for a licensed
+                   user, the moment it does not) and is the quota at least the size of the source
+                   mailbox? Shared, room and equipment mailboxes skip the OneDrive check; they have
+                   none. The only stage that writes anything, and it writes only MailboxProvisioned
+                   and OneDriveProvisioned back to the plan.
 
       Post         After cutover: is the UPN the planned one, is the primary SMTP address, is every
                    planned alias present (X500 included), is the object visible and enabled?
@@ -61,8 +65,9 @@
     Overrides the derived log file path.
 
 .PARAMETER DryRun
-    Suppresses the Provisioned stage's plan writeback - the one and only thing this script changes.
-    Every check still runs and the results file is written with the -DryRun_ marker.
+    Suppresses the Provisioned stage's plan writeback and the OneDrive read that would provision a
+    licensed user's drive (that check reports Skipped instead). Every other check still runs and
+    the results file is written with the -DryRun_ marker.
 
 .PARAMETER Verbosity
     Console detail: Low, Medium (default) or High. The log file always receives every line.
@@ -388,7 +393,12 @@ function Test-AddressClash {
 
                 $kind = [string](Get-MigrationProperty -InputObject $hit -Name 'Kind' -Default 'object')
                 $name = [string](Get-MigrationProperty -InputObject $hit -Name 'DisplayName' -Default '')
-                if (-not $reported.Add("$($candidate.Value)|$kind|$hitId")) { continue }
+                # Keyed on the object id when there is one, so the same holder found once by Graph
+                # (Kind 'User') and once by Exchange (Kind 'UserMailbox') reports as a single row
+                # rather than two. An id-less recipient (Get-EXORecipient without
+                # ExternalDirectoryObjectID, e.g. some contacts) still dedupes per kind.
+                $dedupeKey = if ($hitId) { $hitId } else { $kind }
+                if (-not $reported.Add("$($candidate.Value)|$dedupeKey")) { continue }
 
                 $held = if ($name) { "$kind '$name'" } else { $kind }
                 $results.Add((New-CheckResult -Row $planRow -Action 'AddressClash' -Status 'Failed' -Stage $Stage `
@@ -647,7 +657,10 @@ function Get-RecipientClashObject {
         $filter = (@($wanted[$offset..($offset + $take - 1)] | ForEach-Object {
                     "EmailAddresses -eq 'smtp:$(ConvertTo-MigrationODataString -Value $_)'" }) -join ' -or ')
 
-        try { $page = @(Get-EXORecipient -Filter $filter -ResultSize Unlimited -ErrorAction Stop) }
+        try {
+            $page = @(Get-EXORecipient -Filter $filter -ResultSize Unlimited -ErrorAction Stop -Properties @(
+                    'EmailAddresses', 'PrimarySmtpAddress', 'DisplayName', 'Alias'))
+        }
         catch { throw "Could not read Exchange recipients: $($_.Exception.Message)" }
 
         foreach ($recipient in $page) {
@@ -685,12 +698,14 @@ function Test-ProvisionedRow {
         The destination Graph user, or $null when the lookup returned 404.
     .PARAMETER Mailbox
         The destination mailbox from Get-EXOMailbox, or $null when there is none yet.
-    .PARAMETER DriveExists
-        Whether GET /users/{id}/drive returned a drive.
+    .PARAMETER DriveState
+        Present when GET /users/{id}/drive returned a drive, Absent when it 404'd, or NotChecked
+        when the read was skipped under -DryRun/-WhatIf (that read provisions OneDrive for a
+        licensed user under delegated auth, so it does not run in a rehearsal).
     .PARAMETER SourceMailbox
         The matching source mailbox inventory row, or $null when no inventory was supplied.
     .EXAMPLE
-        Test-ProvisionedRow -Row $planRow -User $user -Mailbox $mailbox -DriveExists
+        Test-ProvisionedRow -Row $planRow -User $user -Mailbox $mailbox -DriveState Present
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -698,12 +713,14 @@ function Test-ProvisionedRow {
         [Parameter(Mandatory)][AllowNull()]$Row,
         [AllowNull()]$User,
         [AllowNull()]$Mailbox,
-        [switch]$DriveExists,
+        [ValidateSet('Present', 'Absent', 'NotChecked')][string]$DriveState = 'Absent',
         [AllowNull()]$SourceMailbox
     )
 
     # Captured under its own name so the closures below read as what they are.
     $planRow = $Row
+    $objectType = [string](Get-MigrationCsvValue -Row $planRow -Name 'ObjectType' -Default '')
+    $isResourceMailbox = @('Shared', 'Room', 'Equipment') -contains $objectType
     $results = [System.Collections.Generic.List[object]]::new()
     $newRow = {
         param([string]$Action, [string]$Status, [string]$Detail)
@@ -762,13 +779,30 @@ function Test-ProvisionedRow {
         }
     }
 
-    & $verdict 'OneDriveExists' ([bool]$DriveExists) 'Drive present.' `
-        'GET /users/{id}/drive returned 404; pre-provision with Request-SPOPersonalSite.'
+    if ($isResourceMailbox) {
+        & $newRow 'OneDriveExists' 'Skipped' 'Shared and resource mailboxes are disabled by design and have no OneDrive.'
+    }
+    elseif ($DriveState -eq 'NotChecked') {
+        & $newRow 'OneDriveExists' 'Skipped' `
+            'Not checked under -DryRun/-WhatIf; the delegated drive read would provision OneDrive for a licensed user.'
+    }
+    else {
+        & $verdict 'OneDriveExists' ($DriveState -eq 'Present') 'Drive present.' `
+            'GET /users/{id}/drive returned 404; pre-provision with Request-SPOPersonalSite.'
+    }
+
+    # A skipped read (resource mailbox, or -DryRun/-WhatIf) leaves the plan's existing value alone
+    # rather than flipping OneDriveProvisioned to False for a check that never ran.
+    $oneDriveProvisioned = if ($isResourceMailbox -or $DriveState -eq 'NotChecked') {
+        Get-MigrationCsvValue -Row $planRow -Name 'OneDriveProvisioned' -Default 'False'
+    }
+    elseif ($DriveState -eq 'Present') { 'True' }
+    else { 'False' }
 
     return @{
         Row                 = $results.ToArray()
         MailboxProvisioned  = if ($hasMailbox) { 'True' } else { 'False' }
-        OneDriveProvisioned = if ($DriveExists) { 'True' } else { 'False' }
+        OneDriveProvisioned = $oneDriveProvisioned
     }
 }
 
@@ -821,8 +855,15 @@ function Test-PostRow {
 
     & $matchesPlan 'UpnMatchesPlan' 'TargetUserPrincipalName' `
         (Get-MigrationProperty -InputObject $User -Name 'userPrincipalName' -Default '') 'The plan has no TargetUserPrincipalName.'
-    & $verdict 'AccountEnabled' ([bool](Get-MigrationProperty -InputObject $User -Name 'accountEnabled' -Default $false)) `
-        'Enabled.' 'The account is disabled.'
+
+    $objectType = [string](Get-MigrationCsvValue -Row $Row -Name 'ObjectType' -Default '')
+    if (@('Shared', 'Room', 'Equipment') -contains $objectType) {
+        & $newRow 'AccountEnabled' 'Skipped' 'Shared and resource mailboxes are disabled by design.'
+    }
+    else {
+        & $verdict 'AccountEnabled' ([bool](Get-MigrationProperty -InputObject $User -Name 'accountEnabled' -Default $false)) `
+            'Enabled.' 'The account is disabled.'
+    }
 
     if ($null -eq $Mailbox) {
         & $newRow 'PrimarySmtpMatchesPlan' 'Failed' 'No mailbox to read addresses from.'
@@ -919,8 +960,23 @@ try {
         Write-MigrationLog -Message "Loaded $($sourceMailboxByAddress.Count) source mailbox record(s)." -Level INFO
     }
 
-    $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
-    $null = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+    $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+
+    # Connect-MigrationExchange reuses a live EXO session whenever -DelegatedOrganization is
+    # omitted, which is exactly how every documented -TenantId-only run is invoked. Without this
+    # check a leftover session to the source tenant runs every Exchange-backed check against the
+    # wrong tenant while Graph correctly targets the destination.
+    $graphTenantId = [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '')
+    $exoTenantId = [string](Get-MigrationProperty -InputObject $exoConnection -Name 'TenantID' -Default '')
+    if ($graphTenantId -and $exoTenantId -and $graphTenantId -ne $exoTenantId) {
+        throw ("Microsoft Graph is connected to tenant $graphTenantId but Exchange Online is connected to " +
+            "tenant $exoTenantId. Re-run with -DelegatedOrganization for the same destination tenant, or run " +
+            "Disconnect-ExchangeOnline first so a fresh session is established.")
+    }
+    Write-MigrationLog -Message ("Checking destination tenant $graphTenantId (Graph as " +
+        "$(Get-MigrationProperty -InputObject $graphContext -Name 'Account' -Default '?'), EXO as " +
+        "$(Get-MigrationProperty -InputObject $exoConnection -Name 'UserPrincipalName' -Default '?')).") -Level INFO
 
     if ($Stage -eq 'Pre') {
         # PlanClean - anything the planner could not resolve is a blocker, not a warning.
@@ -1036,8 +1092,21 @@ try {
                         -Detail 'No TargetObjectId yet; the row has not been provisioned.'))
         }
 
+        # Distribution lists, security groups, contacts and dynamic groups have no Graph user, no
+        # mailbox in the sense these checks mean, and no OneDrive; New-MigrationRecipients already
+        # verifies they were created. Running the user/mailbox checks over them fails UserExists on
+        # every one and forces exit 2 on any plan that contains recipients alongside users.
+        $recipientOnlyObjectTypes = @('Distribution', 'MailEnabledSecurity', 'Contact', 'DynamicDistribution', 'M365Group')
+
         $changed = $false
         foreach ($row in $provisionedRows) {
+            $objectType = Get-MigrationCsvValue -Row $row -Name 'ObjectType' -Default ''
+            if ($recipientOnlyObjectTypes -contains $objectType) {
+                $results.Add((New-CheckResult -Row $row -Action 'ReadinessCheck' -Status 'Skipped' -Stage $Stage `
+                            -Detail 'Recipient rows are verified by New-MigrationRecipients; this stage checks users and mailboxes only.'))
+                continue
+            }
+
             $objectId = Get-MigrationCsvValue -Row $row -Name 'TargetObjectId' -Default ''
 
             $user = $null
@@ -1054,17 +1123,42 @@ try {
                     'HiddenFromAddressListsEnabled', 'EmailAddresses', 'PrimarySmtpAddress'
                 )
             }
-            catch { Write-MigrationLog -Message "No mailbox for $objectId - $($_.Exception.Message)" -Level DEBUG }
+            catch {
+                # Not-found is a real finding (no mailbox yet); anything else - a throttled or
+                # dropped REST session, a permission error, a wrong-tenant session - is rethrown so
+                # it stops the run instead of quietly writing MailboxProvisioned=False for every row.
+                if ($_.Exception.Message -match 'ManagementObjectNotFoundException|couldn.t be found' -or
+                    $_.CategoryInfo.Category -eq 'ObjectNotFound') {
+                    Write-MigrationLog -Message "No mailbox for $objectId - $($_.Exception.Message)" -Level DEBUG
+                }
+                else {
+                    throw "Could not read mailbox $objectId from Exchange Online: $($_.Exception.Message)"
+                }
+            }
 
             if ($Stage -eq 'Post') {
                 foreach ($resultRow in @(Test-PostRow -Row $row -User $user -Mailbox $mailbox)) { $results.Add($resultRow) }
                 continue
             }
 
-            # Application permissions never auto-provision OneDrive, so a 404 here is a real finding.
-            $driveExists = $false
-            try { $driveExists = $null -ne (Invoke-MigrationGraphRequest -Method GET -Uri "/v1.0/users/$objectId/drive") }
-            catch { if (-not (Test-GraphNotFound -ErrorRecord $_)) { throw } }
+            # With the delegated auth this script uses, GET /users/{id}/drive auto-provisions the
+            # user's OneDrive when they are licensed and do not have one yet - a tenant write, so it
+            # is gated behind ShouldProcess/-WhatIf and skipped under -DryRun like every other
+            # mutation, leaving the check Skipped and OneDriveProvisioned unchanged rather than
+            # writing a False that a check which never ran did not actually observe.
+            $driveState = 'NotChecked'
+            if ($PSCmdlet.ShouldProcess($objectId, 'Read OneDrive (provisions the drive if licensed and absent)')) {
+                $isDryRun = [bool](Get-MigrationRunContext).DryRun
+                try {
+                    $drive = Invoke-MigrationAction -Description "Read OneDrive for $objectId (provisions it if licensed and absent)" `
+                        -PassThru -Action { Invoke-MigrationGraphRequest -Method GET -Uri "/v1.0/users/$objectId/drive" }
+                    if (-not $isDryRun) { $driveState = if ($null -ne $drive) { 'Present' } else { 'Absent' } }
+                }
+                catch {
+                    if (-not (Test-GraphNotFound -ErrorRecord $_)) { throw }
+                    if (-not $isDryRun) { $driveState = 'Absent' }
+                }
+            }
 
             $sourceAddress = ([string](Get-MigrationCsvValue -Row $row -Name 'SourcePrimarySmtp' -Default '')).ToLowerInvariant()
             $sourceMailbox = if ($sourceAddress -and $sourceMailboxByAddress.ContainsKey($sourceAddress)) {
@@ -1073,7 +1167,7 @@ try {
             else { $null }
 
             $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox `
-                -DriveExists:$driveExists -SourceMailbox $sourceMailbox
+                -DriveState $driveState -SourceMailbox $sourceMailbox
             foreach ($resultRow in @($graded.Row)) { $results.Add($resultRow) }
 
             if ((Get-MigrationCsvValue -Row $row -Name 'MailboxProvisioned' -Default '') -ne $graded.MailboxProvisioned -or

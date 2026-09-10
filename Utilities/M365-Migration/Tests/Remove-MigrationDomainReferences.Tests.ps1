@@ -167,6 +167,10 @@ Describe 'Remove-MigrationDomainReferences' {
         It 'Reports an unknown recipient type as unsupported' {
             (Resolve-RecipientCmdlet -RecipientTypeDetails 'PublicFolder').IsSupported | Should -BeFalse
         }
+
+        It 'Reports GuestMailUser as unsupported so a guest is never remediated' {
+            (Resolve-RecipientCmdlet -RecipientTypeDetails 'GuestMailUser').IsSupported | Should -BeFalse
+        }
     }
 
     Context 'Address plan computation' {
@@ -302,6 +306,20 @@ Describe 'Remove-MigrationDomainReferences' {
             $plan.IsComplete | Should -BeFalse
             $plan.Reason | Should -Match 'No Exchange Online cmdlet'
         }
+
+        It 'Reports a guest recipient as incomplete with a guest-specific reason, never Set-MailUser' {
+            $record = ConvertTo-DomainReferenceRecord -Properties @{
+                Kind                 = 'RecipientAddress'
+                Identity             = 'sam_fabrikam.com#EXT#@newco.onmicrosoft.com'
+                RecipientTypeDetails = 'GuestMailUser'
+                PrimarySmtpAddress   = 'sam@contoso.com'
+                Addresses            = @('SMTP:sam@contoso.com')
+            }
+
+            $plan = Resolve-DomainAddressPlan -Reference $record -Domain $script:domain -FallbackDomain $script:fallback
+            $plan.IsComplete | Should -BeFalse
+            $plan.Reason | Should -Match 'Guest recipients are not remediated'
+        }
     }
 
     Context 'Primary promotion ordering' {
@@ -382,6 +400,33 @@ Describe 'Remove-MigrationDomainReferences' {
             Remove-Variable -Name domainRefCallLog -Scope Global -ErrorAction SilentlyContinue
             $order | Should -Be @('policy', 'promote', 'remove')
             Should -Invoke Set-DistributionGroup -Times 3 -Exactly
+        }
+
+        It 'Treats an EXO refusal of the policy toggle as best-effort and still promotes and removes' {
+            $null = Initialize-MigrationRun -ScriptName 'DomainRefs-Real' -OutputPath $script:workspace -Verbosity Low
+
+            $global:domainRefCallLog = [System.Collections.Generic.List[string]]::new()
+            Mock Set-DistributionGroup {
+                if ($null -ne $EmailAddressPolicyEnabled) {
+                    throw 'This parameter is available only in on-premises Exchange.'
+                }
+                elseif ($null -ne $PrimarySmtpAddress) { $global:domainRefCallLog.Add('promote') }
+                elseif ($null -ne $EmailAddresses) { $global:domainRefCallLog.Add('remove') }
+            }
+
+            $plan = Resolve-DomainAddressPlan -Reference $script:groupRecord -Domain $script:domain `
+                -FallbackDomain $script:fallback
+            $classification = Resolve-DomainReferenceClass -Reference $script:groupRecord -Domain $script:domain `
+                -FallbackDomain $script:fallback -AddressPlan $plan
+
+            $row = Repair-DomainReference -Reference $script:groupRecord -Classification $classification `
+                -AddressPlan $plan -Confirm:$false
+
+            $row.Status | Should -BeExactly 'Succeeded'
+            $row.Detail | Should -Match 'policy toggle was refused'
+            $order = @($global:domainRefCallLog)
+            Remove-Variable -Name domainRefCallLog -Scope Global -ErrorAction SilentlyContinue
+            $order | Should -Be @('promote', 'remove')
         }
     }
 
@@ -509,6 +554,22 @@ Describe 'Remove-MigrationDomainReferences' {
                 -FallbackDomain $script:fallback
             $class.Class | Should -BeExactly 'Blocker'
             $class.Reason | Should -BeExactly 'GuestDomainAddress'
+        }
+
+        It 'Blocks a guest whose userPrincipalName is really on the domain, not just #EXT#-embedded' {
+            $record = ConvertTo-DomainReferenceRecord -Properties @{
+                Kind              = 'GuestReference'
+                Identity          = 'sam@contoso.com'
+                UserPrincipalName = 'sam@contoso.com'
+                ObjectType        = 'Guest'
+                IsGuest           = $true
+                ReferenceKinds    = @('Upn')
+            }
+
+            $class = Resolve-DomainReferenceClass -Reference $record -Domain $script:domain `
+                -FallbackDomain $script:fallback
+            $class.Class | Should -BeExactly 'Blocker'
+            $class.Reason | Should -BeExactly 'GuestUpnOnDomain'
         }
 
         It 'Blocks an object the run was scoped away from, rather than silently ignoring it' {
@@ -654,12 +715,13 @@ Describe 'Remove-MigrationDomainReferences' {
 
         It 'Plans an address change without calling Exchange Online' {
             $record = ConvertTo-DomainReferenceRecord -Properties @{
-                Kind                 = 'RecipientAddress'
-                Identity             = 'sales@contoso.com'
-                ObjectId             = '44444444-4444-4444-4444-444444444444'
-                RecipientTypeDetails = 'MailUniversalDistributionGroup'
-                PrimarySmtpAddress   = 'sales@contoso.com'
-                Addresses            = @('SMTP:sales@contoso.com', 'smtp:sales@newco.onmicrosoft.com')
+                Kind                      = 'RecipientAddress'
+                Identity                  = 'sales@contoso.com'
+                ObjectId                  = '44444444-4444-4444-4444-444444444444'
+                RecipientTypeDetails      = 'MailUniversalDistributionGroup'
+                PrimarySmtpAddress        = 'sales@contoso.com'
+                EmailAddressPolicyEnabled = $true
+                Addresses                 = @('SMTP:sales@contoso.com', 'smtp:sales@newco.onmicrosoft.com')
             }
             $plan = Resolve-DomainAddressPlan -Reference $record -Domain $script:domain -FallbackDomain $script:fallback
             $class = Resolve-DomainReferenceClass -Reference $record -Domain $script:domain `
@@ -784,11 +846,78 @@ Describe 'Remove-MigrationDomainReferences' {
             $record = ConvertTo-DomainReferenceRecord -Properties @{ Kind = 'UserUpn' }
             $record.Addresses | Should -HaveCount 0
             $record.IsSynced | Should -BeFalse
-            $record.EmailAddressPolicyEnabled | Should -BeTrue
+            $record.EmailAddressPolicyEnabled | Should -BeFalse
         }
 
         It 'Rejects a property name that is not part of the schema' {
             { ConvertTo-DomainReferenceRecord -Properties @{ Nonsense = 'x' } } | Should -Throw '*Unknown domain reference property*'
+        }
+    }
+
+    Context 'Exchange Online session tenant pinning' {
+
+        It 'Passes when the session tenant matches Graph and there is no delegation' {
+            $exo = [pscustomobject]@{ TenantID = 'tenant-a'; DelegatedOrganization = '' }
+            Get-DomainExchangeSessionMismatch -ExchangeContext $exo -GraphTenantId 'tenant-a' `
+                -DelegatedOrganization '' | Should -BeExactly ''
+        }
+
+        It 'Flags a session whose tenant does not match Graph' {
+            $exo = [pscustomobject]@{ TenantID = 'tenant-b'; DelegatedOrganization = '' }
+            $result = Get-DomainExchangeSessionMismatch -ExchangeContext $exo -GraphTenantId 'tenant-a' `
+                -DelegatedOrganization ''
+            $result | Should -Match 'tenant-b'
+        }
+
+        It 'Flags a GDAP session delegated to the wrong customer' {
+            $exo = [pscustomobject]@{ TenantID = 'tenant-a'; DelegatedOrganization = 'wrong.onmicrosoft.com' }
+            $result = Get-DomainExchangeSessionMismatch -ExchangeContext $exo -GraphTenantId 'tenant-a' `
+                -DelegatedOrganization 'contoso.onmicrosoft.com'
+            $result | Should -Match 'wrong.onmicrosoft.com'
+        }
+
+        It 'Reports no session at all as a mismatch' {
+            Get-DomainExchangeSessionMismatch -ExchangeContext $null -GraphTenantId 'tenant-a' `
+                -DelegatedOrganization '' | Should -Match 'No Exchange Online session'
+        }
+    }
+
+    Context 'Remaining references before and after remediation' {
+
+        It 'Counts fixable references as remaining when nothing has succeeded yet' {
+            $fixable = [pscustomobject]@{
+                Reference      = [pscustomobject]@{ Kind = 'RecipientAddress'; ObjectId = 'obj-1'; Identity = 'sam@contoso.com' }
+                Classification = [pscustomobject]@{ Class = 'Fixable' }
+            }
+            $blocker = [pscustomobject]@{
+                Reference      = [pscustomobject]@{ Kind = 'RecipientAddress'; ObjectId = 'obj-2'; Identity = 'sales@contoso.com' }
+                Classification = [pscustomobject]@{ Class = 'Blocker' }
+            }
+
+            $remaining = @(Get-DomainRemainingReferenceSet -Assessed @($fixable, $blocker) -Results @())
+            $remaining | Should -HaveCount 2
+        }
+
+        It 'Drops a fixable reference once its result row reports Succeeded' {
+            $fixable = [pscustomobject]@{
+                Reference      = [pscustomobject]@{ Kind = 'RecipientAddress'; ObjectId = 'obj-1'; Identity = 'sam@contoso.com' }
+                Classification = [pscustomobject]@{ Class = 'Fixable' }
+            }
+            $result = [pscustomobject]@{ ReferenceKind = 'RecipientAddress'; ObjectId = 'obj-1'; Status = 'Succeeded' }
+
+            $remaining = @(Get-DomainRemainingReferenceSet -Assessed @($fixable) -Results @($result))
+            $remaining | Should -HaveCount 0
+        }
+
+        It 'Never drops a Blocker even if a result row matches it' {
+            $blocker = [pscustomobject]@{
+                Reference      = [pscustomobject]@{ Kind = 'RecipientAddress'; ObjectId = 'obj-2'; Identity = 'sales@contoso.com' }
+                Classification = [pscustomobject]@{ Class = 'Blocker' }
+            }
+            $result = [pscustomobject]@{ ReferenceKind = 'RecipientAddress'; ObjectId = 'obj-2'; Status = 'Succeeded' }
+
+            $remaining = @(Get-DomainRemainingReferenceSet -Assessed @($blocker) -Results @($result))
+            $remaining | Should -HaveCount 1
         }
     }
 }

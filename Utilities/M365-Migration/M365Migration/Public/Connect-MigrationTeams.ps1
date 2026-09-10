@@ -42,7 +42,7 @@ function Connect-MigrationTeams {
         [switch]$Reconnect
     )
 
-    Initialize-MigrationModule -Name 'MicrosoftTeams'
+    Initialize-MigrationModule -Name 'MicrosoftTeams' -MinimumVersion '5.7.0'
 
     $existing = $null
     try { $existing = Get-CsTenant -ErrorAction Stop } catch { $existing = $null }
@@ -55,7 +55,7 @@ function Connect-MigrationTeams {
             try { Disconnect-MicrosoftTeams -ErrorAction SilentlyContinue } catch { $null = $_ }
         }
         else {
-            Write-MigrationLog -Message "Reusing the existing Teams session for tenant $($existing.TenantId)." -Level INFO
+            Write-MigrationLog -Message "Reusing the existing Teams session for tenant $($existing.TenantId) ($($existing.DisplayName))." -Level SUCCESS
             return $existing
         }
     }

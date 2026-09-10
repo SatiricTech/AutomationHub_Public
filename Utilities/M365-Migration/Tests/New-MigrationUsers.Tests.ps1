@@ -28,7 +28,7 @@
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
     Justification = 'The stubs must accept every parameter the script passes, including ones a particular test does not assert on; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
-    Justification = 'These are stand-ins for Exchange Online cmdlets whose names the script under test calls. They exist to record that a call happened and change nothing, so ShouldProcess would be meaningless.')]
+    Justification = 'These are stand-ins for the Graph-facing module functions whose names the script under test calls. They exist to record that a call happened and change nothing, so ShouldProcess would be meaningless.')]
 param()
 
 BeforeAll {
@@ -65,7 +65,7 @@ BeforeAll {
             # to fall back to the interim address. That is the interesting path.
             return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true })
         }
-        if ($Uri -like '*/users?*') { return @() }
+        if ($Uri -like '*/users?$filter=*') { return @() }
         return $null
     }
 
@@ -98,6 +98,17 @@ BeforeAll {
         Department               = 'Operations'
         Office                   = 'Chicago'
         MobilePhone              = '+15550100'
+        City                     = 'Chicago'
+        State                    = 'IL'
+        Country                  = 'US'
+        PostalCode               = '60601'
+        StreetAddress            = '233 S Wacker Dr'
+        CompanyName              = 'Contoso Ltd'
+        EmployeeId               = 'E10045'
+        EmployeeType             = 'Employee'
+        BusinessPhone            = '+13125550100'
+        FaxNumber                = '+13125550199'
+        PreferredLanguage        = 'en-US'
         UsageLocation            = 'us'
         InterimUserPrincipalName = 'john.smith@newco.onmicrosoft.com'
         TargetUserPrincipalName  = 'john.smith@newco.com'
@@ -107,6 +118,53 @@ BeforeAll {
 
 AfterAll {
     Remove-Variable -Name usersGraphCalls, usersMutations, usersSkuCatalogCalls -Scope Global -ErrorAction SilentlyContinue
+}
+
+Describe 'New-MigrationUsers - comment-based help matches the parameter block' {
+
+    BeforeAll {
+        # The same parse the function loader used, kept separate so this block reads as a
+        # self-contained check. GetHelpContent() is the parser's own view of the help block,
+        # which is what Get-Help renders, so drift shows up here before a technician sees it.
+        $helpAst = [System.Management.Automation.Language.Parser]::ParseFile($script:scriptPath, [ref]$null, [ref]$null)
+        $script:helpContent = $helpAst.GetHelpContent()
+        $script:declaredParameters = @($helpAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        $script:documentedParameters = @($script:helpContent.Parameters.Keys)
+        $script:verbositySet = @(($helpAst.ParamBlock.Parameters |
+                    Where-Object { $_.Name.VariablePath.UserPath -eq 'Verbosity' }).Attributes |
+                Where-Object { $_.TypeName.Name -eq 'ValidateSet' } |
+                ForEach-Object { $_.PositionalArguments.Value })
+    }
+
+    It 'Documents every declared parameter and nothing else' {
+        $script:declaredParameters.Count | Should -BeGreaterThan 0
+        $missing = @($script:declaredParameters | Where-Object { $script:documentedParameters -notcontains $_.ToUpperInvariant() })
+        $missing | Should -BeNullOrEmpty
+        $stale = @($script:documentedParameters | Where-Object { @($script:declaredParameters | ForEach-Object { $_.ToUpperInvariant() }) -notcontains $_ })
+        $stale | Should -BeNullOrEmpty
+    }
+
+    It 'Names every Verbosity value the ValidateSet accepts' {
+        $script:verbositySet | Should -Be @('Low', 'Medium', 'High')
+        $text = [string]$script:helpContent.Parameters['VERBOSITY']
+        foreach ($value in $script:verbositySet) { $text | Should -Match ([regex]::Escape($value)) }
+    }
+
+    It 'States the PasswordLength range the ValidateRange enforces' {
+        $script:helpContent.Parameters['PASSWORDLENGTH'] | Should -Match '12 to 128'
+    }
+
+    It 'Uses only real parameters in every example' {
+        $script:helpContent.Examples.Count | Should -BeGreaterThan 0
+        $allowed = @($script:declaredParameters) + @('WhatIf', 'Confirm', 'Verbose', 'Debug', 'ErrorAction', 'WarningAction', 'InformationAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer', 'PipelineVariable', 'ProgressAction')
+        foreach ($example in $script:helpContent.Examples) {
+            $commandLine = @(($example -split "`r?`n") | Where-Object { $_.Trim() })[0]
+            $used = @([regex]::Matches($commandLine, '(?<=\s)-([A-Za-z]+)') | ForEach-Object { $_.Groups[1].Value })
+            $used.Count | Should -BeGreaterThan 0
+            $unknown = @($used | Where-Object { $allowed -notcontains $_ })
+            $unknown | Should -BeNullOrEmpty
+        }
+    }
 }
 
 Describe 'New-MigrationUsers - Resolve-RowIdentity' {
@@ -173,6 +231,22 @@ Describe 'New-MigrationUsers - ConvertTo-UserRequestBody' {
         $script:body['department'] | Should -BeExactly 'Operations'
         $script:body['officeLocation'] | Should -BeExactly 'Chicago'
         $script:body['mobilePhone'] | Should -BeExactly '+15550100'
+        $script:body['city'] | Should -BeExactly 'Chicago'
+        $script:body['state'] | Should -BeExactly 'IL'
+        $script:body['country'] | Should -BeExactly 'US'
+        $script:body['postalCode'] | Should -BeExactly '60601'
+        $script:body['streetAddress'] | Should -BeExactly '233 S Wacker Dr'
+        $script:body['companyName'] | Should -BeExactly 'Contoso Ltd'
+        $script:body['employeeId'] | Should -BeExactly 'E10045'
+        $script:body['employeeType'] | Should -BeExactly 'Employee'
+        $script:body['faxNumber'] | Should -BeExactly '+13125550199'
+        $script:body['preferredLanguage'] | Should -BeExactly 'en-US'
+    }
+
+    It 'Wraps BusinessPhone in a one-element businessPhones array' {
+        # The comma keeps Pester from unwrapping a one-element array before the type check.
+        , $script:body['businessPhones'] | Should -BeOfType [array]
+        $script:body['businessPhones'] | Should -Be @('+13125550100')
     }
 
     It 'Uppercases the usage location Graph expects' {
@@ -193,10 +267,22 @@ Describe 'New-MigrationUsers - ConvertTo-UserRequestBody' {
         $row = $script:planRow.PSObject.Copy()
         $row.JobTitle = ''
         $row.MobilePhone = ''
+        $row.City = ''
+        $row.EmployeeId = ''
         $body = ConvertTo-UserRequestBody -Row $row -UserPrincipalName 'john.smith@newco.com' `
             -MailNickname 'john.smith' -UsageLocation 'US' -Password 'Placeholder-1'
         $body.Contains('jobTitle') | Should -BeFalse
         $body.Contains('mobilePhone') | Should -BeFalse
+        $body.Contains('city') | Should -BeFalse
+        $body.Contains('employeeId') | Should -BeFalse
+    }
+
+    It 'Omits businessPhones when BusinessPhone is empty' {
+        $row = $script:planRow.PSObject.Copy()
+        $row.BusinessPhone = ''
+        $body = ConvertTo-UserRequestBody -Row $row -UserPrincipalName 'john.smith@newco.com' `
+            -MailNickname 'john.smith' -UsageLocation 'US' -Password 'Placeholder-1'
+        $body.Contains('businessPhones') | Should -BeFalse
     }
 
     It 'Omits usageLocation when the row and the default are both empty' {
@@ -274,6 +360,37 @@ Describe 'New-MigrationUsers - Invoke-LicenseAssignment' {
         $result = Invoke-LicenseAssignment -UserId 'abc' -SkuPartNumber @('SPE_E3', 'NOSUCHSKU') -Catalog $script:catalog -Identity 'a@newco.com'
         $result.Assigned | Should -Be @('SPE_E3')
         $result.Unknown | Should -Be @('NOSUCHSKU')
+    }
+}
+
+Describe 'New-MigrationUsers - Resolve-LicenseRequest' {
+
+    BeforeAll {
+        $script:licenceCatalog = @([pscustomobject]@{ SkuId = '00000000-0000-0000-0000-0000000000e3'; SkuPartNumber = 'SPE_E3' })
+    }
+
+    It 'Skips a row with no TargetLicenses' {
+        $result = Resolve-LicenseRequest -Row ([pscustomobject]@{ TargetLicenses = '' }) -UsageLocation 'US' -Catalog $script:licenceCatalog
+        $result.SkipReason | Should -Match 'No TargetLicenses'
+        $result.Planned | Should -BeNullOrEmpty
+    }
+
+    It 'Skips a row with no usage location and says what to set' {
+        $result = Resolve-LicenseRequest -Row ([pscustomobject]@{ TargetLicenses = 'SPE_E3' }) -UsageLocation '' -Catalog $script:licenceCatalog
+        $result.SkipReason | Should -Match 'usage location'
+        $result.SkipReason | Should -Match '-DefaultUsageLocation'
+    }
+
+    It 'Separates the part numbers the tenant owns from the ones it does not' {
+        $result = Resolve-LicenseRequest -Row ([pscustomobject]@{ TargetLicenses = 'SPE_E3;NOSUCHSKU' }) -UsageLocation 'US' -Catalog $script:licenceCatalog
+        $result.SkipReason | Should -BeNullOrEmpty
+        $result.Planned | Should -Be @('SPE_E3', 'NOSUCHSKU')
+        $result.Unknown | Should -Be @('NOSUCHSKU')
+    }
+
+    It 'Reports nothing unknown when every planned part number is in the catalogue' {
+        $result = Resolve-LicenseRequest -Row ([pscustomobject]@{ TargetLicenses = 'SPE_E3' }) -UsageLocation 'US' -Catalog $script:licenceCatalog
+        $result.Unknown | Should -BeNullOrEmpty
     }
 }
 
@@ -369,10 +486,21 @@ Describe 'New-MigrationUsers - DryRun end to end' {
         @($script:rows | Where-Object { $_.Identity -eq 'later@contoso.com' }).Count | Should -Be 0
     }
 
-    It 'Reports the planned licences without assigning them' {
-        $row = @($script:rows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' -and $_.Action -eq 'CreateUser' })[0]
-        $row.Detail | Should -Match 'Would assign: SPE_E3'
-        $row.LicensesAssigned | Should -BeNullOrEmpty
+    It 'Plans the licence assignment as its own AssignLicense row without assigning anything' {
+        $row = @($script:rows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' -and $_.Action -eq 'AssignLicense' })
+        $row.Count | Should -Be 1
+        $row[0].Status | Should -BeExactly 'Planned'
+        $row[0].Detail | Should -Match 'Would assign: SPE_E3'
+        $row[0].LicensesAssigned | Should -BeNullOrEmpty
+        $create = @($script:rows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' -and $_.Action -eq 'CreateUser' })[0]
+        $create.Detail | Should -Not -Match 'Would assign'
+    }
+
+    It 'Names a planned SKU the tenant does not own in the rehearsal, still as Planned' {
+        $row = @($script:rows | Where-Object { $_.Identity -eq 'adean@contoso.com' -and $_.Action -eq 'AssignLicense' })[0]
+        $row.Status | Should -BeExactly 'Planned'
+        $row.Detail | Should -Match 'NOSUCHSKU'
+        $row.Detail | Should -Match 'Failed'
     }
 
     It 'Plans the manager pass without touching the directory' {
@@ -507,7 +635,7 @@ Describe 'New-MigrationUsers - a fatal error still leaves the plan and the resul
             $global:usersGraphCalls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri })
             if ($Method -ne 'GET') { $global:usersMutations.Add("$Method $Uri") }
             if ($Uri -like '*/domains*') { return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true }) }
-            if ($Uri -like '*/users?*') { return @() }
+            if ($Uri -like '*/users?$filter=*') { return @() }
             if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
                 return [pscustomobject]@{ id = '99999999-9999-9999-9999-999999999999' }
             }
@@ -559,5 +687,272 @@ Describe 'New-MigrationUsers - a fatal error still leaves the plan and the resul
 
     It 'Still writes the plan back so the object ID the run earned is not lost' {
         @($global:usersMutations | Where-Object { $_ -like 'Save-MigrationPlan*' }).Count | Should -Be 1
+    }
+}
+
+Describe 'New-MigrationUsers - an account that already exists in the destination tenant' {
+
+    BeforeAll {
+        # The lookup finds john.smith already in the destination tenant; every other UPN is new.
+        # That flips $planChanged without any row reaching its ShouldProcess gate, which is the
+        # path where -WhatIf must still keep the plan file untouched.
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            $global:usersGraphCalls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri })
+            if ($Method -ne 'GET') { $global:usersMutations.Add("$Method $Uri") }
+            if ($Uri -like '*/domains*') { return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true }) }
+            if ($Uri -like '*/users?*john.smith@newco.onmicrosoft.com*') {
+                return @([pscustomobject]@{ id = '77777777-7777-7777-7777-777777777777'; userPrincipalName = 'john.smith@newco.onmicrosoft.com' })
+            }
+            if ($Uri -like '*/users?$filter=*') { return @() }
+            return $null
+        }
+    }
+
+    Context 'under -DryRun' {
+
+        BeforeAll {
+            $script:existsDryWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Users-ExistsDry-$([guid]::NewGuid())"
+            New-Item -Path $script:existsDryWorkspace -ItemType Directory -Force | Out-Null
+
+            $script:existsDryPlan = Join-Path $script:existsDryWorkspace 'IdentityPlan.csv'
+            Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:existsDryPlan
+            $script:existsDryHash = (Get-FileHash -LiteralPath $script:existsDryPlan -Algorithm SHA256).Hash
+
+            $global:usersGraphCalls.Clear()
+            $global:usersMutations.Clear()
+
+            & $script:scriptPath -PlanPath $script:existsDryPlan -Wave '1' `
+                -DefaultUsageLocation 'US' -OutputPath $script:existsDryWorkspace -Verbosity Low -DryRun
+            $script:existsDryExit = $LASTEXITCODE
+
+            $file = @(Get-ChildItem -LiteralPath $script:existsDryWorkspace -Filter 'New-Users-DryRun_*.csv')
+            $script:existsDryRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+            $script:existsDryRow = @($script:existsDryRows |
+                Where-Object { $_.Identity -eq 'jsmith@contoso.com' -and $_.Action -eq 'CreateUser' })
+        }
+
+        AfterAll {
+            if ($script:existsDryWorkspace -and (Test-Path -LiteralPath $script:existsDryWorkspace)) {
+                Remove-Item -LiteralPath $script:existsDryWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        It 'Reports the row as Skipped with the object ID it found' {
+            $script:existsDryRow.Count | Should -Be 1
+            $script:existsDryRow[0].Status | Should -BeExactly 'Skipped'
+            $script:existsDryRow[0].TargetObjectId | Should -BeExactly '77777777-7777-7777-7777-777777777777'
+        }
+
+        It 'Says the object ID would be recorded, not that it was' {
+            $script:existsDryRow[0].Detail | Should -Match 'would record'
+            $script:existsDryRow[0].Detail | Should -Not -Match 'recorded its'
+        }
+
+        It 'Writes nothing back to the plan' {
+            @($global:usersMutations | Where-Object { $_ -like 'Save-MigrationPlan*' }).Count | Should -Be 0
+            (Get-FileHash -LiteralPath $script:existsDryPlan -Algorithm SHA256).Hash | Should -BeExactly $script:existsDryHash
+        }
+
+        It 'Exits successfully' {
+            $script:existsDryExit | Should -Be 0
+        }
+    }
+
+    Context 'under -WhatIf' {
+
+        BeforeAll {
+            $script:existsWhatIfWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Users-ExistsWhatIf-$([guid]::NewGuid())"
+            New-Item -Path $script:existsWhatIfWorkspace -ItemType Directory -Force | Out-Null
+
+            $script:existsWhatIfPlan = Join-Path $script:existsWhatIfWorkspace 'IdentityPlan.csv'
+            Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:existsWhatIfPlan
+            $script:existsWhatIfHash = (Get-FileHash -LiteralPath $script:existsWhatIfPlan -Algorithm SHA256).Hash
+
+            $global:usersGraphCalls.Clear()
+            $global:usersMutations.Clear()
+
+            & $script:scriptPath -PlanPath $script:existsWhatIfPlan -Wave '1' `
+                -DefaultUsageLocation 'US' -OutputPath $script:existsWhatIfWorkspace -Verbosity Low -WhatIf
+            $script:existsWhatIfExit = $LASTEXITCODE
+
+            $file = @(Get-ChildItem -LiteralPath $script:existsWhatIfWorkspace -Filter 'New-Users-Results_*.csv')
+            $script:existsWhatIfRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+        }
+
+        AfterAll {
+            if ($script:existsWhatIfWorkspace -and (Test-Path -LiteralPath $script:existsWhatIfWorkspace)) {
+                Remove-Item -LiteralPath $script:existsWhatIfWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        It 'Reports the row as Skipped because it already exists' {
+            $row = @($script:existsWhatIfRows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' -and $_.Action -eq 'CreateUser' })
+            $row.Count | Should -Be 1
+            $row[0].Status | Should -BeExactly 'Skipped'
+            $row[0].Detail | Should -Match 'already exists'
+        }
+
+        It 'Does not write the plan back even though a row changed in memory' {
+            @($global:usersMutations | Where-Object { $_ -like 'Save-MigrationPlan*' }).Count | Should -Be 0
+            (Get-FileHash -LiteralPath $script:existsWhatIfPlan -Algorithm SHA256).Hash | Should -BeExactly $script:existsWhatIfHash
+            Test-Path -LiteralPath "$($script:existsWhatIfPlan).bak" | Should -BeFalse
+        }
+
+        It 'Makes no write call of any kind' {
+            $global:usersMutations | Should -BeNullOrEmpty
+        }
+
+        It 'Exits 0 because a declined write is not a failed one' {
+            $script:existsWhatIfExit | Should -Be 0
+        }
+    }
+}
+
+Describe 'New-MigrationUsers - a rejected assignLicense call is a Failed row of its own' {
+
+    BeforeAll {
+        # The create succeeds and the licence call is refused, which is what a seat shortage or
+        # replication lag on a just-created object looks like from the script's side.
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            $global:usersGraphCalls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri })
+            if ($Method -ne 'GET') { $global:usersMutations.Add("$Method $Uri") }
+            if ($Uri -like '*/domains*') { return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true }) }
+            if ($Uri -like '*/users?$filter=*') { return @() }
+            if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
+                return [pscustomobject]@{ id = '99999999-9999-9999-9999-999999999999' }
+            }
+            if ($Uri -like '*/assignLicense') {
+                throw 'Request_ResourceNotFound: Resource 99999999-9999-9999-9999-999999999999 does not exist or one of its queried reference-property objects are not present.'
+            }
+            return $null
+        }
+
+        $script:licFailWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Users-LicFail-$([guid]::NewGuid())"
+        New-Item -Path $script:licFailWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:licFailPlan = Join-Path $script:licFailWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:licFailPlan
+
+        $global:usersGraphCalls.Clear()
+        $global:usersMutations.Clear()
+
+        & $script:scriptPath -PlanPath $script:licFailPlan -Wave '1' -AssignLicenses `
+            -DefaultUsageLocation 'US' -OutputPath $script:licFailWorkspace -Verbosity Low
+        $script:licFailExit = $LASTEXITCODE
+
+        $file = @(Get-ChildItem -LiteralPath $script:licFailWorkspace -Filter 'New-Users-Results_*.csv')
+        $script:licFailRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+    }
+
+    AfterAll {
+        if ($script:licFailWorkspace -and (Test-Path -LiteralPath $script:licFailWorkspace)) {
+            Remove-Item -LiteralPath $script:licFailWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Still reports the account creations as Succeeded' {
+        @($script:licFailRows | Where-Object { $_.Action -eq 'CreateUser' -and $_.Status -eq 'Succeeded' }).Count | Should -Be 2
+    }
+
+    It 'Reports each licence failure as a Failed AssignLicense row with nothing assigned' {
+        $rows = @($script:licFailRows | Where-Object { $_.Action -eq 'AssignLicense' })
+        $rows.Count | Should -Be 2
+        @($rows | Where-Object { $_.Status -ne 'Failed' }).Count | Should -Be 0
+        @($rows | Where-Object { $_.Detail -notmatch 'Licence assignment failed' }).Count | Should -Be 0
+        @($rows | Where-Object { $_.LicensesAssigned }).Count | Should -Be 0
+    }
+
+    It 'Keeps the licence failure out of the CreateUser row' {
+        @($script:licFailRows | Where-Object { $_.Action -eq 'CreateUser' -and $_.Detail -match 'assignment failed' }).Count | Should -Be 0
+    }
+
+    It 'Exits 2 so an every-row-Succeeded check cannot pass with unlicensed accounts' {
+        $script:licFailExit | Should -Be 2
+    }
+
+    It 'Still writes the plan back with the object IDs the run earned' {
+        @($global:usersMutations | Where-Object { $_ -like 'Save-MigrationPlan*' }).Count | Should -Be 1
+    }
+
+    It 'Logs the licence failure as an error' {
+        $log = @(Get-ChildItem -LiteralPath $script:licFailWorkspace -Filter 'New-MigrationUsers_*.log')
+        $log.Count | Should -Be 1
+        (Get-Content -LiteralPath $log[0].FullName -Raw) | Should -Match '\[ERROR\].*Licence assignment failed'
+    }
+}
+
+Describe 'New-MigrationUsers - a planned SKU the tenant does not own fails the licence row, not the account' {
+
+    BeforeAll {
+        # assignLicense accepts every call; the fixture's adean row plans SPE_E3;NOSUCHSKU while the
+        # catalogue stub only owns SPE_E3.
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            $global:usersGraphCalls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri })
+            if ($Method -ne 'GET') { $global:usersMutations.Add("$Method $Uri") }
+            if ($Uri -like '*/domains*') { return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true }) }
+            if ($Uri -like '*/users?$filter=*') { return @() }
+            if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
+                $upn = [string]$Body['userPrincipalName']
+                $id = if ($upn -like 'john.smith@*') { '11111111-aaaa-aaaa-aaaa-111111111111' } else { '22222222-bbbb-bbbb-bbbb-222222222222' }
+                return [pscustomobject]@{ id = $id }
+            }
+            return $null
+        }
+
+        $script:skuMissWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Users-SkuMiss-$([guid]::NewGuid())"
+        New-Item -Path $script:skuMissWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:skuMissPlan = Join-Path $script:skuMissWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:skuMissPlan
+
+        $global:usersGraphCalls.Clear()
+        $global:usersMutations.Clear()
+
+        & $script:scriptPath -PlanPath $script:skuMissPlan -Wave '1' -AssignLicenses `
+            -DefaultUsageLocation 'US' -OutputPath $script:skuMissWorkspace -Verbosity Low
+        $script:skuMissExit = $LASTEXITCODE
+
+        $file = @(Get-ChildItem -LiteralPath $script:skuMissWorkspace -Filter 'New-Users-Results_*.csv')
+        $script:skuMissRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+    }
+
+    AfterAll {
+        if ($script:skuMissWorkspace -and (Test-Path -LiteralPath $script:skuMissWorkspace)) {
+            Remove-Item -LiteralPath $script:skuMissWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Reports a fully assigned row as Succeeded with the part numbers it assigned' {
+        $row = @($script:skuMissRows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' -and $_.Action -eq 'AssignLicense' })
+        $row.Count | Should -Be 1
+        $row[0].Status | Should -BeExactly 'Succeeded'
+        $row[0].LicensesAssigned | Should -BeExactly 'SPE_E3'
+        $row[0].TargetObjectId | Should -BeExactly '11111111-aaaa-aaaa-aaaa-111111111111'
+    }
+
+    It 'Fails the row whose plan names a SKU the tenant does not own, keeping the part it could assign' {
+        $row = @($script:skuMissRows | Where-Object { $_.Identity -eq 'adean@contoso.com' -and $_.Action -eq 'AssignLicense' })
+        $row.Count | Should -Be 1
+        $row[0].Status | Should -BeExactly 'Failed'
+        $row[0].Detail | Should -Match 'NOSUCHSKU'
+        $row[0].Detail | Should -Match 'Set-MigrationLicenses'
+        $row[0].LicensesAssigned | Should -BeExactly 'SPE_E3'
+    }
+
+    It 'Leaves that account creation itself Succeeded' {
+        $row = @($script:skuMissRows | Where-Object { $_.Identity -eq 'adean@contoso.com' -and $_.Action -eq 'CreateUser' })[0]
+        $row.Status | Should -BeExactly 'Succeeded'
+        $row.Detail | Should -Not -Match 'NOSUCHSKU'
+    }
+
+    It 'Makes the assignLicense call for both accounts' {
+        @($global:usersGraphCalls | Where-Object { $_.Method -eq 'POST' -and $_.Uri -like '*/assignLicense' }).Count | Should -Be 2
+    }
+
+    It 'Exits 2' {
+        $script:skuMissExit | Should -Be 2
     }
 }

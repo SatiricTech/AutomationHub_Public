@@ -35,8 +35,11 @@
     skipped, because a migration run that quietly leaves half the users behind is worse than one
     that stops and says so.
 
-    Every mutation is wrapped in Invoke-MigrationAction and gated by ShouldProcess, so -DryRun and
-    -WhatIf both produce a full results file with Status 'Planned' and change nothing.
+    Every mutation is wrapped in Invoke-MigrationAction and gated by ShouldProcess. -DryRun writes
+    a -DryRun_ results file with Status 'Planned' and changes nothing. -WhatIf (or answering No at
+    the confirmation prompt) does not produce a plan: it records the row Status 'Skipped' with
+    Detail 'Declined at the confirmation prompt.' in a normal Results_ file, because the call was
+    never made and the contract reserves 'Planned' for -DryRun.
 
 .PARAMETER PlanPath
     Path to IdentityPlan.csv.
@@ -57,11 +60,6 @@
 .PARAMETER RemoveOldPrimaryAlias
     After promoting the new primary, remove the demoted old primary instead of keeping it as an
     alias. Ignored for MOERA (*.onmicrosoft.com) addresses, which are never removed.
-
-.PARAMETER DisableEmailAddressPolicy
-    Set EmailAddressPolicyEnabled to False before touching addresses. Without this, an org that
-    still has an email address policy applied can reassert the old primary on the next policy
-    application or hybrid configuration run.
 
 .PARAMETER Unhide
     Make GalVisibility set HiddenFromAddressListsEnabled to False rather than True.
@@ -107,7 +105,9 @@
         -RemoveOldPrimaryAlias -WhatIf
 
     In-place redesign inside one tenant - rows are matched on their current (source) UPN and the old
-    primary is dropped rather than kept as an alias. -WhatIf reports the plan without writing.
+    primary is dropped rather than kept as an alias. -WhatIf declines every confirmation prompt, so
+    the results file records each operation Skipped / Declined at the confirmation prompt. rather
+    than touching the tenant.
 
 .EXAMPLE
     .\Set-MigrationIdentity.ps1 -PlanPath .\IdentityPlan.csv -Apply GalVisibility -Unhide -Wave 2
@@ -116,7 +116,7 @@
 
 .EXAMPLE
     .\Set-MigrationIdentity.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -Apply Upn,PrimarySmtp,Aliases,X500 `
-        -DisableEmailAddressPolicy -DelegatedOrganization contoso.onmicrosoft.com -Prefix Contoso
+        -DelegatedOrganization contoso.onmicrosoft.com -Prefix Contoso
 
     GDAP alternative: the same wave 1 cutover in a customer tenant administered through GDAP
     rather than with a Global Admin account in it. Switches each user from their interim
@@ -160,9 +160,6 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$RemoveOldPrimaryAlias,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$DisableEmailAddressPolicy,
 
     [Parameter(Mandatory = $false)]
     [switch]$Unhide,
@@ -222,7 +219,7 @@ $supportedObjectTypes = @('User', 'Shared', 'Room', 'Equipment')
 $graphUserSelect = 'id,userPrincipalName,mail,mailNickname,displayName,onPremisesSyncEnabled,proxyAddresses'
 
 $exoMailboxProperties = @(
-    'EmailAddresses', 'PrimarySmtpAddress', 'Alias', 'EmailAddressPolicyEnabled',
+    'EmailAddresses', 'PrimarySmtpAddress', 'Alias',
     'HiddenFromAddressListsEnabled', 'RecipientTypeDetails', 'ExternalDirectoryObjectId'
 )
 
@@ -420,7 +417,7 @@ function Set-MailboxAttribute {
         Justification = 'The caller gates the row with ShouldProcess and Invoke-MigrationAction honours -DryRun.')]
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Identity,
-        [Parameter(Mandatory)][ValidateSet('Alias', 'HiddenFromAddressListsEnabled', 'EmailAddressPolicyEnabled')][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('Alias', 'HiddenFromAddressListsEnabled')][string]$Name,
         [Parameter(Mandatory)]$Value,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Description
     )
@@ -598,11 +595,6 @@ try {
                 -RemoveOldPrimary:$RemoveOldPrimaryAlias
         }
 
-        # The address policy is disabled once per object, before any address is touched, because a
-        # policy that is still enabled can reassert the old primary the next time it is applied.
-        $policyNote = ''
-        $policyHandled = $false
-
         foreach ($action in $requestedActions) {
             $status = if ($isDryRun) { 'Planned' } else { 'Succeeded' }
             $detail = ''
@@ -656,22 +648,6 @@ try {
                         if ($mailboxError) {
                             $status = 'Failed'; $detail = $mailboxError
                             break
-                        }
-
-                        if (-not $policyHandled -and $DisableEmailAddressPolicy -and ($addressActions -contains $action)) {
-                            $policyHandled = $true
-                            $policyEnabled = $false
-                            if ($mailbox.PSObject.Properties['EmailAddressPolicyEnabled']) {
-                                $policyEnabled = [bool]$mailbox.EmailAddressPolicyEnabled
-                            }
-                            if ($policyEnabled -and $PSCmdlet.ShouldProcess($identity, 'Disable the email address policy')) {
-                                Set-MailboxAttribute -Identity $objectId -Name 'EmailAddressPolicyEnabled' -Value $false `
-                                    -Description "Disable the email address policy on $identity"
-                                $policyNote = 'Disabled the email address policy.'
-                            }
-                            elseif (-not $policyEnabled) {
-                                $policyNote = 'The email address policy was already disabled.'
-                            }
                         }
 
                         switch ($action) {
@@ -809,11 +785,6 @@ try {
             catch {
                 $status = 'Failed'
                 $detail = $_.Exception.Message
-            }
-
-            if ($policyNote -and ($addressActions -contains $action)) {
-                $detail = "$policyNote $detail"
-                $policyNote = ''
             }
 
             if ($status -eq 'Failed') { $exitCode = 2 }

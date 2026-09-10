@@ -19,9 +19,12 @@
     into another script all want the CSV. When ImportExcel is unavailable and cannot be
     installed, the script warns and writes the CSV alone rather than failing the run.
 
-    Rows with no destination address - excluded, needing review, or not yet named - are
-    reported as Skipped rather than silently dropped, because a mapping file that is quietly
-    short by four rows is how mailboxes get left behind.
+    Only rows the plan has signed off are mapped: PlanStatus Planned, ManualOverride and
+    UpnSmtpDiverge, plus Collision when -IncludeCollisions is given. Every other row -
+    excluded, needing review, invalid, already in the destination - is reported as Skipped
+    with the status named, as is any signed-off row that has no destination address. The
+    results file is written even when nothing could be mapped, because a mapping file that
+    is quietly short by four rows is how mailboxes get left behind.
 
 .PARAMETER PlanPath
     The IdentityPlan.csv to read.
@@ -41,12 +44,18 @@
     Map to the interim addresses (InterimPrimarySmtp / InterimUserPrincipalName) instead of
     the final target addresses - the first pass, before the vanity domain moves tenants.
 
+.PARAMETER IncludeCollisions
+    Also map rows whose PlanStatus is Collision. Off by default: a collision means the
+    planned address is contested and the row usually needs an operator decision first.
+
 .PARAMETER SkipExcel
     Write only the CSV twin, never the workbook. Also stops the script trying to install
     ImportExcel.
 
 .PARAMETER OutputPath
-    Directory for the mapping file, the results CSV and the log. Defaults to the toolkit root.
+    Directory for the mapping file, the results CSV and the log. Defaults to the toolkit
+    output root (%LOCALAPPDATA%\Migration-Automations on Windows, ~/Migration-Automations
+    elsewhere).
 
 .PARAMETER Prefix
     Client or run name. Output lands in <OutputPath>\<Prefix>\ and file names start '<Prefix>_'.
@@ -74,17 +83,19 @@
 
 .EXAMPLE
     .\Export-MigrationMappingFile.ps1 -PlanPath .\IdentityPlan.csv `
-        -ObjectType User, Shared -DryRun -Verbosity High
+        -ObjectType User, Shared -IncludeCollisions -DryRun -Verbosity High
 
-    Dress rehearsal for the user and shared mailbox mappings: every row resolved and reported,
-    no mapping file written.
+    Dress rehearsal for the user and shared mailbox mappings, Collision rows included: every
+    row resolved and reported, no mapping file written.
 
 .NOTES
     Author      : AutomationHub
     Requires    : PowerShell 7.4+ and the bundled M365Migration module. ImportExcel 7.1.0 or
                   later is needed only for the workbook. No tenant connection is made and no
                   Graph scope or Exchange Online role is required, so GDAP does not apply.
-    Exit codes  : 0 success, 1 fatal error, 2 completed with row failures.
+    Exit codes  : 0 success, 1 fatal error (including a selection in which no row could be
+                  mapped). This script never exits 2: rows it cannot map are reported
+                  Skipped, not Failed.
     Written with assistance from Claude (Anthropic).
 #>
 
@@ -104,6 +115,7 @@ param(
     [string[]]$ObjectType = @('User', 'Shared', 'Room', 'Equipment', 'Distribution', 'MailEnabledSecurity', 'Contact'),
 
     [switch]$UseInterim,
+    [switch]$IncludeCollisions,
     [switch]$SkipExcel,
 
     [string]$OutputPath,
@@ -177,6 +189,8 @@ try {
 
     $results = [System.Collections.Generic.List[object]]::new()
     $mappings = [System.Collections.Generic.List[object]]::new()
+    # The result rows behind $mappings, so a declined write can be reflected on exactly those rows.
+    $mappedResults = [System.Collections.Generic.List[object]]::new()
     $seenSources = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $duplicateCount = 0
 
@@ -211,6 +225,18 @@ try {
         }
         $results.Add($result)
 
+        # The plan is the signed-off artefact, so only rows it has approved may reach the mover.
+        # Collision, NeedsReview, Invalid and hand-Excluded rows often still carry the address
+        # the planner assigned before it changed its mind - an address alone is not consent.
+        # -AllowSynced because nothing is written to a tenant here; the mover treats a synced
+        # object like any other. Import-MigrationPlan has already applied -ObjectType.
+        $gate = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions -AllowSynced
+        if (-not $gate.Actionable) {
+            $result.Status = $gate.Status
+            $result.Detail = $gate.Reason
+            continue
+        }
+
         # A row that cannot be mapped is reported, not dropped: a mapping file quietly short by
         # four rows is how mailboxes get left behind.
         if (-not $source) {
@@ -229,13 +255,22 @@ try {
         }
 
         $mappings.Add((& $format.NewRow $source $destination))
+        $mappedResults.Add($result)
         $result.Status = if ($DryRun) { 'Planned' } else { 'Succeeded' }
         $result.Detail = "$source maps to $destination"
     }
 
+    if ($duplicateCount -gt 0) {
+        Write-MigrationLog -Message "$duplicateCount duplicate source address(es) were ignored; the first occurrence of each was kept." -Level WARNING
+    }
+
     if ($mappings.Count -eq 0) {
-        throw ("None of the $($planRows.Count) selected plan row(s) has both a source and a destination address. " +
-            'Resolve the NeedsReview, Collision and Invalid rows, or widen -Wave / -ObjectType.')
+        # Every selected row was Skipped. The results file is the whole point in that case - it
+        # names why each row was left out - so it is written before the run is failed.
+        $null = Export-MigrationResult -Rows $results.ToArray() -Name 'MappingFile'
+        throw ("None of the $($planRows.Count) selected plan row(s) could be mapped - see the results file. " +
+            'Resolve the NeedsReview and Invalid rows, pass -IncludeCollisions to map Collision rows, ' +
+            'or widen -Wave / -ObjectType.')
     }
 
     $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
@@ -243,19 +278,41 @@ try {
         $leader + ($format.FileName -replace '\{timestamp\}', (Get-Date -Format 'yyyyMMdd-HHmmss')))
     $csvPath = [System.IO.Path]::ChangeExtension($mappingPath, '.csv')
 
-    if ($PSCmdlet.ShouldProcess($csvPath, "Write $($mappings.Count) mapping row(s)")) {
+    # The CSV twin is the deliverable, so its ShouldProcess decision is the one the result rows
+    # follow. -WhatIf, or No at the prompt, means nothing was written and the rows must not read
+    # as Succeeded. 'Planned' stays reserved for -DryRun, whose rows are left alone here:
+    # Invoke-MigrationAction already turns that write into a '[DRYRUN] Would:' log line.
+    $csvApproved = $PSCmdlet.ShouldProcess($csvPath, "Write $($mappings.Count) mapping row(s)")
+    if ($csvApproved) {
         Invoke-MigrationAction -Description "Write $($mappings.Count) mapping row(s) to $csvPath" -Action {
             $mappings | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8 -ErrorAction Stop
         }
     }
+    elseif (-not $DryRun) {
+        foreach ($mapped in $mappedResults) {
+            $mapped.Status = 'Skipped'
+            $mapped.Detail = 'Declined at the confirmation prompt.'
+        }
+    }
+
+    # The results file is the operator's check that nothing was left behind, so it is written
+    # as soon as the deliverable is settled: whatever the workbook step does next cannot take
+    # the report with it.
+    $null = Export-MigrationResult -Rows $results.ToArray() -Name 'MappingFile'
 
     if ($format.FileType -eq 'Xlsx') {
         if ($SkipExcel) {
             Write-MigrationLog -Message '-SkipExcel was supplied; the workbook was not written. The CSV twin holds the same mappings.' -Level WARNING
         }
+        elseif (-not $csvApproved) {
+            # No CSV twin means nothing to twin: a workbook on its own would contradict the
+            # Skipped rows the results file has just recorded.
+            Write-MigrationLog -Message 'The mapping write was declined; the workbook was not written either.' -Level INFO
+        }
         elseif ($PSCmdlet.ShouldProcess($mappingPath, "Write $($mappings.Count) mapping row(s)")) {
             # The workbook is a convenience, not the deliverable - the CSV twin carries the same
-            # rows - so a missing ImportExcel is a warning rather than a failed run.
+            # rows - so a missing ImportExcel, or a workbook write that fails (a locked file, a
+            # broken ImportExcel runtime dependency), is a warning rather than a failed run.
             $excelReady = $true
             try { Initialize-MigrationModule -Name 'ImportExcel' -MinimumVersion $script:ExcelMinimumVersion }
             catch {
@@ -265,21 +322,19 @@ try {
             }
 
             if ($excelReady) {
-                Invoke-MigrationAction -Description "Write the $Tool workbook to $mappingPath" -Action {
-                    if (Test-Path -LiteralPath $mappingPath) { Remove-Item -LiteralPath $mappingPath -Force -ErrorAction Stop }
-                    $mappings | Export-Excel -Path $mappingPath -WorksheetName $format.WorksheetName -ErrorAction Stop
+                try {
+                    Invoke-MigrationAction -Description "Write the $Tool workbook to $mappingPath" -Action {
+                        if (Test-Path -LiteralPath $mappingPath) { Remove-Item -LiteralPath $mappingPath -Force -ErrorAction Stop }
+                        $mappings | Export-Excel -Path $mappingPath -WorksheetName $format.WorksheetName -ErrorAction Stop
+                    }
+                }
+                catch {
+                    Write-MigrationLog -Message ("The workbook could not be written: $($_.Exception.Message) " +
+                        "The CSV twin at $csvPath holds the same mappings - use it, or re-run with -SkipExcel to silence this.") -Level WARNING
                 }
             }
         }
     }
-
-    if ($duplicateCount -gt 0) {
-        Write-MigrationLog -Message "$duplicateCount duplicate source address(es) were ignored; the first occurrence of each was kept." -Level WARNING
-    }
-
-    $null = Export-MigrationResult -Rows $results.ToArray() -Name 'MappingFile'
-
-    if (@($results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { $exitCode = 2 }
 }
 catch {
     Write-MigrationLog -Message "Fatal error: $($_.Exception.Message)" -Level ERROR

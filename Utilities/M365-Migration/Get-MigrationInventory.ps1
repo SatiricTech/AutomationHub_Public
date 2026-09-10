@@ -53,14 +53,18 @@
 
 .PARAMETER TenantId
     The Entra tenant to sign in to for Microsoft Graph. Recommended when the technician
-    has access to several tenants.
+    has access to several tenants. The Exchange Online session is then checked against the
+    Graph tenant and reconnected once when it belongs to another tenant, so a leftover session
+    from the other end of a migration is never inventoried by mistake.
 
 .PARAMETER DelegatedOrganization
     The customer tenant domain for delegated (GDAP) Exchange Online access.
 
 .PARAMETER DomainFilter
-    One or more domains. Only objects whose UPN or primary SMTP address is on one of them
-    are inventoried. Accepts 'contoso.com' or '@contoso.com'.
+    One or more domains. Applies to users, mailboxes and mail-enabled groups: only objects
+    whose UPN or primary SMTP address is on one of them are inventoried. Contacts are external
+    by nature and are never filtered; security groups with no mail address are always
+    included. Accepts 'contoso.com' or '@contoso.com'.
 
 .PARAMETER IncludeGuests
     Also inventory guest (#EXT#) accounts. Members only by default.
@@ -128,7 +132,6 @@
       + Files.Read.All             with -IncludeOneDrive
       + AuditLog.Read.All          with -IncludeAuthMethods (and for the LastSignIn column;
         the column is left blank and a warning logged when the scope or licence is absent)
-      + UserAuthenticationMethod.Read.All with -IncludeAuthMethods
 
     Exchange Online roles: View-Only Recipients plus View-Only Configuration - the Global
     Reader or Exchange Recipient Administrator roles both cover it. Mailbox statistics
@@ -204,7 +207,7 @@ $requiredGraphScopes = @(
     'RoleManagement.Read.Directory'
 )
 if ($IncludeOneDrive) { $requiredGraphScopes += 'Files.Read.All' }
-if ($IncludeAuthMethods) { $requiredGraphScopes += @('AuditLog.Read.All', 'UserAuthenticationMethod.Read.All') }
+if ($IncludeAuthMethods) { $requiredGraphScopes += 'AuditLog.Read.All' }
 
 # Tab order is also the worksheet order in the workbook and the order the CSVs are logged in.
 $inventoryTabs = @(
@@ -550,6 +553,7 @@ function ConvertTo-InventoryUserRow {
 
     $manager = Get-InventoryValue $User 'manager'
     $signIn = Get-InventoryValue $User 'signInActivity'
+    $businessPhones = @(Get-InventoryValue $User 'businessPhones' @())
 
     $row = [ordered]@{
         ObjectId               = [string](Get-InventoryValue $User 'id' '')
@@ -563,6 +567,17 @@ function ConvertTo-InventoryUserRow {
         Department             = [string](Get-InventoryValue $User 'department' '')
         Office                 = [string](Get-InventoryValue $User 'officeLocation' '')
         MobilePhone            = [string](Get-InventoryValue $User 'mobilePhone' '')
+        City                   = [string](Get-InventoryValue $User 'city' '')
+        State                  = [string](Get-InventoryValue $User 'state' '')
+        Country                = [string](Get-InventoryValue $User 'country' '')
+        PostalCode             = [string](Get-InventoryValue $User 'postalCode' '')
+        StreetAddress          = [string](Get-InventoryValue $User 'streetAddress' '')
+        CompanyName            = [string](Get-InventoryValue $User 'companyName' '')
+        EmployeeId             = [string](Get-InventoryValue $User 'employeeId' '')
+        EmployeeType           = [string](Get-InventoryValue $User 'employeeType' '')
+        BusinessPhone          = [string]$businessPhones[0]
+        FaxNumber              = [string](Get-InventoryValue $User 'faxNumber' '')
+        PreferredLanguage      = [string](Get-InventoryValue $User 'preferredLanguage' '')
         UsageLocation          = [string](Get-InventoryValue $User 'usageLocation' '')
         AccountEnabled         = [bool](Get-InventoryValue $User 'accountEnabled' $false)
         UserType               = [string](Get-InventoryValue $User 'userType' '')
@@ -726,10 +741,13 @@ function Export-InventoryTab {
         Export-MigrationReport: all nine files and the workbook share one timestamp so the set
         reads as one inventory, and a report writer has nowhere to put the worksheet.
 
-        An empty tab still produces a file with a single informational row so the workbook keeps
-        a predictable shape and a downstream Import-Csv does not fall over on a zero-byte file.
-        The write goes through Invoke-MigrationAction, which is what makes -DryRun log the
-        planned file list and write nothing.
+        An empty tab is written as a header-only CSV carrying the tab's real columns (-Column),
+        so New-MigrationIdentityPlan's required-column check still passes when the file is handed
+        to it; the worksheet gets a single informational row instead because Export-Excel cannot
+        write a sheet from an empty pipeline. A WARNING names the empty tab. When no column list
+        is known the CSV falls back to the same informational row. The write goes through
+        Invoke-MigrationAction, which is what makes -DryRun log the planned file list and write
+        nothing.
     #>
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
@@ -739,21 +757,142 @@ function Export-InventoryTab {
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CsvPath,
         [AllowNull()][AllowEmptyString()][string]$ExcelPath,
+        [AllowNull()][AllowEmptyCollection()][string[]]$Column,
         [switch]$IncludeExcel
     )
 
     $data = @($Row)
     $count = $data.Count
+    $headerOnly = $null
     if ($count -eq 0) {
-        $data = @([pscustomobject]@{ Info = "No $Name records found." })
+        $placeholder = @([pscustomobject]@{ Info = "No $Name records found." })
+        $columns = @($Column | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($columns.Count -gt 0) {
+            $headerOnly = ($columns | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }) -join ','
+        }
+        else {
+            $data = $placeholder
+        }
+        Write-MigrationLog -Level WARNING -Message ("The $Name tab is empty. Do not pass " +
+            "$CsvPath to New-MigrationIdentityPlan - Import-MigrationCsv rejects a CSV with no data rows.")
     }
 
     Invoke-MigrationAction -Description "Write the $Name tab ($count row(s)) to $CsvPath" -Action {
-        $data | Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding UTF8
+        if ($null -ne $headerOnly) {
+            Set-Content -LiteralPath $CsvPath -Value $headerOnly -Encoding UTF8
+        }
+        else {
+            $data | Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding UTF8
+        }
         if ($IncludeExcel -and -not [string]::IsNullOrWhiteSpace($ExcelPath)) {
-            $data | Export-Excel -Path $ExcelPath -WorksheetName $Name -AutoSize -FreezeTopRow -BoldTopRow -AutoFilter
+            $sheet = if ($count -eq 0) { $placeholder } else { $data }
+            $sheet | Export-Excel -Path $ExcelPath -WorksheetName $Name -AutoSize -FreezeTopRow -BoldTopRow -AutoFilter
         }
     }
+}
+
+function Get-InventoryTabColumn {
+    <#
+        The column names of one tab, taken from the same row-shaping code that fills it, so an
+        empty tab's header never drifts from a populated one. Groups, Domains and Licenses are
+        shaped inline in the main block and are listed here by name.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
+        [switch]$IncludeAuthMethodColumn,
+        [switch]$IncludeOneDriveColumn
+    )
+
+    $blank = [pscustomobject]@{}
+    $row = switch ($Name) {
+        'Users' {
+            ConvertTo-InventoryUserRow -User $blank -IncludeAuthMethodColumn:$IncludeAuthMethodColumn `
+                -IncludeOneDriveColumn:$IncludeOneDriveColumn
+        }
+        'UserMailboxes' { ConvertTo-InventoryMailboxRow -Mailbox $blank }
+        'SharedMailboxes' { ConvertTo-InventoryMailboxRow -Mailbox $blank }
+        'MailboxPermissions' { ConvertTo-InventoryPermissionRow -Trustee '' -Permission '' -IsInherited $false }
+        'Contacts' { ConvertTo-InventoryContactRow -MailContact $blank }
+        default { $null }
+    }
+    if ($row) { return @($row.PSObject.Properties.Name) }
+
+    switch ($Name) {
+        'Groups' {
+            return @(
+                'ObjectId', 'DisplayName', 'PrimarySmtpAddress', 'GroupType', 'Alias', 'EmailAddresses',
+                'LegacyExchangeDN', 'ManagedBy', 'Members', 'MemberCount', 'Owners', 'HiddenFromAddressLists',
+                'RequireSenderAuthenticationEnabled', 'AcceptMessagesOnlyFrom', 'ModerationEnabled', 'ModeratedBy',
+                'ReportToManagerEnabled', 'GrantSendOnBehalfTo', 'MemberJoinRestriction', 'MemberDepartRestriction',
+                'RecipientFilter', 'IsSynced', 'Visibility', 'TeamEnabled'
+            )
+        }
+        'Domains' {
+            return @('DomainName', 'IsDefault', 'IsInitial', 'IsVerified', 'AuthenticationType', 'SupportedServices')
+        }
+        'Licenses' {
+            return @('SkuPartNumber', 'FriendlyName', 'SkuId', 'Enabled', 'Consumed', 'Available', 'ServicePlansDisabledCommon')
+        }
+        'Summary' { return @('Item', 'Value') }
+    }
+
+    return @()
+}
+
+function ConvertTo-InventoryFolderTrustee {
+    <#
+        The trustee of a Get-EXOMailboxFolderPermission entry as a plain string. The REST cmdlet
+        returns User as a structured object (DisplayName, UserType, RecipientPrincipal) rather
+        than the display-name string Get-MailboxFolderPermission returns, and a [string] cast of
+        that object is '@{DisplayName=...}' - which neither the Default/Anonymous exclusion nor
+        the recipient index can match. A string is returned as is, so mocks and older module
+        builds keep working; an object yields its principal's primary SMTP address, then its
+        name, then the display name (which is what Default and Anonymous carry).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]$User
+    )
+
+    if ($null -eq $User) { return '' }
+    if ($User -is [string]) { return $User.Trim() }
+
+    $principal = Get-InventoryValue $User 'RecipientPrincipal'
+    if ($null -ne $principal -and $principal -isnot [string]) {
+        foreach ($name in @('PrimarySmtpAddress', 'Name')) {
+            $value = [string](Get-InventoryValue $principal $name '')
+            if ($value) { return $value }
+        }
+    }
+    elseif ($principal -is [string] -and $principal.Trim()) {
+        return $principal.Trim()
+    }
+
+    $display = [string](Get-InventoryValue $User 'DisplayName' '')
+    if ($display) { return $display }
+
+    return ([string]$User).Trim()
+}
+
+function Test-InventoryTenantMatch {
+    <#
+        True when the Graph and Exchange Online sessions belong to the same tenant. Both sides
+        expose the tenant as a GUID (Get-MgContext.TenantId and Get-ConnectionInformation.TenantID)
+        so the comparison is exact; a blank on either side cannot be verified and is treated as a
+        match, with the caller expected to log it.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$GraphTenantId,
+        [AllowNull()][AllowEmptyString()][string]$ExchangeTenantId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($GraphTenantId) -or [string]::IsNullOrWhiteSpace($ExchangeTenantId)) { return $true }
+    return ($GraphTenantId.Trim() -ieq $ExchangeTenantId.Trim())
 }
 
 function Get-InventoryGraphUser {
@@ -762,8 +901,10 @@ function Get-InventoryGraphUser {
         call-per-user pattern that makes a 2,000-seat inventory take an hour. Two properties are
         fragile: signInActivity needs AuditLog.Read.All and an Entra ID P1 context, and
         $expand=manager is occasionally refused alongside it. Rather than making the operator
-        guess which permission they are missing, the call degrades in two documented steps and
-        says in the log which columns went blank.
+        guess which permission they are missing, the call degrades in three documented steps and
+        says in the log which columns went blank. Degrading only happens on a 400 or 403 - any
+        other failure (throttling exhausted, a 5xx, a network drop) is rethrown as itself rather
+        than misreported as the next attempt's canned message.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -774,7 +915,9 @@ function Get-InventoryGraphUser {
 
     $select = @(
         'id', 'userPrincipalName', 'displayName', 'givenName', 'surname', 'mail', 'jobTitle',
-        'department', 'officeLocation', 'mobilePhone', 'usageLocation', 'accountEnabled',
+        'department', 'officeLocation', 'mobilePhone', 'city', 'state', 'country', 'postalCode',
+        'streetAddress', 'companyName', 'employeeId', 'employeeType', 'businessPhones',
+        'faxNumber', 'preferredLanguage', 'usageLocation', 'accountEnabled',
         'userType', 'onPremisesSyncEnabled', 'onPremisesImmutableId', 'assignedLicenses',
         'licenseAssignmentStates', 'proxyAddresses', 'createdDateTime'
     )
@@ -795,10 +938,20 @@ function Get-InventoryGraphUser {
                       'AuditLog.Read.All and an Entra ID P1 licence.'
         }
         @{
-            Uri     = "/v1.0/users?`$select=$withoutActivity&`$top=$PageSize$filter"
+            Uri     = "/v1.0/users?`$select=$withActivity&`$top=$PageSize$filter"
             Message = 'The manager expansion was refused - the ManagerUpn column will be blank.'
         }
+        @{
+            Uri     = "/v1.0/users?`$select=$withoutActivity&`$top=$PageSize$filter"
+            Message = 'The manager expansion and signInActivity were both refused - ManagerUpn ' +
+                      'and LastSignIn will be blank.'
+        }
     )
+
+    # Only a rejected $expand or a refused signInActivity property (400/403) is worth degrading
+    # for - anything else (throttling exhausted, a 5xx, a network drop) is the real failure and
+    # is rethrown rather than misreported as the next attempt's canned message.
+    $retryableStatusCode = @(400, 403)
 
     $lastError = $null
     foreach ($attempt in $attempts) {
@@ -809,7 +962,12 @@ function Get-InventoryGraphUser {
         }
         catch {
             $lastError = $_
-            Write-MigrationLog -Message "Graph user query failed: $($_.Exception.Message)" -Level DEBUG
+            $statusCode = Get-MigrationGraphErrorStatusCode -ErrorRecord $_
+            if ($statusCode -notin $retryableStatusCode) {
+                Write-MigrationLog -Message "Graph user query failed (status $statusCode): $($_.Exception.Message)" -Level WARNING
+                throw
+            }
+            Write-MigrationLog -Message "Graph user query failed (status $statusCode), degrading: $($_.Exception.Message)" -Level DEBUG
         }
     }
 
@@ -885,8 +1043,8 @@ function Get-InventoryAuthMethodMap {
     <#
         Maps user object id to their MFA registration record. The userRegistrationDetails report
         is a single paged read of the whole tenant, so it costs one call regardless of user
-        count. It needs AuditLog.Read.All rather than UserAuthenticationMethod.Read.All, which is
-        the permission most operators reach for first - both are requested so either works.
+        count. It needs AuditLog.Read.All - not UserAuthenticationMethod.Read.All, which is the
+        permission most operators reach for first but does not cover the report.
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -1061,7 +1219,9 @@ function Get-InventoryMailboxPermission {
         }
 
         foreach ($delegate in @(Get-InventoryValue $item 'GrantSendOnBehalfTo' @())) {
-            $trustee = [string]$delegate
+            # GrantSendOnBehalfTo arrives as canonical names ('contoso.com/Users/Jane Doe'); resolve to
+            # the primary SMTP so Set-MigrationMailboxPermissions can map the trustee through the plan.
+            $trustee = Resolve-InventoryRecipient -Identity $delegate
             if (-not (Test-InventoryTrustee -Trustee $trustee -Pattern $ExclusionPattern)) { continue }
             $rows.Add((ConvertTo-InventoryPermissionRow -MailboxPrimarySmtp $smtp -MailboxType $type `
                         -Trustee $trustee -Permission 'SendOnBehalf' -IsInherited $false))
@@ -1069,7 +1229,7 @@ function Get-InventoryMailboxPermission {
 
         try {
             foreach ($ace in @(Get-EXOMailboxFolderPermission -Identity ('{0}:\Calendar' -f $identity) -ErrorAction Stop)) {
-                $trustee = [string](Get-InventoryValue $ace 'User' '')
+                $trustee = ConvertTo-InventoryFolderTrustee -User (Get-InventoryValue $ace 'User')
                 if (-not (Test-InventoryTrustee -Trustee $trustee -Pattern $ExclusionPattern)) { continue }
                 if ($CalendarBuiltIn -contains $trustee) { continue }
 
@@ -1124,8 +1284,25 @@ try {
         }
     }
 
-    Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId | Out-Null
-    Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization | Out-Null
+    $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    $graphTenantId = [string](Get-InventoryValue $graphContext 'TenantId' '')
+
+    # Connect-MigrationExchange now accepts -TenantId and drops/reconnects a cached session
+    # that targets a different tenant, the same guard -DelegatedOrganization already gave it -
+    # so passing Graph's resolved tenant GUID here closes the gap for the primary, non-GDAP
+    # path. Running Source then Destination in one console would otherwise pair the new
+    # tenant's Graph tabs with the old tenant's Exchange tabs, silently.
+    $exchangeInformation = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization -TenantId $graphTenantId
+    $exchangeTenantId = [string](Get-InventoryValue $exchangeInformation 'TenantID' '')
+    if (-not (Test-InventoryTenantMatch -GraphTenantId $graphTenantId -ExchangeTenantId $exchangeTenantId)) {
+        throw ("Graph (tenant $graphTenantId) and Exchange Online (tenant $exchangeTenantId) are signed in to " +
+            'different tenants. Run Disconnect-ExchangeOnline, sign in to the right tenant and re-run.')
+    }
+    if (-not $graphTenantId -or -not $exchangeTenantId) {
+        Write-MigrationLog -Level WARNING -Message ('Could not confirm that Graph and Exchange Online target the same ' +
+            "tenant (Graph '$graphTenantId', Exchange '$exchangeTenantId'). Check the TenantId row of the Summary tab.")
+    }
+    Write-MigrationLog -Level INFO -Message "Graph tenant $graphTenantId; Exchange Online tenant $exchangeTenantId."
 
     #-- Tenant facts ------------------------------------------------------------------------------
     $tenantId = ''
@@ -1268,12 +1445,8 @@ try {
     }
     Write-MigrationLog -Message "Graph returned $($graphGroups.Count) group(s)." -Level INFO
 
-    if ($domains.Count -gt 0) {
-        $mailContacts = @($mailContacts | Where-Object {
-                Test-InventoryDomainMatch -Domain $domains -Address @(
-                    [string](Get-InventoryValue $_ 'PrimarySmtpAddress' ''))
-            })
-    }
+    # Mail contacts are not domain-filtered: a contact's primary SMTP address is its external
+    # address, so any filter on the tenant's own domains would empty the tab.
 
     #-- Recipient index ---------------------------------------------------------------------------
     # Built before any row is shaped so that delegate, moderator and member lists resolve to
@@ -1655,7 +1828,9 @@ try {
     }
 
     foreach ($tab in $inventoryTabs) {
-        Export-InventoryTab -Row $tabData[$tab] -Name $tab -CsvPath $csvPaths[$tab] `
+        $columns = @(Get-InventoryTabColumn -Name $tab -IncludeAuthMethodColumn:$IncludeAuthMethods `
+                -IncludeOneDriveColumn:$IncludeOneDrive)
+        Export-InventoryTab -Row $tabData[$tab] -Name $tab -CsvPath $csvPaths[$tab] -Column $columns `
             -ExcelPath $excelPath -IncludeExcel:$useExcel
     }
 
@@ -1683,7 +1858,9 @@ catch {
 #region Cleanup ----------------------------------------------------------------------------------
 
 # Connections are deliberately left open: an operator normally runs the destination inventory
-# straight after the source one, and tearing the sessions down would force a fresh sign-in.
+# straight after the source one, and tearing the sessions down would force a fresh sign-in. The
+# next run pins Graph with -TenantId and cross-checks the Exchange session against it, so a
+# leftover session from this tenant is reconnected rather than reused.
 Write-Progress -Activity 'Inventory' -Completed
 exit (Complete-MigrationRun -ExitCode $exitCode)
 

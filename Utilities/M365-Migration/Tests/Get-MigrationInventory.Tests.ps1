@@ -32,6 +32,8 @@ BeforeAll {
         'ConvertTo-InventoryPermissionRow'
         'Get-InventoryGroupType'
         'Test-InventoryTrustee'
+        'ConvertTo-InventoryFolderTrustee'
+        'Test-InventoryTenantMatch'
     )
 
     $tokens = $null
@@ -335,6 +337,17 @@ Describe 'ConvertTo-InventoryUserRow' {
             department              = 'Finance'
             officeLocation          = 'HQ'
             mobilePhone             = '+1 555 0100'
+            city                    = 'Seattle'
+            state                   = 'WA'
+            country                 = 'US'
+            postalCode              = '98101'
+            streetAddress           = '123 Main St'
+            companyName             = 'Contoso Ltd'
+            employeeId              = 'E5501'
+            employeeType            = 'Employee'
+            businessPhones          = @('+1 555 0199', '+1 555 0198')
+            faxNumber               = '+1 555 0197'
+            preferredLanguage       = 'en-US'
             usageLocation           = 'US'
             accountEnabled          = $true
             userType                = 'Member'
@@ -362,11 +375,39 @@ Describe 'ConvertTo-InventoryUserRow' {
     It 'Emits the base column set in order and ends with DirectoryRoles' {
         $expected = @(
             'ObjectId', 'UserPrincipalName', 'DisplayName', 'FirstName', 'MiddleName', 'LastName', 'Mail',
-            'JobTitle', 'Department', 'Office', 'MobilePhone', 'UsageLocation', 'AccountEnabled', 'UserType',
+            'JobTitle', 'Department', 'Office', 'MobilePhone', 'City', 'State', 'Country', 'PostalCode',
+            'StreetAddress', 'CompanyName', 'EmployeeId', 'EmployeeType', 'BusinessPhone', 'FaxNumber',
+            'PreferredLanguage', 'UsageLocation', 'AccountEnabled', 'UserType',
             'IsSynced', 'ImmutableId', 'ManagerUpn', 'Licenses', 'LicenseSkuIds', 'LicenseAssignedByGroup',
             'ProxyAddresses', 'LastSignIn', 'CreatedDateTime', 'DirectoryRoles'
         )
         @($script:userRow.PSObject.Properties.Name) | Should -Be $expected
+    }
+
+    It 'Carries the extended source profile attributes' {
+        $script:userRow.City | Should -BeExactly 'Seattle'
+        $script:userRow.State | Should -BeExactly 'WA'
+        $script:userRow.Country | Should -BeExactly 'US'
+        $script:userRow.PostalCode | Should -BeExactly '98101'
+        $script:userRow.StreetAddress | Should -BeExactly '123 Main St'
+        $script:userRow.CompanyName | Should -BeExactly 'Contoso Ltd'
+        $script:userRow.EmployeeId | Should -BeExactly 'E5501'
+        $script:userRow.EmployeeType | Should -BeExactly 'Employee'
+        $script:userRow.FaxNumber | Should -BeExactly '+1 555 0197'
+        $script:userRow.PreferredLanguage | Should -BeExactly 'en-US'
+    }
+
+    It 'Takes only the first entry of businessPhones' {
+        $script:userRow.BusinessPhone | Should -BeExactly '+1 555 0199'
+    }
+
+    It 'Leaves the new attribute columns empty for a user Graph returned with a narrower property set' {
+        $sparse = ConvertTo-InventoryUserRow -User ([pscustomobject]@{
+                id = '99999999-9999-9999-9999-999999999999'
+            }) -SkuNameById $script:skuNameById -DirectoryRole @()
+        $sparse.City | Should -BeExactly ''
+        $sparse.EmployeeId | Should -BeExactly ''
+        $sparse.BusinessPhone | Should -BeExactly ''
     }
 
     It 'Maps licence GUIDs to part numbers and keeps the GUIDs too' {
@@ -525,5 +566,46 @@ Describe 'Test-InventoryTrustee and ConvertTo-InventoryPermissionRow' {
         $row = ConvertTo-InventoryPermissionRow -MailboxPrimarySmtp 'jane@contoso.com' -MailboxType 'UserMailbox' `
             -Trustee 'CONTOSO\deleted-account' -Permission 'FullAccess' -IsInherited $false
         $row.TrusteeType | Should -BeExactly 'Unresolved'
+    }
+}
+
+Describe 'ConvertTo-InventoryFolderTrustee' {
+
+    It 'Returns a plain string unchanged' {
+        ConvertTo-InventoryFolderTrustee -User 'bob@contoso.com' | Should -BeExactly 'bob@contoso.com'
+    }
+
+    It 'Resolves an object-shaped User to the recipient PrimarySmtpAddress' {
+        $user = [pscustomobject]@{
+            DisplayName        = 'Bob Jones'
+            UserType           = 'Internal'
+            RecipientPrincipal = [pscustomobject]@{ PrimarySmtpAddress = 'bob@contoso.com'; Name = 'bjones' }
+        }
+        ConvertTo-InventoryFolderTrustee -User $user | Should -BeExactly 'bob@contoso.com'
+    }
+
+    It 'Falls back to DisplayName for a built-in trustee, matching Default and Anonymous' {
+        $user = [pscustomobject]@{ DisplayName = 'Default'; UserType = 'Default'; RecipientPrincipal = $null }
+        ConvertTo-InventoryFolderTrustee -User $user | Should -BeExactly 'Default'
+    }
+
+    It 'Returns empty for a null User' {
+        ConvertTo-InventoryFolderTrustee -User $null | Should -BeExactly ''
+    }
+}
+
+Describe 'Test-InventoryTenantMatch' {
+
+    It 'Matches identical tenant GUIDs case-insensitively' {
+        Test-InventoryTenantMatch -GraphTenantId 'AAAA-1111' -ExchangeTenantId 'aaaa-1111' | Should -BeTrue
+    }
+
+    It 'Detects a mismatch' {
+        Test-InventoryTenantMatch -GraphTenantId 'aaaa-1111' -ExchangeTenantId 'bbbb-2222' | Should -BeFalse
+    }
+
+    It 'Treats a blank side as unverifiable, not a mismatch' {
+        Test-InventoryTenantMatch -GraphTenantId '' -ExchangeTenantId 'bbbb-2222' | Should -BeTrue
+        Test-InventoryTenantMatch -GraphTenantId 'aaaa-1111' -ExchangeTenantId '' | Should -BeTrue
     }
 }

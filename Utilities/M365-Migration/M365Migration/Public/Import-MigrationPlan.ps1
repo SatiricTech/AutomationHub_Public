@@ -23,7 +23,9 @@ function Import-MigrationPlan {
         successful run that did nothing.
 
     .PARAMETER Path
-        The identity plan CSV.
+        The identity plan CSV. A wildcard pattern (for example
+        '.\Contoso_IdentityPlan_*.csv') is resolved when it matches exactly one file;
+        zero or more than one match is still an error.
 
     .PARAMETER Wave
         Restricts the result to these waves.
@@ -60,19 +62,32 @@ function Import-MigrationPlan {
         [AllowNull()][AllowEmptyCollection()][string[]]$PlanStatus
     )
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    $resolvedPath = $Path
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -and $Path -match '[*?\[]') {
+        $candidates = @()
+        try { $candidates = @(Resolve-Path -Path $Path -ErrorAction Stop | Where-Object { Test-Path -LiteralPath $_.Path -PathType Leaf }) }
+        catch { $candidates = @() }
+
+        if ($candidates.Count -gt 1) {
+            throw ("The identity plan pattern '$Path' matched $($candidates.Count) files: " +
+                (($candidates | ForEach-Object { $_.Path }) -join ', ') + '. Pass one specific file name.')
+        }
+        if ($candidates.Count -eq 1) { $resolvedPath = $candidates[0].Path }
+    }
+
+    if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
         throw "Identity plan not found: $Path"
     }
 
     try {
-        $raw = @(Import-Csv -LiteralPath $Path -Encoding utf8 -ErrorAction Stop)
+        $raw = @(Import-Csv -LiteralPath $resolvedPath -Encoding utf8 -ErrorAction Stop)
     }
     catch {
-        throw "Could not read the identity plan '$Path': $($_.Exception.Message)"
+        throw "Could not read the identity plan '$resolvedPath': $($_.Exception.Message)"
     }
 
     if ($raw.Count -eq 0) {
-        throw "The identity plan '$Path' contains no data rows."
+        throw "The identity plan '$resolvedPath' contains no data rows."
     }
 
     $headers = @($raw[0].PSObject.Properties.Name)
@@ -105,7 +120,7 @@ function Import-MigrationPlan {
         $rows.Add([pscustomobject]$row)
     }
 
-    Write-MigrationLog -Message "Loaded $($rows.Count) plan row(s) from $Path" -Level INFO
+    Write-MigrationLog -Message "Loaded $($rows.Count) plan row(s) from $resolvedPath" -Level INFO
 
     $selectParameters = @{ Rows = $rows.ToArray(); IncludeExcluded = $true }
     if ($Wave) { $selectParameters['Wave'] = $Wave }
@@ -120,7 +135,7 @@ function Import-MigrationPlan {
         if ($ObjectType) { $describe.Add("ObjectType = $($ObjectType -join ', ')") }
         if ($PlanStatus) { $describe.Add("PlanStatus = $($PlanStatus -join ', ')") }
         $criteria = if ($describe.Count -gt 0) { ' matching ' + ($describe -join '; ') } else { '' }
-        throw "The identity plan '$Path' returned no rows$criteria. Check the filter values against the plan file."
+        throw "The identity plan '$resolvedPath' returned no rows$criteria. Check the filter values against the plan file."
     }
 
     if ($filtered.Count -ne $rows.Count) {

@@ -284,11 +284,13 @@ Describe 'New-MigrationIdentityPlan - naming templates' {
             UsersCsv           = (Join-Path $script:Fixtures 'Collisions.csv')
             MailNicknameFormat = '{f}{last}'
         }
-        (Get-AdversarialRow -Result $result -Identity 'alex1@contoso.com').PlanStatus | Should -BeExactly 'Planned'
+        $firstRow = Get-AdversarialRow -Result $result -Identity 'alex1@contoso.com'
+        $firstRow.PlanStatus | Should -BeExactly 'Planned'
         $row = Get-AdversarialRow -Result $result -Identity 'alex3@contoso.com'
-        $row.TargetMailNickname | Should -BeExactly 'aname'
+        $row.TargetMailNickname | Should -BeExactly 'aname3'
         $row.PlanStatus | Should -BeExactly 'Collision'
         $row.PlanDetail | Should -BeLike "*Mail nickname 'aname' is already used by alex1@contoso.com*"
+        $firstRow.TargetMailNickname | Should -Not -BeExactly $row.TargetMailNickname
     }
 }
 
@@ -414,13 +416,13 @@ Describe 'New-MigrationIdentityPlan - guests and exclusions' {
         $script:GuestUpn = 'raj_fabrikam.com#EXT#@contoso.onmicrosoft.com'
     }
 
-    It 'passes an #EXT# guest UPN through untouched with -IncludeGuests' {
+    It 'leaves the target/interim UPN empty for a guest, carrying only the external mail' {
         $result = Invoke-AdversarialPlan -Name 'guests-included' -Parameter ($script:GuestParameters + @{ IncludeGuests = $true })
         $row = Get-AdversarialRow -Result $result -Identity $script:GuestUpn
         $row.ObjectType | Should -BeExactly 'Guest'
-        $row.TargetUserPrincipalName | Should -BeExactly $script:GuestUpn
+        $row.TargetUserPrincipalName | Should -BeExactly ''
+        $row.InterimUserPrincipalName | Should -BeExactly ''
         $row.TargetPrimarySmtp | Should -BeExactly 'raj@fabrikam.com'
-        (Test-MigrationAddress -Address $row.TargetUserPrincipalName -Kind Upn).IsValid | Should -BeTrue
     }
 
     It 'excludes a guest by default' {

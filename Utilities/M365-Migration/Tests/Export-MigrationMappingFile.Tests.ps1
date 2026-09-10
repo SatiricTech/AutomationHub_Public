@@ -92,14 +92,34 @@ Describe 'Export-MigrationMappingFile' {
                 Should -Be @('Source user/group', 'Destination user/group')
         }
 
-        It 'Maps every plan row that has both a source and a target address' {
-            $script:Default.Mappings.Count | Should -Be 10
+        It 'Maps every signed-off plan row that has both a source and a target address' {
+            $script:Default.Mappings.Count | Should -Be 9
         }
 
         It 'Maps a user onto the target address the plan chose' {
             $row = @($script:Default.Mappings | Where-Object { $_.'Source user/group' -eq 'jsmith@contoso.com' })
             $row.Count | Should -Be 1
             $row[0].'Destination user/group' | Should -BeExactly 'john.smith@newco.com'
+        }
+
+        It 'Maps a ManualOverride row onto the address the operator set by hand' {
+            $row = @($script:Default.Mappings | Where-Object { $_.'Source user/group' -eq 'mhand@contoso.com' })
+            $row.Count | Should -Be 1
+            $row[0].'Destination user/group' | Should -BeExactly 'maria.hand@newco.com'
+        }
+
+        It 'Leaves out rows the plan has not signed off, even when they still carry a target address' {
+            $sources = @($script:Default.Mappings | ForEach-Object { $_.'Source user/group' })
+            $sources | Should -Not -Contain 'jqsmith@contoso.com'    # Collision
+            $sources | Should -Not -Contain 'aschmidt@contoso.com'   # Collision
+            $sources | Should -Not -Contain 'tleaver@contoso.com'    # Excluded by hand after planning
+
+            $excluded = @($script:Default.Results | Where-Object { $_.Source -eq 'tleaver@contoso.com' })[0]
+            $excluded.Status | Should -BeExactly 'Skipped'
+            $excluded.Detail | Should -BeLike "PlanStatus is 'Excluded'*"
+
+            @($script:Default.Results | Where-Object { $_.Source -eq 'jqsmith@contoso.com' })[0].Detail |
+                Should -BeLike "PlanStatus is 'Collision'*"
         }
 
         It 'Maps shared mailboxes, groups and contacts as well as users' {
@@ -119,15 +139,15 @@ Describe 'Export-MigrationMappingFile' {
 
         It 'Reports every row it could not map as Skipped, with a reason' {
             $skipped = @($script:Default.Results | Where-Object { $_.Status -eq 'Skipped' })
-            $skipped.Count | Should -Be 5
+            $skipped.Count | Should -Be 8
             @($skipped | Where-Object { $_.Source -eq 'prince@contoso.com' })[0].Detail |
-                Should -BeLike 'No target address in the plan (PlanStatus NeedsReview)*'
+                Should -BeLike "PlanStatus is 'NeedsReview'*"
         }
 
         It 'Records the mapped rows as Succeeded with the four standard columns first' {
             @($script:Default.Results[0].PSObject.Properties.Name | Select-Object -First 4) |
                 Should -Be @('Identity', 'Action', 'Status', 'Detail')
-            @($script:Default.Results | Where-Object { $_.Status -eq 'Succeeded' }).Count | Should -Be 10
+            @($script:Default.Results | Where-Object { $_.Status -eq 'Succeeded' }).Count | Should -Be 9
         }
 
         It 'Writes no workbook when -SkipExcel is used' {
@@ -146,9 +166,34 @@ Describe 'Export-MigrationMappingFile' {
             $row.'Destination user/group' | Should -BeExactly 'john.smith@newco.onmicrosoft.com'
         }
 
-        It 'Names the interim address in the reason when a row has none' {
-            @($script:Interim.Results | Where-Object { $_.Source -eq 'prince@contoso.com' })[0].Detail |
-                Should -BeLike 'No interim address in the plan*'
+        It 'Names the interim address in the reason when a signed-off row has none' {
+            $row = @($script:Interim.Results | Where-Object { $_.Source -eq 'mhand@contoso.com' })[0]
+            $row.Status | Should -BeExactly 'Skipped'
+            $row.Detail | Should -BeLike 'No interim address in the plan (PlanStatus ManualOverride)*'
+            @($script:Interim.Mappings | Where-Object { $_.'Source user/group' -eq 'mhand@contoso.com' }).Count | Should -Be 0
+        }
+    }
+
+    Context '-IncludeCollisions' {
+
+        BeforeAll {
+            $script:Collisions = Invoke-MappingRun -OutputPath (Join-Path $TestDrive 'collisions') -Parameter @{ IncludeCollisions = $true }
+        }
+
+        It 'Maps the Collision rows onto the suffixed addresses the planner assigned' {
+            $script:Collisions.ExitCode | Should -Be 0
+            $script:Collisions.Mappings.Count | Should -Be 11
+            @($script:Collisions.Mappings | Where-Object { $_.'Source user/group' -eq 'jqsmith@contoso.com' })[0].'Destination user/group' |
+                Should -BeExactly 'john.q.smith@newco.com'
+            @($script:Collisions.Mappings | Where-Object { $_.'Source user/group' -eq 'aschmidt@contoso.com' })[0].'Destination user/group' |
+                Should -BeExactly 'anna-maria.schmidt-braun2@newco.com'
+        }
+
+        It 'Still leaves out the rows with any other unsigned-off status' {
+            $sources = @($script:Collisions.Mappings | ForEach-Object { $_.'Source user/group' })
+            $sources | Should -Not -Contain 'tleaver@contoso.com'
+            $sources | Should -Not -Contain 'prince@contoso.com'
+            @($script:Collisions.Results | Where-Object { $_.Status -eq 'Skipped' }).Count | Should -Be 6
         }
     }
 
@@ -205,7 +250,29 @@ Describe 'Export-MigrationMappingFile' {
             $result.ExitCode | Should -Be 0
             $result.MappingPath | Should -BeExactly ''
             $result.ResultPath | Should -BeLike '*MappingFile-DryRun_*'
-            @($result.Results | Where-Object { $_.Status -eq 'Planned' }).Count | Should -Be 10
+            @($result.Results | Where-Object { $_.Status -eq 'Planned' }).Count | Should -Be 9
+        }
+    }
+
+    Context '-WhatIf' {
+
+        It 'Writes no mapping file and reports the mapped rows as declined, never Succeeded' {
+            $result = Invoke-MappingRun -OutputPath (Join-Path $TestDrive 'whatif') -Parameter @{ WhatIf = $true }
+
+            $result.ExitCode | Should -Be 0
+            $result.MappingPath | Should -BeExactly ''
+            $result.WorkbookPath | Should -BeExactly ''
+            $result.ResultPath | Should -BeLike '*MappingFile-Results_*'
+            @($result.Results | Where-Object { $_.Status -eq 'Succeeded' }).Count | Should -Be 0
+            @($result.Results | Where-Object { $_.Status -eq 'Planned' }).Count | Should -Be 0
+
+            $declined = @($result.Results | Where-Object { $_.Detail -eq 'Declined at the confirmation prompt.' })
+            $declined.Count | Should -Be 9
+            @($declined | Where-Object { $_.Status -ne 'Skipped' }).Count | Should -Be 0
+
+            # The rows that could not be mapped anyway keep their own reason.
+            @($result.Results | Where-Object { $_.Source -eq 'prince@contoso.com' })[0].Detail |
+                Should -BeLike "PlanStatus is 'NeedsReview'*"
         }
     }
 
@@ -217,6 +284,45 @@ Describe 'Export-MigrationMappingFile' {
             $result.WorkbookPath | Should -Not -BeNullOrEmpty
             $result.MappingPath | Should -Not -BeNullOrEmpty
             (Get-Item -LiteralPath $result.WorkbookPath).Length | Should -BeGreaterThan 0
+        }
+    }
+
+    Context 'A workbook write that fails' {
+
+        BeforeAll {
+            # Stubs defined here shadow the module's Initialize-MigrationModule and ImportExcel's
+            # Export-Excel for the script, which runs in a child scope of this context. The first
+            # keeps the test independent of whether ImportExcel is installed; the second stands
+            # in for a locked file or a broken ImportExcel runtime dependency.
+            function Initialize-MigrationModule { [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Stub replaces the real command; parameters are accepted and ignored')] param($Name, $MinimumVersion) }
+            function Export-Excel {
+                [CmdletBinding()]
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Stub replaces the real command; parameters are accepted and ignored')]
+                param(
+                    [Parameter(ValueFromPipeline)]$InputObject,
+                    [string]$Path,
+                    [string]$WorksheetName
+                )
+                process { }
+                end { throw "The process cannot access the file '$Path' because it is being used by another process." }
+            }
+
+            $script:BrokenWorkbook = Invoke-MappingRun -OutputPath (Join-Path $TestDrive 'brokenworkbook') -Parameter @{ SkipExcel = $false }
+        }
+
+        It 'Keeps the CSV twin, still writes the results file and exits 0' {
+            $script:BrokenWorkbook.ExitCode | Should -Be 0
+            $script:BrokenWorkbook.WorkbookPath | Should -BeExactly ''
+            $script:BrokenWorkbook.MappingPath | Should -Not -BeNullOrEmpty
+            $script:BrokenWorkbook.Mappings.Count | Should -Be 9
+            $script:BrokenWorkbook.ResultPath | Should -Not -BeNullOrEmpty
+            @($script:BrokenWorkbook.Results | Where-Object { $_.Status -eq 'Succeeded' }).Count | Should -Be 9
+        }
+
+        It 'Warns in the log and points at the CSV twin' {
+            $log = @(Get-ChildItem -Path (Join-Path $TestDrive 'brokenworkbook') -Filter '*.log' -Recurse)[0]
+            $log | Should -Not -BeNullOrEmpty
+            (Get-Content -LiteralPath $log.FullName -Raw) | Should -BeLike '*The workbook could not be written:*The CSV twin at *holds the same mappings*'
         }
     }
 
@@ -235,12 +341,16 @@ Describe 'Export-MigrationMappingFile' {
             $result.ExitCode | Should -Be 1
         }
 
-        It 'Exits 1 when no selected row has a destination address' {
+        It 'Exits 1 but still reports every Skipped row when nothing in the selection can be mapped' {
             $result = Invoke-MappingRun -OutputPath (Join-Path $TestDrive 'nodestination') -Parameter @{
                 ObjectType = @('Guest')
             }
             $result.ExitCode | Should -Be 1
             $result.MappingPath | Should -BeExactly ''
+            $result.ResultPath | Should -Not -BeNullOrEmpty
+            $result.Results.Count | Should -Be 1
+            @($result.Results | Where-Object { $_.Status -ne 'Skipped' }).Count | Should -Be 0
+            $result.Results[0].Detail | Should -BeLike "PlanStatus is 'Excluded'*"
         }
     }
 }

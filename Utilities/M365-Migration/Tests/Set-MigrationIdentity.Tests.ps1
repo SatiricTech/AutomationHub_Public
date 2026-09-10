@@ -46,8 +46,7 @@ BeforeAll {
         Justification = 'Stub named after the real cmdlet so Pester can mock it; it has no body and changes nothing.')]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSupportsShouldProcess', '',
         Justification = 'Stub mirrors the real cmdlet signature, which takes -Confirm; it has no body and changes nothing.')]
-        param($Identity, $EmailAddresses, $Alias, $HiddenFromAddressListsEnabled,
-            $EmailAddressPolicyEnabled, $ErrorAction)
+        param($Identity, $EmailAddresses, $Alias, $HiddenFromAddressListsEnabled, $ErrorAction)
     }
 
     $script:TempRoot = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "SetMigrationIdentity-$([guid]::NewGuid())"

@@ -44,7 +44,10 @@
 
 .PARAMETER LocationId
     Emergency location ID to associate with the assignment (Calling Plan / Operator Connect).
-    Auto-filled from a LocationId CSV column when present.
+    Auto-filled from a LocationId CSV column when present. The ID is tenant-scoped, so a value
+    carried over from a source-tenant export will not resolve in the destination: with -User
+    an unresolvable -LocationId fails the row; with -CsvPath the assignment still proceeds
+    without a location and the row's Detail says an emergency location must be set manually.
 
 .PARAMETER VoiceRoutingPolicy
     Online voice routing policy to grant after assignment (required for Direct Routing
@@ -105,14 +108,18 @@
     Rehearses a single assignment and writes only the DryRun results file.
 
 .EXAMPLE
-    .\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments.csv -Prefix Destination
+    .\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Source_TeamsPhoneAssignments.csv -TenantId newco.onmicrosoft.com -Prefix Destination
 
-    Reassigns every number from a source-tenant export into the destination tenant.
+    Reassigns every number from a source-tenant export into the destination tenant. -TenantId
+    is passed explicitly so a Teams session left connected to the source tenant is not reused
+    by mistake.
 
 .EXAMPLE
-    .\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Contoso_Remove-TeamsPhoneAssignments-Results_20260908-101500.csv -Prefix Contoso
+    .\Set-MigrationTeamsPhoneAssignments.ps1 -CsvPath .\Contoso_Remove-TeamsPhoneAssignments-Results_20260908-101500.csv -TenantId newco.onmicrosoft.com -Prefix Contoso
 
     Restores the numbers a previous Remove- run released, using its results file as the input.
+    -TenantId again targets the destination tenant explicitly rather than reusing whatever
+    Teams session happens to be live.
 
 .NOTES
     Author      : AutomationHub
@@ -207,7 +214,13 @@ try {
         throw "CSV not found: $CsvPath"
     }
 
-    $null = Connect-MigrationTeams -TenantId $TenantId
+    $teamsTenant = Connect-MigrationTeams -TenantId $TenantId
+    # Connect-MigrationTeams silently reuses whatever Teams session is already live when
+    # -TenantId is omitted, so the connected tenant is surfaced here - before any prompt -
+    # rather than trusting the operator to notice a bare GUID buried in an earlier log line.
+    if ($teamsTenant) {
+        Write-MigrationLog -Message "Connected tenant: $($teamsTenant.DisplayName) ($($teamsTenant.TenantId))." -Level INFO
+    }
 
     if ($PSCmdlet.ParameterSetName -eq 'Unassigned') {
         Write-MigrationLog -Message 'Retrieving unassigned telephone numbers...' -Level INFO
@@ -369,8 +382,16 @@ try {
 
         try {
             if (-not $number) {
-                $status = 'Skipped'
-                $detail = "No usable phone number ('$($item.PhoneNumber)')."
+                if ([string]::IsNullOrWhiteSpace($item.PhoneNumber)) {
+                    $status = 'Skipped'
+                    $detail = "No usable phone number ('$($item.PhoneNumber)')."
+                }
+                else {
+                    # Format-MigrationE164 returns $null for blank input AND for a value it
+                    # could not parse; a typo must not read the same as a legitimately blank
+                    # cell, so only an actually-blank source value is a Skip.
+                    throw "Unparseable phone number ('$($item.PhoneNumber)')."
+                }
             }
             else {
                 $target = Resolve-MigrationTeamsUser -Identity $identity
@@ -378,20 +399,26 @@ try {
                 $identity = [string]$target.UserPrincipalName
                 $displayName = [string]$target.DisplayName
 
-                # The inventory is keyed without any extension suffix.
+                # Teams keys a Direct Routing extension WITH the extension (e.g.
+                # '+12065551000;ext=524' is its own inventory row, distinct from the bare
+                # '+12065551000'), so the ownership check must match on the full number.
+                # The bare number is a fallback for type auto-detection only - never for
+                # deciding whether someone else already holds the number.
                 $bareNumber = ($number -split ';')[0]
-                $numberInfo = if ($numbersByTelephone.ContainsKey($bareNumber)) { $numbersByTelephone[$bareNumber] } else { $null }
+                $numberInfo = if ($numbersByTelephone.ContainsKey($number)) { $numbersByTelephone[$number] } else { $null }
+                $bareNumberInfo = if ($numbersByTelephone.ContainsKey($bareNumber)) { $numbersByTelephone[$bareNumber] } else { $null }
 
                 if ($numberInfo -and -not [string]::IsNullOrWhiteSpace($numberInfo.AssignedPstnTargetId) -and
                     [string]$numberInfo.AssignedPstnTargetId -ne [string]$target.Identity) {
-                    throw ("Number $bareNumber is already assigned to another target " +
+                    throw ("Number $number is already assigned to another target " +
                         "($($numberInfo.AssignedPstnTargetId)). Unassign it first.")
                 }
 
                 if ([string]::IsNullOrWhiteSpace($numberType)) {
                     # Numbers absent from the tenant inventory are Direct Routing - Calling
                     # Plan and Operator Connect numbers always appear there.
-                    $numberType = if ($numberInfo) { [string]$numberInfo.NumberType } else { 'DirectRouting' }
+                    $typeSource = if ($numberInfo) { $numberInfo } else { $bareNumberInfo }
+                    $numberType = if ($typeSource) { [string]$typeSource.NumberType } else { 'DirectRouting' }
                 }
                 $matchedType = $validNumberTypes | Where-Object { $_ -ieq $numberType } | Select-Object -First 1
                 if (-not $matchedType) {
@@ -399,18 +426,40 @@ try {
                 }
                 $numberType = $matchedType
 
+                # LocationId is tenant-scoped (Get-CsOnlineLisLocation), so a value carried
+                # over from a source-tenant export - including the all-zeros placeholder the
+                # Get- export emits for numbers with no location - cannot simply be forwarded.
+                # -User is a single operator-typed value: an unknown ID fails the row. -CsvPath
+                # is bulk source data: an unresolvable ID is dropped and the row still assigns,
+                # with a note that the location must be set manually.
+                $locationId = $item.LocationId
+                $locationNote = ''
+                if ($locationId -eq '00000000-0000-0000-0000-000000000000') { $locationId = $null }
+                if ($locationId) {
+                    try {
+                        $null = Get-CsOnlineLisLocation -LocationId $locationId -ErrorAction Stop
+                    }
+                    catch {
+                        if ($PSCmdlet.ParameterSetName -eq 'User') {
+                            throw "LocationId '$locationId' does not exist in this tenant: $($_.Exception.Message)"
+                        }
+                        $locationId = $null
+                        $locationNote = ' LocationId did not exist in this tenant; assign an emergency location manually.'
+                    }
+                }
+
                 $assignParameters = @{
                     Identity        = $identity
                     PhoneNumber     = $number
                     PhoneNumberType = $numberType
                     ErrorAction     = 'Stop'
                 }
-                if ($item.LocationId) { $assignParameters['LocationId'] = $item.LocationId }
+                if ($locationId) { $assignParameters['LocationId'] = $locationId }
 
                 if ($isDryRun) {
                     $null = Invoke-MigrationAction -Description "Assign $number ($numberType) to $identity" -Action { }
                     $status = 'Planned'
-                    $detail = "Would assign $number ($numberType)."
+                    $detail = "Would assign $number ($numberType).$locationNote"
                     if ($policy) {
                         $null = Invoke-MigrationAction -Description "Grant voice routing policy '$policy' to $identity" -Action { }
                         $detail += " Would grant voice routing policy '$policy'."
@@ -421,7 +470,7 @@ try {
                         Set-CsPhoneNumberAssignment @assignParameters
                     }
                     $status = 'Succeeded'
-                    $detail = "Assigned $number ($numberType)."
+                    $detail = "Assigned $number ($numberType).$locationNote"
 
                     if ($policy) {
                         $null = Invoke-MigrationAction -Description "Grant voice routing policy '$policy' to $identity" -Action {

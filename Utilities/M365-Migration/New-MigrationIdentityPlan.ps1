@@ -29,7 +29,9 @@
 
     Re-running against an updated inventory is safe: with -ExistingPlanPath, any row already
     provisioned (a non-empty TargetObjectId) or marked ManualOverride keeps its destination
-    identity verbatim, and its addresses are treated as reserved.
+    identity verbatim, and its addresses are treated as reserved. A preserved row whose source
+    object is no longer in the inventory is not carried into the new plan; it is named in a
+    log warning so the operator can decide whether the object was removed on purpose.
 
 .PARAMETER UsersCsv
     The Users tab from Get-MigrationInventory. Required - it is the spine of the plan.
@@ -68,8 +70,9 @@
 
 .PARAMETER MailNicknameFormat
     Template for the mail nickname. When omitted the resolved SMTP local part is used, which
-    survives collision resolution. A template that gives two people the same nickname leaves
-    the second of them Collision, because Entra ID keeps one mail nickname per tenant.
+    survives collision resolution. Entra ID keeps one mail nickname per tenant, so when a
+    template gives two people the same nickname the later one (by source object ID) gets a
+    numeric suffix and is marked Collision.
 
 .PARAMETER SkuMapPath
     CSV of SourceSkuPartNumber,TargetSkuPartNumber. A ';' separated target maps one licence to
@@ -92,7 +95,8 @@
 
 .PARAMETER ExistingPlanPath
     A previous IdentityPlan.csv. Rows carrying a TargetObjectId or the PlanStatus ManualOverride
-    keep their destination identity, wave and provisioning state verbatim.
+    keep their destination identity, wave and provisioning state verbatim. Such a row whose
+    source object is missing from the new inventory is dropped, with a warning in the log.
 
 .PARAMETER ReservedAddressesPath
     Files listing addresses already in use in the destination. Each may be a destination
@@ -102,7 +106,9 @@
     Plan disabled source accounts instead of excluding them.
 
 .PARAMETER IncludeGuests
-    Plan guest (#EXT#) accounts. Guests keep their existing external identity verbatim.
+    Plan guest (#EXT#) accounts. A guest keeps its external mail address as TargetPrimarySmtp;
+    the UPN and mail nickname columns stay empty because the destination tenant assigns both
+    when the guest is re-invited there.
 
 .PARAMETER IncludeSynced
     Plan directory-synced objects, whose authoritative copy lives in on-premises AD.
@@ -269,10 +275,18 @@ $script:ReservedAddressColumns = @(
     'ExternalEmailAddress', 'TargetAliases'
 )
 
+# Every destination address column, emptied together on a row an operator still has to name.
+$script:TargetAddressColumns = @(
+    'TargetUserPrincipalName', 'TargetPrimarySmtp', 'TargetAliases', 'TargetMailNickname',
+    'InterimUserPrincipalName', 'InterimPrimarySmtp'
+)
+
 # Columns whose plan name and inventory name are identical, per source kind.
 $script:PassThroughColumns = @{
     'User'          = @('DisplayName', 'FirstName', 'MiddleName', 'LastName', 'JobTitle',
-        'Department', 'Office', 'MobilePhone', 'ManagerUpn', 'AccountEnabled', 'IsSynced')
+        'Department', 'Office', 'MobilePhone', 'City', 'State', 'Country', 'PostalCode',
+        'StreetAddress', 'CompanyName', 'EmployeeId', 'EmployeeType', 'BusinessPhone',
+        'FaxNumber', 'PreferredLanguage', 'ManagerUpn', 'AccountEnabled', 'IsSynced')
     'SharedMailbox' = @('DisplayName', 'AccountEnabled', 'IsSynced')
     'Group'         = @('DisplayName', 'IsSynced')
     'Contact'       = @('DisplayName', 'FirstName', 'LastName')
@@ -672,17 +686,24 @@ try {
     }
 
     # --- Rows preserved from a previous plan ---------------------------------------------------
+    # The index maps each identity value to the row's position in $preservedRows, so a row
+    # matched through any of its identities is one hit, and a row matched by nothing can be
+    # named at the end.
+    $preservedRows = [System.Collections.Generic.List[object]]::new()
     $preservedIndex = @{}
+    $preservedHits = [System.Collections.Generic.HashSet[int]]::new()
     if ($ExistingPlanPath) {
         foreach ($existing in @(Import-MigrationPlan -Path $ExistingPlanPath)) {
             $hasTargetObject = -not [string]::IsNullOrWhiteSpace((Get-MigrationCsvValue -Row $existing -Name 'TargetObjectId' -Default ''))
             if (-not $hasTargetObject -and (Get-MigrationCsvValue -Row $existing -Name 'PlanStatus' -Default '') -ne 'ManualOverride') { continue }
 
+            $preservedRows.Add($existing)
+            $ordinal = $preservedRows.Count - 1
             foreach ($keyColumn in $script:IdentityColumns) {
                 $keyValue = Get-MigrationCsvValue -Row $existing -Name $keyColumn -Default ''
                 if (-not $keyValue) { continue }
                 $indexKey = "$keyColumn|$($keyValue.ToLowerInvariant())"
-                if (-not $preservedIndex.ContainsKey($indexKey)) { $preservedIndex[$indexKey] = $existing }
+                if (-not $preservedIndex.ContainsKey($indexKey)) { $preservedIndex[$indexKey] = $ordinal }
             }
 
             # A preserved identity is, by definition, already spoken for in the destination.
@@ -690,8 +711,7 @@ try {
                 & $reserve (Get-MigrationCsvValue -Row $existing -Name $column -Default '')
             }
         }
-        Write-MigrationLog -Message ("Existing plan '$ExistingPlanPath' contributes " +
-            "$((@($preservedIndex.Values) | Sort-Object -Property SourceObjectId -Unique).Count) preserved row(s).") -Level INFO
+        Write-MigrationLog -Message "Existing plan '$ExistingPlanPath' contributes $($preservedRows.Count) preserved row(s)." -Level INFO
     }
 
     # --- Build the source item list -------------------------------------------------------------
@@ -834,7 +854,11 @@ try {
             $keyValue = Get-MigrationCsvValue -Row $row -Name $keyColumn -Default ''
             if (-not $keyValue) { continue }
             $indexKey = "$keyColumn|$($keyValue.ToLowerInvariant())"
-            if ($preservedIndex.ContainsKey($indexKey)) { $preserved = $preservedIndex[$indexKey]; break }
+            if ($preservedIndex.ContainsKey($indexKey)) {
+                $preserved = $preservedRows[[int]$preservedIndex[$indexKey]]
+                [void]$preservedHits.Add([int]$preservedIndex[$indexKey])
+                break
+            }
         }
 
         $item['IsPreserved'] = [bool]$preserved
@@ -866,6 +890,20 @@ try {
         }
     }
 
+    # A preserved row that matched nothing belongs to a source object that has left the
+    # inventory. It is not carried forward - the object may have been removed on purpose, and a
+    # row nobody re-inventoried must not stay actionable - but it is named, because the
+    # destination object it points at still exists.
+    for ($ordinal = 0; $ordinal -lt $preservedRows.Count; $ordinal++) {
+        if ($preservedHits.Contains($ordinal)) { continue }
+        $orphan = $preservedRows[$ordinal]
+        $identity = @($orphan.SourceUserPrincipalName, $orphan.SourcePrimarySmtp, $orphan.DisplayName, $orphan.SourceObjectId) |
+            Where-Object { $_ } | Select-Object -First 1
+        Write-MigrationLog -Message ("The existing plan row for '$identity' (TargetObjectId '$($orphan.TargetObjectId)', " +
+            "PlanStatus '$($orphan.PlanStatus)') matches no object in the inventory and was not carried into the new " +
+            'plan. Re-run the inventory if the source object still exists, or add the row back by hand.') -Level WARNING
+    }
+
     # A wave map is usually pasted together by hand from an old spreadsheet, so the entries that
     # matched nobody are named rather than silently ignored - they are normally typos.
     $unmatchedWaves = @($waveMap.Keys | Where-Object { -not $waveMapHits.Contains($_) } | Sort-Object)
@@ -881,12 +919,13 @@ try {
         $row = $item.Row
 
         if ($item.IsGuest) {
-            # A guest is an invitation to an identity that lives in another tenant. Rewriting it
-            # would break the link, so it is carried across exactly as Entra ID stores it, and the
-            # nickname is only a legal placeholder - Entra generates the real one.
+            # A guest is an invitation to an identity that lives in another tenant. Its external
+            # mail address is the identity that travels; the '#EXT#' UPN and the mail nickname
+            # belong to the source tenant and are minted afresh when the destination re-invites
+            # it, so no template is applied and nothing is claimed here.
             $item['UpnLocalPart'] = ''
             $item['SmtpLocalPart'] = ''
-            $item['NicknameLocalPart'] = ((Split-PlanAddress -Address $row.SourceUserPrincipalName).Local.ToLowerInvariant() -replace '[^a-z0-9._-]', '')
+            $item['NicknameLocalPart'] = ''
             $item['MissingTokens'] = @()
             continue
         }
@@ -916,8 +955,6 @@ try {
         $item['UpnLocalPart'] = if ($row.ObjectType -eq 'User') { & $build $UpnFormat } else { '' }
         $item['SmtpLocalPart'] = & $build $(if ($item.UsesTemplate) { $smtpTemplate } else { 'Keep' })
         $item['NicknameLocalPart'] = if ($nicknameTemplate) { & $build $nicknameTemplate } else { '' }
-        $item['WantedUpnLocalPart'] = $item['UpnLocalPart']
-        $item['WantedSmtpLocalPart'] = $item['SmtpLocalPart']
         $item['MissingTokens'] = [string[]]$missing.ToArray()
 
         if ($missing.Count -gt 0) {
@@ -928,64 +965,78 @@ try {
     }
 
     # --- Collision resolution -------------------------------------------------------------------
+    # Entra ID keeps one namespace across user principal names and proxy addresses, so a user's
+    # UPN and every recipient's primary SMTP address compete for the same local parts. They are
+    # therefore resolved in one pass over one taken set. An item whose UPN and SMTP local parts
+    # agree makes a single claim, so both keep the same local part when a suffix or a middle
+    # initial is needed; only a deliberately divergent -SmtpFormat claims the two separately.
     $namedItems = @($planned | Where-Object { $_.Row.PlanStatus -ne 'NeedsReview' -and -not $_.IsGuest })
     $newCandidate = {
-        param($Item, [string]$Slot)
+        param($Item, [string[]]$Slot, [string]$KeySuffix)
         [pscustomobject]@{
-            Key = [string]$Item.Key; LocalPart = [string]$Item[$Slot]
-            MiddleInitial = [string]$Item.Row.MiddleName; Domain = $targetDomainName
+            Key = "$($Item.Key)$KeySuffix"; ItemKey = [string]$Item.Key; Slot = $Slot
+            LocalPart = [string]$Item[$Slot[0]]; MiddleInitial = [string]$Item.Row.MiddleName; Domain = $targetDomainName
         }
     }
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $namedItems) {
+        $upnLocalPart = [string]$item['UpnLocalPart']
+        $smtpLocalPart = [string]$item['SmtpLocalPart']
+        if ($upnLocalPart -and $smtpLocalPart -and $upnLocalPart -ieq $smtpLocalPart) {
+            $candidates.Add((& $newCandidate $item @('UpnLocalPart', 'SmtpLocalPart') ''))
+            continue
+        }
+        if ($smtpLocalPart) { $candidates.Add((& $newCandidate $item @('SmtpLocalPart') '')) }
+        if ($upnLocalPart) { $candidates.Add((& $newCandidate $item @('UpnLocalPart') '|upn')) }
+    }
 
-    # Only users hold a user principal name, which is why the UPN set is deliberately smaller.
-    $collisionSets = @(
-        @{ Kind = 'UPN'; Slot = 'UpnLocalPart'; Resolved = @(Resolve-MigrationCollision -Reserved $reservedAddresses.ToArray() `
-                    -Candidates @($namedItems | Where-Object { $_.Row.ObjectType -eq 'User' } | ForEach-Object { & $newCandidate $_ 'UpnLocalPart' })) }
-        @{ Kind = 'SMTP'; Slot = 'SmtpLocalPart'; Resolved = @(Resolve-MigrationCollision -Reserved $reservedAddresses.ToArray() `
-                    -Candidates @($namedItems | ForEach-Object { & $newCandidate $_ 'SmtpLocalPart' })) }
-    )
-    foreach ($set in $collisionSets) {
-        $set['ByKey'] = @{}
-        foreach ($resolved in $set.Resolved) { $set['ByKey'][[string]$resolved.Key] = $resolved }
+    $resolvedClaims = @(Resolve-MigrationCollision -Reserved $reservedAddresses.ToArray() -Candidates $candidates.ToArray())
+
+    $claimsByItem = @{}
+    foreach ($claim in $resolvedClaims) {
+        $itemKey = [string]$claim.ItemKey
+        if (-not $claimsByItem.ContainsKey($itemKey)) { $claimsByItem[$itemKey] = [System.Collections.Generic.List[object]]::new() }
+        $claimsByItem[$itemKey].Add($claim)
     }
 
     # Who ended up holding each address, so a collision message can name the winner.
     $itemByKey = @{}
     foreach ($item in $items) { $itemByKey[[string]$item.Key] = $item }
     $describeClaimant = {
-        param([object[]]$Resolved, [string]$LocalPart)
-        foreach ($entry in $Resolved) {
+        param([string]$LocalPart)
+        foreach ($entry in $resolvedClaims) {
             if ([string]$entry.ResolvedLocalPart -ne $LocalPart) { continue }
-            $owner = $itemByKey[[string]$entry.Key]
+            $owner = $itemByKey[[string]$entry.ItemKey]
             if ($null -eq $owner) { return '' }
             return [string](@($owner.Row.SourceUserPrincipalName, $owner.Row.SourcePrimarySmtp,
                     $owner.Row.DisplayName) | Where-Object { $_ } | Select-Object -First 1)
         }
         return ''
     }
+    $slotLabel = @{ 'UpnLocalPart' = 'UPN'; 'SmtpLocalPart' = 'SMTP' }
 
     foreach ($item in $namedItems) {
         $key = [string]$item.Key
+        if (-not $claimsByItem.ContainsKey($key)) { continue }
         $details = [System.Collections.Generic.List[string]]::new()
         $unresolved = $false
 
-        foreach ($set in $collisionSets) {
-            if (-not $set.ByKey.ContainsKey($key)) { continue }
-            $resolved = $set.ByKey[$key]
-            $item[$set.Slot] = [string]$resolved.ResolvedLocalPart
-            if (-not $resolved.Collided) { continue }
+        foreach ($claim in $claimsByItem[$key]) {
+            foreach ($slot in @($claim.Slot)) { $item[$slot] = [string]$claim.ResolvedLocalPart }
+            if (-not $claim.Collided) { continue }
 
-            $wanted = [string]$item["Wanted$($set.Slot)"]
-            $claimant = & $describeClaimant $set.Resolved $wanted
+            $wanted = ([string]$claim.LocalPart).Trim().ToLowerInvariant()
+            $label = @(@($claim.Slot) | ForEach-Object { $slotLabel[$_] }) -join ' and '
+            $claimant = & $describeClaimant $wanted
             $taken = if ($claimant) { "taken by $claimant" } else { 'already reserved in the destination' }
 
-            if ($resolved.Resolution -eq 'Unresolved') {
-                $item[$set.Slot] = ''
+            if ($claim.Resolution -eq 'Unresolved') {
+                foreach ($slot in @($claim.Slot)) { $item[$slot] = '' }
                 $unresolved = $true
-                $details.Add("$($set.Kind) ${wanted}@$targetDomainName is $taken and no free alternative was found - assign one by hand.")
+                $details.Add("$label ${wanted}@$targetDomainName is $taken and no free alternative was found - assign one by hand.")
             }
             else {
-                $details.Add("$($set.Kind) ${wanted}@$targetDomainName is $taken; used $($resolved.ResolvedLocalPart)@$targetDomainName.")
+                $details.Add("$label ${wanted}@$targetDomainName is $taken; used $($claim.ResolvedLocalPart)@$targetDomainName.")
             }
         }
 
@@ -1002,10 +1053,15 @@ try {
         $row = $item.Row
 
         if ($item.IsGuest) {
-            $row.TargetUserPrincipalName = $row.SourceUserPrincipalName
+            # A guest's user principal name and mail nickname belong to the source tenant and
+            # are minted afresh by the destination when it re-invites the guest, so they are
+            # left empty here (like Shared/Group/Contact rows) rather than copied verbatim -
+            # copying the source #EXT# UPN would fail destination domain-verification checks
+            # and can never be an object the destination actually creates.
+            $row.TargetUserPrincipalName = ''
             $row.TargetPrimarySmtp = $row.SourcePrimarySmtp
-            $row.TargetMailNickname = [string]$item['NicknameLocalPart']
-            $row.InterimUserPrincipalName = $row.TargetUserPrincipalName
+            $row.TargetMailNickname = ''
+            $row.InterimUserPrincipalName = ''
             $row.InterimPrimarySmtp = $row.TargetPrimarySmtp
             if (-not $row.PlanDetail) {
                 $row.PlanDetail = 'Guest kept with its existing external identity; re-invite it in the destination tenant.'
@@ -1120,9 +1176,22 @@ try {
         $owner = $nicknameOwners[$nickname].Row
         $ownerName = @($owner.SourceUserPrincipalName, $owner.SourcePrimarySmtp, $owner.DisplayName) |
             Where-Object { $_ } | Select-Object -First 1
+
+        # A numeric suffix keeps the row nameable and out of collision limbo; three-way
+        # duplicates are handled because each suffix tried is checked against the same
+        # $nicknameOwners table that later rows will also be checked against.
+        $suffix = 2
+        do {
+            $suffixedNickname = ("$nickname$suffix" -replace '[^a-z0-9._-]', '')
+            $suffix++
+        } while ($nicknameOwners.ContainsKey($suffixedNickname))
+
+        $row.TargetMailNickname = $suffixedNickname
+        $nicknameOwners[$suffixedNickname] = $item
         $row.PlanStatus = 'Collision'
-        $row.PlanDetail = (@($row.PlanDetail, ("Mail nickname '$($row.TargetMailNickname)' is already used by " +
-                "$ownerName; give one of them a different nickname.")) | Where-Object { $_ }) -join ' '
+        $row.PlanDetail = (@($row.PlanDetail, ("Mail nickname '$nickname' is already used by $ownerName; " +
+                "used '$suffixedNickname' instead - give one of them a different nickname if that is not acceptable.")) |
+            Where-Object { $_ }) -join ' '
     }
 
     # --- Summary and write ------------------------------------------------------------------------

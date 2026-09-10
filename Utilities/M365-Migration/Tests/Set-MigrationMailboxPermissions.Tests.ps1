@@ -229,10 +229,31 @@ Describe 'ConvertFrom-PermissionEntry' {
     }
 }
 
+Describe 'Get-CanonicalNameLeaf' {
+
+    It 'Returns the leaf of a canonical name' {
+        Get-CanonicalNameLeaf -Value 'newco.com/Users/Bea Kane' | Should -BeExactly 'Bea Kane'
+    }
+
+    It 'Returns an address unchanged, since it has no slash' {
+        Get-CanonicalNameLeaf -Value 'bea.kane@newco.com' | Should -BeExactly 'bea.kane@newco.com'
+    }
+
+    It 'Returns an empty value unchanged' {
+        Get-CanonicalNameLeaf -Value '' | Should -BeExactly ''
+    }
+}
+
 Describe 'ConvertTo-PermissionPrincipal' {
 
     It 'Passes a plain string through' {
-        ConvertTo-PermissionPrincipal -Entry 'john.smith@newco.com' | Should -Be @('john.smith@newco.com')
+        ConvertTo-PermissionPrincipal -Entry 'john.smith@newco.com' | Should -Contain 'john.smith@newco.com'
+    }
+
+    It 'Also returns the leaf of a canonical-name string, for GrantSendOnBehalfTo' {
+        $principals = ConvertTo-PermissionPrincipal -Entry 'newco.com/Users/Bea Kane'
+        $principals | Should -Contain 'newco.com/Users/Bea Kane'
+        $principals | Should -Contain 'Bea Kane'
     }
 
     It 'Reads the User property of a mailbox permission' {
@@ -301,6 +322,31 @@ Describe 'Get-PermissionDiff' {
             -TrusteeIdentifier @('newco.com/Users/Bea Kane') -Kind SendOnBehalf).Action | Should -BeExactly 'Skip'
     }
 
+    It 'Skips a SendOnBehalf entry using the identifiers the main loop actually produces' {
+        # The main loop passes the mapped destination address plus the plan's DisplayName - never
+        # the canonical string itself - so this is the shape that has to match.
+        (Get-PermissionDiff -Existing $script:ExistingSendOnBehalf `
+            -TrusteeIdentifier @('bea.kane@newco.com', 'Bea Kane') -Kind SendOnBehalf).Action | Should -BeExactly 'Skip'
+    }
+
+    It 'Skips a calendar entry whose existing rights are the same set in a different order' {
+        $existing = @([pscustomobject]@{ User = 'Alice Dean'; AccessRights = @('FolderVisible', 'ReadItems') })
+        (Get-PermissionDiff -Existing $existing -TrusteeIdentifier @('Alice Dean') -Kind Calendar `
+            -AccessRights 'ReadItems,FolderVisible').Action | Should -BeExactly 'Skip'
+    }
+
+    It 'Updates a calendar entry whose existing rights are a different set of the same count' {
+        $existing = @([pscustomobject]@{ User = 'Alice Dean'; AccessRights = @('FolderVisible', 'Reviewer') })
+        (Get-PermissionDiff -Existing $existing -TrusteeIdentifier @('Alice Dean') -Kind Calendar `
+            -AccessRights 'ReadItems,FolderVisible').Action | Should -BeExactly 'Update'
+    }
+
+    It 'Updates a calendar entry whose existing rights are a subset of the wanted rights' {
+        $existing = @([pscustomobject]@{ User = 'Alice Dean'; AccessRights = @('FolderVisible') })
+        (Get-PermissionDiff -Existing $existing -TrusteeIdentifier @('Alice Dean') -Kind Calendar `
+            -AccessRights 'ReadItems,FolderVisible').Action | Should -BeExactly 'Update'
+    }
+
     It 'Adds against an empty existing set' {
         (Get-PermissionDiff -Existing @() -TrusteeIdentifier @('john.smith@newco.com') -Kind FullAccess).Action |
             Should -BeExactly 'Add'
@@ -325,6 +371,39 @@ Describe 'The permissions inventory maps end to end' {
         })
         $unmapped.Count | Should -Be 1
         $unmapped[0].Trustee | Should -BeExactly 'departed@contoso.com'
+    }
+}
+
+Describe 'Test-MigrationSourceDomainAddress' {
+
+    BeforeAll {
+        $script:SourceDomains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        [void]$script:SourceDomains.Add('contoso.com')
+    }
+
+    It 'Is true for an address at a known source domain' {
+        Test-MigrationSourceDomainAddress -Address 'dl@contoso.com' -SourceDomain $script:SourceDomains |
+            Should -BeTrue
+    }
+
+    It 'Is case-insensitive on the domain' {
+        Test-MigrationSourceDomainAddress -Address 'dl@CONTOSO.COM' -SourceDomain $script:SourceDomains |
+            Should -BeTrue
+    }
+
+    It 'Is false for an address at a domain the plan does not name as a source' {
+        Test-MigrationSourceDomainAddress -Address 'team@fabrikam.com' -SourceDomain $script:SourceDomains |
+            Should -BeFalse
+    }
+
+    It 'Is false for a value with no @' {
+        Test-MigrationSourceDomainAddress -Address 'not-an-address' -SourceDomain $script:SourceDomains |
+            Should -BeFalse
+    }
+
+    It 'Is false when no source domains were collected' {
+        $empty = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        Test-MigrationSourceDomainAddress -Address 'dl@contoso.com' -SourceDomain $empty | Should -BeFalse
     }
 }
 
@@ -491,5 +570,69 @@ Describe 'A declined confirmation is a Skip, not a Plan' {
 
     It 'Leaves no row claiming an outcome the tenant never saw' {
         @($script:WhatIfRows | Where-Object { $_.Status -in @('Planned', 'Succeeded') }).Count | Should -Be 0
+    }
+}
+
+Describe 'An unmapped forwarding target is not passed through into the source tenant' {
+
+    <#
+        Same technique as the block above: shadowing functions win over the real cmdlets for
+        anything the script calls, so the run stays offline while proving the -Apply Forwarding
+        path end to end against the UserMailboxesForwarding fixture.
+    #>
+
+    BeforeAll {
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [switch]$Reconnect)
+            return [pscustomobject]@{ Organization = 'newco.onmicrosoft.com' }
+        }
+        function Get-AcceptedDomain {
+            param($ErrorAction)
+            return @([pscustomobject]@{ DomainName = 'newco.com' }, [pscustomobject]@{ DomainName = 'newco.onmicrosoft.com' })
+        }
+        function Get-EXOMailbox {
+            param($Identity, $Properties, $ErrorAction)
+            return [pscustomobject]@{
+                PrimarySmtpAddress    = [string]$Identity
+                GrantSendOnBehalfTo   = @()
+                ForwardingAddress     = ''
+                ForwardingSmtpAddress = ''
+            }
+        }
+
+        $script:ForwardingFixture = Join-Path -Path $script:FixtureRoot -ChildPath 'UserMailboxesForwarding.csv'
+        $script:ForwardingWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "SetMailboxPermissions-Forward-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:ForwardingWorkspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:PlanFixture -MailboxPermissionsCsv $script:PermissionFixture `
+            -UserMailboxesCsv $script:ForwardingFixture -Apply Forwarding -OutputPath $script:ForwardingWorkspace `
+            -Verbosity Low -DryRun -Confirm:$false
+
+        $file = @(Get-ChildItem -LiteralPath $script:ForwardingWorkspace -Filter 'Set-MailboxPermissions-DryRun_*.csv')
+        $script:ForwardingRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+    }
+
+    AfterAll {
+        if ($script:ForwardingWorkspace -and (Test-Path -LiteralPath $script:ForwardingWorkspace)) {
+            Remove-Item -LiteralPath $script:ForwardingWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Skips an unmapped internal ForwardingAddress rather than re-creating it' {
+        $row = $script:ForwardingRows | Where-Object { $_.SourceMailbox -eq 'jsmith@contoso.com' }
+        $row.Status | Should -BeExactly 'Skipped'
+        $row.Detail | Should -Match 'departed@contoso.com'
+    }
+
+    It 'Skips a ForwardingSmtpAddress that sits at a source-tenant domain the plan does not map' {
+        $row = $script:ForwardingRows | Where-Object { $_.SourceMailbox -eq 'reception@contoso.com' }
+        $row.Status | Should -BeExactly 'Skipped'
+        $row.Detail | Should -Match 'source-domain'
+    }
+
+    It 'Still plans a legitimate external ForwardingSmtpAddress the plan does not map' {
+        $row = $script:ForwardingRows | Where-Object { $_.SourceMailbox -eq 'adean@contoso.com' }
+        $row.Status | Should -BeExactly 'Planned'
+        $row.Detail | Should -Match 'team@fabrikam.com'
     }
 }

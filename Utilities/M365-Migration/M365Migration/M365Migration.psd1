@@ -1,6 +1,6 @@
 @{
     RootModule           = 'M365Migration.psm1'
-    ModuleVersion        = '1.1.0'
+    ModuleVersion        = '1.1.1'
     GUID                 = 'b3f4a1c2-6d58-4c7e-9a31-5e8d2f0b7c44'
     Author               = 'AutomationHub'
     CompanyName          = 'AutomationHub'

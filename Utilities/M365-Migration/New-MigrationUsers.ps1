@@ -23,10 +23,15 @@
     pre-mailbox stopgap and re-apply the hide through Set-MigrationIdentity afterwards.
 
     Licensing. -AssignLicenses assigns each row's TargetLicenses immediately after
-    creation. A usage location is mandatory for that call, so a row with no UsageLocation
-    and no -DefaultUsageLocation is created but reported as licence-skipped rather than
-    failed. Set-MigrationLicenses remains the tool for a licensing-only pass, seat
-    pre-checks and removals.
+    creation and reports the outcome as a separate AssignLicense results row, so an
+    unlicensed account is never hidden inside a Succeeded CreateUser row. That row is
+    Succeeded when every planned part number was assigned, Failed when the assignLicense
+    call was rejected or a part number is not in the tenant's SKU catalogue (the account
+    exists but is under-licensed - fix the plan or the subscription, then run
+    Set-MigrationLicenses), and Skipped when nothing was attempted because the row has no
+    TargetLicenses or no usage location. A usage location is mandatory for the call, so
+    set UsageLocation on the row or pass -DefaultUsageLocation. Set-MigrationLicenses
+    remains the tool for a licensing-only pass, seat pre-checks and removals.
 
     Managers. -SetManagers runs a second pass once every row has been created, because a
     manager frequently appears later in the plan than the people reporting to them.
@@ -35,8 +40,10 @@
     Passwords are generated per user and written to the results CSV only. They are never
     logged. Store the results file the way you would store any other password list.
 
-    -DryRun connects read-only, evaluates every row, and writes a results file whose rows
-    are all Status 'Planned'.
+    -DryRun connects with read-only scopes, makes only read calls, evaluates every row,
+    and writes a results file in which every action that would have been taken is Status
+    'Planned'; rows the script would never act on (guests, non-User rows, excluded or
+    already-existing accounts) are 'Skipped'.
 
 .PARAMETER PlanPath
     The identity plan CSV from New-MigrationIdentityPlan. Read in full, filtered in
@@ -58,13 +65,15 @@
     Runs a second pass that resolves ManagerUpn through the plan and sets the manager.
 
 .PARAMETER ForceChangePassword
-    Whether the generated password must be changed at first sign-in. Defaults to $true.
+    Whether the generated password must be changed at first sign-in. Defaults to $true;
+    pass -ForceChangePassword:$false to leave the generated password in place.
 
 .PARAMETER PasswordLength
-    Length of the generated password. Defaults to 16.
+    Length of the generated password, 12 to 128 characters. Defaults to 16.
 
 .PARAMETER DefaultUsageLocation
-    Two-letter ISO country code used when a plan row has no UsageLocation.
+    Two-letter ISO country code used when a plan row has no UsageLocation. Whichever value
+    wins is stamped on the account at creation and is required for -AssignLicenses.
 
 .PARAMETER TenantId
     The destination tenant to sign in to.
@@ -82,7 +91,9 @@
     Overrides the derived log file path.
 
 .PARAMETER DryRun
-    Evaluates every row and writes a '-DryRun_' results file without changing anything.
+    Connects with read-only scopes, evaluates every row and writes a 'New-Users-DryRun_'
+    results file without changing anything. See the DESCRIPTION for which rows are
+    'Planned' and which are 'Skipped'.
 
 .PARAMETER Verbosity
     Console verbosity: Low, Medium (default) or High. The log file always gets everything.
@@ -109,15 +120,24 @@
     Written with assistance from Claude (Anthropic).
 
     Graph scopes (delegated):
-      User.ReadWrite.All        create users, set manager, assign licences
-      Directory.ReadWrite.All   read the tenant's verified domains, write directory objects
-      Organization.Read.All     read subscribedSkus - only needed with -AssignLicenses
+      User.ReadWrite.All        create users, set managers, assign licences
+      User.Read.All             requested instead of User.ReadWrite.All under -DryRun,
+                                which only reads /users
+      Domain.Read.All           read the tenant's verified domains - not requested with
+                                -UseInterim, which never reads them
+      Organization.Read.All     read subscribedSkus - only requested with -AssignLicenses
+
+    Connect-MigrationGraph compares the requested scopes to the cached session literally,
+    so a -DryRun followed by a live run in the same session signs in twice: the read-only
+    session lacks User.ReadWrite.All and is dropped. The reverse is also true.
 
     Roles: User Administrator is enough for ordinary accounts. Creating or re-parenting an
     account that holds a privileged role needs Privileged Authentication Administrator.
 
-    GDAP: supported - pass -TenantId with the customer tenant. There is no
-    -DelegatedOrganization here; that parameter belongs to the Exchange Online scripts.
+    Sign in as the dedicated Global Admin for the destination tenant and pin it with
+    -TenantId. A GDAP relationship works the same way - pass the customer tenant in
+    -TenantId. There is no -DelegatedOrganization here; that parameter belongs to the
+    Exchange Online scripts.
 
     Exit codes: 0 success, 1 fatal error, 2 completed with row failures.
 #>
@@ -181,9 +201,13 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # Declared here so a reviewer can see the blast radius of a run without reading the body.
-# Organization.Read.All is only requested when it is needed: asking for consent to a scope
-# the run will not use is how tenants end up over-permissioned.
-$requiredGraphScopes = @('User.ReadWrite.All', 'Directory.ReadWrite.All')
+# A scope is only requested when the run will use it: asking for consent to one it will not
+# use is how tenants end up over-permissioned. -DryRun makes read calls only - GET /users,
+# /domains and /subscribedSkus; every write sits inside Invoke-MigrationAction, which returns
+# without calling Graph - so it asks for the read-only user scope. Connect-MigrationGraph
+# compares scopes literally, so switching between -DryRun and a live run costs a fresh sign-in.
+$requiredGraphScopes = @(if ($DryRun) { 'User.Read.All' } else { 'User.ReadWrite.All' })
+if (-not $UseInterim) { $requiredGraphScopes += 'Domain.Read.All' }
 if ($AssignLicenses) { $requiredGraphScopes += 'Organization.Read.All' }
 
 $script:results = [System.Collections.Generic.List[object]]::new()
@@ -298,6 +322,12 @@ function ConvertTo-UserRequestBody {
         the caller asked to hide the account, so an unhidden account is left at the
         directory default rather than pinned to a value Exchange will later disagree with.
 
+        BusinessPhone is a single plan column but businessPhones is a Graph string
+        collection, so a non-empty value is wrapped in a one-element array. Graph also
+        treats businessPhones as a sensitive attribute - only specific privileged admin
+        roles can set it - so a 403 on that property alone does not mean the rest of the
+        row is wrong.
+
     .EXAMPLE
         ConvertTo-UserRequestBody -Row $row -UserPrincipalName 'john.smith@newco.com' -MailNickname 'john.smith' -UsageLocation 'US' -Password $generated
 
@@ -345,15 +375,28 @@ function ConvertTo-UserRequestBody {
     if ($lastName) { $body['surname'] = $lastName }
 
     $optional = [ordered]@{
-        jobTitle       = 'JobTitle'
-        department     = 'Department'
-        officeLocation = 'Office'
-        mobilePhone    = 'MobilePhone'
+        jobTitle          = 'JobTitle'
+        department        = 'Department'
+        officeLocation    = 'Office'
+        mobilePhone       = 'MobilePhone'
+        city              = 'City'
+        state             = 'State'
+        country           = 'Country'
+        postalCode        = 'PostalCode'
+        streetAddress     = 'StreetAddress'
+        companyName       = 'CompanyName'
+        employeeId        = 'EmployeeId'
+        employeeType      = 'EmployeeType'
+        faxNumber         = 'FaxNumber'
+        preferredLanguage = 'PreferredLanguage'
     }
     foreach ($graphName in $optional.Keys) {
         $value = Get-MigrationCsvValue -Row $Row -Name $optional[$graphName] -Default ''
         if ($value) { $body[$graphName] = $value }
     }
+
+    $businessPhone = Get-MigrationCsvValue -Row $Row -Name 'BusinessPhone' -Default ''
+    if ($businessPhone) { $body['businessPhones'] = @($businessPhone) }
 
     if ($UsageLocation) { $body['usageLocation'] = $UsageLocation.ToUpperInvariant() }
     if ($HideFromAddressLists) { $body['showInAddressList'] = $false }
@@ -403,6 +446,53 @@ function ConvertTo-FailureDetail {
     }
 
     return $text
+}
+
+function Resolve-LicenseRequest {
+    <#
+    .SYNOPSIS
+        Decides whether a plan row's licences can be assigned and which part numbers the tenant owns.
+
+    .DESCRIPTION
+        The same decision is needed twice - once to describe a dry run and once before the
+        live assignLicense call - and it must come out the same both times, or the rehearsal
+        stops predicting the run. A SkipReason means nothing would be attempted. Unknown lists
+        the planned part numbers the tenant does not own; a live run reports those as Failed,
+        because the plan asked for them and the account would otherwise be left
+        under-licensed without anything changing the exit code.
+
+    .EXAMPLE
+        Resolve-LicenseRequest -Row $row -UsageLocation 'US' -Catalog $skuCatalog
+
+        Returns the planned part numbers, the ones missing from the catalogue, and an empty
+        SkipReason.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]$Row,
+        [AllowEmptyString()][string]$UsageLocation = '',
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Catalog
+    )
+
+    $planned = @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $Row -Name 'TargetLicenses' -Default ''))
+
+    $skipReason = ''
+    if ($planned.Count -eq 0) {
+        $skipReason = 'No TargetLicenses on the plan row; nothing to assign.'
+    }
+    elseif (-not $UsageLocation) {
+        $skipReason = 'assignLicense requires a usage location. Set UsageLocation on the row or pass -DefaultUsageLocation.'
+    }
+
+    $owned = @($Catalog | ForEach-Object { [string]$_.SkuPartNumber })
+    $unknown = @($planned | Where-Object { $owned -notcontains $_ })
+
+    return [pscustomobject]@{
+        Planned    = $planned
+        Unknown    = $unknown
+        SkipReason = $skipReason
+    }
 }
 
 function Invoke-LicenseAssignment {
@@ -677,7 +767,12 @@ try {
                 $row.ProvisionStatus = 'Exists'
                 $row.ProvisionDetail = "Account already present in the destination tenant as $upn."
                 $planChanged = $true
-                Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail 'Account already exists in the destination tenant; recorded its object ID.' `
+                # The plan write-back is suppressed under -DryRun, so the row must not claim it happened.
+                $existsDetail = if ($DryRun) {
+                    'Account already exists in the destination tenant; a live run would record its object ID in the plan.'
+                }
+                else { 'Account already exists in the destination tenant; recorded its object ID.' }
+                Add-ResultRow @common -Action 'CreateUser' -Status 'Skipped' -Detail $existsDetail `
                     -TargetUserPrincipalName $upn -TargetObjectId $existingId -UsageLocation $usageLocation
                 continue
             }
@@ -708,12 +803,26 @@ try {
 
             if ($DryRun) {
                 $detail.Insert(0, "Would create $upn on the $($chosen.AddressSource.ToLowerInvariant()) address.")
-                if ($AssignLicenses) {
-                    $planned = @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $row -Name 'TargetLicenses' -Default ''))
-                    if ($planned.Count -gt 0) { $detail.Add("Would assign: $($planned -join ', ').") }
-                }
                 Add-ResultRow @common -Action 'CreateUser' -Status 'Planned' -Detail ($detail -join ' ') `
                     -TargetUserPrincipalName $upn -UsageLocation $usageLocation
+
+                # The rehearsal emits the same AssignLicense row the live run will, so a SKU the
+                # tenant does not own is visible before anything is created.
+                if ($AssignLicenses) {
+                    $licence = Resolve-LicenseRequest -Row $row -UsageLocation $usageLocation -Catalog $skuCatalog
+                    if ($licence.SkipReason) {
+                        Add-ResultRow @common -Action 'AssignLicense' -Status 'Skipped' -Detail "Licences skipped: $($licence.SkipReason)" `
+                            -TargetUserPrincipalName $upn -UsageLocation $usageLocation
+                    }
+                    else {
+                        $licenceDetail = "Would assign: $($licence.Planned -join ', ')."
+                        if ($licence.Unknown.Count -gt 0) {
+                            $licenceDetail += " Not in the tenant SKU catalogue: $($licence.Unknown -join ', ') - a live run reports this row Failed."
+                        }
+                        Add-ResultRow @common -Action 'AssignLicense' -Status 'Planned' -Detail $licenceDetail `
+                            -TargetUserPrincipalName $upn -UsageLocation $usageLocation
+                    }
+                }
                 continue
             }
 
@@ -730,37 +839,55 @@ try {
             $row.ProvisionStatus = 'Created'
             $planChanged = $true
 
-            $licensesAssigned = ''
-            if ($AssignLicenses) {
-                $planned = @(Split-MigrationList -Value (Get-MigrationCsvValue -Row $row -Name 'TargetLicenses' -Default ''))
-                if ($planned.Count -eq 0) {
-                    $detail.Add('No TargetLicenses on the plan row; nothing assigned.')
-                }
-                elseif (-not $usageLocation) {
-                    $detail.Add('Licences skipped: assignLicense requires a usage location. Set UsageLocation on the row or pass -DefaultUsageLocation.')
-                }
-                elseif (-not $newObjectId) {
-                    $detail.Add('Licences skipped: the create call returned no object ID.')
-                }
-                else {
-                    try {
-                        $licenceResult = Invoke-LicenseAssignment -UserId $newObjectId -SkuPartNumber $planned `
-                            -Catalog $skuCatalog -Identity $upn
-                        $licensesAssigned = Join-MigrationList -Values $licenceResult.Assigned
-                        if ($licenceResult.Unknown.Count -gt 0) {
-                            $detail.Add("Not in the tenant SKU catalogue: $($licenceResult.Unknown -join ', ').")
-                        }
-                    }
-                    catch {
-                        $detail.Add("Licence assignment failed: $($_.Exception.Message)")
-                    }
-                }
-            }
-
             $row.ProvisionDetail = ($detail -join ' ')
             Add-ResultRow @common -Action 'CreateUser' -Status 'Succeeded' -Detail ($detail -join ' ') `
                 -TargetUserPrincipalName $upn -TargetObjectId $newObjectId -UsageLocation $usageLocation `
-                -LicensesAssigned $licensesAssigned -GeneratedPassword $generatedPassword
+                -GeneratedPassword $generatedPassword
+
+            # Licensing is its own results row so that a rejected assignLicense call, or a part
+            # number the tenant does not own, is a Failed row that sets exit code 2 rather than a
+            # sentence inside a Succeeded one. The plan row's ProvisionDetail carries both
+            # outcomes, because the plan has one row per account.
+            if ($AssignLicenses) {
+                $licence = Resolve-LicenseRequest -Row $row -UsageLocation $usageLocation -Catalog $skuCatalog
+                $licenceStatus = 'Skipped'
+                $licenceDetail = ''
+                $licensesAssigned = ''
+
+                if ($licence.SkipReason) {
+                    $licenceDetail = "Licences skipped: $($licence.SkipReason)"
+                }
+                else {
+                    try {
+                        $licenceResult = Invoke-LicenseAssignment -UserId $newObjectId -SkuPartNumber $licence.Planned `
+                            -Catalog $skuCatalog -Identity $upn
+                        $licensesAssigned = Join-MigrationList -Values $licenceResult.Assigned
+                        if ($licenceResult.Unknown.Count -gt 0) {
+                            $licenceStatus = 'Failed'
+                            $parts = [System.Collections.Generic.List[string]]::new()
+                            if ($licenceResult.Assigned.Count -gt 0) { $parts.Add("Assigned $($licenceResult.Assigned -join ', ').") }
+                            $parts.Add("Not in the tenant SKU catalogue: $($licenceResult.Unknown -join ', '); the account is under-licensed. " +
+                                'Fix TargetLicenses or the tenant subscription, then run Set-MigrationLicenses.')
+                            $licenceDetail = $parts -join ' '
+                        }
+                        else {
+                            $licenceStatus = 'Succeeded'
+                            $licenceDetail = "Assigned $($licenceResult.Assigned -join ', ')."
+                        }
+                    }
+                    catch {
+                        $licenceStatus = 'Failed'
+                        $licenceDetail = ("Licence assignment failed, so the account is unlicensed: $($_.Exception.Message) " +
+                            'Fix the cause, then run Set-MigrationLicenses.')
+                    }
+                }
+
+                if ($licenceStatus -eq 'Failed') { Write-MigrationLog -Message "$identity - $licenceDetail" -Level ERROR }
+                $row.ProvisionDetail = (@($row.ProvisionDetail, $licenceDetail) | Where-Object { $_ }) -join ' '
+                Add-ResultRow @common -Action 'AssignLicense' -Status $licenceStatus -Detail $licenceDetail `
+                    -TargetUserPrincipalName $upn -TargetObjectId $newObjectId -UsageLocation $usageLocation `
+                    -LicensesAssigned $licensesAssigned
+            }
         }
         catch {
             $mapped = ConvertTo-FailureDetail -Message $_.Exception.Message -UserPrincipalName $upn
@@ -864,10 +991,14 @@ catch {
 finally {
     Write-Progress -Activity 'Creating destination accounts' -Completed
 
-    if ($planChanged) {
+    # The gate is this script's own ShouldProcess, not only Save-MigrationPlan's: -WhatIf does not
+    # reach a module function, so without it a row that hit the 'already exists' branch (or threw
+    # before its own ShouldProcess) would have the plan and its .bak rewritten under -WhatIf. A
+    # declined write is not a failed one, so $planSaveFailed stays clear and the run exits 0.
+    if ($planChanged -and $PSCmdlet.ShouldProcess($PlanPath, 'Write provisioning results back to the plan')) {
         try {
             $null = Invoke-MigrationAction -Description "Write provisioning results back to $PlanPath" -Action {
-                Save-MigrationPlan -Path $PlanPath -Rows $planRows
+                Save-MigrationPlan -Path $PlanPath -Rows $planRows -WhatIf:$WhatIfPreference
             }
         }
         catch {

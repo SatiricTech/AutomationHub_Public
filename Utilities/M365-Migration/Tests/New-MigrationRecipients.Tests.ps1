@@ -64,7 +64,10 @@ BeforeAll {
     function New-Mailbox { $global:recipientMutations.Add('New-Mailbox') }
     function New-DistributionGroup { $global:recipientMutations.Add('New-DistributionGroup') }
     function New-DynamicDistributionGroup { $global:recipientMutations.Add('New-DynamicDistributionGroup') }
-    function New-MailContact { $global:recipientMutations.Add('New-MailContact') }
+    function New-MailContact {
+        param($Name, $DisplayName, $Alias, $ExternalEmailAddress, $PrimarySmtpAddress, $ErrorAction)
+        $global:recipientMutations.Add("New-MailContact PrimarySmtpAddress=$PrimarySmtpAddress ExternalEmailAddress=$ExternalEmailAddress")
+    }
     function Set-Mailbox { $global:recipientMutations.Add('Set-Mailbox') }
     function Set-DistributionGroup { $global:recipientMutations.Add('Set-DistributionGroup') }
     function Set-DynamicDistributionGroup { $global:recipientMutations.Add('Set-DynamicDistributionGroup') }
@@ -278,6 +281,16 @@ Describe 'New-MigrationRecipients - group settings diff' {
             -AddressSetting @('ManagedBy') -Map $script:addressMap
         $state.Settings.Contains('ManagedBy') | Should -BeFalse
         $state.Unmapped | Should -Be @('ManagedBy: gone@contoso.com')
+    }
+
+    It 'Resolves a canonical Exchange identity to an address through -Resolver, so the diff can match it' {
+        $resolver = { param($id) if ($id -eq 'newco.com/Users/John Smith') { 'john.smith@newco.com' } else { [string]$id } }
+        $current = ConvertTo-GroupSettingState -InputObject ([pscustomobject]@{ ManagedBy = @('newco.com/Users/John Smith') }) `
+            -AddressSetting @('ManagedBy') -Resolver $resolver
+        $current.Settings['ManagedBy'] | Should -Be @('john.smith@newco.com')
+
+        $changes = Get-GroupSettingChange -Desired @{ ManagedBy = @('john.smith@newco.com') } -Current $current.Settings
+        $changes.Count | Should -Be 0
     }
 }
 
@@ -548,5 +561,206 @@ Describe 'New-MigrationRecipients - a fatal error still leaves the plan and the 
 
     It 'Still writes the plan back so nothing the run recorded is lost' {
         @($global:recipientMutations | Where-Object { $_ -like 'Save-MigrationPlan*' }).Count | Should -Be 1
+    }
+}
+
+Describe 'New-MigrationRecipients - a declined UpdateSettings confirmation makes no Exchange call' {
+
+    BeforeAll {
+        # An adopted recipient with the right type and target address, so the row reaches the
+        # settings phase instead of being turned away by the type/name adoption guard.
+        function Get-Recipient {
+            param([string]$Identity, [string]$ErrorAction)
+            $global:recipientReads.Add("Get-Recipient $Identity")
+            if ($Identity -eq 'allstaff@newco.com') {
+                return @([pscustomobject]@{
+                        PrimarySmtpAddress       = 'allstaff@newco.com'
+                        ExternalDirectoryObjectId = 'dl-object-id'
+                        RecipientTypeDetails      = 'MailUniversalDistributionGroup'
+                        DisplayName               = 'All Staff'
+                    })
+            }
+            return @()
+        }
+
+        $script:updateSettingsWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Recipients-UpdateSettingsWhatIf-$([guid]::NewGuid())"
+        New-Item -Path $script:updateSettingsWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:updateSettingsPlan = Join-Path $script:updateSettingsWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:updateSettingsPlan
+
+        $global:recipientMutations.Clear()
+        $global:recipientReads.Clear()
+
+        & $script:scriptPath -PlanPath $script:updateSettingsPlan -Wave '1' -Type Distribution -Mode UpdateSettings `
+            -GroupsCsv (Join-Path $script:fixtureRoot 'Groups.csv') `
+            -OutputPath $script:updateSettingsWorkspace -Verbosity Low -WhatIf
+        $script:updateSettingsExitCode = $LASTEXITCODE
+
+        $script:updateSettingsFile = @(Get-ChildItem -LiteralPath $script:updateSettingsWorkspace -Filter 'New-Recipients-Results_*.csv')
+        $script:updateSettingsRows = if ($script:updateSettingsFile.Count -eq 1) {
+            @(Import-Csv -LiteralPath $script:updateSettingsFile[0].FullName)
+        }
+        else { @() }
+    }
+
+    AfterAll {
+        if ($script:updateSettingsWorkspace -and (Test-Path -LiteralPath $script:updateSettingsWorkspace)) {
+            Remove-Item -LiteralPath $script:updateSettingsWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits successfully' {
+        $script:updateSettingsExitCode | Should -Be 0
+    }
+
+    It 'Reports the row as Skipped, not Succeeded' {
+        $row = @($script:updateSettingsRows | Where-Object { $_.Action -eq 'UpdateSettings' })
+        $row.Count | Should -Be 1
+        $row[0].Status | Should -BeExactly 'Skipped'
+        $row[0].Detail | Should -BeExactly 'Declined at the confirmation prompt.'
+    }
+
+    It 'Calls no Exchange write cmdlet - the alias, settings and member steps never ran' {
+        $global:recipientMutations | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'New-MigrationRecipients - a mail contact is created with PrimarySmtpAddress set' {
+
+    BeforeAll {
+        $script:contactWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Recipients-Contact-$([guid]::NewGuid())"
+        New-Item -Path $script:contactWorkspace -ItemType Directory -Force | Out-Null
+
+        # A lone Contact row with an actionable PlanStatus - the shared fixture's Contact row is
+        # deliberately NeedsReview, so this test builds its own single-row plan rather than
+        # disturbing the counts other Describes assert on the shared fixture.
+        $script:contactPlan = Join-Path $script:contactWorkspace 'IdentityPlan.csv'
+        $contactRow = @($script:planRows | Where-Object { $_.ObjectType -eq 'Contact' })[0].PSObject.Copy()
+        $contactRow.PlanStatus = 'Planned'
+        $contactRow | Export-Csv -LiteralPath $script:contactPlan -NoTypeInformation
+
+        $global:recipientMutations.Clear()
+        $global:recipientReads.Clear()
+
+        & $script:scriptPath -PlanPath $script:contactPlan -Wave '1' -Type Contact -Mode Create `
+            -OutputPath $script:contactWorkspace -Verbosity Low
+        $script:contactExitCode = $LASTEXITCODE
+    }
+
+    AfterAll {
+        if ($script:contactWorkspace -and (Test-Path -LiteralPath $script:contactWorkspace)) {
+            Remove-Item -LiteralPath $script:contactWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits successfully' {
+        $script:contactExitCode | Should -Be 0
+    }
+
+    It 'Creates the contact with its own target address as PrimarySmtpAddress, not just ExternalEmailAddress' {
+        $call = @($global:recipientMutations | Where-Object { $_ -like 'New-MailContact*' })
+        $call.Count | Should -Be 1
+        $call[0] | Should -Match 'PrimarySmtpAddress=auditor@newco\.com'
+        $call[0] | Should -Match 'ExternalEmailAddress=auditor@fabrikam\.com'
+    }
+}
+
+Describe 'New-MigrationRecipients - a mismatched -TenantId stops the run before any row' {
+
+    BeforeAll {
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [switch]$Reconnect)
+            return [pscustomobject]@{ Organization = 'contoso.onmicrosoft.com'; TenantId = 'contoso-tenant-id' }
+        }
+
+        $script:wrongTenantWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Recipients-WrongTenant-$([guid]::NewGuid())"
+        New-Item -Path $script:wrongTenantWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:wrongTenantPlan = Join-Path $script:wrongTenantWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:wrongTenantPlan
+
+        $global:recipientMutations.Clear()
+        $global:recipientReads.Clear()
+
+        & $script:scriptPath -PlanPath $script:wrongTenantPlan -Wave '1' -TenantId 'newco.onmicrosoft.com' `
+            -OutputPath $script:wrongTenantWorkspace -Verbosity Low -DryRun
+        $script:wrongTenantExitCode = $LASTEXITCODE
+    }
+
+    AfterAll {
+        if ($script:wrongTenantWorkspace -and (Test-Path -LiteralPath $script:wrongTenantWorkspace)) {
+            Remove-Item -LiteralPath $script:wrongTenantWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits 1 without touching any row' {
+        $script:wrongTenantExitCode | Should -Be 1
+        $global:recipientReads | Should -BeNullOrEmpty
+    }
+
+    It 'Logs which organisation it connected to instead' {
+        $log = @(Get-ChildItem -LiteralPath $script:wrongTenantWorkspace -Filter 'New-MigrationRecipients_*.log')
+        $log.Count | Should -Be 1
+        (Get-Content -LiteralPath $log[0].FullName -Raw) | Should -Match "contoso\.onmicrosoft\.com.*-TenantId asked for 'newco\.onmicrosoft\.com'"
+    }
+}
+
+Describe 'New-MigrationRecipients - an alias hit with a mismatched type is not adopted' {
+
+    BeforeAll {
+        # 'allstaff' (the alias) resolves to an unrelated shared mailbox that happens to share the
+        # nickname - a SharedMailbox is not a MailUniversalDistributionGroup, so the row must fail
+        # rather than record that object as this row's TargetObjectId.
+        function Get-Recipient {
+            param([string]$Identity, [string]$ErrorAction)
+            $global:recipientReads.Add("Get-Recipient $Identity")
+            if ($Identity -eq 'allstaff') {
+                return @([pscustomobject]@{
+                        PrimarySmtpAddress       = 'allstaff@newco.com'
+                        ExternalDirectoryObjectId = 'wrong-type-object-id'
+                        RecipientTypeDetails      = 'SharedMailbox'
+                        DisplayName               = 'Some Other Mailbox'
+                    })
+            }
+            return @()
+        }
+
+        $script:typeMismatchWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Recipients-TypeMismatch-$([guid]::NewGuid())"
+        New-Item -Path $script:typeMismatchWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:typeMismatchPlan = Join-Path $script:typeMismatchWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:typeMismatchPlan
+
+        $global:recipientMutations.Clear()
+        $global:recipientReads.Clear()
+
+        & $script:scriptPath -PlanPath $script:typeMismatchPlan -Wave '1' -Type Distribution -Mode UpdateSettings `
+            -GroupsCsv (Join-Path $script:fixtureRoot 'Groups.csv') `
+            -OutputPath $script:typeMismatchWorkspace -Verbosity Low
+        $script:typeMismatchExitCode = $LASTEXITCODE
+
+        $script:typeMismatchFile = @(Get-ChildItem -LiteralPath $script:typeMismatchWorkspace -Filter 'New-Recipients-Results_*.csv')
+        $script:typeMismatchRows = if ($script:typeMismatchFile.Count -eq 1) {
+            @(Import-Csv -LiteralPath $script:typeMismatchFile[0].FullName)
+        }
+        else { @() }
+    }
+
+    AfterAll {
+        if ($script:typeMismatchWorkspace -and (Test-Path -LiteralPath $script:typeMismatchWorkspace)) {
+            Remove-Item -LiteralPath $script:typeMismatchWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Fails the row instead of adopting the mismatched object' {
+        $row = @($script:typeMismatchRows | Where-Object { $_.Identity -eq 'allstaff@contoso.com' })
+        $row.Count | Should -Be 1
+        $row[0].Status | Should -BeExactly 'Failed'
+        $row[0].Detail | Should -Match 'not the Distribution type'
+    }
+
+    It 'Calls no Exchange write cmdlet - only the plan write-back records the failure' {
+        @($global:recipientMutations | Where-Object { $_ -notlike 'Save-MigrationPlan*' }) | Should -BeNullOrEmpty
     }
 }

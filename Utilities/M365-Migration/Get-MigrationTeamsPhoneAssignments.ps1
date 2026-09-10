@@ -14,14 +14,22 @@
 
     The assignments CSV columns are the round-trip contract between those three scripts and
     are deliberately left exactly as they are: UserPrincipalName, DisplayName, PhoneNumber
-    (E.164), Extension, PhoneNumberType (CallingPlan / OperatorConnect / DirectRouting),
-    EnterpriseVoiceEnabled, OnlineVoiceRoutingPolicy, TenantDialPlan, TeamsCallingPolicy,
-    LocationId, UsageLocation, AccountEnabled and LineUri.
+    (E.164), Extension, PhoneNumberType (CallingPlan / OperatorConnect / OCMobile /
+    DirectRouting), EnterpriseVoiceEnabled, OnlineVoiceRoutingPolicy, TenantDialPlan,
+    TeamsCallingPolicy, LocationId, UsageLocation, AccountEnabled and LineUri. Two
+    informational columns follow them, which the consumers ignore: AccountType (User,
+    ResourceAccount, Guest, IneligibleUser...) and AdditionalNumbers - any Alternate or
+    Private lines the user holds beyond the one in PhoneNumber, as 'number:category' joined
+    by ';'. Set-MigrationTeamsPhoneAssignments reassigns only PhoneNumber, so the run logs a
+    warning whenever AdditionalNumbers is populated for anyone.
 
-    EVERY user is exported, whether or not they have a phone number - users without one
-    simply have blank phone columns, so the CSV is also your list of who still needs a
-    number. Use -OnlyUsersWithNumbers to narrow the export to users that currently have an
-    assignment.
+    EVERY account Get-CsOnlineUser returns is exported, whether or not it has a phone number -
+    accounts without one simply have blank phone columns, so the CSV is also your list of who
+    still needs a number. That includes resource accounts (auto attendants, call queues),
+    guests and unlicensed accounts, which are counted in the log and marked by AccountType so
+    you can prune them before feeding the CSV to Remove-/Set-. Soft-deleted accounts are
+    excluded. Use -OnlyUsersWithNumbers to narrow the export to accounts that currently have
+    an assignment.
 
     The number inventory is pulled once (paged) and joined to the user list locally, so users
     are not queried one number at a time. The script is read-only against the tenant, and
@@ -40,8 +48,11 @@
     Overrides the auto-derived log file path.
 
 .PARAMETER TenantId
-    Tenant ID (GUID) to sign in to. Useful for MSP / multi-tenant admins so the interactive
-    sign-in lands in the intended tenant.
+    Tenant ID (GUID) or a verified domain such as contoso.onmicrosoft.com to sign in to, so
+    the interactive sign-in lands in the intended tenant when the admin account can see more
+    than one. A GUID lets Connect-MigrationTeams reuse a live session for the same tenant; a
+    domain always forces a fresh sign-in. Whichever form is used, the tenant that was read is
+    named on the console and in the log before anything is written.
 
 .PARAMETER OnlyUsersWithNumbers
     Narrow the export to users that currently have a phone number assigned. By default every
@@ -62,10 +73,10 @@
     (everything). The log file always receives every line regardless of this setting.
 
 .EXAMPLE
-    .\Get-MigrationTeamsPhoneAssignments.ps1 -Prefix Source
+    .\Get-MigrationTeamsPhoneAssignments.ps1 -Prefix Source -TenantId contoso.onmicrosoft.com
 
-    Signs in interactively and writes Source\Source_TeamsPhoneAssignments_<timestamp>.csv
-    plus the run log and results file.
+    Signs in interactively as the source tenant's Global Admin and writes
+    Source\Source_TeamsPhoneAssignments_<timestamp>.csv plus the run log and results file.
 
 .EXAMPLE
     .\Get-MigrationTeamsPhoneAssignments.ps1 -OutputPath 'D:\Migrations' -Prefix Contoso -IncludeUnassignedNumbers
@@ -146,20 +157,53 @@ try {
         Write-MigrationLog -Message "$Label CSV ($($Rows.Count) row(s)): $Path" -Level SUCCESS
     }
 
-    $null = Connect-MigrationTeams -TenantId $TenantId
+    $tenant = Connect-MigrationTeams -TenantId $TenantId
+
+    # Name the tenant at SUCCESS, which every verbosity shows on the console. A session reused
+    # from an earlier script in the same console is logged by Connect-MigrationTeams at INFO
+    # only, so without this line a 'Source' export could silently read the destination tenant.
+    # Both reads go through Get-MigrationProperty: Get-CsTenant's property bag varies by module
+    # version and the script runs under strict mode.
+    $connectedTenantId = [string](Get-MigrationProperty -InputObject $tenant -Name 'TenantId' -Default '')
+    $connectedTenantName = [string](Get-MigrationProperty -InputObject $tenant -Name 'DisplayName' -Default '')
+    Write-MigrationLog -Message "Reading tenant $connectedTenantId ($connectedTenantName)" -Level SUCCESS
 
     Write-MigrationLog -Message 'Retrieving telephone number inventory...' -Level INFO
     $allNumbers = @(Get-MigrationPhoneNumberInventory)
     Write-MigrationLog -Message "Numbers in inventory: $($allNumbers.Count)" -Level INFO
 
-    # Index the inventory by the assigned user's object ID so each user's number type and
-    # location resolve without a per-user lookup. Direct Routing numbers that were never
-    # uploaded to the inventory simply are not in this map - the user's LineUri still
-    # captures the number itself.
+    # The inventory is indexed three ways so each user's number type and location resolve
+    # without a per-user lookup:
+    #   - by TelephoneNumber, in the inventory's own form ('+E164' or '+E164;ext=NNN'), so the
+    #     type and location come from the number actually in the user's LineUri. A user can
+    #     hold a Primary plus Private/Alternate lines under one AssignedPstnTargetId, and the
+    #     cmdlet sorts by number, so keying on the user alone hands back whichever line sorted
+    #     last;
+    #   - by AssignedPstnTargetId, preferring the Primary row, as the fallback for users whose
+    #     LineUri is blank;
+    #   - every row per AssignedPstnTargetId, to report the extra lines in AdditionalNumbers.
+    # Direct Routing numbers that were never uploaded to the inventory are in none of these -
+    # the user's LineUri still captures the number itself.
+    $numbersByPhone = @{}
     $numbersByTarget = @{}
+    $numbersPerTarget = @{}
     foreach ($number in $allNumbers) {
-        if (-not [string]::IsNullOrWhiteSpace($number.AssignedPstnTargetId)) {
-            $numbersByTarget[[string]$number.AssignedPstnTargetId] = $number
+        $phoneKey = [string](Get-MigrationProperty -InputObject $number -Name 'TelephoneNumber' -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($phoneKey)) {
+            $numbersByPhone[$phoneKey.Trim()] = $number
+        }
+
+        $targetId = [string](Get-MigrationProperty -InputObject $number -Name 'AssignedPstnTargetId' -Default '')
+        if ([string]::IsNullOrWhiteSpace($targetId)) { continue }
+
+        if (-not $numbersPerTarget.ContainsKey($targetId)) {
+            $numbersPerTarget[$targetId] = [System.Collections.Generic.List[object]]::new()
+        }
+        $numbersPerTarget[$targetId].Add($number)
+
+        $category = [string](Get-MigrationProperty -InputObject $number -Name 'AssignmentCategory' -Default '')
+        if (-not $numbersByTarget.ContainsKey($targetId) -or $category -ieq 'Primary') {
+            $numbersByTarget[$targetId] = $number
         }
     }
 
@@ -167,12 +211,13 @@ try {
     $users = $null
     if ($OnlyUsersWithNumbers) {
         # Server-side filter keeps the pull small; fall back to a full pull if the connected
-        # module version rejects the filter syntax.
+        # module version rejects the filter syntax. The real error is logged because the same
+        # catch also sees auth and throttling failures, which the full pull will then repeat.
         try {
             $users = @(Get-CsOnlineUser -Filter 'LineUri -ne $null' -ErrorAction Stop)
         }
         catch {
-            Write-MigrationLog -Message 'Server-side LineUri filter not supported by this module version - pulling all users and filtering locally.' -Level WARNING
+            Write-MigrationLog -Message "Server-side LineUri filter failed ($($_.Exception.Message)) - pulling all users and filtering locally." -Level WARNING
             $users = $null
         }
     }
@@ -183,6 +228,34 @@ try {
         }
     }
 
+    # Get-CsOnlineUser returns soft-deleted accounts alongside live ones (SoftDeletionTimestamp
+    # set). They must not reach the Remove-/Set- scripts, so they are dropped here rather than
+    # in the server-side filter, which already has a fallback path for unsupported syntax.
+    $pulledCount = $users.Count
+    $users = @($users | Where-Object {
+            [string]::IsNullOrWhiteSpace([string](Get-MigrationProperty -InputObject $_ -Name 'SoftDeletionTimestamp' -Default ''))
+        })
+    $softDeletedCount = $pulledCount - $users.Count
+    if ($softDeletedCount -gt 0) {
+        Write-MigrationLog -Message "Excluded $softDeletedCount soft-deleted account(s) from the export." -Level WARNING
+    }
+
+    # Resource accounts, guests and unlicensed accounts come back too and can carry a LineUri
+    # (an auto attendant's number, say). They stay in the export, marked by AccountType, and
+    # are counted here so the operator knows to prune them before a cutover run.
+    $flaggedAccountTypes = @('ResourceAccount', 'Guest', 'IneligibleUser')
+    $accountTypeCounts = @{}
+    foreach ($candidate in $users) {
+        $candidateType = [string](Get-MigrationProperty -InputObject $candidate -Name 'AccountType' -Default '')
+        if ($candidateType -in $flaggedAccountTypes) {
+            $accountTypeCounts[$candidateType] = [int]$accountTypeCounts[$candidateType] + 1
+        }
+    }
+    if ($accountTypeCounts.Count -gt 0) {
+        $typeSummary = @($accountTypeCounts.GetEnumerator() | Sort-Object -Property Name | ForEach-Object { "$($_.Value) $($_.Name)" }) -join ', '
+        Write-MigrationLog -Message "Export includes non-user accounts ($typeSummary) - check the AccountType column before feeding the CSV to Remove-/Set-MigrationTeamsPhoneAssignments." -Level WARNING
+    }
+
     $withNumber = @($users | Where-Object { -not [string]::IsNullOrWhiteSpace($_.LineUri) }).Count
     Write-MigrationLog -Message "Users to export: $($users.Count) ($withNumber with a phone number, $($users.Count - $withNumber) without)" -Level INFO
 
@@ -190,6 +263,7 @@ try {
     # them; $results is the toolkit's standard summary of the same pass.
     $exportRows = [System.Collections.Generic.List[object]]::new()
     $results = [System.Collections.Generic.List[object]]::new()
+    $usersWithAdditionalNumbers = 0
     $index = 0
 
     foreach ($user in $users) {
@@ -208,7 +282,29 @@ try {
         try {
             $line = Split-MigrationTeamsLineUri -LineUri $user.LineUri
             $userId = [string]$user.Identity
-            $numberInfo = if ($userId -and $numbersByTarget.ContainsKey($userId)) { $numbersByTarget[$userId] } else { $null }
+            $accountType = [string](Get-MigrationProperty -InputObject $user -Name 'AccountType' -Default '')
+
+            # Resolve the inventory row for the number in the user's LineUri. Only a blank
+            # LineUri falls back to the per-user map; otherwise a second line held by the same
+            # user could supply the wrong type and location.
+            $numberInfo = $null
+            $phoneKey = $null
+            if ($line.Number) {
+                $phoneKey = if ($line.Extension) { "$($line.Number);ext=$($line.Extension)" } else { $line.Number }
+                if ($numbersByPhone.ContainsKey($phoneKey)) {
+                    $numberInfo = $numbersByPhone[$phoneKey]
+                }
+                elseif ($line.Extension -and $numbersByPhone.ContainsKey($line.Number)) {
+                    # The LineUri carries an extension the inventory row does not. Accept the
+                    # bare number only when the inventory says it belongs to this user.
+                    $bare = $numbersByPhone[$line.Number]
+                    $bareTarget = [string](Get-MigrationProperty -InputObject $bare -Name 'AssignedPstnTargetId' -Default '')
+                    if ($userId -and $bareTarget -eq $userId) { $numberInfo = $bare }
+                }
+            }
+            elseif ($userId -and $numbersByTarget.ContainsKey($userId)) {
+                $numberInfo = $numbersByTarget[$userId]
+            }
 
             $phoneNumber = if ($line.Number) { $line.Number }
             elseif ($numberInfo) { [string]$numberInfo.TelephoneNumber }
@@ -217,6 +313,20 @@ try {
             $numberType = if ($numberInfo) { [string]$numberInfo.NumberType }
             elseif ($line.Number) { 'DirectRouting' }
             else { $null }
+
+            # Every other inventory row assigned to this user is an Alternate/Private line the
+            # Set- script will not carry; list them so the operator can handle them by hand.
+            $exportedNumber = if ($numberInfo) { [string](Get-MigrationProperty -InputObject $numberInfo -Name 'TelephoneNumber' -Default '') } else { $phoneKey }
+            $additionalNumbers = [System.Collections.Generic.List[string]]::new()
+            if ($userId -and $numbersPerTarget.ContainsKey($userId)) {
+                foreach ($held in $numbersPerTarget[$userId]) {
+                    $heldNumber = [string](Get-MigrationProperty -InputObject $held -Name 'TelephoneNumber' -Default '')
+                    if ([string]::IsNullOrWhiteSpace($heldNumber) -or $heldNumber -eq $exportedNumber) { continue }
+                    $heldCategory = [string](Get-MigrationProperty -InputObject $held -Name 'AssignmentCategory' -Default '')
+                    $additionalNumbers.Add($(if ($heldCategory) { "${heldNumber}:${heldCategory}" } else { $heldNumber }))
+                }
+            }
+            if ($additionalNumbers.Count -gt 0) { $usersWithAdditionalNumbers++ }
 
             $exportRows.Add([pscustomobject][ordered]@{
                     UserPrincipalName        = $user.UserPrincipalName
@@ -232,10 +342,13 @@ try {
                     UsageLocation            = $user.UsageLocation
                     AccountEnabled           = $user.AccountEnabled
                     LineUri                  = $user.LineUri
+                    AccountType              = $accountType
+                    AdditionalNumbers        = ($additionalNumbers -join ';')
                 })
 
             $status = if ($isDryRun) { 'Planned' } else { 'Succeeded' }
-            $detail = if ($phoneNumber) { "Read assignment $phoneNumber ($numberType)." } else { 'No phone number assigned.' }
+            $typeNote = if ($accountType) { " Account type $accountType." } else { '' }
+            $detail = if ($phoneNumber) { "Read assignment $phoneNumber ($numberType).$typeNote" } else { "No phone number assigned.$typeNote" }
         }
         catch {
             $status = 'Failed'
@@ -254,6 +367,10 @@ try {
     }
 
     Write-Progress -Activity 'Exporting Teams phone assignments' -Completed
+
+    if ($usersWithAdditionalNumbers -gt 0) {
+        Write-MigrationLog -Message "$usersWithAdditionalNumbers user(s) hold Alternate/Private numbers beyond the one in PhoneNumber. They are listed in the AdditionalNumbers column; Set-MigrationTeamsPhoneAssignments will not carry them." -Level WARNING
+    }
 
     if ($exportRows.Count -eq 0) {
         Write-MigrationLog -Message 'No users matched - nothing to export.' -Level WARNING

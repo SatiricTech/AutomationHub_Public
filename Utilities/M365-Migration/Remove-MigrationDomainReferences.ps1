@@ -15,25 +15,34 @@
     Pass 2 remediates, but only when the run is not -ReportOnly and not -DryRun AND
     -AcknowledgeSourceTenant was supplied. The connected tenant is logged prominently first, because
     the failure that matters here is running a destructive cleanup against the destination tenant by
-    mistake. Users have their userPrincipalName PATCHed onto the fallback domain; recipients get an
-    onmicrosoft address promoted to primary (after disabling the email address policy where the type
-    supports it) and then every @Domain proxy address removed.
+    mistake: the Exchange Online session is compared with the Graph tenant before anything is read,
+    reconnected once when it belongs to another tenant, and the run aborts if it still does. Users
+    have their userPrincipalName PATCHed onto the fallback domain; recipients get an onmicrosoft
+    address promoted to primary and then every @Domain proxy address removed. Before the promotion
+    the script makes a best-effort attempt to disable the recipient's email address policy:
+    Microsoft documents -EmailAddressPolicyEnabled as on-premises only, so a refusal from Exchange
+    Online is logged as a warning and the promotion still runs.
 
     Reported as blockers rather than touched: directory-synced objects, soft-deleted users still
-    holding the domain, guests carrying an address on it, and any reference Graph cannot map to a
-    supported object. A guest whose #EXT# UPN merely embeds the domain in its generated local part is
-    informational - Entra owns that form and rewriting it would break the guest.
+    holding the domain, guests carrying an address or a userPrincipalName on it (their Exchange
+    recipient included - nothing about a guest is rewritten here), and any reference Graph cannot
+    map to a supported object. A guest whose #EXT# UPN merely embeds the domain in its generated
+    local part is informational - Entra owns that form and rewriting it would break the guest.
 
-    After remediation the domain is re-enumerated. The script exits 2 when blockers remain or any row
-    failed, so a pipeline can tell "domain is clear" from "domain still has references".
+    After remediation the domain is re-enumerated. The script exits 2 while any reference remains -
+    blockers, or fixable references a report-mode run did not apply - and when any row failed, so a
+    pipeline can tell "domain is clear" from "domain still has references". A -ReportOnly or -DryRun
+    run therefore exits 2 whenever there is anything left to do; exit 0 means the domain can be
+    removed now.
 
 .PARAMETER Domain
     The vanity domain being released, for example contoso.com. Must be a custom domain on the
     connected tenant; the initial .onmicrosoft.com domain can never be removed and is rejected.
 
 .PARAMETER FallbackDomain
-    The domain UPNs and promoted primary addresses move to. Defaults to the tenant's initial
-    .onmicrosoft.com domain.
+    The domain UPNs and promoted primary addresses move to. Must be a verified domain on the source
+    tenant - normally its initial .onmicrosoft.com domain, which is the default when the parameter
+    is omitted. A destination-tenant domain is rejected because it is not verified here.
 
 .PARAMETER TenantId
     The tenant to sign in to for Microsoft Graph. Recommended whenever the operator has access to
@@ -89,18 +98,29 @@
     domain as blockers so nothing is silently missed.
 
 .EXAMPLE
-    .\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -FallbackDomain newco.onmicrosoft.com `
+    .\Remove-MigrationDomainReferences.ps1 -Domain contoso.com -FallbackDomain contoso.onmicrosoft.com `
         -DelegatedOrganization contoso.onmicrosoft.com -AcknowledgeSourceTenant -Verbosity High
 
-    GDAP alternative: a partner-delegated run against a customer tenant, with an explicit
-    fallback domain, instead of signing in as a Global Admin in the source tenant.
+    GDAP alternative: a partner-delegated run against a customer tenant, naming the customer's own
+    initial domain as the fallback explicitly, instead of signing in as a Global Admin in the source
+    tenant.
 
 .NOTES
     Author: AutomationHub
     Written with assistance from Claude (Anthropic).
 
-    Graph scopes: Domain.Read.All (the domain and its domainNameReferences), User.ReadWrite.All
-    (users, soft-deleted users, PATCH userPrincipalName), Directory.Read.All.
+    Graph scopes: Domain.Read.All (the domain and its domainNameReferences), Directory.Read.All, and
+    User.Read.All for a report run (-ReportOnly, -DryRun or no -AcknowledgeSourceTenant) or
+    User.ReadWrite.All for a remediation run (users, soft-deleted users, PATCH userPrincipalName).
+    A report run never asks for a write scope. The trade-off: the remediation run that follows it
+    finds the cached Graph session without User.ReadWrite.All, drops it and signs in again. That
+    second sign-in is expected, not a fault.
+
+    Tenant pinning: Exchange Online sessions are reused between phase scripts, so a session left
+    open by a destination-tenant script would otherwise be enumerated and written to here while the
+    banner named the source. The session's TenantID is compared with the Graph tenant (and, under
+    GDAP, its DelegatedOrganization with -DelegatedOrganization) before anything is read; a
+    mismatch reconnects once and then aborts. The banner names both sessions.
 
     EXO roles: Recipient Management (Exchange Administrator covers it); the Set-UnifiedGroup path
     also needs Groups management rights. Changing an administrator's UPN needs Privileged
@@ -113,7 +133,8 @@
     ("out of the current user's write scope"). Those are reported as blockers - fix proxyAddresses
     on-premises and let Entra Connect sync the change.
 
-    Exit codes: 0 clear, 1 fatal, 2 completed with blockers remaining or rows failed.
+    Exit codes: 0 clear, 1 fatal, 2 completed with references remaining (blockers, or fixable
+    references a report-mode run did not apply) or rows failed.
 #>
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
@@ -166,7 +187,14 @@ $ErrorActionPreference = 'Stop'
 
 #region Configuration
 
-$requiredGraphScopes = @(
+# A report run only reads. Asking for the write scope there would make the report the operator is
+# told to run first prompt for - and cache - consent to change users in the source tenant.
+$readGraphScopes = @(
+    'Domain.Read.All'
+    'User.Read.All'
+    'Directory.Read.All'
+)
+$writeGraphScopes = @(
     'Domain.Read.All'
     'User.ReadWrite.All'
     'Directory.Read.All'
@@ -209,7 +237,9 @@ function ConvertTo-DomainReferenceRecord {
         IsSynced                  = $false
         SyncStateKnown            = $true
         IsGuest                   = $false
-        EmailAddressPolicyEnabled = $true
+        # Absent means "not reported". An unreported flag must not schedule a toggle Exchange Online
+        # may refuse, so the default is off and the step is taken only when Exchange said True.
+        EmailAddressPolicyEnabled = $false
         ReferenceKinds            = @()
     }
 
@@ -292,7 +322,9 @@ function Resolve-RecipientCmdlet {
         Maps an Exchange recipient type to the Set-* cmdlet that edits its addresses and says whether
         that cmdlet exposes -EmailAddressPolicyEnabled. Address edits are not one cmdlet, and binding
         a parameter the cmdlet does not have fails halfway through a cutover, so the mapping is data
-        and unit tested rather than a chain of if statements at the call site.
+        and unit tested rather than a chain of if statements at the call site. The toggle flag is
+        advisory: Microsoft documents -EmailAddressPolicyEnabled as on-premises only, so the step it
+        schedules is best-effort (see Repair-DomainReference).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -303,6 +335,9 @@ function Resolve-RecipientCmdlet {
     )
 
     # Contacts are not subject to email address policies, and Set-UnifiedGroup exposes no toggle.
+    # GuestMailUser is deliberately absent: a guest's addresses are never rewritten here - the help
+    # promises it and the Graph pass reports the same guest as a blocker - so its plan comes back
+    # incomplete with a guest-specific reason instead of a Set-MailUser call.
     $map = @{
         'UserMailbox'                    = @('Set-Mailbox', $true)
         'SharedMailbox'                  = @('Set-Mailbox', $true)
@@ -313,7 +348,6 @@ function Resolve-RecipientCmdlet {
         'LinkedMailbox'                  = @('Set-Mailbox', $true)
         'DiscoveryMailbox'               = @('Set-Mailbox', $true)
         'MailUser'                       = @('Set-MailUser', $true)
-        'GuestMailUser'                  = @('Set-MailUser', $true)
         'MailContact'                    = @('Set-MailContact', $false)
         'MailUniversalDistributionGroup' = @('Set-DistributionGroup', $true)
         'MailUniversalSecurityGroup'     = @('Set-DistributionGroup', $true)
@@ -402,7 +436,13 @@ function Resolve-DomainAddressPlan {
 
     if (-not $cmdlet.IsSupported) {
         $plan.IsComplete = $false
-        $plan.Reason = "No Exchange Online cmdlet covers recipient type '$($Reference.RecipientTypeDetails)'."
+        $plan.Reason = if (([string]$Reference.RecipientTypeDetails).Trim() -eq 'GuestMailUser') {
+            "Guest recipients are not remediated: this guest carries an address on $Domain. " +
+            'Remove or re-invite the guest; its #EXT# UPN must never be rewritten.'
+        }
+        else {
+            "No Exchange Online cmdlet covers recipient type '$($Reference.RecipientTypeDetails)'."
+        }
         return $plan
     }
 
@@ -558,7 +598,16 @@ function Resolve-DomainReferenceClass {
 
     switch ($Reference.Kind) {
         'GuestReference' {
-            if (@($Reference.ReferenceKinds) -contains 'Address') {
+            # A userType=Guest account can carry an ordinary UPN on the domain (a member converted
+            # to guest, common after an acquisition). That is a real domain name reference, not the
+            # generated #EXT# form, and only the #EXT# embed is harmless.
+            $kinds = @($Reference.ReferenceKinds)
+            if ($kinds -contains 'Upn') {
+                & $set 'Blocker' 'GuestUpnOnDomain' ("This guest's userPrincipalName is on $Domain. " +
+                    'Convert the account to a Member and rerun, or delete it; a guest UPN is not ' +
+                    'rewritten here.') 'None'
+            }
+            elseif ($kinds -contains 'Address') {
                 & $set 'Blocker' 'GuestDomainAddress' ("This guest carries an address on $Domain. " +
                     'Remove or re-invite the guest; its #EXT# UPN must never be rewritten.') 'None'
             }
@@ -599,7 +648,13 @@ function Resolve-DomainReferenceClass {
                 break
             }
             if (-not $AddressPlan.IsComplete) {
-                & $set 'Blocker' 'AddressPlanIncomplete' $AddressPlan.Reason 'None'
+                # A guest recipient carries the reason token the Graph pass gives the same guest,
+                # so the Blockers CSV reads the same whichever pass reported it.
+                $reason = if (([string]$Reference.RecipientTypeDetails).Trim() -eq 'GuestMailUser') {
+                    'GuestDomainAddress'
+                }
+                else { 'AddressPlanIncomplete' }
+                & $set 'Blocker' $reason $AddressPlan.Reason 'None'
                 break
             }
             if (@($AddressPlan.Steps).Count -eq 0) {
@@ -725,12 +780,25 @@ function Repair-DomainReference {
                 if ([string]::IsNullOrWhiteSpace($objectId)) { $objectId = $identity }
                 $row.Current = (@($AddressPlan.VanityAddresses) -join ';')
                 $row.Target = [string]$AddressPlan.PromoteAddress
+                $policyNote = ''
 
                 foreach ($step in $steps) {
                     switch ($step) {
                         'DisableEmailAddressPolicy' {
-                            Invoke-MigrationAction -Description "Disable the email address policy on $identity" -Action {
-                                & $setCmdlet -Identity $objectId -EmailAddressPolicyEnabled $false -ErrorAction Stop
+                            # Microsoft documents -EmailAddressPolicyEnabled as on-premises only for
+                            # every cmdlet in the map, yet Exchange Online reports the flag as True on
+                            # most recipients. The toggle is therefore best-effort: a refusal must not
+                            # fail the row before the promotion has run, and no cloud policy exists to
+                            # reassert the vanity address on these recipient types.
+                            try {
+                                Invoke-MigrationAction -Description "Disable the email address policy on $identity" -Action {
+                                    & $setCmdlet -Identity $objectId -EmailAddressPolicyEnabled $false -ErrorAction Stop
+                                }
+                            }
+                            catch {
+                                $policyNote = 'The email address policy toggle was refused; the promotion ran without it.'
+                                Write-MigrationLog -Message ("Exchange Online refused to disable the email address " +
+                                    "policy on $identity ($($_.Exception.Message)); continuing with the promotion.") -Level WARNING
                             }
                         }
                         'PromotePrimary' {
@@ -747,6 +815,8 @@ function Repair-DomainReference {
                         }
                     }
                 }
+
+                if ($policyNote) { $row.Detail = "$($row.Detail) $policyNote" }
             }
             default {
                 $row.Status = 'Skipped'
@@ -760,6 +830,86 @@ function Repair-DomainReference {
     }
 
     return $row
+}
+
+function Get-DomainExchangeSessionMismatch {
+    <#
+        Says why an Exchange Online session cannot be trusted to be the source tenant, or '' when it
+        can. TenantID (a GUID) is compared with the Graph tenant; Organization is not used because
+        Get-ConnectionInformation populates it only for certificate and managed-identity sessions.
+        Under GDAP the session's DelegatedOrganization has to match too, or a partner session that
+        happens to be in the wrong customer would pass on the partner GUID alone.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [psobject]$ExchangeContext,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$GraphTenantId,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$DelegatedOrganization
+    )
+
+    if ($null -eq $ExchangeContext) { return 'No Exchange Online session was established' }
+
+    $exoTenant = [string](Get-MigrationProperty $ExchangeContext 'TenantID' '')
+    $exoDelegated = [string](Get-MigrationProperty $ExchangeContext 'DelegatedOrganization' '')
+
+    if ($DelegatedOrganization -and ($exoDelegated -ne $DelegatedOrganization)) {
+        return ("Exchange Online session is delegated to '$exoDelegated', not to " +
+            "'$DelegatedOrganization'")
+    }
+    if (-not $DelegatedOrganization -and $GraphTenantId -and $exoTenant -and
+        ($exoTenant -ne $GraphTenantId)) {
+        return "Exchange Online session belongs to tenant $exoTenant, Graph is signed in to $GraphTenantId"
+    }
+
+    return ''
+}
+
+function Get-DomainRemainingReferenceSet {
+    <#
+        The references still standing between the operator and the domain removal, judged from the
+        assessment and the results file: every blocker, plus every fixable reference no result row
+        reports as Succeeded. It is what a run reports when nothing was changed - a report, a dry
+        run, a missing acknowledgement or a declined prompt - and the floor for a run that did
+        change something, which then re-enumerates for the real answer.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [psobject[]]$Assessed,
+
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [psobject[]]$Results
+    )
+
+    $succeeded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in @($Results)) {
+        if ([string]$row.Status -ne 'Succeeded') { continue }
+        $key = [string](Get-MigrationProperty $row 'ObjectId' '')
+        if (-not $key) { $key = [string](Get-MigrationProperty $row 'Identity' '') }
+        if ($key) { $null = $succeeded.Add(('{0}|{1}' -f [string](Get-MigrationProperty $row 'ReferenceKind' ''), $key)) }
+    }
+
+    foreach ($item in @($Assessed)) {
+        if ($null -eq $item) { continue }
+        $class = [string]$item.Classification.Class
+        if ($class -eq 'Blocker') { $item; continue }
+        if ($class -ne 'Fixable') { continue }
+
+        $key = [string]$item.Reference.ObjectId
+        if (-not $key) { $key = [string]$item.Reference.Identity }
+        if (-not $succeeded.Contains(('{0}|{1}' -f [string]$item.Reference.Kind, $key))) { $item }
+    }
 }
 
 function Get-DomainReferenceSet {
@@ -803,8 +953,12 @@ function Get-DomainReferenceSet {
     # to the classifier instead of letting a missing property read as "not synced".
     $syncStateKnown = $true
     try {
+        # Get-EXORecipient returns only the Minimum property set plus what -Properties names, and
+        # the Minimum set has neither PrimarySmtpAddress nor DisplayName; without asking for them
+        # every record's identity would be built from properties Exchange never sent.
         $recipients = @(Get-EXORecipient -Filter $filter -ResultSize Unlimited -Properties `
-                EmailAddresses, ExternalEmailAddress, EmailAddressPolicyEnabled, IsDirSynced -ErrorAction Stop)
+                EmailAddresses, ExternalEmailAddress, EmailAddressPolicyEnabled, IsDirSynced, `
+                PrimarySmtpAddress, DisplayName -ErrorAction Stop)
     }
     catch {
         Write-MigrationLog -Message ("Recipient scan with extended properties failed " +
@@ -819,7 +973,8 @@ function Get-DomainReferenceSet {
     foreach ($recipient in $recipients) {
         $objectId = [string](Get-MigrationProperty $recipient 'ExternalDirectoryObjectId' '')
         $identity = [string](Get-MigrationProperty $recipient 'PrimarySmtpAddress' '')
-        if (-not $identity) { $identity = [string](Get-MigrationProperty $recipient 'Identity' '') }
+        # Name is in the Minimum set, so it is what the degraded retry can offer as an identity.
+        if (-not $identity) { $identity = [string](Get-MigrationProperty $recipient 'Name' '') }
         if ($objectId) { $null = $exchangeIds.Add($objectId) }
 
         $records.Add((ConvertTo-DomainReferenceRecord -Properties @{
@@ -835,7 +990,7 @@ function Get-DomainReferenceSet {
                     Addresses                 = @(Get-MigrationProperty $recipient 'EmailAddresses' @())
                     IsSynced                  = [bool](Get-MigrationProperty $recipient 'IsDirSynced' $false)
                     SyncStateKnown            = $syncStateKnown
-                    EmailAddressPolicyEnabled = [bool](Get-MigrationProperty $recipient 'EmailAddressPolicyEnabled' $true)
+                    EmailAddressPolicyEnabled = [bool](Get-MigrationProperty $recipient 'EmailAddressPolicyEnabled' $false)
                     ReferenceKinds            = @('Address')
                 }))
     }
@@ -888,8 +1043,11 @@ function Get-DomainReferenceSet {
 
         $kind = if ($isGuest) { 'GuestReference' } elseif ($upnOnDomain) { 'UserUpn' } else { 'UserProxy' }
 
-        # An address the mailbox already accounted for is not a second reference to report.
-        if ($kind -eq 'UserProxy' -and $exchangeIds.Contains($userId)) { continue }
+        # An address the Exchange pass already accounted for is not a second reference to report: a
+        # mailbox's proxy is remediated through its recipient, and a guest's address is reported as
+        # a blocker through its GuestMailUser recipient. A UPN on the domain is a reference the
+        # recipient row cannot cover, so it is always kept.
+        if (-not $upnOnDomain -and $exchangeIds.Contains($userId)) { continue }
 
         $records.Add((ConvertTo-DomainReferenceRecord -Properties @{
                     Kind               = $kind
@@ -1036,20 +1194,40 @@ try {
             'only. Nothing will be changed.') -Level WARNING
     }
 
+    $requiredGraphScopes = if ($effectiveDryRun) { $readGraphScopes } else { $writeGraphScopes }
     $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
-    Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization | Out-Null
+    $graphTenantId = [string](Get-MigrationProperty $graphContext 'TenantId' '')
+
+    # Exchange Online sessions are reused between phase scripts, so the one found here may belong
+    # to the destination tenant. It is compared with the Graph tenant before anything is read or
+    # written, reconnected once, and the run aborts if the two still disagree.
+    $exoContext = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+    $exoMismatch = Get-DomainExchangeSessionMismatch -ExchangeContext $exoContext `
+        -GraphTenantId $graphTenantId -DelegatedOrganization $DelegatedOrganization
+    if ($exoMismatch) {
+        Write-MigrationLog -Message "$exoMismatch; reconnecting Exchange Online once." -Level WARNING
+        $exoContext = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization -Reconnect
+        $exoMismatch = Get-DomainExchangeSessionMismatch -ExchangeContext $exoContext `
+            -GraphTenantId $graphTenantId -DelegatedOrganization $DelegatedOrganization
+        if ($exoMismatch) { throw "$exoMismatch. Disconnect-ExchangeOnline and sign in to the source tenant." }
+    }
 
     $organization = @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/organization?$select=id,displayName')
     $tenantName = if ($organization.Count -gt 0) {
         [string](Get-MigrationProperty $organization[0] 'displayName' '(unknown)')
     }
     else { '(unknown)' }
-    $tenantLabel = "$tenantName ($([string](Get-MigrationProperty $graphContext 'TenantId' '(unknown)')))"
+    $tenantLabel = "$tenantName ($(if ($graphTenantId) { $graphTenantId } else { '(unknown)' }))"
+    $exoLabel = '{0} as {1}' -f @(
+        [string](Get-MigrationProperty $exoContext 'TenantID' '(unknown)')
+        [string](Get-MigrationProperty $exoContext 'UserPrincipalName' '(unknown)')
+    )
 
     # This banner is the last line of defence against running a destructive cleanup on the wrong
     # tenant, so it is logged at WARNING and repeated in the confirmation prompt below.
     Write-MigrationLog -Message '==========================================================' -Level WARNING
     Write-MigrationLog -Message "SOURCE TENANT: $tenantLabel" -Level WARNING
+    Write-MigrationLog -Message "Exchange Online session: $exoLabel" -Level WARNING
     Write-MigrationLog -Message "Releasing domain: $Domain" -Level WARNING
     Write-MigrationLog -Message '==========================================================' -Level WARNING
 
@@ -1162,7 +1340,9 @@ try {
     $resultsExported = $true
 
     # --- Re-enumerate so the operator is told the truth about what is left. ----------------------
-    $remaining = @($blocked)
+    # Until a change has actually been applied, every fixable reference is still a reference: a
+    # report run with 200 fixable users and no blockers has not cleared the domain.
+    $remaining = @(Get-DomainRemainingReferenceSet -Assessed $assessed -Results @($results))
     if (@($results | Where-Object { $_.Status -eq 'Succeeded' }).Count -gt 0) {
         Write-MigrationLog -Message 'Re-enumerating the domain after the changes' -Level INFO
         $remaining = @(Get-DomainReferenceAssessment -Domain $Domain -FallbackDomain $resolvedFallback `
@@ -1196,8 +1376,17 @@ try {
             "Nothing references $Domain any more; it can be removed from the tenant.")
     }
     else {
-        Write-MigrationLog -Level WARNING -Message (
-            "$Domain still has $(@($remaining).Count) reference(s) blocking removal:")
+        $unapplied = @($remaining | Where-Object { $_.Classification.Class -eq 'Fixable' }).Count
+        $blockersLeft = @($remaining | Where-Object { $_.Classification.Class -eq 'Blocker' }).Count
+        if ($unapplied -gt 0) {
+            Write-MigrationLog -Level WARNING -Message (
+                "${Domain}: $unapplied reference(s) would be changed by a remediation run; " +
+                "$blockersLeft blocker(s) remain:")
+        }
+        else {
+            Write-MigrationLog -Level WARNING -Message (
+                "$Domain still has $blockersLeft reference(s) blocking removal:")
+        }
         foreach ($item in @($remaining)) {
             Write-MigrationLog -Message ("  {0,-45} {1} - {2}" -f $item.Reference.Identity,
                 $item.Classification.Reason, $item.Classification.Detail) -Level WARNING

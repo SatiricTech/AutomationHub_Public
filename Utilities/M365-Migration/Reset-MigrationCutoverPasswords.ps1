@@ -12,7 +12,8 @@
 
     The target users are supplied one of four ways (choose exactly one): -PlanPath (an
     IdentityPlan.csv, filtered by -Wave, acting only on PlanStatus Planned /
-    ManualOverride / UpnSmtpDiverge, plus Collision with -IncludeCollisions, and reset by
+    ManualOverride / UpnSmtpDiverge, plus Collision with -IncludeCollisions - every other
+    User row in the wave is recorded as Skipped with its PlanStatus in Detail - and reset by
     TargetUserPrincipalName falling back to InterimUserPrincipalName), -CsvPath (a CSV of
     users), -Group (an Entra security group, all user members) or -TestUser (one account,
     to rehearse the flow).
@@ -26,9 +27,10 @@
     never to the console. Store that file securely and delete it once the credentials have
     been handed out.
 
-    DryRun connects read-only, resolves exactly which users would be affected, writes a
-    -DryRun_ results file whose rows are Status 'Planned', and generates no passphrases at
-    all - a credential is never emitted for a reset that did not happen.
+    DryRun signs in with the same scopes as the real run but performs no writes: it
+    resolves exactly which users would be affected, writes a -DryRun_ results file whose
+    rows are Status 'Planned', and generates no passphrases at all - a credential is never
+    emitted for a reset that did not happen.
 
 .PARAMETER PlanPath
     Path to the IdentityPlan.csv produced by the planning phase.
@@ -42,8 +44,10 @@
 
 .PARAMETER CsvPath
     Path to a CSV describing the users to reset. The user column is resolved through the
-    toolkit's alias vocabulary (UserPrincipalName, UPN, User Principal Name, UserName, User,
-    CurrentUPN, Login).
+    toolkit's alias vocabulary: a UPN column (UserPrincipalName, UPN, User Principal Name,
+    UserName, User, CurrentUPN, Login) or an email column (PrimarySmtpAddress, Email, Mail,
+    PrimaryEmail, EmailAddress, PrimarySMTP, WindowsEmailAddress), which is resolved by the
+    user's mail attribute. When both are present the UPN column wins.
 
 .PARAMETER Group
     An Entra security group by object ID (GUID) or display name. All user members are reset.
@@ -75,8 +79,9 @@
     stay true for a cutover.
 
 .PARAMETER DryRun
-    Preview only. Connects read-only, resolves the target users, reports who would be reset,
-    writes a -DryRun_ results file with Status 'Planned', and changes nothing.
+    Preview only. Signs in with the same scopes as the real run but performs no writes:
+    resolves the target users, reports who would be reset, writes a -DryRun_ results file
+    with Status 'Planned', and changes nothing.
 
 .PARAMETER Verbosity
     Console noise level: Low (errors and successes), Medium (adds warnings), High
@@ -105,11 +110,14 @@
 .NOTES
     Author      : AutomationHub
     Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
-                  Microsoft.Graph.Authentication / .Users / .Groups (installed on demand).
-    Graph scopes: User.ReadWrite.All, User-PasswordProfile.ReadWrite.All,
-                  Directory.ReadWrite.All, Group.Read.All. The password profile write is
-                  gated behind User-PasswordProfile.ReadWrite.All specifically -
-                  User.ReadWrite.All alone returns 403 whatever the admin's role.
+                  Microsoft.Graph.Authentication (installed on demand by Connect-MigrationGraph).
+                  All Graph reads and writes go through raw REST calls via
+                  Invoke-MigrationGraphRequest - no Microsoft.Graph.Users or
+                  Microsoft.Graph.Groups submodule is required.
+    Graph scopes: User.ReadWrite.All, User-PasswordProfile.ReadWrite.All, Group.Read.All.
+                  The password profile write is gated behind
+                  User-PasswordProfile.ReadWrite.All specifically - User.ReadWrite.All alone
+                  returns 403 whatever the admin's role.
     Roles       : the signed-in account needs a role that can reset the target users (e.g.
                   User Administrator); resetting another ADMINISTRATOR requires Privileged
                   Authentication Administrator. GDAP works through -TenantId.
@@ -176,15 +184,11 @@ Import-Module (Join-Path $PSScriptRoot 'M365Migration' 'M365Migration.psd1') -Fo
 $requiredGraphScopes = @(
     'User.ReadWrite.All'
     'User-PasswordProfile.ReadWrite.All'
-    'Directory.ReadWrite.All'
     'Group.Read.All'
 )
 
-$actionablePlanStatuses = @('Planned', 'ManualOverride', 'UpnSmtpDiverge')
-if ($IncludeCollisions) { $actionablePlanStatuses += 'Collision' }
-
 $guidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-$graphUserProperties = @('Id', 'UserPrincipalName', 'DisplayName')
+$graphUserSelect = 'id,userPrincipalName,displayName'
 
 #endregion ---------------------------------------------------------------------
 
@@ -230,34 +234,60 @@ function Resolve-CutoverPlanIdentity {
 
 function Resolve-CutoverUser {
     <#
-        Resolves a UPN, email or object ID to a Graph user, returning $null rather than
-        throwing when the identity is unknown so a per-row loop can record the miss and carry on.
+        Resolves a UPN, email or object ID to a Graph user. Returns User (the Graph user, or
+        $null when the identity is unknown) and Error (empty, or the failure text when the
+        lookup itself broke - 403, 429 after retries, 5xx, an expired token). The two are kept
+        apart so a per-row loop records a miss as Skipped and a broken lookup as Failed, rather
+        than passing a throttled wave off as a hundred users that do not exist.
     #>
     [CmdletBinding()]
+    [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
         [string]$Identity
     )
 
+    $raw = $null
     try {
         if ($Identity -match $guidPattern) {
-            return Get-MgUser -UserId $Identity -Property $graphUserProperties -ErrorAction SilentlyContinue
+            $raw = Invoke-MigrationGraphRequest -Method GET -Uri "/v1.0/users/$Identity`?`$select=$graphUserSelect"
         }
-
-        $safe = ConvertTo-MigrationODataString -Value $Identity
-        $user = Get-MgUser -Filter "userPrincipalName eq '$safe'" -Property $graphUserProperties -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($null -eq $user) {
-            $user = Get-MgUser -Filter "mail eq '$safe'" -Property $graphUserProperties -ErrorAction SilentlyContinue |
+        else {
+            $safe = ConvertTo-MigrationODataString -Value $Identity
+            $raw = @(Invoke-MigrationGraphRequest -Method GET `
+                    -Uri "/v1.0/users?`$filter=userPrincipalName eq '$safe'&`$select=$graphUserSelect") |
                 Select-Object -First 1
+            if ($null -eq $raw) {
+                $raw = @(Invoke-MigrationGraphRequest -Method GET `
+                        -Uri "/v1.0/users?`$filter=mail eq '$safe'&`$select=$graphUserSelect") |
+                    Select-Object -First 1
+            }
         }
-        return $user
     }
     catch {
-        Write-MigrationLog -Message "Could not resolve user '$Identity': $($_.Exception.Message)" -Level DEBUG
-        return $null
+        # Only the by-id GET can 404 (a $filter miss returns an empty set); Get-MigrationGraphErrorStatusCode
+        # maps Graph's error body (or the SDK's 'Request_ResourceNotFound' message shape) to 404.
+        $code = Get-MigrationGraphErrorStatusCode -ErrorRecord $_
+        if ($code -ne 404) {
+            return [pscustomobject]@{
+                User  = $null
+                Error = "Could not resolve user '$Identity': $($_.Exception.Message)"
+            }
+        }
+        Write-MigrationLog -Message "User '$Identity' does not exist in this tenant." -Level DEBUG
     }
+
+    $user = $null
+    if ($null -ne $raw) {
+        $user = [pscustomobject]@{
+            Id                = [string](Get-MigrationProperty -InputObject $raw -Name 'id' -Default '')
+            UserPrincipalName = [string](Get-MigrationProperty -InputObject $raw -Name 'userPrincipalName' -Default '')
+            DisplayName       = [string](Get-MigrationProperty -InputObject $raw -Name 'displayName' -Default '')
+        }
+    }
+
+    [pscustomobject]@{ User = $user; Error = '' }
 }
 
 function Resolve-CutoverGroup {
@@ -274,11 +304,16 @@ function Resolve-CutoverGroup {
     )
 
     if ($Identity -match $guidPattern) {
-        return Get-MgGroup -GroupId $Identity -Property 'Id', 'DisplayName' -ErrorAction Stop
+        $raw = Invoke-MigrationGraphRequest -Method GET -Uri "/v1.0/groups/$Identity`?`$select=id,displayName"
+        return [pscustomobject]@{
+            Id          = [string](Get-MigrationProperty -InputObject $raw -Name 'id' -Default '')
+            DisplayName = [string](Get-MigrationProperty -InputObject $raw -Name 'displayName' -Default '')
+        }
     }
 
     $safe = ConvertTo-MigrationODataString -Value $Identity
-    $hits = @(Get-MgGroup -Filter "displayName eq '$safe'" -Property 'Id', 'DisplayName' -All -ErrorAction Stop)
+    $hits = @(Invoke-MigrationGraphRequest -Method GET -All `
+            -Uri "/v1.0/groups?`$filter=displayName eq '$safe'&`$select=id,displayName")
     if ($hits.Count -eq 0) {
         throw ("No group found with display name '$Identity'. Provide the group's object ID or its exact " +
             'display name - not its email address.')
@@ -286,7 +321,10 @@ function Resolve-CutoverGroup {
     if ($hits.Count -gt 1) {
         throw "Multiple groups match display name '$Identity'. Re-run with the group's object ID to disambiguate."
     }
-    $hits[0]
+    [pscustomobject]@{
+        Id          = [string](Get-MigrationProperty -InputObject $hits[0] -Name 'id' -Default '')
+        DisplayName = [string](Get-MigrationProperty -InputObject $hits[0] -Name 'displayName' -Default '')
+    }
 }
 
 #endregion ---------------------------------------------------------------------
@@ -306,33 +344,62 @@ try {
         'Plan' { if (-not (Test-Path -LiteralPath $PlanPath)) { throw "Identity plan not found: $PlanPath" } }
     }
 
-    Initialize-MigrationModule -Name 'Microsoft.Graph.Users', 'Microsoft.Graph.Groups'
-    $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    # Connect-MigrationGraph installs and imports Microsoft.Graph.Authentication itself; every
+    # Graph call this script makes is raw REST through Invoke-MigrationGraphRequest, so no
+    # Microsoft.Graph.Users / .Groups submodule - and the version-matching failure they can
+    # trigger against an already-loaded Microsoft.Graph.Authentication - ever enters the picture.
+    $context = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    # Connect-MigrationGraph logs a reused cached session at INFO, which the default verbosity
+    # hides; a credential reset must show the tenant it is about to act on at every verbosity.
+    Write-MigrationLog -Message "Target tenant: $($context.TenantId) as $($context.Account)" -Level SUCCESS
 
     # Each entry pairs the Graph user (or $null when unresolved) with the identity the
-    # operator supplied, so an unresolved row still reports something recognisable.
+    # operator supplied, so an unresolved row still reports something recognisable. Error
+    # carries a lookup that failed outright (throttling, 403, expired token) so the row is
+    # recorded as Failed rather than passed off as a user that does not exist.
     $targets = [System.Collections.Generic.List[object]]::new()
     $addTarget = {
-        param([string]$Supplied, $User, [string]$Note)
-        $targets.Add([pscustomobject]@{ Supplied = $Supplied; User = $User; Note = $Note })
+        param([string]$Supplied, $User, [string]$Note, [string]$LookupError = '')
+        $targets.Add([pscustomobject]@{ Supplied = $Supplied; User = $User; Note = $Note; Error = $LookupError })
+    }
+    $addResolvedTarget = {
+        param([string]$Supplied, [string]$Note)
+        $lookup = Resolve-CutoverUser -Identity $Supplied
+        & $addTarget $Supplied $lookup.User $Note $lookup.Error
     }
 
     switch ($PSCmdlet.ParameterSetName) {
         'Plan' {
-            $planRows = @(Import-MigrationPlan -Path $PlanPath -Wave $Wave -ObjectType 'User' -PlanStatus $actionablePlanStatuses)
+            $planRows = @(Import-MigrationPlan -Path $PlanPath -Wave $Wave -ObjectType 'User')
             Write-MigrationLog -Message "Plan rows to process: $($planRows.Count)" -Level INFO
 
             foreach ($row in $planRows) {
                 $choice = Resolve-CutoverPlanIdentity -Row $row
+                $sourceUpn = [string](Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default '(unknown source row)')
+                $shown = if ([string]::IsNullOrWhiteSpace($choice.Identity)) { $sourceUpn } else { $choice.Identity }
+
+                # -AllowSynced: the plan's IsSynced column describes the SOURCE object, while
+                # this reset targets the freshly created cloud user in the destination tenant,
+                # which carries no sync state. Every other gate reason becomes a Skipped row
+                # so the wave's results reconcile against the plan row for row.
+                $gate = Test-MigrationPlanRowActionable -Row $row -IncludeCollisions:$IncludeCollisions -AllowSynced
+                if (-not $gate.Actionable) {
+                    $reason = $gate.Reason
+                    if ((Get-MigrationCsvValue -Row $row -Name 'PlanStatus' -Default '') -eq 'Collision') {
+                        $reason += ' Re-run with -IncludeCollisions to process it.'
+                    }
+                    & $addTarget $shown $null $reason
+                    continue
+                }
+
                 if ([string]::IsNullOrWhiteSpace($choice.Identity)) {
-                    $sourceUpn = [string](Get-MigrationCsvValue -Row $row -Name 'SourceUserPrincipalName' -Default '(unknown source row)')
                     & $addTarget $sourceUpn $null $choice.Reason
                     continue
                 }
                 if ($choice.Source -eq 'Interim') {
                     Write-MigrationLog -Message "$($choice.Identity): $($choice.Reason)" -Level WARNING
                 }
-                & $addTarget $choice.Identity (Resolve-CutoverUser -Identity $choice.Identity) $choice.Reason
+                & $addResolvedTarget $choice.Identity $choice.Reason
             }
         }
 
@@ -353,7 +420,7 @@ try {
             foreach ($row in $rows) {
                 $identity = [string](Get-MigrationCsvValue -Row $row -Name $userColumn -Default '')
                 if ([string]::IsNullOrWhiteSpace($identity)) { continue }
-                & $addTarget $identity (Resolve-CutoverUser -Identity $identity) ''
+                & $addResolvedTarget $identity ''
             }
         }
 
@@ -363,13 +430,15 @@ try {
 
             # Group members arrive as directory objects; only #microsoft.graph.user entries
             # can hold a password profile, so nested groups and service principals are dropped.
-            foreach ($member in @(Get-MgGroupMember -GroupId $resolvedGroup.Id -All -ErrorAction Stop)) {
-                if ($member.AdditionalProperties['@odata.type'] -ne '#microsoft.graph.user') { continue }
-                $memberUpn = [string]$member.AdditionalProperties['userPrincipalName']
+            $members = @(Invoke-MigrationGraphRequest -Method GET -All `
+                    -Uri "/v1.0/groups/$($resolvedGroup.Id)/members?`$select=id,userPrincipalName,displayName")
+            foreach ($member in $members) {
+                if ([string](Get-MigrationProperty -InputObject $member -Name '@odata.type' -Default '') -ne '#microsoft.graph.user') { continue }
+                $memberUpn = [string](Get-MigrationProperty -InputObject $member -Name 'userPrincipalName' -Default '')
                 & $addTarget $memberUpn ([pscustomobject]@{
-                        Id                = $member.Id
+                        Id                = [string](Get-MigrationProperty -InputObject $member -Name 'id' -Default '')
                         UserPrincipalName = $memberUpn
-                        DisplayName       = [string]$member.AdditionalProperties['displayName']
+                        DisplayName       = [string](Get-MigrationProperty -InputObject $member -Name 'displayName' -Default '')
                     }) ''
             }
             if ($targets.Count -eq 0) {
@@ -379,7 +448,7 @@ try {
 
         'TestUser' {
             Write-MigrationLog -Message "Resolving single test user '$TestUser'..." -Level INFO
-            & $addTarget $TestUser (Resolve-CutoverUser -Identity $TestUser) ''
+            & $addResolvedTarget $TestUser ''
         }
     }
 
@@ -404,6 +473,10 @@ try {
         $passwordProfile = $null
 
         try {
+            # A lookup that broke (throttling, 403, expired token) is a Failed row with the
+            # Graph message, never a Skipped 'not found' - the wave must not look clean.
+            if ($target.Error) { throw $target.Error }
+
             if ($null -eq $user) {
                 $status = 'Skipped'
                 $detail = if ($target.Note) { $target.Note } else { 'User not found in this tenant.' }
@@ -423,14 +496,15 @@ try {
                 elseif ($PSCmdlet.ShouldProcess($identity, 'Reset password to a new passphrase')) {
                     $generated = New-MigrationPassphrase -WordCount $WordCount
                     $passwordProfile = @{
-                        Password                      = $generated
-                        ForceChangePasswordNextSignIn = $ForceChangePassword
+                        password                      = $generated
+                        forceChangePasswordNextSignIn = $ForceChangePassword
                     }
-                    # -ErrorAction Stop makes the Graph call terminating so a failed reset lands
-                    # in catch and is recorded as Failed - never reported as a success with a
-                    # credential that was never actually set.
+                    # Invoke-MigrationGraphRequest throws on a failed call (after its own retry
+                    # budget) so a failed reset lands in catch and is recorded as Failed - never
+                    # reported as a success with a credential that was never actually set.
                     $null = Invoke-MigrationAction -Description "Reset the password for $identity" -Action {
-                        Update-MgUser -UserId $user.Id -PasswordProfile $passwordProfile -ErrorAction Stop
+                        $null = Invoke-MigrationGraphRequest -Method PATCH -Uri "/v1.0/users/$($user.Id)" `
+                            -Body @{ passwordProfile = $passwordProfile }
                     }
                     $status = 'Succeeded'
                     $detail = 'Password reset; change required at next sign-in.'

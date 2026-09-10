@@ -66,6 +66,10 @@ BeforeAll {
             MailNickname = $MailNickname; Address = @($Address)
         }
     }
+
+    # ExchangeOnlineManagement is not loaded in the test session, so Get-EXORecipient does not
+    # exist and Pester cannot Mock a command that is not defined. This stub stands in for it.
+    function Get-EXORecipient { [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Stub stands in for the ExchangeOnlineManagement cmdlet so Pester can mock it')] param($Filter, $ResultSize, $Properties, $ErrorAction) }
 }
 
 Describe 'ConvertTo-BareAddress' {
@@ -197,6 +201,23 @@ Describe 'Test-AddressClash' {
         $row = New-TestPlanRow -Property @{ TargetUserPrincipalName = 'john.smith@newco.com' }
         @(Test-AddressClash -Row @($row) -ExistingObject @()) | Should -HaveCount 0
     }
+
+    It 'Reports one row, not two, when the same holder is found once by Graph and once by Exchange' {
+        $row = New-TestPlanRow -Property @{ TargetUserPrincipalName = 'john.smith@newco.com'; TargetPrimarySmtp = 'john.smith@newco.com' }
+        $existing = @(
+            New-ExistingObject -Id $script:otherId -Kind 'User' -DisplayName 'John Smith' -Address @('john.smith@newco.com')
+            New-ExistingObject -Id $script:otherId -Kind 'UserMailbox' -DisplayName 'John Smith' -Address @('john.smith@newco.com')
+        )
+        @(Test-AddressClash -Row @($row) -ExistingObject $existing) | Should -HaveCount 1
+    }
+
+    It 'Still dedupes id-less recipients found under the same kind' {
+        $row = New-TestPlanRow -Property @{ TargetPrimarySmtp = 'accounts@newco.com' }
+        $existing = @(
+            New-ExistingObject -Id '' -Kind 'MailContact' -DisplayName 'Accounts' -Address @('accounts@newco.com')
+        )
+        @(Test-AddressClash -Row @($row) -ExistingObject $existing) | Should -HaveCount 1
+    }
 }
 
 Describe 'Measure-SeatRequirement' {
@@ -278,7 +299,7 @@ Describe 'Test-ProvisionedRow' {
         $user = [pscustomobject]@{ id = $script:targetId; userPrincipalName = 'john.smith@newco.com' }
         $mailbox = [pscustomobject]@{ PrimarySmtpAddress = 'john.smith@newco.com'; LitigationHoldEnabled = $false }
 
-        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveExists
+        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveState Present
         $graded.MailboxProvisioned | Should -Be 'True'
         $graded.OneDriveProvisioned | Should -Be 'True'
         (@($graded.Row) | Where-Object Action -EQ 'OneDriveExists').Status | Should -Be 'Succeeded'
@@ -299,7 +320,7 @@ Describe 'Test-ProvisionedRow' {
         $user = [pscustomobject]@{ id = $script:targetId; userPrincipalName = 'john.smith@newco.com' }
         $mailbox = [pscustomobject]@{ PrimarySmtpAddress = 'john.smith@newco.com'; LitigationHoldEnabled = $true }
 
-        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveExists
+        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveState Present
         (@($graded.Row) | Where-Object Action -EQ 'LitigationHoldOff').Status | Should -Be 'Failed'
     }
 
@@ -308,7 +329,7 @@ Describe 'Test-ProvisionedRow' {
         $user = [pscustomobject]@{ id = $script:targetId; userPrincipalName = 'john.smith@newco.com' }
         $mailbox = [pscustomobject]@{ PrimarySmtpAddress = 'john.smith@newco.com'; LitigationHoldEnabled = $false }
 
-        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveExists
+        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveState Present
         (@($graded.Row) | Where-Object Action -EQ 'ArchiveEnabled').Status | Should -Be 'Skipped'
         (@($graded.Row) | Where-Object Action -EQ 'MailboxQuota').Status | Should -Be 'Skipped'
     }
@@ -322,7 +343,7 @@ Describe 'Test-ProvisionedRow' {
         }
         $source = [pscustomobject]@{ PrimarySmtpAddress = 'jsmith@contoso.com'; ArchiveStatus = 'Active' }
 
-        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveExists -SourceMailbox $source
+        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveState Present -SourceMailbox $source
         (@($graded.Row) | Where-Object Action -EQ 'ArchiveEnabled').Status | Should -Be 'Failed'
     }
 
@@ -335,10 +356,30 @@ Describe 'Test-ProvisionedRow' {
         }
         $source = [pscustomobject]@{ PrimarySmtpAddress = 'jsmith@contoso.com'; TotalItemSizeGB = '73.5' }
 
-        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveExists -SourceMailbox $source
+        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveState Present -SourceMailbox $source
         $quota = @($graded.Row) | Where-Object Action -EQ 'MailboxQuota'
         $quota.Status | Should -Be 'Failed'
         $quota.Detail | Should -BeLike '*73.5 GB*'
+    }
+
+    It 'Skips OneDriveExists and leaves the plan value alone when the drive read did not run' {
+        $row = New-TestPlanRow -Property @{ TargetObjectId = $script:targetId; OneDriveProvisioned = 'True' }
+        $user = [pscustomobject]@{ id = $script:targetId; userPrincipalName = 'john.smith@newco.com' }
+        $mailbox = [pscustomobject]@{ PrimarySmtpAddress = 'john.smith@newco.com'; LitigationHoldEnabled = $false }
+
+        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveState NotChecked
+        $graded.OneDriveProvisioned | Should -Be 'True'
+        (@($graded.Row) | Where-Object Action -EQ 'OneDriveExists').Status | Should -Be 'Skipped'
+    }
+
+    It 'Skips OneDriveExists for a shared mailbox and leaves the plan value alone' {
+        $row = New-TestPlanRow -Property @{ TargetObjectId = $script:targetId; ObjectType = 'Shared'; OneDriveProvisioned = 'False' }
+        $user = [pscustomobject]@{ id = $script:targetId; userPrincipalName = 'sales@newco.com' }
+        $mailbox = [pscustomobject]@{ PrimarySmtpAddress = 'sales@newco.com'; LitigationHoldEnabled = $false }
+
+        $graded = Test-ProvisionedRow -Row $row -User $user -Mailbox $mailbox -DriveState Present
+        $graded.OneDriveProvisioned | Should -Be 'False'
+        (@($graded.Row) | Where-Object Action -EQ 'OneDriveExists').Status | Should -Be 'Skipped'
     }
 }
 
@@ -417,6 +458,20 @@ Describe 'Test-PostRow' {
         $results | Should -HaveCount 1
         $results[0].Action | Should -Be 'UserExists'
     }
+
+    It 'Skips AccountEnabled for a disabled-by-design shared mailbox' {
+        $row = New-TestPlanRow -Property @{
+            TargetObjectId = $script:targetId; TargetUserPrincipalName = 'sales@newco.com'
+            TargetPrimarySmtp = 'sales@newco.com'; ObjectType = 'Shared'
+        }
+        $user = [pscustomobject]@{ id = $script:targetId; userPrincipalName = 'sales@newco.com'; accountEnabled = $false }
+        $mailbox = [pscustomobject]@{
+            PrimarySmtpAddress = 'sales@newco.com'; HiddenFromAddressListsEnabled = $false
+            EmailAddresses = @('SMTP:sales@newco.com')
+        }
+        $results = @(Test-PostRow -Row $row -User $user -Mailbox $mailbox)
+        (@($results | Where-Object Action -EQ 'AccountEnabled')).Status | Should -Be 'Skipped'
+    }
 }
 
 Describe 'Test-GraphNotFound' {
@@ -432,6 +487,39 @@ Describe 'Test-GraphNotFound' {
         $record = $null
         try { throw 'Insufficient privileges to complete the operation' } catch { $record = $_ }
         Test-GraphNotFound -ErrorRecord $record | Should -BeFalse
+    }
+}
+
+Describe 'Get-RecipientClashObject' {
+
+    It 'Requests the properties the address and mail nickname clash checks read' {
+        Mock Get-EXORecipient { return @() }
+
+        $null = Get-RecipientClashObject -EmailAddress @('accounts@newco.com')
+
+        Should -Invoke Get-EXORecipient -Times 1 -ParameterFilter {
+            $Properties -contains 'EmailAddresses' -and $Properties -contains 'PrimarySmtpAddress' -and
+            $Properties -contains 'DisplayName' -and $Properties -contains 'Alias'
+        }
+    }
+
+    It 'Builds an Address array from EmailAddresses and PrimarySmtpAddress' {
+        Mock Get-EXORecipient {
+            return @([pscustomobject]@{
+                    ExternalDirectoryObjectId = $script:otherId
+                    RecipientType             = 'MailUniversalDistributionGroup'
+                    DisplayName               = 'Accounts'
+                    Alias                     = 'accounts'
+                    PrimarySmtpAddress        = 'accounts@newco.com'
+                    EmailAddresses            = @('SMTP:accounts@newco.com', 'smtp:ap@newco.com')
+                })
+        }
+
+        $found = @(Get-RecipientClashObject -EmailAddress @('accounts@newco.com'))
+        $found | Should -HaveCount 1
+        $found[0].Address | Should -Contain 'accounts@newco.com'
+        $found[0].Address | Should -Contain 'ap@newco.com'
+        $found[0].MailNickname | Should -Be 'accounts'
     }
 }
 

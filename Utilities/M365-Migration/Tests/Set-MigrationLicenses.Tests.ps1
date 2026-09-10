@@ -173,6 +173,129 @@ Describe 'Resolve-LicenseChange' {
         $change.AddSkuId | Should -BeNullOrEmpty
         $change.AlreadyAssigned | Should -Be @('SPE_E3')
     }
+
+    It 'Re-adds a SKU whose group assignment is in Error state and names the state' {
+        # The group ran out of seats: the user holds no working licence, so 'group-assigned, left
+        # alone' would leave them unlicensed with nothing in the results saying so.
+        $state = @([pscustomobject]@{
+                skuId = $script:e3Id; assignedByGroup = '00000000-0000-0000-0000-000000000abc'
+                state = 'Error'; error = 'CountViolation'
+            })
+        $change = Resolve-LicenseChange -DesiredSkuPartNumber @('SPE_E3') -Catalog $script:catalog -AssignmentState $state
+        $change.AddSkuId | Should -Be @($script:e3Id)
+        $change.GroupAssigned | Should -BeNullOrEmpty
+        @($change.BrokenAssignment) | Should -HaveCount 1
+        $change.BrokenAssignment[0] | Should -BeLike 'SPE_E3 (group assignment in state Error, CountViolation)'
+    }
+
+    It 'Treats an ActiveWithError group assignment as held' {
+        $state = @([pscustomobject]@{
+                skuId = $script:e3Id; assignedByGroup = '00000000-0000-0000-0000-000000000abc'
+                state = 'ActiveWithError'; error = 'MutuallyExclusiveViolation'
+            })
+        $change = Resolve-LicenseChange -DesiredSkuPartNumber @('SPE_E3') -Catalog $script:catalog -AssignmentState $state
+        $change.AddSkuId | Should -BeNullOrEmpty
+        $change.GroupAssigned | Should -Be @('SPE_E3')
+        $change.BrokenAssignment | Should -BeNullOrEmpty
+    }
+
+    It 'Re-sends a Disabled direct assignment the plan asks for' {
+        $state = @([pscustomobject]@{ skuId = $script:e3Id; assignedByGroup = $null; state = 'Disabled'; error = 'None' })
+        $change = Resolve-LicenseChange -DesiredSkuPartNumber @('SPE_E3') -Catalog $script:catalog -AssignmentState $state
+        $change.AddSkuId | Should -Be @($script:e3Id)
+        $change.AlreadyAssigned | Should -BeNullOrEmpty
+        $change.BrokenAssignment[0] | Should -BeLike 'SPE_E3 (direct assignment in state Disabled)'
+    }
+
+    It 'Still removes a broken direct assignment with -RemoveUnplanned' {
+        $state = @([pscustomobject]@{ skuId = $script:emsId; assignedByGroup = ''; state = 'Error'; error = 'CountViolation' })
+        $change = Resolve-LicenseChange -DesiredSkuPartNumber @('SPE_E3') -Catalog $script:catalog `
+            -AssignmentState $state -RemoveUnplanned
+        $change.RemoveSkuId | Should -Be @($script:emsId)
+        $change.RemoveSkuPartNumber | Should -Be @('EMS')
+    }
+
+    It 'Still refuses to remove a broken group assignment with -RemoveUnplanned' {
+        $state = @([pscustomobject]@{
+                skuId = $script:emsId; assignedByGroup = '00000000-0000-0000-0000-000000000abc'
+                state = 'Error'; error = 'CountViolation'
+            })
+        $change = Resolve-LicenseChange -DesiredSkuPartNumber @('SPE_E3') -Catalog $script:catalog `
+            -AssignmentState $state -RemoveUnplanned
+        $change.RemoveSkuId | Should -BeNullOrEmpty
+        $change.GroupAssigned | Should -Be @('EMS')
+    }
+}
+
+Describe 'Get-PlanRowIdentifier and Find-PlanRowUser' {
+
+    BeforeAll {
+        $script:liveId = '00000000-0000-0000-0000-000000000001'
+        $script:byInterim = New-TestUser -Id $script:liveId -UserPrincipalName 'john.smith@newco.onmicrosoft.com'
+        $script:byTarget = New-TestUser -Id '00000000-0000-0000-0000-000000000002' -UserPrincipalName 'john.smith@newco.com'
+        $script:userMap = @{
+            ById  = @{ $script:liveId = $script:byInterim }
+            ByUpn = @{
+                'john.smith@newco.onmicrosoft.com' = $script:byInterim
+                'john.smith@newco.com'             = $script:byTarget
+            }
+        }
+    }
+
+    It 'Returns every identifier the plan row offers' {
+        $row = New-TestPlanRow -Property @{
+            TargetObjectId = $script:liveId; InterimUserPrincipalName = 'john.smith@newco.onmicrosoft.com'
+            TargetUserPrincipalName = 'john.smith@newco.com'
+        }
+        $ids = Get-PlanRowIdentifier -Row $row
+        $ids.ObjectId | Should -Be $script:liveId
+        $ids.InterimUpn | Should -Be 'john.smith@newco.onmicrosoft.com'
+        $ids.TargetUpn | Should -Be 'john.smith@newco.com'
+    }
+
+    It 'Matches by TargetObjectId first' {
+        $row = New-TestPlanRow -Property @{
+            TargetObjectId = $script:liveId; InterimUserPrincipalName = 'other@newco.onmicrosoft.com'
+            TargetUserPrincipalName = 'john.smith@newco.com'
+        }
+        $match = Find-PlanRowUser -Row $row -UserMap $script:userMap
+        $match.MatchedBy | Should -Be 'TargetObjectId'
+        $match.User.id | Should -Be $script:liveId
+        $match.Warning | Should -BeNullOrEmpty
+    }
+
+    It 'Falls back to the interim UPN before the target UPN when the TargetObjectId is stale, and says so' {
+        # Licensing runs before the UPN cutover, so the interim address is the one that exists.
+        $row = New-TestPlanRow -Property @{
+            TargetObjectId = '00000000-0000-0000-0000-00000000dead'
+            InterimUserPrincipalName = 'John.Smith@newco.onmicrosoft.com'
+            TargetUserPrincipalName = 'john.smith@newco.com'
+        }
+        $match = Find-PlanRowUser -Row $row -UserMap $script:userMap
+        $match.MatchedBy | Should -Be 'InterimUserPrincipalName'
+        $match.User.id | Should -Be $script:liveId
+        $match.Warning | Should -BeLike '*00000000-0000-0000-0000-00000000dead*stale*'
+    }
+
+    It 'Falls back to the target UPN when nothing else matches' {
+        $row = New-TestPlanRow -Property @{
+            InterimUserPrincipalName = 'nobody@newco.onmicrosoft.com'; TargetUserPrincipalName = 'john.smith@newco.com'
+        }
+        $match = Find-PlanRowUser -Row $row -UserMap $script:userMap
+        $match.MatchedBy | Should -Be 'TargetUserPrincipalName'
+        $match.User.id | Should -Be '00000000-0000-0000-0000-000000000002'
+        $match.Warning | Should -BeNullOrEmpty
+    }
+
+    It 'Returns no user when no identifier matches' {
+        $row = New-TestPlanRow -Property @{
+            TargetObjectId = '00000000-0000-0000-0000-00000000dead'
+            InterimUserPrincipalName = 'nobody@newco.onmicrosoft.com'; TargetUserPrincipalName = 'nobody@newco.com'
+        }
+        $match = Find-PlanRowUser -Row $row -UserMap $script:userMap
+        $match.User | Should -BeNullOrEmpty
+        $match.MatchedBy | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Measure-LicenseSeat' {
@@ -331,6 +454,65 @@ Describe 'Set-PlanRowLicense' {
 
         $result.Status | Should -Be 'Failed'
         $result.Detail | Should -BeLike '*No destination user*'
+    }
+
+    It 'Names every identifier it tried when no destination user was found' {
+        New-TestRun
+        $row = New-TestPlanRow -Property @{
+            TargetObjectId = '00000000-0000-0000-0000-00000000dead'
+            InterimUserPrincipalName = 'john.smith@newco.onmicrosoft.com'
+            TargetUserPrincipalName = 'john.smith@newco.com'; TargetLicenses = 'SPE_E3'
+        }
+        $result = Set-PlanRowLicense -Row $row -User $null -Catalog $script:catalog -SkuMap $null
+
+        $result.Status | Should -Be 'Failed'
+        $result.Detail | Should -BeLike '*TargetObjectId 00000000-0000-0000-0000-00000000dead*'
+        $result.Detail | Should -BeLike '*InterimUserPrincipalName john.smith@newco.onmicrosoft.com*'
+        $result.Detail | Should -BeLike '*TargetUserPrincipalName john.smith@newco.com*'
+    }
+
+    It 'Fails a row naming a SKU the tenant does not subscribe to and sends nothing, removals included' {
+        # Under -Force this row used to read Skipped 'Nothing to do' while -RemoveUnplanned still
+        # stripped the user's direct licence.
+        New-TestRun
+        $state = @([pscustomobject]@{ skuId = $script:emsId; assignedByGroup = $null })
+        $row = New-TestPlanRow -Property @{ TargetUserPrincipalName = 'john.smith@newco.com'; TargetLicenses = 'NOT_A_SKU'; UsageLocation = 'US' }
+        $result = Set-PlanRowLicense -Row $row -User (New-TestUser -UsageLocation 'US' -AssignmentState $state) `
+            -Catalog $script:catalog -SkuMap $null -RemoveUnplanned
+
+        $result.Status | Should -Be 'Failed'
+        $result.Detail | Should -BeLike '*Not a SKU in this tenant: NOT_A_SKU*'
+        $result.Unknown | Should -Be 'NOT_A_SKU'
+        Should -Invoke Invoke-MigrationGraphRequest -Times 0 -Exactly
+    }
+
+    It 'Fails an unknown-SKU row before the usageLocation PATCH rather than reporting it Succeeded' {
+        New-TestRun
+        $row = New-TestPlanRow -Property @{ TargetUserPrincipalName = 'john.smith@newco.com'; TargetLicenses = 'SPE_E3;NOT_A_SKU' }
+        $result = Set-PlanRowLicense -Row $row -User (New-TestUser) -Catalog $script:catalog -SkuMap $null -DefaultUsageLocation 'US'
+
+        $result.Status | Should -Be 'Failed'
+        $result.Detail | Should -BeLike '*NOT_A_SKU*'
+        Should -Invoke Invoke-MigrationGraphRequest -Times 0 -Exactly
+    }
+
+    It 'Re-sends a SKU whose group assignment is in Error state and names the error in the Detail' {
+        New-TestRun
+        $state = @([pscustomobject]@{
+                skuId = $script:e3Id; assignedByGroup = '00000000-0000-0000-0000-000000000abc'
+                state = 'Error'; error = 'CountViolation'
+            })
+        $row = New-TestPlanRow -Property @{ TargetUserPrincipalName = 'john.smith@newco.com'; TargetLicenses = 'SPE_E3'; UsageLocation = 'US' }
+        $result = Set-PlanRowLicense -Row $row -User (New-TestUser -UsageLocation 'US' -AssignmentState $state) `
+            -Catalog $script:catalog -SkuMap $null
+
+        $result.Status | Should -Be 'Succeeded'
+        $result.Added | Should -Be 'SPE_E3'
+        $result.GroupAssigned | Should -BeNullOrEmpty
+        $result.Detail | Should -BeLike '*added SPE_E3*'
+        $result.Detail | Should -BeLike '*group assignment in state Error, CountViolation*'
+        $script:calls | Should -HaveCount 1
+        $script:calls[0].Method | Should -Be 'POST'
     }
 
     It 'Reports a Graph failure as a Failed row rather than throwing' {

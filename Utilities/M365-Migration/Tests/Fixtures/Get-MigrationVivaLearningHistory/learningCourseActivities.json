@@ -1,0 +1,40 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('00000000-0000-0000-0000-00000000a001')/employeeExperience/learningCourseActivities",
+  "value": [
+    {
+      "@odata.type": "#microsoft.graph.learningAssignment",
+      "id": "00000000-0000-0000-0000-00000000ac01",
+      "externalCourseActivityId": "assign-001",
+      "learnerUserId": "00000000-0000-0000-0000-00000000a001",
+      "learningContentId": "00000000-0000-0000-0000-00000000c001",
+      "learningProviderId": "00000000-0000-0000-0000-00000000f001",
+      "completionPercentage": 40,
+      "completedDateTime": null,
+      "startedDateTime": "2026-08-01T09:00:00",
+      "status": "inProgress",
+      "assignedDateTime": "2026-07-15T08:30:00Z",
+      "assignerUserId": "00000000-0000-0000-0000-00000000a002",
+      "assignmentType": "required",
+      "dueDateTime": {
+        "dateTime": "2026-09-30T00:00:00.0000000",
+        "timeZone": "UTC"
+      },
+      "notes": {
+        "contentType": "text",
+        "content": "Complete before onboarding week."
+      }
+    },
+    {
+      "@odata.type": "#microsoft.graph.learningSelfInitiatedCourse",
+      "id": "00000000-0000-0000-0000-00000000ac02",
+      "externalCourseActivityId": "self-001",
+      "learnerUserId": "00000000-0000-0000-0000-00000000a001",
+      "learningContentId": "00000000-0000-0000-0000-00000000c999",
+      "learningProviderId": "00000000-0000-0000-0000-00000000f999",
+      "completionPercentage": 100,
+      "completedDateTime": "2026-08-20T16:45:00Z",
+      "startedDateTime": "2026-08-18T10:00:00Z",
+      "status": "completed"
+    }
+  ]
+}

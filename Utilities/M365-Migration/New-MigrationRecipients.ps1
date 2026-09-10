@@ -21,7 +21,11 @@
 
     UpdateSettings is what makes this usable alongside a mailbox-migration vendor: groups
     the vendor already created in the destination are adopted rather than duplicated, and
-    the settings are applied on top of them.
+    the settings are applied on top of them. An existing object is only adopted when its
+    recipient type is the one the row would create, and a hit found by mail nickname alone
+    must also carry the row's display name; anything else fails the row rather than being
+    claimed. Settings are compared against the adopted object's full state, so a re-run
+    resends only what differs and leaves destination-side edits alone.
 
     Address mapping. Members, owners, moderators and delivery restrictions in the source
     inventory are all source-tenant addresses. Applying them unchanged would either fail or,
@@ -42,8 +46,10 @@
     never removed - an unexpected member is a conversation, not something a script should
     silently delete.
 
-    -DryRun connects read-only, evaluates every row, and writes a results file whose rows
-    are all Status 'Planned'. Nothing is created or changed and the plan is not written back.
+    -DryRun evaluates every row and writes a results file in which every action that would
+    change the tenant is Status 'Planned'; rows the script would not act on are 'Skipped'.
+    The Exchange session is the same as a live run - nothing is written, and the plan is not
+    written back.
 
 .PARAMETER PlanPath
     The identity plan CSV (IdentityPlan.csv). Read in full, filtered in memory, and written
@@ -71,8 +77,9 @@
     points at someone outside both tenants.
 
 .PARAMETER SharedMailboxesCsv
-    The source tenant's Mailboxes inventory CSV. Supplies HiddenFromAddressLists and
-    GrantSendOnBehalfTo for shared, room and equipment mailboxes.
+    The source tenant's SharedMailboxes inventory CSV (Source_SharedMailboxes_*.csv). Supplies
+    HiddenFromAddressListsEnabled and GrantSendOnBehalfTo for shared, room and equipment
+    mailboxes.
 
 .PARAMETER MailboxPermissionsCsv
     The source tenant's MailboxPermissions inventory CSV. When supplied, FullAccess and
@@ -83,6 +90,13 @@
 .PARAMETER UseInterim
     Uses each row's InterimPrimarySmtp instead of TargetPrimarySmtp. Use this while the
     vanity domain still belongs to the source tenant.
+
+.PARAMETER TenantId
+    Pins the run to the destination tenant: its onmicrosoft.com domain or its tenant ID.
+    Exchange Online has no sign-in pin outside GDAP, so the check happens after the session
+    is established or reused - when the connected organisation is not this tenant the run
+    stops before the first row instead of creating recipients in whatever tenant a leftover
+    session belongs to. Pass it on every run.
 
 .PARAMETER DelegatedOrganization
     The customer tenant for GDAP delegated access, for example 'newco.onmicrosoft.com'.
@@ -108,13 +122,13 @@
     Console verbosity: Low, Medium (default) or High. The log file always gets everything.
 
 .EXAMPLE
-    .\New-MigrationRecipients.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -DryRun
+    .\New-MigrationRecipients.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -TenantId newco.onmicrosoft.com -DryRun
 
     Rehearses wave one: reports which recipients would be created, which already exist and
     which members could not be mapped, and writes a DryRun results file.
 
 .EXAMPLE
-    .\New-MigrationRecipients.ps1 -PlanPath .\IdentityPlan.csv -Type Shared,Room -UseInterim -MailboxPermissionsCsv .\Contoso_MailboxPermissions.csv -Prefix Contoso
+    .\New-MigrationRecipients.ps1 -PlanPath .\IdentityPlan.csv -Type Shared,Room -UseInterim -MailboxPermissionsCsv .\Contoso_MailboxPermissions.csv -TenantId newco.onmicrosoft.com -Prefix Contoso
 
     Stages the shared and resource mailboxes on newco.onmicrosoft.com and re-applies their
     FullAccess and SendAs grants with the trustees mapped to their destination accounts.
@@ -134,6 +148,11 @@
     New-DistributionGroup, New-DynamicDistributionGroup, New-MailContact, the matching Set-
     cmdlets, Add-DistributionGroupMember, Add-MailboxPermission, Add-RecipientPermission).
     Organization Management also works. No Graph session is needed.
+
+    Sessions: Connect-MigrationExchange reuses any Exchange Online session already open in the
+    shell, and no script disconnects. -TenantId is the guard against the source-tenant session
+    Get-MigrationInventory left behind: it is compared with the organisation the session
+    reports and a mismatch stops the run.
 
     GDAP: supported through -DelegatedOrganization, which is a delegated/interactive sign-in
     path. It cannot be combined with app-only certificate authentication. If GDAP claims are
@@ -183,6 +202,10 @@ param(
     [string]$MailboxPermissionsCsv,
 
     [switch]$UseInterim,
+
+    [AllowNull()]
+    [AllowEmptyString()]
+    [string]$TenantId,
 
     [Alias('Tenant')]
     [AllowNull()]
@@ -239,6 +262,12 @@ $addressGroupSetting = @(
     'GrantSendOnBehalfTo'
 )
 
+# ManagedBy, ModeratedBy, GrantSendOnBehalfTo and the delivery restrictions come back from
+# Exchange as canonical names ('newco.com/Users/John Smith'), not addresses. The settings diff
+# compares addresses, so each name is resolved through Get-Recipient once and remembered.
+$recipientAddressCache = @{}
+$resolveRecipientAddress = { param($Identity) Resolve-RecipientAddress -Identity $Identity -Cache $recipientAddressCache }
+
 $script:results = [System.Collections.Generic.List[object]]::new()
 
 #endregion Configuration --------------------------------------------------------------
@@ -288,6 +317,57 @@ function ConvertTo-AddressArray {
     }
 
     return $result.ToArray()
+}
+
+function Resolve-RecipientAddress {
+    <#
+    .SYNOPSIS
+        Resolves an Exchange identity to its primary SMTP address, memoised per run.
+
+    .DESCRIPTION
+        ManagedBy, ModeratedBy, GrantSendOnBehalfTo and delivery-restriction members come
+        back from Get-DistributionGroup/Get-Mailbox as ADObjectId-ish identities (for
+        example 'newco.com/Users/John Smith'), not addresses, so the settings diff cannot
+        compare them against the plan's address map until each one is looked up. -Cache
+        keeps that lookup to at most once per identity for the whole run.
+
+        A value that is already an address is returned unchanged without a lookup. A value
+        that cannot be resolved is returned as-is too, so the diff still treats it as
+        'something is there' rather than silently dropping it.
+
+    .EXAMPLE
+        Resolve-RecipientAddress -Identity 'newco.com/Users/John Smith' -Cache $cache
+
+        Returns 'john.smith@newco.com', looking it up once and remembering the answer.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]$Identity,
+        [Parameter(Mandatory)][hashtable]$Cache
+    )
+
+    $text = [string]$Identity
+    if (-not $text) { return '' }
+    if ($text -match '^[^@\s]+@[^@\s]+$') { return $text }
+
+    $lookup = $text.ToLowerInvariant()
+    if ($Cache.ContainsKey($lookup)) { return $Cache[$lookup] }
+
+    $resolved = $text
+    try {
+        $found = @(Get-Recipient -Identity $text -ErrorAction Stop)
+        if ($found.Count -gt 0) {
+            $primary = Get-MigrationCsvValue -Row $found[0] -Name 'PrimarySmtpAddress' -Default ''
+            if ($primary) { $resolved = [string]$primary }
+        }
+    }
+    catch {
+        Write-MigrationLog -Message "Could not resolve recipient identity '$text' to an address: $($_.Exception.Message)" -Level DEBUG
+    }
+
+    $Cache[$lookup] = $resolved
+    return $resolved
 }
 
 function ConvertTo-RecipientBoolean {
@@ -417,6 +497,12 @@ function ConvertTo-GroupSettingState {
         A setting the source object says nothing about is left out of the result entirely,
         not defaulted, so the diff can tell 'off' from 'not stated'.
 
+        -Map and -Resolver serve opposite directions of the same problem: the desired side
+        carries source-tenant addresses that -Map translates through the plan; the current
+        side comes back from Exchange as ADObjectId-ish identities ('newco.com/Users/John
+        Smith') that -Resolver turns into a primary SMTP address so the two sides can be
+        compared as plain strings. Pass at most one.
+
     .EXAMPLE
         ConvertTo-GroupSettingState -InputObject $group -BooleanSetting $booleanGroupSetting -TextSetting $textGroupSetting -AddressSetting $addressGroupSetting
 
@@ -429,7 +515,8 @@ function ConvertTo-GroupSettingState {
         [AllowNull()][AllowEmptyCollection()][string[]]$BooleanSetting = @(),
         [AllowNull()][AllowEmptyCollection()][string[]]$TextSetting = @(),
         [AllowNull()][AllowEmptyCollection()][string[]]$AddressSetting = @(),
-        [AllowNull()][hashtable]$Map
+        [AllowNull()][hashtable]$Map,
+        [AllowNull()]$Resolver
     )
 
     $settings = [ordered]@{}
@@ -476,6 +563,18 @@ function ConvertTo-GroupSettingState {
                     if (-not $unmapped.Contains("${name}: $miss")) { $unmapped.Add("${name}: $miss") }
                 }
                 if ($resolved.Mapped.Count -gt 0) { $settings[$name] = $resolved.Mapped }
+            }
+            elseif ($Resolver) {
+                # Exchange returns these as identities, not addresses ('newco.com/Users/John
+                # Smith'), so each one is resolved to its primary SMTP address before the diff
+                # ever compares it against the desired side.
+                $resolvedAddresses = [System.Collections.Generic.List[string]]::new()
+                foreach ($item in @($raw)) {
+                    $resolvedAddress = [string](& $Resolver $item)
+                    if (-not $resolvedAddress) { continue }
+                    if (-not $resolvedAddresses.Contains($resolvedAddress)) { $resolvedAddresses.Add($resolvedAddress) }
+                }
+                if ($resolvedAddresses.Count -gt 0) { $settings[$name] = $resolvedAddresses.ToArray() }
             }
             else {
                 $addresses = ConvertTo-AddressArray -Value $raw
@@ -875,11 +974,33 @@ if ($doUpdate -and -not $GroupsCsv -and @($Type | Where-Object { $_ -in @('Distr
 }
 
 try {
-    $null = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+    $exchangeConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
 }
 catch {
     Write-MigrationLog -Message $_.Exception.Message -Level ERROR
     exit (Complete-MigrationRun -ExitCode 1)
+}
+
+# Connect-MigrationExchange reuses whatever Exchange Online session is already open in the
+# shell, and nothing in this toolkit disconnects one - a source-tenant session left behind by
+# Get-MigrationInventory would otherwise be reused here silently. -DelegatedOrganization is
+# already checked by Connect-MigrationExchange itself; -TenantId is the same check for the
+# primary, non-GDAP path. Connect-MigrationExchange now accepts its own -TenantId (GUID form)
+# and would reconnect silently on a mismatch, but a live recipient-creation run is kept as a
+# hard stop instead - re-run after confirming the tenant rather than having the script pick a
+# session for you.
+if ($TenantId -and $exchangeConnection) {
+    $connectedOrganization = Get-MigrationCsvValue -Row $exchangeConnection -Name 'Organization' -Default ''
+    $connectedTenantId = Get-MigrationCsvValue -Row $exchangeConnection -Name 'TenantId' -Default ''
+    $tenantMatches = ($connectedOrganization -and $connectedOrganization -eq $TenantId) -or
+        ($connectedTenantId -and $connectedTenantId -eq $TenantId)
+    if (-not $tenantMatches -and ($connectedOrganization -or $connectedTenantId)) {
+        $connectedAs = if ($connectedOrganization) { $connectedOrganization } else { $connectedTenantId }
+        Write-MigrationLog -Message ("Connected to '$connectedAs' but -TenantId asked for '$TenantId'. Stopping before " +
+            'the first row rather than creating recipients in the wrong tenant. Disconnect-ExchangeOnline and re-run.') `
+            -Level ERROR
+        exit (Complete-MigrationRun -ExitCode 1)
+    }
 }
 
 $planChanged = $false
@@ -954,11 +1075,32 @@ try {
             if (-not $alias) { $alias = ($targetAddress -split '@')[0] }
 
             #-- Does it already exist? --------------------------------------------------------
+            # A hit is only adopted when it is plausibly this row's object - matching on Name or
+            # Alias alone would let an unrelated destination object with the same nickname be
+            # recorded as this row's TargetObjectId and then have this row's settings applied to
+            # it. RecipientTypeDetails must match what this row would create; a hit found only
+            # through the alias candidate (not the target address itself) must also carry the
+            # row's DisplayName.
+            $expectedRecipientTypeDetails = switch ($objectType) {
+                'Shared' { 'SharedMailbox' }
+                'Room' { 'RoomMailbox' }
+                'Equipment' { 'EquipmentMailbox' }
+                'Distribution' { 'MailUniversalDistributionGroup' }
+                'MailEnabledSecurity' { 'MailUniversalSecurityGroup' }
+                'DynamicDistribution' { 'DynamicDistributionGroup' }
+                'Contact' { 'MailContact' }
+                default { '' }
+            }
+            $recipientAdoptedByAliasOnly = $false
+
             foreach ($candidate in @($targetAddress, $alias)) {
                 if ($recipient) { break }
                 try {
                     $found = @(Get-Recipient -Identity $candidate -ErrorAction Stop)
-                    if ($found.Count -gt 0) { $recipient = $found[0] }
+                    if ($found.Count -gt 0) {
+                        $recipient = $found[0]
+                        $recipientAdoptedByAliasOnly = ($candidate -eq $alias -and $candidate -ne $targetAddress)
+                    }
                 }
                 catch {
                     # 'Not found' is the expected answer for a recipient that does not exist yet.
@@ -975,9 +1117,31 @@ try {
             }
 
             if ($recipient) {
+                $hitTypeDetails = Get-MigrationCsvValue -Row $recipient -Name 'RecipientTypeDetails' -Default ''
+                if ($expectedRecipientTypeDetails -and $hitTypeDetails -and $hitTypeDetails -ne $expectedRecipientTypeDetails) {
+                    throw ("An existing recipient matches '$targetAddress' or alias '$alias' but is a " +
+                        "$hitTypeDetails, not the $objectType type this row would create ($expectedRecipientTypeDetails). " +
+                        'Not adopting it - rename the plan row''s target address or alias, or remove the conflicting object.')
+                }
+                if ($recipientAdoptedByAliasOnly) {
+                    $hitDisplayName = Get-MigrationCsvValue -Row $recipient -Name 'DisplayName' -Default ''
+                    if ($hitDisplayName -ne $displayName) {
+                        throw ("Alias '$alias' is already used by '$hitDisplayName' in the destination tenant, which " +
+                            "does not match this row's DisplayName '$displayName'. Not adopting it.")
+                    }
+                }
+
                 $targetObjectId = Get-MigrationCsvValue -Row $recipient -Name 'ExternalDirectoryObjectId' -Default ''
                 if (-not $targetObjectId) { $targetObjectId = Get-MigrationCsvValue -Row $recipient -Name 'Guid' -Default '' }
             }
+
+            # Every subsequent Set-*/Add-* call targets the object by its own identity rather than
+            # by $targetAddress: an adopted object (found via the alias candidate, or a vendor
+            # placeholder not yet pointed at the vanity domain) does not necessarily hold
+            # $targetAddress at all. $targetAddress is kept only for reporting and for the create
+            # call, which is what establishes it in the first place.
+            $recipientIdentity = $targetAddress
+            if ($targetObjectId) { $recipientIdentity = $targetObjectId }
 
             #-- Create ------------------------------------------------------------------------
             if ($doCreate -and -not $recipient) {
@@ -1026,7 +1190,12 @@ try {
                                 'external address in the plan row SourceUserPrincipalName column.')
                         }
                         # Deliberately not mapped: a contact points at someone outside both tenants.
+                        # PrimarySmtpAddress is the contact's own address inside this tenant - without
+                        # it the contact's primary address defaults to ExternalEmailAddress, and every
+                        # later Set-MailContact/Add-DistributionGroupMember targeting $targetAddress
+                        # would then find nothing.
                         $createParameters['ExternalEmailAddress'] = $externalAddress
+                        $createParameters['PrimarySmtpAddress'] = $targetAddress
                         $created = Invoke-MigrationAction -Description $createDescription -PassThru -Action {
                             New-MailContact @createParameters
                         }
@@ -1047,6 +1216,7 @@ try {
                     $recipient = $created
                     $targetObjectId = Get-MigrationCsvValue -Row $created -Name 'ExternalDirectoryObjectId' -Default ''
                     if (-not $targetObjectId) { $targetObjectId = Get-MigrationCsvValue -Row $created -Name 'Guid' -Default '' }
+                    if ($targetObjectId) { $recipientIdentity = $targetObjectId }
 
                     $row.TargetObjectId = $targetObjectId
                     $row.ProvisionStatus = 'Created'
@@ -1082,6 +1252,12 @@ try {
                 continue
             }
 
+            if (-not $PSCmdlet.ShouldProcess($targetAddress, "Update $objectType settings")) {
+                Add-ResultRow @common -Action 'UpdateSettings' -Status 'Skipped' -TargetAddress $targetAddress `
+                    -TargetObjectId $targetObjectId -Detail 'Declined at the confirmation prompt.'
+                continue
+            }
+
             $updateDetail = [System.Collections.Generic.List[string]]::new()
             $unmappable = [System.Collections.Generic.List[string]]::new()
             $settingsChanged = [System.Collections.Generic.List[string]]::new()
@@ -1097,11 +1273,37 @@ try {
                 'Contact' { 'Set-MailContact' }
                 default { '' }
             }
+            $getCmdlet = switch ($objectType) {
+                { $_ -in @('Shared', 'Room', 'Equipment') } { 'Get-Mailbox' }
+                { $_ -in @('Distribution', 'MailEnabledSecurity') } { 'Get-DistributionGroup' }
+                'DynamicDistribution' { 'Get-DynamicDistributionGroup' }
+                'Contact' { 'Get-MailContact' }
+                default { '' }
+            }
+
+            # Get-Recipient - what $recipient holds - does not reliably return every
+            # object-specific property (Microsoft Learn: 'use the corresponding cmdlet, for
+            # example Get-Mailbox or Get-DistributionGroup'). ManagedBy, ModeratedBy and the
+            # rest of the settings diff need the typed cmdlet's full view, or every one of
+            # those settings looks 'not stated' and gets resent on every run. A re-read
+            # failure (a permission gap, a dropped session) falls back to $recipient rather
+            # than failing the whole row - the diff is then best-effort, same as before this
+            # fix, instead of losing the row entirely.
+            $liveRecipient = $recipient
+            if ($getCmdlet -and $recipient) {
+                try {
+                    $liveRecipient = & $getCmdlet -Identity $recipientIdentity -ErrorAction Stop
+                }
+                catch {
+                    Write-MigrationLog -Message ("Could not re-read '$targetAddress' with $getCmdlet for the settings " +
+                        "comparison; using the Get-Recipient result instead: $($_.Exception.Message)") -Level WARNING
+                }
+            }
 
             #-- Aliases and the X500 address --------------------------------------------------
             $aliasAddresses = @(Get-PlanAliasAddress -Row $row -PrimaryAddress $targetAddress)
             if ($aliasAddresses.Count -gt 0 -and $setCmdlet) {
-                $aliasParameters = @{ Identity = $targetAddress; EmailAddresses = @{ Add = $aliasAddresses }; ErrorAction = 'Stop' }
+                $aliasParameters = @{ Identity = $recipientIdentity; EmailAddresses = @{ Add = $aliasAddresses }; ErrorAction = 'Stop' }
                 $null = Invoke-MigrationAction -Description "Add $($aliasAddresses.Count) proxy address(es) to $targetAddress" -Action {
                     & $setCmdlet @aliasParameters
                 }
@@ -1128,12 +1330,12 @@ try {
                         }
                     }
 
-                    $current = ConvertTo-GroupSettingState -InputObject $recipient -BooleanSetting $booleanGroupSetting `
-                        -TextSetting $textGroupSetting -AddressSetting $addressGroupSetting
+                    $current = ConvertTo-GroupSettingState -InputObject $liveRecipient -BooleanSetting $booleanGroupSetting `
+                        -TextSetting $textGroupSetting -AddressSetting $addressGroupSetting -Resolver $resolveRecipientAddress
                     $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
 
                     if ($changes.Count -gt 0 -and $setCmdlet) {
-                        foreach ($name in (Invoke-SettingChange -Cmdlet $setCmdlet -Identity $targetAddress -Change $changes)) {
+                        foreach ($name in (Invoke-SettingChange -Cmdlet $setCmdlet -Identity $recipientIdentity -Change $changes)) {
                             $settingsChanged.Add($name)
                         }
                     }
@@ -1148,7 +1350,7 @@ try {
 
                         $existingMembers = @()
                         try {
-                            $existingMembers = @(Get-DistributionGroupMember -Identity $targetAddress -ResultSize Unlimited -ErrorAction Stop |
+                            $existingMembers = @(Get-DistributionGroupMember -Identity $recipientIdentity -ResultSize Unlimited -ErrorAction Stop |
                                     ForEach-Object { [string](Get-MigrationCsvValue -Row $_ -Name 'PrimarySmtpAddress' -Default '') } |
                                     Where-Object { $_ })
                         }
@@ -1161,7 +1363,7 @@ try {
                             if ($existingMembers -contains $member) { continue }
                             try {
                                 $null = Invoke-MigrationAction -Description "Add $member to $targetAddress" -Action {
-                                    Add-DistributionGroupMember -Identity $targetAddress -Member $member -BypassSecurityGroupManagerCheck -ErrorAction Stop
+                                    Add-DistributionGroupMember -Identity $recipientIdentity -Member $member -BypassSecurityGroupManagerCheck -ErrorAction Stop
                                 }
                                 $membersAdded++
                             }
@@ -1182,11 +1384,11 @@ try {
                         -BooleanSetting @('HiddenFromAddressListsEnabled') -AddressSetting @('GrantSendOnBehalfTo') -Map $addressMap
                     foreach ($miss in $desired.Unmapped) { $unmappable.Add($miss) }
 
-                    $current = ConvertTo-GroupSettingState -InputObject $recipient `
-                        -BooleanSetting @('HiddenFromAddressListsEnabled') -AddressSetting @('GrantSendOnBehalfTo')
+                    $current = ConvertTo-GroupSettingState -InputObject $liveRecipient `
+                        -BooleanSetting @('HiddenFromAddressListsEnabled') -AddressSetting @('GrantSendOnBehalfTo') -Resolver $resolveRecipientAddress
                     $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
 
-                    foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-Mailbox' -Identity $targetAddress -Change $changes)) {
+                    foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-Mailbox' -Identity $recipientIdentity -Change $changes)) {
                         $settingsChanged.Add($name)
                     }
                 }
@@ -1210,13 +1412,13 @@ try {
                         try {
                             if ($right -eq 'FullAccess') {
                                 $null = Invoke-MigrationAction -Description "Grant FullAccess on $targetAddress to $trustee" -Action {
-                                    Add-MailboxPermission -Identity $targetAddress -User $trustee -AccessRights FullAccess `
+                                    Add-MailboxPermission -Identity $recipientIdentity -User $trustee -AccessRights FullAccess `
                                         -AutoMapping $true -ErrorAction Stop
                                 }
                             }
                             else {
                                 $null = Invoke-MigrationAction -Description "Grant SendAs on $targetAddress to $trustee" -Action {
-                                    Add-RecipientPermission -Identity $targetAddress -Trustee $trustee -AccessRights SendAs `
+                                    Add-RecipientPermission -Identity $recipientIdentity -Trustee $trustee -AccessRights SendAs `
                                         -Confirm:$false -ErrorAction Stop
                                 }
                             }
@@ -1235,9 +1437,9 @@ try {
                 $inventoryRow = Find-IndexedRow -Row $row -Index $contactIndex
                 if ($inventoryRow) {
                     $desired = ConvertTo-GroupSettingState -InputObject $inventoryRow -BooleanSetting @('HiddenFromAddressListsEnabled')
-                    $current = ConvertTo-GroupSettingState -InputObject $recipient -BooleanSetting @('HiddenFromAddressListsEnabled')
+                    $current = ConvertTo-GroupSettingState -InputObject $liveRecipient -BooleanSetting @('HiddenFromAddressListsEnabled')
                     $changes = Get-GroupSettingChange -Desired $desired.Settings -Current $current.Settings
-                    foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-MailContact' -Identity $targetAddress -Change $changes)) {
+                    foreach ($name in (Invoke-SettingChange -Cmdlet 'Set-MailContact' -Identity $recipientIdentity -Change $changes)) {
                         $settingsChanged.Add($name)
                     }
                 }

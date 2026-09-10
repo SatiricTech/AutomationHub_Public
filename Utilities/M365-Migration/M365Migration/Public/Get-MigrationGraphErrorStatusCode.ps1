@@ -59,5 +59,12 @@ function Get-MigrationGraphErrorStatusCode {
         return [int]$Matches[1]
     }
 
+    # SDK cmdlets (Get-MgUser -UserId on a missing object, for example) report a miss as
+    # '[Request_ResourceNotFound] : Resource ... does not exist ...' with ErrorDetails null
+    # and no numeric status anywhere in the text, so only the code name is left to match.
+    if ($message -match '(?i)\bRequest_ResourceNotFound\b' -or $message -match '(?i)\bResourceNotFound\b') {
+        return 404
+    }
+
     return 0
 }

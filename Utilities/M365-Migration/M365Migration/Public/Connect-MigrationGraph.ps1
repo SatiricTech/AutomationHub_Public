@@ -15,7 +15,11 @@ function Connect-MigrationGraph {
         results file that has to be reconciled by hand.
 
     .PARAMETER Scopes
-        The delegated permissions the calling script needs.
+        The delegated permissions the calling script needs. A granted ReadWrite scope
+        satisfies its read-only sibling (User.ReadWrite.All satisfies User.Read.All,
+        Directory.ReadWrite.All satisfies Directory.Read.All, and so on), so a technician
+        who ran a live pass earlier in the session is not forced to re-consent just to
+        rehearse the same script with -DryRun afterwards.
 
     .PARAMETER TenantId
         The tenant to sign in to. Recommended when the technician has access to several.
@@ -54,12 +58,26 @@ function Connect-MigrationGraph {
 
     Initialize-MigrationModule -Name 'Microsoft.Graph.Authentication'
 
+    # A ReadWrite scope covers every call its read-only sibling would have permitted, so it
+    # is treated as satisfying that sibling when checking what a session already holds -
+    # otherwise a -DryRun run right after (or before) a live run of the same script forces
+    # a needless reconnect even though the cached session is already privileged enough.
+    $scopeIsGranted = {
+        param([string[]]$Granted, [string]$Requested)
+        if ($Granted -contains $Requested) { return $true }
+        if ($Requested -notmatch '\bRead\b' -or $Requested -match 'ReadWrite') { return $false }
+        foreach ($grantedScope in $Granted) {
+            if (($grantedScope -replace 'ReadWrite', 'Read') -eq $Requested) { return $true }
+        }
+        return $false
+    }
+
     $existing = $null
     try { $existing = Get-MgContext } catch { $existing = $null }
 
     if ($existing) {
         $granted = @($existing.Scopes)
-        $missing = @($Scopes | Where-Object { $granted -notcontains $_ })
+        $missing = @($Scopes | Where-Object { -not (& $scopeIsGranted $granted $_) })
         $wrongTenant = $TenantId -and $existing.TenantId -and ($existing.TenantId -ne $TenantId)
 
         if ($Reconnect -or $missing.Count -gt 0 -or $wrongTenant) {
@@ -70,7 +88,7 @@ function Connect-MigrationGraph {
             try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { $null = $_ }
         }
         else {
-            Write-MigrationLog -Message "Reusing the existing Graph session for tenant $($existing.TenantId) as $($existing.Account)." -Level INFO
+            Write-MigrationLog -Message "Reusing the existing Graph session for tenant $($existing.TenantId) as $($existing.Account)." -Level SUCCESS
             return $existing
         }
     }
@@ -91,7 +109,7 @@ function Connect-MigrationGraph {
     }
 
     $grantedScopes = @($context.Scopes)
-    $notGranted = @($Scopes | Where-Object { $grantedScopes -notcontains $_ })
+    $notGranted = @($Scopes | Where-Object { -not (& $scopeIsGranted $grantedScopes $_) })
     if ($notGranted.Count -gt 0) {
         try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { $null = $_ }
         throw ('The Graph session was not granted the following required scope(s): ' + ($notGranted -join ', ') +
@@ -99,6 +117,18 @@ function Connect-MigrationGraph {
             'Until consent is granted every call using them fails with 403 Authorization_RequestDenied.')
     }
 
-    Write-MigrationLog -Message "Connected to Microsoft Graph - tenant $($context.TenantId) as $($context.Account)." -Level SUCCESS
+    # Best effort - the display name is a convenience for the log line, not something worth
+    # failing a connection over, so any failure here (missing Organization.Read.All among
+    # them) is swallowed.
+    $organizationName = ''
+    try {
+        $organization = Invoke-MgGraphRequest -Method GET -Uri '/v1.0/organization?$select=displayName' -OutputType PSObject -ErrorAction Stop
+        $first = @($organization.value) | Select-Object -First 1
+        if ($first) { $organizationName = [string]$first.displayName }
+    }
+    catch { $organizationName = '' }
+
+    $organizationText = if ($organizationName) { " ($organizationName)" } else { '' }
+    Write-MigrationLog -Message "Connected to Microsoft Graph - tenant $($context.TenantId)$organizationText as $($context.Account)." -Level SUCCESS
     return $context
 }
