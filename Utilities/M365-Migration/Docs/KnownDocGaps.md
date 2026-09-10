@@ -110,6 +110,20 @@ branch. Someone following it against the released code found the script was not 
 **Suggested fix.** Stamp each runbook with the release or merge it corresponds to, and do not
 publish one describing unreleased scripts without marking it as pending.
 
+## 10. A skipped row in the mapping export means content will not migrate
+
+**What happens.** The mapping exporter writes only the rows the plan has signed off. Anything
+else is recorded as `Skipped` in the results file and simply does not appear in the mapping
+file. The console prints a skipped count, but the mapping file itself looks complete and
+carries no trace of the omission. An operator who uploads it to the migration tool has
+silently excluded those people, and the first sign of trouble is their content never arriving.
+
+**Suggested fix.** State next to the export step that the row count of the mapping file must
+be reconciled against the number of in-scope plan rows before the file is uploaded, and that
+any `Skipped` row is a person whose mailbox and drive will not move. Consider making the
+exporter refuse to write a mapping file when any in-scope row is skipped unless a flag
+acknowledges it, since an incomplete mapping is worse than no mapping.
+
 ---
 
 ## The pattern behind these
