@@ -24,6 +24,9 @@
 #>
 
 BeforeAll {
+    # Match the scripts, which run under Set-StrictMode -Version Latest.
+    Set-StrictMode -Version Latest
+
     Import-Module (Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1') -Force
 
     $script:ScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Get-MigrationVivaLearningHistory.ps1')).Path

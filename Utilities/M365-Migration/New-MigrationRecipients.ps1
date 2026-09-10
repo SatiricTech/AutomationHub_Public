@@ -577,7 +577,10 @@ function ConvertTo-GroupSettingState {
                 if ($resolvedAddresses.Count -gt 0) { $settings[$name] = $resolvedAddresses.ToArray() }
             }
             else {
-                $addresses = ConvertTo-AddressArray -Value $raw
+                # @() is load-bearing: the helper's array unrolls through the pipeline, so one
+                # address arrives as a bare string and none as $null - .Count throws on both
+                # under Set-StrictMode.
+                $addresses = @(ConvertTo-AddressArray -Value $raw)
                 if ($addresses.Count -gt 0) { $settings[$name] = $addresses }
             }
         }

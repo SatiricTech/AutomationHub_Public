@@ -28,6 +28,9 @@
 param()
 
 BeforeAll {
+    # Match the scripts, which run under Set-StrictMode -Version Latest.
+    Set-StrictMode -Version Latest
+
     Import-Module (Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1') -Force
 
     $script:scriptPath = Join-Path $PSScriptRoot '..' 'New-MigrationRecipients.ps1'
@@ -112,7 +115,7 @@ Describe 'New-MigrationRecipients - ConvertTo-AddressArray' {
     }
 
     It 'Returns an empty array for a null value' {
-        (ConvertTo-AddressArray -Value $null).Count | Should -Be 0
+        @(ConvertTo-AddressArray -Value $null).Count | Should -Be 0
     }
 }
 
@@ -283,6 +286,22 @@ Describe 'New-MigrationRecipients - group settings diff' {
         $state.Unmapped | Should -Be @('ManagedBy: gone@contoso.com')
     }
 
+    It 'Reads a single-address or empty setting under strict mode when neither -Map nor -Resolver is given' {
+        # ConvertTo-AddressArray emits through the pipeline, so one address unrolls to a bare string
+        # and none to $null; the caller must wrap it or .Count throws under strict mode.
+        Set-StrictMode -Version Latest
+        try {
+            $one = ConvertTo-GroupSettingState -InputObject ([pscustomobject]@{ ManagedBy = 'solo@newco.com' }) `
+                -AddressSetting @('ManagedBy')
+            $one.Settings['ManagedBy'] | Should -Be @('solo@newco.com')
+
+            $none = ConvertTo-GroupSettingState -InputObject ([pscustomobject]@{ ManagedBy = '' }) `
+                -AddressSetting @('ManagedBy')
+            $none.Settings.Contains('ManagedBy') | Should -BeFalse
+        }
+        finally { Set-StrictMode -Off }
+    }
+
     It 'Resolves a canonical Exchange identity to an address through -Resolver, so the diff can match it' {
         $resolver = { param($id) if ($id -eq 'newco.com/Users/John Smith') { 'john.smith@newco.com' } else { [string]$id } }
         $current = ConvertTo-GroupSettingState -InputObject ([pscustomobject]@{ ManagedBy = @('newco.com/Users/John Smith') }) `
@@ -319,7 +338,7 @@ Describe 'New-MigrationRecipients - Get-PlanAliasAddress' {
 
     It 'Returns nothing when the row has no aliases and no legacy DN' {
         $row = [pscustomobject]@{ TargetAliases = ''; SourceX500 = ''; LegacyExchangeDN = '' }
-        (Get-PlanAliasAddress -Row $row -PrimaryAddress 'a@newco.com').Count | Should -Be 0
+        @(Get-PlanAliasAddress -Row $row -PrimaryAddress 'a@newco.com').Count | Should -Be 0
     }
 }
 

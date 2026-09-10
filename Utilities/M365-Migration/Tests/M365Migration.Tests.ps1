@@ -1,6 +1,9 @@
 #Requires -Version 7.4
 
 BeforeAll {
+    # Match the scripts, which run under Set-StrictMode -Version Latest.
+    Set-StrictMode -Version Latest
+
     $script:modulePath = Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1'
     $script:moduleRoot = Split-Path -Path $script:modulePath -Parent
     Import-Module $script:modulePath -Force

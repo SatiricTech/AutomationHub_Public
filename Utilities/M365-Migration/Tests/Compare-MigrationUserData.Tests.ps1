@@ -11,6 +11,9 @@
 #>
 
 BeforeAll {
+    # Match the scripts, which run under Set-StrictMode -Version Latest.
+    Set-StrictMode -Version Latest
+
     $script:scriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Compare-MigrationUserData.ps1')).Path
     $script:fixtures = (Resolve-Path (Join-Path $PSScriptRoot 'Fixtures' 'Compare-MigrationUserData')).Path
 

@@ -26,6 +26,9 @@
 param()
 
 BeforeAll {
+    # Match the scripts, which run under Set-StrictMode -Version Latest.
+    Set-StrictMode -Version Latest
+
     $script:MigrationRoot = Join-Path -Path $PSScriptRoot -ChildPath '..'
     Import-Module (Join-Path -Path $script:MigrationRoot -ChildPath 'M365Migration/M365Migration.psd1') -Force
 

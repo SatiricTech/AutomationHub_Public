@@ -18,6 +18,9 @@ $script:HasImportExcel = @(Get-Module -ListAvailable -Name ImportExcel -ErrorAct
         Where-Object { $_.Version -ge [version]'7.1.0' }).Count -gt 0
 
 BeforeAll {
+    # Match the scripts, which run under Set-StrictMode -Version Latest.
+    Set-StrictMode -Version Latest
+
     Import-Module (Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1') -Force
 
     $script:MappingScript = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Export-MigrationMappingFile.ps1')).ProviderPath

@@ -575,7 +575,7 @@ function ConvertTo-InventoryUserRow {
         CompanyName            = [string](Get-InventoryValue $User 'companyName' '')
         EmployeeId             = [string](Get-InventoryValue $User 'employeeId' '')
         EmployeeType           = [string](Get-InventoryValue $User 'employeeType' '')
-        BusinessPhone          = [string]$businessPhones[0]
+        BusinessPhone          = if ($businessPhones.Count -gt 0) { [string]$businessPhones[0] } else { '' }
         FaxNumber              = [string](Get-InventoryValue $User 'faxNumber' '')
         PreferredLanguage      = [string](Get-InventoryValue $User 'preferredLanguage' '')
         UsageLocation          = [string](Get-InventoryValue $User 'usageLocation' '')
@@ -1260,7 +1260,9 @@ try {
     $run = Initialize-MigrationRun -ScriptName 'Get-MigrationInventory' -OutputPath $OutputPath -Prefix $Prefix `
         -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
 
-    $domains = ConvertTo-InventoryDomainList -Domain $DomainFilter
+    # @() is load-bearing: the helper emits through the pipeline, so no filter arrives as $null and
+    # a single domain as a bare string - either one makes .Count throw under Set-StrictMode.
+    $domains = @(ConvertTo-InventoryDomainList -Domain $DomainFilter)
     if ($domains.Count -gt 0) {
         Write-MigrationLog -Message "Domain filter: $(Join-MigrationList -Values $domains)" -Level INFO
     }

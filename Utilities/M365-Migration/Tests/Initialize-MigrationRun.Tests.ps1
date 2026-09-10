@@ -1,6 +1,9 @@
 #Requires -Version 7.4
 
 BeforeAll {
+    # Match the scripts, which run under Set-StrictMode -Version Latest.
+    Set-StrictMode -Version Latest
+
     Import-Module (Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1') -Force
 
     $script:workspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Run-$([guid]::NewGuid())"
