@@ -1,6 +1,9 @@
 #Requires -Version 7.4
 
 BeforeAll {
+    # Match the scripts, which run under Set-StrictMode -Version Latest.
+    Set-StrictMode -Version Latest
+
     Import-Module (Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1') -Force
 
     $script:workspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Report-$([guid]::NewGuid())"
@@ -22,7 +25,7 @@ Describe 'Export-MigrationReport' {
 
     Context 'File naming' {
 
-        It 'Names the file <Name>_<timestamp>.csv in the run output directory' {
+        It 'Names the file Name_timestamp.csv in the run output directory' {
             $null = Initialize-MigrationRun -ScriptName 'Remove-DomainReferences' -OutputPath $script:workspace
             $path = Export-MigrationReport -Rows $script:sampleRows -Name 'DomainReferences'
             [System.IO.Path]::GetFileName($path) | Should -Match '^DomainReferences_\d{8}-\d{6}\.csv$'

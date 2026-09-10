@@ -21,6 +21,9 @@
 param()
 
 BeforeAll {
+    # Match the scripts, which run under Set-StrictMode -Version Latest.
+    Set-StrictMode -Version Latest
+
     Import-Module (Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1') -Force
 
     $scriptPath = Join-Path $PSScriptRoot '..' 'Reset-MigrationCutoverPasswords.ps1'

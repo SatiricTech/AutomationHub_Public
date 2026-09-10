@@ -8,7 +8,7 @@ function Invoke-MigrationAction {
         DryRun promise credible: there is exactly one place where a write can happen,
         and it is guarded by one flag read from the run context.
 
-        In DryRun the action is not invoked and $null is returned, after logging
+        In DryRun the action is not invoked and nothing is emitted, after logging
         '[DRYRUN] Would: <Description>'. Otherwise the description is logged, the action
         runs, and any failure is logged and re-thrown so the caller's per-row catch can
         mark the row Failed.
@@ -59,7 +59,9 @@ function Invoke-MigrationAction {
 
     if ($isDryRun) {
         Write-MigrationLog -Message "[DRYRUN] Would: $Description" -Level WARNING
-        return $null
+        # A bare return: 'return $null' would emit a null into the pipeline, and a caller that does
+        # not capture this call would then hand back two objects instead of its one result row.
+        return
     }
 
     Write-MigrationLog -Message $Description -Level INFO

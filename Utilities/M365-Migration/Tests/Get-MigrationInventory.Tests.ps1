@@ -12,6 +12,10 @@
 #>
 
 BeforeAll {
+    # The script itself runs under Set-StrictMode -Version Latest, so the lifted functions must be
+    # exercised the same way - out-of-range indexing and .Count on $null only throw under it.
+    Set-StrictMode -Version Latest
+
     Import-Module (Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1') -Force
 
     $inventoryScript = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Get-MigrationInventory.ps1')).Path
@@ -114,6 +118,21 @@ Describe 'ConvertTo-InventoryDomainList' {
     It 'Returns an empty array when no filter was supplied' {
         @(ConvertTo-InventoryDomainList -Domain @()).Count | Should -Be 0
         @(ConvertTo-InventoryDomainList -Domain $null).Count | Should -Be 0
+    }
+
+    It 'Can be counted under strict mode the way the main block calls it, with or without a filter' {
+        # Mirrors the assignment in the script's main block. Without the @() wrapper a missing
+        # filter is $null and a single domain is a bare string, and .Count throws under strict mode.
+        Set-StrictMode -Version Latest
+        try {
+            $none = @(ConvertTo-InventoryDomainList -Domain $null)
+            $none.Count | Should -Be 0
+
+            $one = @(ConvertTo-InventoryDomainList -Domain @('Contoso.com'))
+            $one.Count | Should -Be 1
+            $one[0] | Should -Be 'contoso.com'
+        }
+        finally { Set-StrictMode -Off }
     }
 }
 
