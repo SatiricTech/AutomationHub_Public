@@ -124,6 +124,31 @@ any `Skipped` row is a person whose mailbox and drive will not move. Consider ma
 exporter refuse to write a mapping file when any in-scope row is skipped unless a flag
 acknowledges it, since an incomplete mapping is worse than no mapping.
 
+## 11. Re-planning with an existing plan freezes licences too
+
+**What happens.** `-ExistingPlanPath` is documented as preserving a row's destination
+identity, wave and provisioning state. It also preserves the target licence column. So a
+re-run whose whole purpose is to apply a new or corrected SKU map silently skips every
+operator-override row, leaving those users mapped to their old source SKUs — which may not
+even exist in the destination tenant.
+
+**Suggested fix.** Say plainly which columns `-ExistingPlanPath` freezes, licences included,
+and warn that a SKU map change does not reach those rows. Consider preserving identity while
+still recomputing licences, since identity is the thing an operator hand-edits and licences
+are the thing a map is meant to own.
+
+## 12. The seat pre-check counts users who already hold the licence
+
+**What happens.** The seat check totals every plan row that wants a SKU and compares it with
+the free seats, without subtracting rows whose destination user already has that licence. On a
+migration with a pilot wave already provisioned and licensed, the reported shortfall is
+overstated by the size of that wave, and the check keeps failing after enough seats have been
+bought.
+
+**Suggested fix.** Subtract rows whose target user already holds the SKU, or report both
+numbers — total planned and net new — so the operator knows how many seats to actually buy.
+Until then, note in the docs that the figure is an upper bound when an earlier wave exists.
+
 ---
 
 ## The pattern behind these
