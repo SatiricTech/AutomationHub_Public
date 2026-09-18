@@ -111,7 +111,7 @@
     Dot-sources the helper functions without loading WinForms, as the Pester suite does.
 
 .NOTES
-    Version:    1.1.0
+    Version:    1.1.1
     Created:    2026-09-17
     Platform:   Windows Server 2016 or later, Windows PowerShell 5.1, elevated, -STA.
     Exit codes: 0 the GUI ran and was closed normally; 1 unexpected error; 2 a refusal condition
@@ -881,21 +881,29 @@ function Format-WatchdogGuiTaskResult {
         worker exit code and is mapped as one, so the exit-code map itself stays a faithful copy of
         the public scripts' .NOTES lists.
     .PARAMETER LastTaskResult
-        The task's LastTaskResult.
+        The task's LastTaskResult. Task Scheduler reports it as an unsigned 32-bit value, and an
+        abnormal run (the action was killed, or powershell.exe itself crashed) leaves an
+        HRESULT-style code above 0x7FFFFFFF there, so the parameter is not [int]: casting
+        4294770688 (0xFFFD0000) to Int32 threw, and because the status line is refreshed at
+        startup the GUI exited 1 before its window opened.
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param (
         [Parameter(Mandatory)]
-        [int]$LastTaskResult
+        [uint32]$LastTaskResult
     )
 
     switch ($LastTaskResult) {
         267011 { return '267011 - the task has not run yet.' }
         267009 { return '267009 - the task is running now.' }
         267014 { return '267014 - the last run was stopped before it finished.' }
+        { $_ -gt [int]::MaxValue } {
+            return ('0x{0:X8} - the last run ended abnormally (not a worker exit code); ' +
+                'press Install to re-register the task, then Check status again.') -f $LastTaskResult
+        }
         default {
-            $mapped = Get-WatchdogGuiExitCodeMeaning -ExitCode $LastTaskResult -Script 'Worker'
+            $mapped = Get-WatchdogGuiExitCodeMeaning -ExitCode ([int]$LastTaskResult) -Script 'Worker'
             return ('{0} - {1}' -f $mapped.ExitCode, $mapped.Meaning)
         }
     }
@@ -948,7 +956,7 @@ function Format-WatchdogGuiTaskStatus {
         if ($TaskInfo.LastRunTime) { $lastRun = ([datetime]$TaskInfo.LastRunTime).ToString('yyyy-MM-dd HH:mm:ss') }
         if ($TaskInfo.NextRunTime) { $nextRun = ([datetime]$TaskInfo.NextRunTime).ToString('yyyy-MM-dd HH:mm:ss') }
         if ($null -ne $TaskInfo.LastTaskResult) {
-            $resultText = Format-WatchdogGuiTaskResult -LastTaskResult ([int]$TaskInfo.LastTaskResult)
+            $resultText = Format-WatchdogGuiTaskResult -LastTaskResult ([uint32]$TaskInfo.LastTaskResult)
         }
     }
 
@@ -1998,7 +2006,15 @@ function Update-WatchdogGuiStatusLine {
         Write-WatchdogGuiLog "Could not query the scheduled task '$script:WatchdogGuiTaskName': $_" -Level 'WARNING'
     }
     $configPresent = [bool](Test-Path -LiteralPath $script:WatchdogGuiConfigPath -PathType Leaf)
-    $lines = Format-WatchdogGuiTaskStatus -TaskState $taskState -TaskInfo $taskInfo -ConfigPresent:$configPresent
+    # This runs while the window is being built, so a formatting problem must degrade to a
+    # warning in the status bar rather than propagate and close the GUI before it opens.
+    try {
+        $lines = Format-WatchdogGuiTaskStatus -TaskState $taskState -TaskInfo $taskInfo -ConfigPresent:$configPresent
+    }
+    catch {
+        Write-WatchdogGuiLog "Could not format the task status: $_" -Level 'WARNING'
+        $lines = @("Status unavailable: $_ (Check status will retry; the log pane has the detail).")
+    }
     $script:Gui.StatusItem.Text = $lines[0]
     if ($Detailed) {
         foreach ($line in $lines) { Write-WatchdogGuiLog $line }
@@ -2665,7 +2681,7 @@ if (-not $NoGui -and $MyInvocation.InvocationName -ne '.') {
     $exitCode = 1
     try {
         Initialize-WatchdogGuiLog -Path $LogPath | Out-Null
-        Write-WatchdogGuiLog "=== Install-WinServiceWatchdogGui 1.1.0 starting on $env:COMPUTERNAME ===" -NoPane
+        Write-WatchdogGuiLog "=== Install-WinServiceWatchdogGui 1.1.1 starting on $env:COMPUTERNAME ===" -NoPane
         Write-WatchdogGuiLog ("Parameters: PackageRoot='$PackageRoot' SettingsPath='$SettingsPath' " +
             "Verbosity=$Verbosity DryRun=$($DryRun.IsPresent)") -NoPane
         $exitCode = Start-WatchdogGui -PackageRoot $PackageRoot -SettingsFile $SettingsPath

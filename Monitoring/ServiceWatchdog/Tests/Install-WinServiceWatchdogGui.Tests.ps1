@@ -304,6 +304,18 @@ Describe 'Format-WatchdogGuiTaskResult' {
         $lines[0] | Should -Match 'has not run yet'
         $lines[0] | Should -Not -Match 'Unrecognised'
     }
+
+    It 'accepts the unsigned HRESULT-style results Task Scheduler reports for an abnormal run' {
+        # LastTaskResult is a UInt32; 0xFFFD0000 overflowed the old [int] parameter and the GUI
+        # exited 1 at startup on a server whose earlier task run had died this way.
+        $text = Format-WatchdogGuiTaskResult -LastTaskResult ([uint32]4294770688)
+        $text | Should -Match '0xFFFD0000'
+        $text | Should -Match 'ended abnormally'
+
+        $info = [pscustomobject]@{ LastRunTime = $null; NextRunTime = $null; LastTaskResult = [uint32]4294770688 }
+        $lines = Format-WatchdogGuiTaskStatus -TaskState 'Ready' -TaskInfo $info -ConfigPresent
+        $lines[0] | Should -Match '0xFFFD0000'
+    }
 }
 
 Describe 'Read-WatchdogGuiFileTail' {
