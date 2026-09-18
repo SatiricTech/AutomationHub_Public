@@ -9,6 +9,12 @@ function Format-MigrationPrefix {
         a hyphen. An empty prefix is legal and returns an empty string, which callers
         read as "no prefix".
 
+        Underscores are also replaced with a hyphen, even though a filesystem tolerates
+        them: '_' is the output filename contract's separator (see
+        Get-MigrationOutputPath and ConvertFrom-MigrationOutputPath), and a prefix that
+        contained one would let Initialize-MigrationRun build a filename the parser
+        could not read back apart.
+
     .PARAMETER Value
         The raw prefix supplied by the operator.
 
@@ -16,6 +22,11 @@ function Format-MigrationPrefix {
         Format-MigrationPrefix -Value 'Contoso Wave 1'
 
         Returns 'Contoso-Wave-1'.
+
+    .EXAMPLE
+        Format-MigrationPrefix -Value 'Client_A'
+
+        Returns 'Client-A' - the underscore is replaced, not preserved.
 
     .NOTES
         Author: AutomationHub
@@ -32,5 +43,6 @@ function Format-MigrationPrefix {
     if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
 
     $clean = $Value.Trim() -replace '[^\w\.\-]+', '-'
+    $clean = $clean -replace '_+', '-'
     return ($clean -replace '-{2,}', '-').Trim('-')
 }

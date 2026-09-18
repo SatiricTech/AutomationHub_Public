@@ -77,7 +77,7 @@ function ConvertFrom-MigrationOutputPath {
     $hyphenIndex = $rawName.LastIndexOf('-')
     if ($hyphenIndex -ge 0) {
         $candidate = $rawName.Substring($hyphenIndex + 1)
-        if ($modeSuffixes -contains $candidate) {
+        if ($modeSuffixes -ccontains $candidate) {
             $suffix = $candidate
             $name = $rawName.Substring(0, $hyphenIndex)
         }

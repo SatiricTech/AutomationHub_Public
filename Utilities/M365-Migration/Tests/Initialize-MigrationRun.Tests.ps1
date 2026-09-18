@@ -46,6 +46,11 @@ Describe 'Initialize-MigrationRun' {
         $run.Prefix | Should -BeExactly 'Contoso-Wave-1'
     }
 
+    It 'Replaces an underscore in the prefix, since it is the output filename contract''s separator' {
+        $run = Initialize-MigrationRun -ScriptName 'Test-Script' -OutputPath $script:workspace -Prefix 'Client_A'
+        $run.Prefix | Should -BeExactly 'Client-A'
+    }
+
     It 'Honours an explicit -LogPath' {
         $logPath = Join-Path $script:workspace 'explicit.log'
         $run = Initialize-MigrationRun -ScriptName 'Test-Script' -OutputPath $script:workspace -LogPath $logPath

@@ -18,10 +18,11 @@ function Get-MigrationOutputPath {
         is what lets the function be exercised in tests, and lets ad-hoc callers use it,
         without standing up a run first.
 
-        Name and Suffix must not contain an underscore: the underscore is the separator
-        the parser (ConvertFrom-MigrationOutputPath) relies on to split prefix, name and
-        timestamp apart. A hyphen is fine and expected - script and function names such
-        as 'Set-Identity' or 'Migration-Inventory' are common Name values.
+        Name, Suffix and Prefix must not contain an underscore: the underscore is the
+        separator the parser (ConvertFrom-MigrationOutputPath) relies on to split
+        prefix, name and timestamp apart. A hyphen is fine and expected - script and
+        function names such as 'Set-Identity' or 'Migration-Inventory' are common Name
+        values.
 
     .PARAMETER Name
         The base name of the file, for example 'Set-Identity' or 'IdentityPlan'. Must not
@@ -45,7 +46,8 @@ function Get-MigrationOutputPath {
 
     .PARAMETER Prefix
         Names the client or run; becomes the filename's leading '<Prefix>_'. Defaults to
-        the run context's Prefix, or no leader at all when no run is active.
+        the run context's Prefix, or no leader at all when no run is active. Must not
+        contain an underscore.
 
     .EXAMPLE
         Get-MigrationOutputPath -Name 'Set-Identity' -Suffix 'Results'
@@ -86,8 +88,8 @@ function Get-MigrationOutputPath {
         [string]$Prefix
     )
 
-    if ($Name -match '_' -or $Suffix -match '_') {
-        throw 'Name and Suffix must not contain an underscore: it is the separator of the filename contract.'
+    if ($Name -match '_' -or $Suffix -match '_' -or $Prefix -match '_') {
+        throw 'Name, Suffix and Prefix must not contain an underscore: it is the separator of the filename contract.'
     }
 
     $run = Get-MigrationRunContext
