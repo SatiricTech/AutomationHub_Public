@@ -523,7 +523,7 @@ function New-WatchdogMailResult {
         [string]$ProviderMessageId,
 
         [AllowNull()]
-        [string]$Error,
+        [string]$ErrorMessage,
 
         [AllowNull()]
         [System.Nullable[int]]$StatusCode
@@ -532,7 +532,7 @@ function New-WatchdogMailResult {
     return @{
         Sent              = $Sent
         ProviderMessageId = $ProviderMessageId
-        Error             = $Error
+        Error             = $ErrorMessage
         StatusCode        = $StatusCode
     }
 }
@@ -589,7 +589,7 @@ function Send-WatchdogMailSmtp2Go {
         catch {
             $message = "SMTP2GO request failed on attempt ${attempt}: $($_.Exception.Message)"
             Write-WatchdogLog -Message $message -Level Error
-            return (New-WatchdogMailResult -Sent $false -Error $message)
+            return (New-WatchdogMailResult -Sent $false -ErrorMessage $message)
         }
 
         $statusCode = [int]$response.StatusCode
@@ -613,7 +613,7 @@ function Send-WatchdogMailSmtp2Go {
             }
             $message = "SMTP2GO accepted the request but delivered to no recipient (failed=$failed)"
             Write-WatchdogLog -Message $message -Level Error
-            return (New-WatchdogMailResult -Sent $false -Error $message -StatusCode $statusCode)
+            return (New-WatchdogMailResult -Sent $false -ErrorMessage $message -StatusCode $statusCode)
         }
 
         $providerError = [string](Get-WatchdogField -Object $data -Name 'error')
@@ -637,7 +637,7 @@ function Send-WatchdogMailSmtp2Go {
 
         $message = "SMTP2GO returned HTTP ${statusCode}: $providerError"
         Write-WatchdogLog -Message $message -Level Error
-        return (New-WatchdogMailResult -Sent $false -Error $message -StatusCode $statusCode)
+        return (New-WatchdogMailResult -Sent $false -ErrorMessage $message -StatusCode $statusCode)
     }
 }
 
@@ -721,7 +721,7 @@ function Send-WatchdogMailSmtp {
     catch {
         $errorText = "SMTP send via $($Config.SmtpHost):$($Config.SmtpPort) failed: $($_.Exception.Message)"
         Write-WatchdogLog -Message $errorText -Level Error
-        return (New-WatchdogMailResult -Sent $false -Error $errorText)
+        return (New-WatchdogMailResult -Sent $false -ErrorMessage $errorText)
     }
     finally {
         foreach ($disposable in @($message, $client)) {
@@ -1000,8 +1000,10 @@ function Get-WatchdogConfig {
         MailFrom                = $setting['WATCHDOG_MAIL_FROM']
         MailTo                  = $mailTo
         MailSubjectPrefix       = $setting['WATCHDOG_MAIL_SUBJECT_PREFIX']
-        MailTimeoutSeconds      = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_MAIL_TIMEOUT_SECONDS' `
-            -Value $setting['WATCHDOG_MAIL_TIMEOUT_SECONDS']
+        # Guarded rather than strict: a 0 or a typo here would otherwise stop every email.
+        MailTimeoutSeconds      = ConvertTo-WatchdogSettingLimit -Name 'WATCHDOG_MAIL_TIMEOUT_SECONDS' `
+            -Value $setting['WATCHDOG_MAIL_TIMEOUT_SECONDS'] `
+            -Default ([int]$defaults['WATCHDOG_MAIL_TIMEOUT_SECONDS'])
         Smtp2GoApiUrl           = $null
         Smtp2GoApiKey           = $null
         SmtpHost                = $null
@@ -1010,15 +1012,19 @@ function Get-WatchdogConfig {
         SmtpPassword            = $null
         SmtpUseStartTls         = $true
         TableEndpoint           = $tableEndpoint
-        MaxAlertsPerHostPerHour = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR' `
-            -Value $setting['WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR']
+        # Guarded rather than strict: a 0 or a typo here would otherwise stop every alert.
+        MaxAlertsPerHostPerHour = ConvertTo-WatchdogSettingLimit -Name 'WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR' `
+            -Value $setting['WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR'] `
+            -Default ([int]$defaults['WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR'])
         # Guarded rather than strict: a 0 or a typo here would otherwise stop every email.
         MaxEmailsPerHour        = ConvertTo-WatchdogSettingLimit -Name 'WATCHDOG_MAX_EMAILS_PER_HOUR' `
             -Value $setting['WATCHDOG_MAX_EMAILS_PER_HOUR'] `
             -Default ([int]$defaults['WATCHDOG_MAX_EMAILS_PER_HOUR'])
         AllowedSites            = ConvertTo-WatchdogSettingList -Value $setting['WATCHDOG_ALLOWED_SITES']
-        StaleHours              = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_STALE_HOURS' `
-            -Value $setting['WATCHDOG_STALE_HOURS']
+        # Guarded rather than strict: a 0 or a typo here would otherwise break the digest.
+        StaleHours              = ConvertTo-WatchdogSettingLimit -Name 'WATCHDOG_STALE_HOURS' `
+            -Value $setting['WATCHDOG_STALE_HOURS'] `
+            -Default ([int]$defaults['WATCHDOG_STALE_HOURS'])
         DigestAlwaysSend        = ConvertTo-WatchdogSettingBool -Name 'WATCHDOG_DIGEST_ALWAYS_SEND' `
             -Value $setting['WATCHDOG_DIGEST_ALWAYS_SEND']
     }
@@ -1029,7 +1035,10 @@ function Get-WatchdogConfig {
     }
     else {
         $config.SmtpHost = $setting['WATCHDOG_SMTP_HOST']
-        $config.SmtpPort = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_SMTP_PORT' -Value $setting['WATCHDOG_SMTP_PORT']
+        # Guarded rather than strict: a 0 or a typo here would otherwise stop every email.
+        $config.SmtpPort = ConvertTo-WatchdogSettingLimit -Name 'WATCHDOG_SMTP_PORT' `
+            -Value $setting['WATCHDOG_SMTP_PORT'] `
+            -Default ([int]$defaults['WATCHDOG_SMTP_PORT'])
         $config.SmtpUsername = $setting['WATCHDOG_SMTP_USERNAME']
         $config.SmtpPassword = $setting['WATCHDOG_SMTP_PASSWORD']
         $config.SmtpUseStartTls = ConvertTo-WatchdogSettingBool -Name 'WATCHDOG_SMTP_USE_STARTTLS' `

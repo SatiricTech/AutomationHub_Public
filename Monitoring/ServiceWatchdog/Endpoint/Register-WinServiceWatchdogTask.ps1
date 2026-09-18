@@ -139,10 +139,11 @@
     Platform:   Windows Server 2016 or later, Windows PowerShell 5.1 or PowerShell 7,
                 elevated. #Requires -RunAsAdministrator stops the script before it runs when
                 not elevated; the host reports exit 1 in that case.
-    Exit codes: 0 success; 1 unexpected error; 2 config invalid, config not yet edited,
-                config outside InstallPath, worker already present without -Force, or
-                execution limit too small; 10 test alert not delivered (task registered);
-                50 task registered but one or more -SetServiceRecovery steps failed.
+    Exit codes: 0 success; 1 unexpected error; 2 InstallPath is a filesystem root or Windows
+                system folder, config invalid, config not yet edited, config outside
+                InstallPath, worker already present without -Force, or execution limit too
+                small; 10 test alert not delivered (task registered); 50 task registered but
+                one or more -SetServiceRecovery steps failed.
 
     Checklist deviations from the powershell-authoring skill (Enterprise tier), per
     DESIGN.md section 4.1:

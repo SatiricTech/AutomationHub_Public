@@ -133,7 +133,7 @@ BeforeAll {
 
             [int]$Failed = 0,
 
-            [string]$Error,
+            [string]$ErrorMessage,
 
             [hashtable]$Headers = @{}
         )
@@ -151,7 +151,7 @@ BeforeAll {
         else {
             $content = @{
                 request_id = 'req-1'
-                data       = @{ error_code = 'E_TEST'; error = $Error }
+                data       = @{ error_code = 'E_TEST'; error = $ErrorMessage }
             }
         }
         return [pscustomobject]@{
@@ -334,9 +334,104 @@ Describe 'ServiceWatchdogAlert module' {
             }
         }
 
-        It 'rejects a non-numeric numeric setting naming it' {
-            $environment = New-TestEnvironment -Overrides @{ WATCHDOG_STALE_HOURS = 'soon' }
-            { Get-WatchdogConfig -Environment $environment } | Should -Throw -ExpectedMessage '*WATCHDOG_STALE_HOURS*'
+        It 'falls back to the default host-alert cap and warns instead of blocking every alert (<_>)' -ForEach @(
+            '0', '-5', 'none', '60 per hour'
+        ) {
+            # Same parked bug as WATCHDOG_MAX_EMAILS_PER_HOUR: 0 (and any non-numeric value)
+            # reached the limiters, whose -Limit starts at 1, so the binding threw.
+            $environment = New-TestEnvironment -Overrides @{ WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR = $_ }
+
+            $config = Get-WatchdogConfig -Environment $environment
+
+            $config.MaxAlertsPerHostPerHour | Should -Be 6
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'Warning' -and $Message -match 'WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR'
+            }
+        }
+
+        It 'keeps a valid host-alert cap and logs no warning for it' {
+            $environment = New-TestEnvironment -Overrides @{ WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR = '1' }
+
+            (Get-WatchdogConfig -Environment $environment).MaxAlertsPerHostPerHour | Should -Be 1
+
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 0 -ParameterFilter {
+                $Message -match 'WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR'
+            }
+        }
+
+        It 'falls back to the default stale-hours setting and warns instead of breaking the digest (<_>)' -ForEach @(
+            '0', '-5', 'none', '60 per hour'
+        ) {
+            # Same parked bug as WATCHDOG_MAX_EMAILS_PER_HOUR: 0 (and any non-numeric value)
+            # reached a ValidateRange(1, ...) parameter downstream, so the digest broke.
+            $environment = New-TestEnvironment -Overrides @{ WATCHDOG_STALE_HOURS = $_ }
+
+            $config = Get-WatchdogConfig -Environment $environment
+
+            $config.StaleHours | Should -Be 26
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'Warning' -and $Message -match 'WATCHDOG_STALE_HOURS'
+            }
+        }
+
+        It 'keeps a valid stale-hours setting and logs no warning for it' {
+            $environment = New-TestEnvironment -Overrides @{ WATCHDOG_STALE_HOURS = '1' }
+
+            (Get-WatchdogConfig -Environment $environment).StaleHours | Should -Be 1
+
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 0 -ParameterFilter {
+                $Message -match 'WATCHDOG_STALE_HOURS'
+            }
+        }
+
+        It 'falls back to the default mail timeout and warns instead of blocking every send (<_>)' -ForEach @(
+            '0', '-5', 'none', '60 per hour'
+        ) {
+            # Same parked bug as WATCHDOG_MAX_EMAILS_PER_HOUR: 0 (and any non-numeric value)
+            # reached a ValidateRange(1, ...) parameter downstream, so nothing was mailed.
+            $environment = New-TestEnvironment -Overrides @{ WATCHDOG_MAIL_TIMEOUT_SECONDS = $_ }
+
+            $config = Get-WatchdogConfig -Environment $environment
+
+            $config.MailTimeoutSeconds | Should -Be 20
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'Warning' -and $Message -match 'WATCHDOG_MAIL_TIMEOUT_SECONDS'
+            }
+        }
+
+        It 'keeps a valid mail timeout and logs no warning for it' {
+            $environment = New-TestEnvironment -Overrides @{ WATCHDOG_MAIL_TIMEOUT_SECONDS = '1' }
+
+            (Get-WatchdogConfig -Environment $environment).MailTimeoutSeconds | Should -Be 1
+
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 0 -ParameterFilter {
+                $Message -match 'WATCHDOG_MAIL_TIMEOUT_SECONDS'
+            }
+        }
+
+        It 'falls back to the default SMTP port and warns instead of blocking every send (<_>)' -ForEach @(
+            '0', '-5', 'none', '60 per hour'
+        ) {
+            # Same parked bug as WATCHDOG_MAX_EMAILS_PER_HOUR: 0 (and any non-numeric value)
+            # reached a ValidateRange(1, ...) parameter downstream, so nothing was mailed.
+            $environment = New-TestEnvironment -Provider 'Smtp' -Overrides @{ WATCHDOG_SMTP_PORT = $_ }
+
+            $config = Get-WatchdogConfig -Environment $environment
+
+            $config.SmtpPort | Should -Be 587
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'Warning' -and $Message -match 'WATCHDOG_SMTP_PORT'
+            }
+        }
+
+        It 'keeps a valid SMTP port and logs no warning for it' {
+            $environment = New-TestEnvironment -Provider 'Smtp' -Overrides @{ WATCHDOG_SMTP_PORT = '1' }
+
+            (Get-WatchdogConfig -Environment $environment).SmtpPort | Should -Be 1
+
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 0 -ParameterFilter {
+                $Message -match 'WATCHDOG_SMTP_PORT'
+            }
         }
 
         It 'appends a trailing slash to the table endpoint when missing' {
@@ -708,7 +803,7 @@ Describe 'ServiceWatchdogAlert module' {
 
         It 'returns the provider error text on 400 and does not retry' {
             Mock -ModuleName $script:ModuleName Invoke-WebRequest {
-                New-Smtp2GoResponse -StatusCode 400 -Error 'sender not verified'
+                New-Smtp2GoResponse -StatusCode 400 -ErrorMessage 'sender not verified'
             }
             $result = Send-WatchdogMail -Config $script:Config -Subject 'S' -TextBody 'T' -HtmlBody 'H'
             $result.Sent | Should -BeFalse
@@ -722,7 +817,7 @@ Describe 'ServiceWatchdogAlert module' {
             # The mock body runs in the module scope and a closure sees only what it captured, so the
             # responses are built here and the counter travels inside a captured hashtable.
             $calls = @{ Count = 0 }
-            $throttled = New-Smtp2GoResponse -StatusCode 429 -Error 'throttled' -Headers @{ 'Retry-After' = @('7') }
+            $throttled = New-Smtp2GoResponse -StatusCode 429 -ErrorMessage 'throttled' -Headers @{ 'Retry-After' = @('7') }
             $accepted = New-Smtp2GoResponse
             Mock -ModuleName $script:ModuleName Invoke-WebRequest ({
                     $calls.Count++
@@ -741,7 +836,7 @@ Describe 'ServiceWatchdogAlert module' {
 
         It 'caps Retry-After at 30 seconds' {
             Mock -ModuleName $script:ModuleName Invoke-WebRequest {
-                New-Smtp2GoResponse -StatusCode 503 -Error 'busy' -Headers @{ 'Retry-After' = @('600') }
+                New-Smtp2GoResponse -StatusCode 503 -ErrorMessage 'busy' -Headers @{ 'Retry-After' = @('600') }
             }
             $null = Send-WatchdogMail -Config $script:Config -Subject 'S' -TextBody 'T' -HtmlBody 'H'
             Should -Invoke -ModuleName $script:ModuleName Start-Sleep -Times 2 -Exactly -ParameterFilter {
@@ -750,7 +845,7 @@ Describe 'ServiceWatchdogAlert module' {
         }
 
         It 'gives up after three 503 responses' {
-            Mock -ModuleName $script:ModuleName Invoke-WebRequest { New-Smtp2GoResponse -StatusCode 503 -Error 'busy' }
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest { New-Smtp2GoResponse -StatusCode 503 -ErrorMessage 'busy' }
             $result = Send-WatchdogMail -Config $script:Config -Subject 'S' -TextBody 'T' -HtmlBody 'H'
             $result.Sent | Should -BeFalse
             $result.StatusCode | Should -Be 503
@@ -773,7 +868,7 @@ Describe 'ServiceWatchdogAlert module' {
         }
 
         It 'never writes the API key to the log' {
-            Mock -ModuleName $script:ModuleName Invoke-WebRequest { New-Smtp2GoResponse -StatusCode 400 -Error 'bad' }
+            Mock -ModuleName $script:ModuleName Invoke-WebRequest { New-Smtp2GoResponse -StatusCode 400 -ErrorMessage 'bad' }
             $null = Send-WatchdogMail -Config $script:Config -Subject 'S' -TextBody 'T' -HtmlBody 'H'
             Should -Invoke -ModuleName $script:ModuleName Write-WatchdogLog -Times 0 -Exactly -ParameterFilter {
                 $Message -like '*unit-test-api-key*'
