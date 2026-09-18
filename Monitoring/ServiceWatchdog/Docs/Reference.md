@@ -13,6 +13,9 @@ running; come here for every field, parameter, exit code and troubleshooting det
   - [Invoke-WinServiceWatchdog.ps1](#invoke-winservicewatchdogps1)
   - [Register-WinServiceWatchdogTask.ps1](#register-winservicewatchdogtaskps1)
   - [Unregister-WinServiceWatchdogTask.ps1](#unregister-winservicewatchdogtaskps1)
+- [Package](#package)
+  - [Install-WinServiceWatchdogGui.ps1](#install-winservicewatchdogguips1)
+  - [New-ServiceWatchdogClientPackage.ps1](#new-servicewatchdogclientpackageps1)
 - [Azure Function](#azure-function)
   - [App settings](#app-settings)
   - [HTTP contract (`POST /api/servicewatchdog/alert`)](#http-contract-post-apiservicewatchdogalert)
@@ -213,6 +216,97 @@ forever.
 .\Unregister-WinServiceWatchdogTask.ps1                                   # task only; config kept for later re-registration
 .\Unregister-WinServiceWatchdogTask.ps1 -RemoveEventSource -RemoveFiles -Force   # complete unattended removal
 ```
+
+## Package
+
+`Package/` is a drop-and-deploy front end for the three endpoint scripts above: a technician
+copies one folder to a server, double-clicks a launcher, ticks services and presses a button.
+It contains no monitoring logic — every check, restart and alert still happens inside the
+endpoint scripts, which it runs in child `powershell.exe` processes and whose output it
+streams into a read-only log pane. `README.md` has the build-and-hand-over walk-through.
+
+### Install-WinServiceWatchdogGui.ps1
+
+Windows-only WinForms front end. Windows PowerShell 5.1, elevated, and in a single threaded
+apartment, all three of which `Run-ServiceWatchdog.cmd` arranges (it self-elevates through
+UAC and passes `-STA`, and it stays open on a non-zero exit so the error is readable).
+
+Parameters: `-SettingsPath` (default `ServiceWatchdog.settings.json` beside the script),
+`-PackageRoot` (default the script's own folder), `-NoGui` (load the helper functions and
+stop, which is how the Pester suite tests them off Windows), `-Verbosity`, `-DryRun` (builds
+the config in memory and logs every child command line, writes nothing, launches nothing),
+`-LogPath`. Exit codes: `0` the window opened and was closed, `1` unexpected error, `2` a
+refusal. Child script exit codes are mapped to their documented meaning and reported, never
+propagated.
+
+The endpoint scripts are looked for in `<PackageRoot>\Endpoint` first — where a built client
+package keeps its pinned copy — and then in `<PackageRoot>\..\Endpoint`, which is where they
+live in this repository, so the GUI also runs straight from a clone.
+
+| Button | What it does |
+|---|---|
+| **Install & test** | Writes `%ProgramData%\ServiceWatchdog\ServiceWatchdog.json` from the settings `Defaults`, the site name and the ticked services, then runs `Register-WinServiceWatchdogTask.ps1 -TestAlert -RunNow -Force`. Writing the config first is what stops the registrar taking its "edit the config and re-run" exit 2 path. On a server that already has the watchdog this is an update: the previous selection was pre-ticked at startup and is simply rewritten. |
+| **Send test alert** | Runs the *installed* worker (not the pinned source copy) with `-TestAlert`, so what is exercised is what the scheduled task actually executes. Changes nothing else. |
+| **Check status** | Task state, last run time, last result mapped to its documented meaning, a `-ValidateConfig` pass on the installed config, and the last 20 lines of today's worker log. |
+| **Uninstall** | Confirms, then runs `Unregister-WinServiceWatchdogTask.ps1` for the task only. `-RemoveFiles` and `-RemoveEventSource` are deliberately not passed: the install folder, config and logs stay, so a re-install needs no new function key. |
+
+Refusals, each a message box and exit `2`: not Windows, not elevated, not `-STA`,
+`ServiceWatchdog.settings.json` missing or still carrying a literal `REPLACE`, a
+`Defaults.MaxRunSeconds` and `Webhook.TimeoutSeconds` pair whose worst-case run
+(`MaxRunSeconds + 2 * (2 * TimeoutSeconds + 5) + 15`) exceeds the scheduled task's 420 second
+execution limit, or no `Register-WinServiceWatchdogTask.ps1` in either endpoint location. The
+`REPLACE` check is case-sensitive, so a real client called *Replacement Parts Co* is accepted.
+
+The function key is never shown: every line of child output is scrubbed of it before it
+reaches the log pane, the GUI's log file or a dialog. A scheduled task's `LastTaskResult` of
+`267011`, `267009` or `267014` is named ("has not run yet", "is running now", "was stopped")
+rather than mapped through the worker exit codes, so a freshly registered task does not read
+as a fault.
+
+On-device paths:
+
+| Path | Contents |
+|---|---|
+| `%ProgramData%\ServiceWatchdog\` | `ServiceWatchdog.json`, `ServiceWatchdog.state.json` and the installed worker. Created by the GUI with the Administrators group as owner and a SYSTEM plus Administrators DACL **before** the config (which holds the function key) is written, then re-applied by the registrar. An existing folder is left alone for the registrar to validate. |
+| `%ProgramData%\ServiceWatchdog\Logs\ServiceWatchdog-<yyyyMMdd>.log` | The worker's own daily log. |
+| `%ProgramData%\ServiceWatchdog\Logs\Install-WinServiceWatchdogGui-<yyyyMMdd-HHmmss>.log` | The GUI's own log, one per launch, holding every line the pane showed. |
+| Task Scheduler `\ServiceWatchdog` | SYSTEM, every 5 minutes and 5 minutes after boot. |
+| Application event log, source `ServiceWatchdog` | Every decision the worker makes. |
+
+Package files on the server: `Run-ServiceWatchdog.cmd`, `Install-WinServiceWatchdogGui.ps1`,
+`ServiceWatchdog.settings.json` (**holds the function key**),
+`ServiceWatchdog.settings.example.json`, `PACKAGE-VERSION.txt` and `Endpoint\` (the three
+scripts, the example config and `VERSION.txt`). The folder can be deleted once the task is
+registered; the install folder is what the task runs from.
+
+### New-ServiceWatchdogClientPackage.ps1
+
+Builds one client's package. PowerShell 7 on Windows, macOS or Linux, or Windows PowerShell
+5.1 — nothing in the builder is Windows-specific, only what it builds.
+
+`-ClientName` (1 to 64 characters, shown in the GUI's window title), `-FunctionUrl` (the full
+`https://<host>/api/servicewatchdog/alert`, that URL without its path, or just the host name,
+which is completed for you; `http`, a different path and a query string are all refused),
+`-FunctionKey` as a SecureString **or** `-FunctionKeyPlainText` as a string, `-OutputPath`,
+`-DefaultsPath`, `-Force`, `-Verbosity`, `-DryRun`. Exit codes: `0` built, `1` unexpected
+error, `2` a refusal.
+
+Prefer `-FunctionKey`: a SecureString from `Read-Host -AsSecureString` or a SecretManagement
+vault never lands in the shell history, a transcript or the process arguments other users on
+the box can read. `-FunctionKeyPlainText` exists for a CI job reading a pipeline variable and
+warns about exactly that trade-off when it is used.
+
+`-DefaultsPath` takes either a `Defaults` object or a whole settings file with a `Defaults`
+property; omitted values keep the shipped default, an unknown key is a refusal rather than a
+silent no-op, and the result is checked against the 420 second task limit before anything is
+written. `-Force` both overwrites an existing `<OutputPath>\ServiceWatchdog` and allows the
+build to proceed inside a git working tree — the default refusal there exists because the
+output holds a live function key.
+
+`Endpoint\VERSION.txt` and `PACKAGE-VERSION.txt` are stamped with the repository's git short
+SHA when git can answer, and with `no-git-<yyyyMMdd>` plus a note when it cannot, so a package
+found on a server later can be traced to the commit it was cut from. The hand-over summary
+names the client, the URL, the package path and the key's *length* — never the key.
 
 ## Azure Function
 

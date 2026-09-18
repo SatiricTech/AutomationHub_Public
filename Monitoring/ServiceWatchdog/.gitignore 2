@@ -1,9 +1,6 @@
 # Real per-server configuration and runtime state never belong in source control.
 ServiceWatchdog.json
 *.state.json
-# The GUI package's filled-in settings file, which holds a function key. The unanchored
-# ServiceWatchdog.json line above does not cover it: the name is different.
-Package/ServiceWatchdog.settings.json
 # Local Azure Functions settings and build artifacts.
 local.settings.json
 *.zip

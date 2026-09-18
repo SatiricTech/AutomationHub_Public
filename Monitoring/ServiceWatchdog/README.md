@@ -79,13 +79,18 @@ Event types sent by the endpoint: `alert`, `flapping`, `reminder`, `recovered`,
 | `Deploy/main.bicep` | Infrastructure: Function App, storage tables, Key Vault, Application Insights, role assignments |
 | `Deploy/Install-AzureServiceWatchdogFunction.ps1` | One-shot Azure deployment from an operator workstation |
 | `Deploy/main.parameters.example.json` | Parameter file for deploying the template by hand |
+| `Package/Install-WinServiceWatchdogGui.ps1` | WinForms front end: tick services, press a button, no JSON to edit (Windows PowerShell 5.1, elevated, `-STA`) |
+| `Package/Run-ServiceWatchdog.cmd` | Double-click entry point for the GUI; self-elevates and passes `-STA` |
+| `Package/New-ServiceWatchdogClientPackage.ps1` | Builds a filled-in, hand-over-ready copy of the package for one client (PowerShell 7 or 5.1, any OS) |
+| `Package/ServiceWatchdog.settings.example.json` | Template for the package's settings file (URL, key, defaults); the filled-in `ServiceWatchdog.settings.json` is git-ignored |
 | `Docs/Hudu-ServiceWatchdog.html` | Knowledge-base article draft (callout and table classes from the house stylesheet) |
 | `Docs/Hudu-ServiceWatchdog-ServerInstall.html` | Server registration hand-off guide for the staff who register servers, with fill-in fields for the URL, key and site name |
 | `Tests/` | Pester suites for every script and the module, the worker-to-function payload contract check, and the Windows PowerShell 5.1 compatibility checker |
 
-`.gitignore` excludes the real `ServiceWatchdog.json`, `*.state.json`,
-`local.settings.json`, `Deploy/main.parameters.json`, zips and test output, so a real
-function key or API key is never committed by accident.
+`.gitignore` excludes the real `ServiceWatchdog.json`,
+`Package/ServiceWatchdog.settings.json`, `*.state.json`, `local.settings.json`,
+`Deploy/main.parameters.json`, zips and test output, so a real function key or API key is
+never committed by accident.
 
 ## Requirements
 
@@ -263,6 +268,45 @@ validation and registration (an existing config in the install folder is never o
 keep that source copy out of source control, it holds the function key).
 
 Check the inbox for the `[TEST]` email, then see [Testing an installation](#testing-an-installation).
+
+### Drop-and-deploy package (GUI)
+
+Instead of sending a technician the `Endpoint/` folder, a URL and a key to paste into JSON,
+build them a folder that already knows all three. `Package/` holds a WinForms front end that
+writes the config and drives the same three endpoint scripts in child processes, streaming
+their output into a log pane; it owns no monitoring logic, so nothing about the behaviour
+above changes.
+
+Build one package per client, on your own workstation (PowerShell 7 or 5.1, any OS):
+
+```powershell
+$key = Read-Host -Prompt 'Function key' -AsSecureString
+cd Monitoring/ServiceWatchdog/Package
+./New-ServiceWatchdogClientPackage.ps1 -ClientName 'Example Org' `
+    -FunctionUrl 'https://func-svcwatchdog-a1b2c3.azurewebsites.net/api/servicewatchdog/alert' `
+    -FunctionKey $key -OutputPath ~/Handover
+```
+
+That produces `~/Handover/ServiceWatchdog/` with the launcher, the GUI, a filled-in
+`ServiceWatchdog.settings.json`, a pinned copy of `Endpoint/` and two version stamps
+carrying the git short SHA it was cut from. `-FunctionUrl` also accepts just the Function
+App host name. `-DefaultsPath` overrides the retry, alerting and logging defaults from a JSON
+file; `-DryRun` reports the plan without writing anything. The builder refuses to write into
+a git working tree unless `-Force` is passed, because **the finished folder holds a live
+function key** — zip it and send it the way you would send a password.
+
+The technician then:
+
+1. Copies the `ServiceWatchdog` folder to the server (`C:\Temp` is fine).
+2. Double-clicks **`Run-ServiceWatchdog.cmd`** and accepts the UAC prompt.
+3. Checks the site name (pre-filled with the computer name) and **ticks the services** to
+   watch — running services are listed first, and the filter box narrows by either name.
+4. Presses **Install & test** and waits a minute or two, then confirms the `[TEST]` email.
+
+Re-running it later loads the installed config, pre-fills the site name and pre-ticks the
+services already watched, so adding or removing one is a tick and another **Install & test**.
+The buttons, the on-device paths and the GUI's own log file are documented in
+[Docs/Reference.md](Docs/Reference.md#package).
 
 Full configuration, script parameter, HTTP contract and app-setting reference:
 [Docs/Reference.md](Docs/Reference.md).

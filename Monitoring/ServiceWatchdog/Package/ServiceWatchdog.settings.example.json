@@ -1,0 +1,27 @@
+{
+  "SchemaVersion": 1,
+  "ClientName": "REPLACE_WITH_CLIENT_NAME",
+  "Webhook": {
+    "Url": "https://REPLACE-ME.azurewebsites.net/api/servicewatchdog/alert",
+    "FunctionKey": "REPLACE_WITH_FUNCTION_KEY",
+    "TimeoutSeconds": 30
+  },
+  "Defaults": {
+    "MaxStartAttempts": 5,
+    "RetryDelaySeconds": 30,
+    "PostStartVerifySeconds": 10,
+    "StartPendingWaitSeconds": 60,
+    "MaxRunSeconds": 240,
+    "Alerting": {
+      "ReminderMinutes": 240,
+      "NotifyOnRemediation": false,
+      "RemediationCooldownMinutes": 60,
+      "HeartbeatHours": 24
+    },
+    "Logging": {
+      "LogRoot": "",
+      "LogRetentionDays": 30,
+      "EventLogHealthyRuns": false
+    }
+  }
+}
