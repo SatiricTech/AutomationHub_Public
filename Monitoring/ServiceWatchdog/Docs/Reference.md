@@ -223,6 +223,11 @@ by the app's system-assigned identity (Key Vault Secrets User). Redeploying the 
 replaces the whole settings collection, so change settings through the template or the
 install script, not only in the portal.
 
+The numeric settings (`WATCHDOG_MAIL_TIMEOUT_SECONDS`, `WATCHDOG_SMTP_PORT`,
+`WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR`, `WATCHDOG_MAX_EMAILS_PER_HOUR`,
+`WATCHDOG_STALE_HOURS`) have a minimum of 1: a value below 1 or a non-numeric one logs a
+warning and falls back to the default shown, rather than failing every send or digest.
+
 | Setting | Default | Notes |
 |---|---|---|
 | `WATCHDOG_MAIL_PROVIDER` | `Smtp2GoApi` | or `Smtp` |
