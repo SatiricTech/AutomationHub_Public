@@ -178,7 +178,11 @@ Describe 'DryRun over a CSV of assignments' {
     It 'Plans a user extension whose base number a different target holds, instead of reporting a false conflict' {
         $row = $script:dryRows['mary.jones@newco.onmicrosoft.com']
         $row.Status | Should -BeExactly 'Planned'
-        $row.PhoneNumber | Should -Be '+15551110000;ext=524'
+        # The results file runs every cell through ConvertTo-MigrationSafeCell, and a leading
+        # '+' is one of the formula-triggering characters it guards against, so a phone
+        # number - like any other value that happens to start with it - comes back with a
+        # leading apostrophe.
+        $row.PhoneNumber | Should -Be "'+15551110000;ext=524"
         $row.Detail | Should -Not -Match 'already assigned'
     }
 

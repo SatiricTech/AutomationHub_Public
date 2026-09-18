@@ -17,6 +17,8 @@
         'ConvertFrom-MigrationOutputPath'
         'ConvertTo-MigrationLocalPart'
         'ConvertTo-MigrationODataString'
+        'ConvertTo-MigrationSafeCell'
+        'ConvertTo-MigrationSafeRow'
         'ConvertTo-MigrationX500'
         'Export-MigrationReport'
         'Export-MigrationResult'

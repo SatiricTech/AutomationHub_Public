@@ -273,6 +273,11 @@ try {
             'or widen -Wave / -ObjectType.')
     }
 
+    # Sanitised once, here, so the CSV twin and the workbook - written from the same
+    # collection below - can never disagree, and neither can carry a formula-looking source
+    # or destination address into a spreadsheet.
+    $mappings = @($mappings | ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ })
+
     $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
     $mappingPath = Join-Path -Path $run.OutputDirectory -ChildPath (
         $leader + ($format.FileName -replace '\{timestamp\}', (Get-Date -Format 'yyyyMMdd-HHmmss')))

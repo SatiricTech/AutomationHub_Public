@@ -119,6 +119,10 @@ function Export-MigrationReport {
         $data = @([pscustomobject]@{ Info = "No $Name records found." })
     }
 
+    # Sanitised once, here, so a source value that happens to start with a formula-triggering
+    # character never reaches a spreadsheet as a live formula.
+    $data = @($data | ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ })
+
     try {
         $data | Export-Csv -LiteralPath $filePath -NoTypeInformation -Encoding utf8 -ErrorAction Stop
     }

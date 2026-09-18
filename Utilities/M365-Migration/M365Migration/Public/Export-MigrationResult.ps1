@@ -96,7 +96,9 @@ function Export-MigrationResult {
         foreach ($column in $columns) {
             $value = ''
             if ($row.PSObject.Properties[$column]) { $value = $row.PSObject.Properties[$column].Value }
-            $ordered[$column] = $value
+            # Sanitised here, once, so every writer downstream - Export-Csv today, anything
+            # else tomorrow - only ever sees a value a spreadsheet cannot read as a formula.
+            $ordered[$column] = ConvertTo-MigrationSafeCell -Value $value
         }
         $shaped.Add([pscustomobject]$ordered)
     }

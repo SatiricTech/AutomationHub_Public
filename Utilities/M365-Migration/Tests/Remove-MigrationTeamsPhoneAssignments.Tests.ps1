@@ -212,7 +212,11 @@ Describe 'DryRun over the Get- export' {
         $row = $script:dryRows['john.smith@contoso.com']
         $row.Status | Should -BeExactly 'Planned'
         $row.Detail | Should -BeExactly 'Would remove +15551234567 (CallingPlan).'
-        $row.PhoneNumber | Should -Be '+15551234567'
+        # The results file runs every cell through ConvertTo-MigrationSafeCell, and a leading
+        # '+' is one of the formula-triggering characters it guards against, so a phone
+        # number - like any other value that happens to start with it - comes back with a
+        # leading apostrophe.
+        $row.PhoneNumber | Should -Be "'+15551234567"
         $row.Extension | Should -Be '101'
         $row.LocationId | Should -Be 'loc-hq'
         $row.OnlineVoiceRoutingPolicy | Should -Be 'US-East'

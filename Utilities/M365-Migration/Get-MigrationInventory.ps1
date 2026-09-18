@@ -777,6 +777,15 @@ function Export-InventoryTab {
             "$CsvPath to New-MigrationIdentityPlan - Import-MigrationCsv rejects a CSV with no data rows.")
     }
 
+    # Sanitised once, here, so the CSV and (when included) the workbook sheet for this tab
+    # are built from the same rows and neither can carry a formula-looking cell into a
+    # spreadsheet. $placeholder is sanitised too - it is what the workbook sheet uses when
+    # the tab is empty and $data has been replaced by $headerOnly-driven raw text instead.
+    $data = @($data | ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ })
+    if ($count -eq 0) {
+        $placeholder = @($placeholder | ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ })
+    }
+
     Invoke-MigrationAction -Description "Write the $Name tab ($count row(s)) to $CsvPath" -Action {
         if ($null -ne $headerOnly) {
             Set-Content -LiteralPath $CsvPath -Value $headerOnly -Encoding UTF8
