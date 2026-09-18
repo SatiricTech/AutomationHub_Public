@@ -122,11 +122,18 @@ Utilities/M365-Migration/
   M365Migration/            shared module (manifest + Public/ + Private/); imported by every script
   Templates/                IdentityPlan.sample.csv, SkuMap.sample.csv, ExclusionRules.sample.csv
   Tests/                    Pester 6 suites, one per script and per pure function
-  Docs/                     source HTML for the published Hudu article
+  Docs/                     source HTML for the published Hudu article, plus the two backlogs
   *.ps1                     the 17 phase scripts
 ```
 
 Copy the whole folder to run it; the scripts are no longer individually standalone.
+
+`Docs/KnownDocGaps.md` lists the places this README and the runbook are known to mislead a
+first-time operator, each one found during a live migration. Read it before following the
+runbook, and add to it whenever a run is lost to something the docs should have said.
+
+`Docs/EnhancementBacklog.md` collects wanted behaviour changes noticed while running the
+toolkit for real - friction rather than defects.
 
 ---
 
