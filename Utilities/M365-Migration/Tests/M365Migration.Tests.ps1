@@ -11,9 +11,9 @@ BeforeAll {
 
 Describe 'M365Migration manifest' {
 
-    It 'Is a valid manifest at version 1.1.1' {
+    It 'Is a valid manifest at version 1.2.0' {
         $manifest = Test-ModuleManifest -Path $script:modulePath -ErrorAction Stop
-        $manifest.Version.ToString() | Should -BeExactly '1.1.1'
+        $manifest.Version.ToString() | Should -BeExactly '1.2.0'
         $manifest.PowerShellVersion.ToString() | Should -BeExactly '7.4'
     }
 
