@@ -57,6 +57,14 @@ Describe 'Initialize-MigrationRun' {
         $run.LogPath | Should -BeExactly $logPath
     }
 
+    It 'Produces a log filename ConvertFrom-MigrationOutputPath parses back to Name Test-Script' {
+        $run = Initialize-MigrationRun -ScriptName 'Test-Script' -OutputPath $script:workspace -Prefix 'Contoso'
+        $parsed = ConvertFrom-MigrationOutputPath -Path $run.LogPath
+        $parsed.Name | Should -Be 'Test-Script'
+        $parsed.Suffix | Should -Be ''
+        $parsed.Extension | Should -Be 'log'
+    }
+
     It 'Records bound parameters in the log' {
         $run = Initialize-MigrationRun -ScriptName 'Test-Script' -OutputPath $script:workspace -Verbosity High `
             -BoundParameters @{ PlanPath = 'C:\plan.csv'; Wave = '1' }

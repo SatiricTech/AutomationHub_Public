@@ -95,11 +95,13 @@ function Initialize-MigrationRun {
         }
     }
 
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $resolvedLogPath = $LogPath
     if ([string]::IsNullOrWhiteSpace($resolvedLogPath)) {
-        $logName = if ($cleanPrefix) { "${cleanPrefix}_${ScriptName}_$timestamp.log" } else { "${ScriptName}_$timestamp.log" }
-        $resolvedLogPath = Join-Path -Path $directory -ChildPath $logName
+        # The run context does not exist yet at this point (it is built a few lines below),
+        # so -Directory and -Prefix are passed explicitly rather than left for
+        # Get-MigrationOutputPath to resolve from Get-MigrationRunContext.
+        $resolvedLogPath = Get-MigrationOutputPath -Directory $directory -Prefix $cleanPrefix -Name $ScriptName `
+            -Extension 'log'
     }
 
     $script:MigrationRun = @{

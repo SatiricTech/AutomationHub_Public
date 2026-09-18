@@ -61,6 +61,36 @@ Describe 'Export-MigrationReport' {
         }
     }
 
+    Context '-SuppressInDryRun and -Timestamp' {
+
+        It 'writes nothing under -SuppressInDryRun in a dry run and returns an empty string' {
+            InModuleScope M365Migration {
+                $script:MigrationRun = @{
+                    OutputDirectory = $TestDrive; Prefix = 'T'; DryRun = $true
+                    LogPath         = (Join-Path $TestDrive 'x.log'); Verbosity = 'Low'
+                    ScriptName      = 'x'; StartedAt = Get-Date
+                }
+                $path = Export-MigrationReport -Rows @([pscustomobject]@{ A = 1 }) -Name 'Thing' -SuppressInDryRun
+                $path | Should -Be ''
+                Get-ChildItem $TestDrive -Filter '*Thing*' | Should -BeNullOrEmpty
+                $script:MigrationRun = $null
+            }
+        }
+
+        It 'uses the supplied -Timestamp in the filename' {
+            InModuleScope M365Migration {
+                $script:MigrationRun = @{
+                    OutputDirectory = $TestDrive; Prefix = 'T'; DryRun = $false
+                    LogPath         = (Join-Path $TestDrive 'x.log'); Verbosity = 'Low'
+                    ScriptName      = 'x'; StartedAt = Get-Date
+                }
+                $path = Export-MigrationReport -Rows @() -Name 'Thing' -Timestamp ([datetime]'2026-01-02T03:04:05')
+                Split-Path $path -Leaf | Should -Be 'T_Thing_20260102-030405.csv'
+                $script:MigrationRun = $null
+            }
+        }
+    }
+
     Context 'Content' {
 
         It 'Writes every row and column as given, with no Status summary block' {
