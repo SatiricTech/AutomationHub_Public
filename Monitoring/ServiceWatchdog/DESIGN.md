@@ -506,9 +506,13 @@ Steps, each through `Invoke-Action`:
    ACL between the first run and the edit-and-re-run (review ruling, 2026-09-04).
 3. Copy the worker script; if it already exists and `-Force` is not set, exit 2 with a
    message to re-run with `-Force` (every re-run after the first install therefore carries
-   `-Force`; the copy is idempotent). If no config exists, copy
+   `-Force`; the copy is idempotent). If no config exists at `ConfigPath`, check
+   `SourcePath` for a filled-in `ServiceWatchdog.json` next to the script: if one is
+   present, copy it to `ConfigPath` as the seed and fall through to step 4, so a single run
+   goes straight through validation and registration (one-pass install). Otherwise copy
    `ServiceWatchdog.example.json` to `ConfigPath`, then stop with exit 2 and a message to
-   edit it and re-run.
+   edit it and re-run. Either way, a config already present at `ConfigPath` is never
+   overwritten — the one-pass seed only ever fills an empty install folder.
 4. Validate the config by running the worker with `-ValidateConfig -ConfigPath <path>`,
    adding `-DryRun` when the installer itself runs under `-DryRun` (an invalid config makes
    the worker record event 1020, which would otherwise register the event source: a real
