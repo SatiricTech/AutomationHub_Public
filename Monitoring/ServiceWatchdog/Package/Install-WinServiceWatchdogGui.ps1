@@ -25,19 +25,27 @@
     Window contents, top to bottom: site name (pre-filled with the computer name, or the
     installed config's SiteName), a filterable checked list of every service on the machine
     (running first, then alphabetical by display name, already-watched services pre-checked),
-    the four action buttons, the log pane, and a status line.
+    the four action buttons, the log viewer row, the log pane, and a status line.
 
     Buttons:
-      Install & test   Writes C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json from
+      Install          Writes C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json from
                        ServiceWatchdog.settings.json Defaults + site name + ticked services, then runs the
-                       registrar with -TestAlert -RunNow. Because the config is written first,
+                       registrar with -RunNow -Force. Because the config is written first,
                        the registrar's "edit the config and re-run" exit 2 never happens. On an
                        installed server this is an update: the previous selection is loaded at
-                       startup and simply rewritten.
+                       startup and simply rewritten. No test email is sent: delivery is a
+                       separate decision, made with Send test alert once the task exists, so an
+                       install is never held up by an Azure-side problem and a technician can
+                       re-test delivery without re-registering anything.
       Send test alert  Runs the installed worker with -TestAlert and points the technician at
                        the inbox for the [TEST] email.
       Check status     Scheduled task state, last run time, mapped last result, a
                        -ValidateConfig pass, and the tail of today's worker log.
+      View logs        Writes one of five things into the log pane: today's worker log in full,
+                       the last 50 lines of the newest worker log, the last 50 Application log
+                       events from the ServiceWatchdog source, the tail of the newest registrar
+                       or uninstaller log, or this launch's own GUI log. A single dump is capped
+                       at 2000 lines with a note naming the file to open for the rest.
       Uninstall        Confirms, then runs the unregistrar. The install folder, config and logs
                        are deliberately left in place so a re-install needs no new key.
 
@@ -103,7 +111,7 @@
     Dot-sources the helper functions without loading WinForms, as the Pester suite does.
 
 .NOTES
-    Version:    1.0.0
+    Version:    1.1.0
     Created:    2026-09-17
     Platform:   Windows Server 2016 or later, Windows PowerShell 5.1, elevated, -STA.
     Exit codes: 0 the GUI ran and was closed normally; 1 unexpected error; 2 a refusal condition
@@ -804,7 +812,7 @@ function Get-WatchdogGuiExitCodeMeaning {
     switch ($Script) {
         'Register' {
             switch ($ExitCode) {
-                0 { $meaning = 'Scheduled task registered and the test alert was delivered.'; $severity = 'Success' }
+                0 { $meaning = 'Scheduled task registered and the first run completed.'; $severity = 'Success' }
                 1 { $meaning = 'Unexpected error in the registrar; see the log pane.' }
                 2 {
                     $meaning = 'Refused: the config is invalid, sits outside the install folder, the install ' +
@@ -1412,6 +1420,371 @@ function Get-WatchdogGuiInstalledConfig {
     }
 }
 
+function Get-WatchdogGuiLogChoice {
+    <#
+    .SYNOPSIS
+        Returns the View logs choices, in the order they appear in the drop-down.
+    .DESCRIPTION
+        One table so the drop-down, the handler and the Pester suite cannot disagree about what
+        the choices are: the GUI adds Label to the ComboBox and passes the selected item's Kind
+        back into Resolve-WatchdogGuiLogFile, and nothing else parses the label text.
+    .OUTPUTS
+        PSCustomObject[] with Kind and Label.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param ()
+
+    return @(
+        [pscustomobject]@{ Kind = 'WorkerToday'; Label = "Today's worker log" }
+        [pscustomobject]@{ Kind = 'WorkerTail'; Label = 'Last 50 worker log lines' }
+        [pscustomobject]@{ Kind = 'Events'; Label = 'Last 50 events (Application log)' }
+        [pscustomobject]@{ Kind = 'RegistrarLogs'; Label = 'Registrar / uninstaller logs' }
+        [pscustomobject]@{ Kind = 'GuiLog'; Label = "This session's GUI log" }
+    )
+}
+
+function Get-WatchdogGuiNewestLogFile {
+    <#
+    .SYNOPSIS
+        Returns the full path of the most recently written log matching any of the given patterns.
+    .DESCRIPTION
+        Used for the "newest of a family" choices. A missing folder, an unreadable folder and a
+        folder with no match are all the same answer ($null), because every caller reports the
+        same "nothing to show yet" sentence for them and a log viewer must never throw.
+    .PARAMETER LogRoot
+        The Logs folder to search. Not recursive: the endpoint scripts keep one flat folder.
+    .PARAMETER Pattern
+        One or more wildcard file name patterns, for example ServiceWatchdog-*.log.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$LogRoot,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Pattern
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LogRoot) -or -not (Test-Path -LiteralPath $LogRoot -PathType Container)) {
+        return $null
+    }
+    try {
+        $files = @()
+        foreach ($item in $Pattern) {
+            $files += @(Get-ChildItem -LiteralPath $LogRoot -Filter $item -File -ErrorAction SilentlyContinue)
+        }
+        # -Filter 'x-*.log' also matches x-1.log.bak on Windows, so the extension is re-checked.
+        $newest = @($files |
+                Where-Object { $_.Extension -eq '.log' } |
+                Sort-Object -Property LastWriteTime -Descending |
+                Select-Object -First 1)
+        if (@($newest).Count -lt 1) {
+            return $null
+        }
+        return [string]$newest[0].FullName
+    }
+    catch {
+        return $null
+    }
+}
+
+function Resolve-WatchdogGuiLogFile {
+    <#
+    .SYNOPSIS
+        Resolves a View logs choice to the file it should read.
+    .DESCRIPTION
+        The daily worker log name (ServiceWatchdog-<yyyyMMdd>.log) and the registrar and
+        uninstaller names (Register-WinServiceWatchdogTask-<yyyyMMdd-HHmmss>.log and its
+        Unregister- counterpart) are the ones those scripts build themselves; this is the only
+        place in the GUI that knows them, so a rename in the endpoint scripts is a one-line fix
+        here. The Events choice has no file and returns a $null path.
+    .PARAMETER Kind
+        A Kind from Get-WatchdogGuiLogChoice.
+    .PARAMETER LogRoot
+        The Logs folder. Ignored for GuiLog, which is this launch's own log file.
+    .PARAMETER Date
+        The day whose worker log is wanted. Defaults to today.
+    .OUTPUTS
+        PSCustomObject with Kind, Path (possibly $null) and Exists.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateSet('WorkerToday', 'WorkerTail', 'Events', 'RegistrarLogs', 'GuiLog')]
+        [string]$Kind,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$LogRoot,
+
+        [datetime]$Date = (Get-Date)
+    )
+
+    $path = $null
+    switch ($Kind) {
+        'WorkerToday' {
+            if (-not [string]::IsNullOrWhiteSpace($LogRoot)) {
+                $path = Join-Path $LogRoot ('ServiceWatchdog-{0}.log' -f $Date.ToString('yyyyMMdd'))
+            }
+        }
+        'WorkerTail' {
+            $path = Get-WatchdogGuiNewestLogFile -LogRoot $LogRoot -Pattern @('ServiceWatchdog-*.log')
+        }
+        'RegistrarLogs' {
+            $path = Get-WatchdogGuiNewestLogFile -LogRoot $LogRoot -Pattern @('Register-*.log', 'Unregister-*.log')
+        }
+        'GuiLog' {
+            $path = $script:LogFilePath
+        }
+        'Events' {
+            $path = $null
+        }
+    }
+
+    $exists = $false
+    if (-not [string]::IsNullOrWhiteSpace($path)) {
+        $exists = [bool](Test-Path -LiteralPath $path -PathType Leaf)
+    }
+    return [pscustomobject]@{
+        Kind   = $Kind
+        Path   = $path
+        Exists = $exists
+    }
+}
+
+function Get-WatchdogGuiMissingLogMessage {
+    <#
+    .SYNOPSIS
+        The sentence shown when a View logs choice has nothing to show.
+    .DESCRIPTION
+        An absent log is normal, not a fault: the worker writes today's file only on its first
+        run after midnight, and the registrar log only exists once an install has been attempted.
+        Each choice therefore gets a sentence that says why it is empty rather than a bare "file
+        not found" a technician would escalate.
+    .PARAMETER Kind
+        A Kind from Get-WatchdogGuiLogChoice.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateSet('WorkerToday', 'WorkerTail', 'Events', 'RegistrarLogs', 'GuiLog')]
+        [string]$Kind
+    )
+
+    switch ($Kind) {
+        'WorkerToday' {
+            return 'No log for today yet: the worker has not run since midnight.'
+        }
+        'WorkerTail' {
+            return 'No worker log found: the watchdog has not run on this server yet.'
+        }
+        'RegistrarLogs' {
+            return 'No registrar or uninstaller log found yet: nothing has been installed or removed on this server.'
+        }
+        'GuiLog' {
+            return "This launch's GUI log file has not been created yet."
+        }
+        default {
+            return ("No events found in the Application log for source $script:WatchdogGuiEventSource yet: the " +
+                'event source is created by the registrar.')
+        }
+    }
+}
+
+function Get-WatchdogGuiLogTail {
+    <#
+    .SYNOPSIS
+        Returns the last N lines of a log file, or an empty array when there is nothing to read.
+    .DESCRIPTION
+        Get-Content -Tail is tried first because it does not read the whole file. It can fail on a
+        log the worker still has open, so the fallback re-reads the file with FileShare
+        ReadWrite,Delete, the same share mode Read-WatchdogGuiFileTail uses for child output. A
+        missing, locked or unreadable file returns an empty array: a log viewer must never throw
+        or take the window down.
+    .PARAMETER Path
+        The log file. $null, empty and absent all return an empty array.
+    .PARAMETER Lines
+        How many trailing lines to return.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param (
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Path,
+
+        [ValidateRange(1, 100000)]
+        [int]$Lines = 50
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return @()
+    }
+
+    try {
+        return @(Get-Content -LiteralPath $Path -Tail $Lines -ErrorAction Stop)
+    }
+    catch {
+        try {
+            $text = ''
+            $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            try {
+                $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+                $text = $reader.ReadToEnd()
+                $reader.Dispose()
+            }
+            finally {
+                $stream.Dispose()
+            }
+            $all = @(($text -split "`r?`n") | Where-Object { -not [string]::IsNullOrEmpty($_) })
+            if (@($all).Count -le $Lines) {
+                return @($all)
+            }
+            return @($all[(@($all).Count - $Lines)..(@($all).Count - 1)])
+        }
+        catch {
+            return @()
+        }
+    }
+}
+
+function Limit-WatchdogGuiDumpLine {
+    <#
+    .SYNOPSIS
+        Caps one log dump so a huge file cannot fill the log pane, keeping the newest lines.
+    .DESCRIPTION
+        The pane is an unbounded WinForms TextBox: appending a 200,000 line log would take
+        minutes and leave the window unusable. The newest lines are the ones a technician wants,
+        so the head is dropped and a note naming the file replaces it.
+    .PARAMETER Line
+        The lines to cap. $null and empty are returned as an empty array.
+    .PARAMETER MaxLines
+        The cap. 2000 by default.
+    .PARAMETER Path
+        The file the lines came from, named in the truncation note when supplied.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param (
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]]$Line,
+
+        [ValidateRange(1, 100000)]
+        [int]$MaxLines = 2000,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    $all = @($Line)
+    if (@($all).Count -le $MaxLines) {
+        return @($all)
+    }
+
+    $note = "... truncated to the last $MaxLines lines; open the file for the rest."
+    if (-not [string]::IsNullOrWhiteSpace($Path)) {
+        $note = "... truncated to the last $MaxLines lines; open $Path for the rest."
+    }
+    $kept = @($all[(@($all).Count - $MaxLines)..(@($all).Count - 1)])
+    return @(@($note) + $kept)
+}
+
+function Format-WatchdogGuiEvent {
+    <#
+    .SYNOPSIS
+        Renders one Application log event as a single pane line.
+    .DESCRIPTION
+        'time  Id n  Level  first line of the message'. Only the first non-blank line of the
+        message is kept: the worker writes multi-line event bodies and five of those would push
+        the previous events out of sight, which defeats the point of a 50 event list.
+    .PARAMETER EventRecord
+        A Get-WinEvent record, or anything with TimeCreated, Id, LevelDisplayName and Message.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory)]
+        [object]$EventRecord
+    )
+
+    $time = '(no time)'
+    if ($EventRecord.TimeCreated) {
+        $time = ([datetime]$EventRecord.TimeCreated).ToString('yyyy-MM-dd HH:mm:ss')
+    }
+
+    $level = [string]$EventRecord.LevelDisplayName
+    if ([string]::IsNullOrWhiteSpace($level)) { $level = 'Unknown' }
+
+    $first = ''
+    $message = [string]$EventRecord.Message
+    if (-not [string]::IsNullOrWhiteSpace($message)) {
+        $candidate = @(($message -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) |
+            Select-Object -First 1
+        if ($null -ne $candidate) { $first = ([string]$candidate).Trim() }
+    }
+    if ([string]::IsNullOrWhiteSpace($first)) { $first = '(no message text)' }
+
+    return '{0}  Id {1}  {2}  {3}' -f $time, [string]$EventRecord.Id, $level, $first
+}
+
+function Get-WatchdogGuiEventLine {
+    <#
+    .SYNOPSIS
+        Reads the last N ServiceWatchdog events from the Application log as formatted lines.
+    .DESCRIPTION
+        Get-WinEvent throws rather than returning nothing when a filter matches no events, and it
+        throws again when the provider has never been registered, which is the normal state of a
+        server the watchdog has not been installed on yet. Both are reported as the "nothing yet"
+        sentence instead of an error, so pressing View logs before an install is not alarming.
+    .PARAMETER MaxEvents
+        How many of the newest events to read.
+    .PARAMETER ProviderName
+        The event source. Defaults to the project's own source.
+    .PARAMETER LogName
+        The event log. Defaults to Application, where the worker writes.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param (
+        [ValidateRange(1, 1000)]
+        [int]$MaxEvents = 50,
+
+        [ValidateNotNullOrEmpty()]
+        [string]$ProviderName = $script:WatchdogGuiEventSource,
+
+        [ValidateNotNullOrEmpty()]
+        [string]$LogName = 'Application'
+    )
+
+    $events = @()
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{ LogName = $LogName; ProviderName = $ProviderName } `
+                -MaxEvents $MaxEvents -ErrorAction Stop)
+    }
+    catch {
+        $detail = [string]$_
+        if ($detail -match 'No events were found' -or $detail -match 'could not be found') {
+            return @(Get-WatchdogGuiMissingLogMessage -Kind 'Events')
+        }
+        return @("Could not read the $LogName log for source $ProviderName ($detail).")
+    }
+
+    if (@($events).Count -lt 1) {
+        return @(Get-WatchdogGuiMissingLogMessage -Kind 'Events')
+    }
+    return @($events | ForEach-Object { Format-WatchdogGuiEvent -EventRecord $_ })
+}
+
 #endregion
 
 
@@ -1525,6 +1898,7 @@ function Set-WatchdogGuiBusy {
     $script:Gui.ServiceList.Enabled = -not $Busy
     $script:Gui.SiteBox.Enabled = -not $Busy
     $script:Gui.FilterBox.Enabled = -not $Busy
+    if ($script:Gui.LogChoiceBox) { $script:Gui.LogChoiceBox.Enabled = -not $Busy }
     if ($Busy) {
         $script:Gui.StatusItem.Text = "Working... $Activity"
         $script:Gui.Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
@@ -1680,13 +2054,19 @@ function Get-WatchdogGuiLogLevelForResult {
 function Invoke-WatchdogGuiInstallAction {
     <#
     .SYNOPSIS
-        Install & test: writes the config, then runs the registrar with -TestAlert -RunNow.
+        Install: writes the config, then runs the registrar with -RunNow -Force.
     .DESCRIPTION
         Writing the config first is deliberate: the registrar's documented first-run behaviour is
         to copy the example config and exit 2 asking the operator to edit it, and that path must
         never be reached here. On a server that already has the watchdog this is an update, which
         is why -Force is passed: the worker is already present in the install folder and the
         registrar refuses to overwrite it otherwise.
+
+        -TestAlert is deliberately not passed. Installing and proving email delivery are separate
+        decisions: an Azure-side problem used to turn a perfectly good install into the registrar's
+        exit 10, and a technician who wanted a second test email had to re-run the whole
+        registration. The success dialog therefore points at Send test alert, which exercises the
+        installed worker on its own.
     #>
     [CmdletBinding()]
     [OutputType([void])]
@@ -1709,7 +2089,7 @@ function Invoke-WatchdogGuiInstallAction {
         }
 
         Set-WatchdogGuiBusy -Busy $true -Activity 'writing the config and registering the task'
-        Write-WatchdogGuiLog "--- Install & test: site '$siteName', $($script:Gui.CheckedNames.Count) service(s) ---"
+        Write-WatchdogGuiLog "--- Install: site '$siteName', $($script:Gui.CheckedNames.Count) service(s) ---"
 
         $config = New-WatchdogGuiConfig -Settings $script:Gui.Settings -SiteName $siteName `
             -Service @($script:Gui.CheckedNames)
@@ -1724,7 +2104,7 @@ function Invoke-WatchdogGuiInstallAction {
             '-SourcePath', $script:Gui.Paths.EndpointPath,
             '-InstallPath', $script:WatchdogGuiInstallPath,
             '-TaskName', $script:WatchdogGuiTaskName,
-            '-TestAlert', '-RunNow', '-Force', '-Verbosity', 'High'
+            '-RunNow', '-Force', '-Verbosity', 'High'
         )
         $result = Invoke-WatchdogGuiChildScript -ScriptPath $script:Gui.Paths.Register -ArgumentList $arguments
         if (-not $result.Streamed) { Write-WatchdogGuiOutputBlock -Text $result.Output }
@@ -1735,14 +2115,15 @@ function Invoke-WatchdogGuiInstallAction {
         $message = $mapped.Meaning
         $icon = 'Warning'
         if ($mapped.IsSuccess) {
-            $message = $mapped.Meaning + "`r`n`r`nCheck the inbox for the [TEST] email."
+            $message = $mapped.Meaning + "`r`n`r`nNo test email was sent. Press Send test alert to prove " +
+            'delivery, then check the inbox for the [TEST] email.'
             $icon = 'Information'
         }
-        Show-WatchdogGuiMessage -Message $message -Title 'Install & test' -Icon $icon
+        Show-WatchdogGuiMessage -Message $message -Title 'Install' -Icon $icon
     }
     catch {
-        Write-WatchdogGuiLog "Install & test failed: $_" -Level 'ERROR'
-        Show-WatchdogGuiMessage -Message "Install & test failed:`r`n$_" -Title 'Install & test' -Icon 'Error'
+        Write-WatchdogGuiLog "Install failed: $_" -Level 'ERROR'
+        Show-WatchdogGuiMessage -Message "Install failed:`r`n$_" -Title 'Install' -Icon 'Error'
     }
     finally {
         Set-WatchdogGuiBusy -Busy $false
@@ -1765,7 +2146,7 @@ function Invoke-WatchdogGuiTestAlertAction {
     try {
         if (-not (Test-Path -LiteralPath $script:WatchdogGuiWorkerPath -PathType Leaf)) {
             Show-WatchdogGuiMessage -Message ("The worker is not installed yet at $script:WatchdogGuiWorkerPath. " +
-                'Run Install & test first.') -Icon 'Warning'
+                'Run Install first.') -Icon 'Warning'
             return
         }
         Set-WatchdogGuiBusy -Busy $true -Activity 'sending a test alert'
@@ -1824,29 +2205,95 @@ function Invoke-WatchdogGuiStatusAction {
                 Show-WatchdogGuiMessage -Message ("The installed config at $script:WatchdogGuiConfigPath did not validate " +
                     "(worker exit $($result.ExitCode)).`r`n`r`n$($mapped.Meaning)`r`n`r`nThe log pane has the " +
                     'worker lines that say which value is wrong. Fix the site name or the service list here ' +
-                    'and use Install & test to rewrite the config.') -Title 'Check status' -Icon 'Error'
+                    'and use Install to rewrite the config.') -Title 'Check status' -Icon 'Error'
             }
         }
         else {
             Write-WatchdogGuiLog "No installed worker at $script:WatchdogGuiWorkerPath; nothing to validate." -Level 'WARNING'
             Show-WatchdogGuiMessage -Message ('The watchdog is not installed on this server yet: there is no worker at ' +
-                "$script:WatchdogGuiWorkerPath.`r`n`r`nTick the services to watch and use Install & test.") `
+                "$script:WatchdogGuiWorkerPath.`r`n`r`nTick the services to watch and use Install.") `
                 -Title 'Check status' -Icon 'Warning'
         }
 
-        $workerLog = Join-Path $script:WatchdogGuiWorkerLogRoot ('ServiceWatchdog-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
-        if (Test-Path -LiteralPath $workerLog -PathType Leaf) {
-            Write-WatchdogGuiLog "Last 20 lines of $workerLog"
-            $tail = Get-Content -LiteralPath $workerLog -Tail 20 -ErrorAction SilentlyContinue
-            foreach ($line in @($tail)) { Write-WatchdogGuiLog ('  | ' + $line) }
+        # Same resolver and reader the View logs drop-down uses, so the daily log name lives in
+        # exactly one place.
+        $today = Resolve-WatchdogGuiLogFile -Kind 'WorkerToday' -LogRoot $script:WatchdogGuiWorkerLogRoot
+        if ($today.Exists) {
+            Write-WatchdogGuiLog "Last 20 lines of $($today.Path)"
+            foreach ($line in @(Get-WatchdogGuiLogTail -Path $today.Path -Lines 20)) {
+                Write-WatchdogGuiLog ('  | ' + $line)
+            }
+            Write-WatchdogGuiLog 'View logs has the whole file, the event list and the registrar log.'
         }
         else {
-            Write-WatchdogGuiLog "No worker log for today at $workerLog." -Level 'WARNING'
+            Write-WatchdogGuiLog ("$(Get-WatchdogGuiMissingLogMessage -Kind 'WorkerToday') Expected " +
+                "$($today.Path).") -Level 'WARNING'
         }
     }
     catch {
         Write-WatchdogGuiLog "Check status failed: $_" -Level 'ERROR'
         Show-WatchdogGuiMessage -Message "Check status failed:`r`n$_" -Title 'Check status' -Icon 'Error'
+    }
+    finally {
+        Set-WatchdogGuiBusy -Busy $false
+    }
+}
+
+function Invoke-WatchdogGuiViewLogAction {
+    <#
+    .SYNOPSIS
+        View logs: writes the selected log, event list or file tail into the log pane.
+    .DESCRIPTION
+        Everything a technician needs after an install is in %ProgramData%\ServiceWatchdog\Logs or
+        the Application log, and on a locked-down server opening either from Explorer is a detour
+        this window can save. The pane is the only output: no file is opened, nothing is copied,
+        and the chosen dump is bracketed by a header and a footer line so two viewings in a row
+        cannot be read as one.
+
+        The whole dump goes through Write-WatchdogGuiLog like every other line, so it is scrubbed
+        of the function key and lands in the GUI's own log file as well as the pane.
+    #>
+    [CmdletBinding()]
+    [OutputType([void])]
+    param ()
+
+    try {
+        if (-not $script:Gui) { return }
+        $choices = @(Get-WatchdogGuiLogChoice)
+        $index = [int]$script:Gui.LogChoiceBox.SelectedIndex
+        if ($index -lt 0 -or $index -ge @($choices).Count) { $index = 0 }
+        $choice = $choices[$index]
+
+        Set-WatchdogGuiBusy -Busy $true -Activity 'reading logs'
+        Write-WatchdogGuiLog ('--- View logs: {0} ---' -f $choice.Label)
+
+        $lines = @()
+        if ($choice.Kind -eq 'Events') {
+            $lines = @(Get-WatchdogGuiEventLine -MaxEvents 50)
+        }
+        else {
+            $resolved = Resolve-WatchdogGuiLogFile -Kind $choice.Kind -LogRoot $script:WatchdogGuiWorkerLogRoot
+            if (-not $resolved.Exists) {
+                $lines = @(Get-WatchdogGuiMissingLogMessage -Kind $choice.Kind)
+                if ($resolved.Path) { $lines += "Expected $($resolved.Path)." }
+            }
+            else {
+                Write-WatchdogGuiLog "File: $($resolved.Path)"
+                # Today's worker log is shown in full (capped); every other choice is a 50 line tail.
+                $wanted = 50
+                if ($choice.Kind -eq 'WorkerToday') { $wanted = 100000 }
+                $lines = @(Limit-WatchdogGuiDumpLine -Line @(Get-WatchdogGuiLogTail -Path $resolved.Path `
+                            -Lines $wanted) -Path $resolved.Path)
+                if (@($lines).Count -lt 1) { $lines = @('The file is empty.') }
+            }
+        }
+
+        foreach ($line in $lines) { Write-WatchdogGuiLog ('  | ' + [string]$line) }
+        Write-WatchdogGuiLog ('--- end of {0} ---' -f $choice.Label)
+    }
+    catch {
+        Write-WatchdogGuiLog "View logs failed: $_" -Level 'ERROR'
+        Show-WatchdogGuiMessage -Message "View logs failed:`r`n$_" -Title 'View logs' -Icon 'Error'
     }
     finally {
         Set-WatchdogGuiBusy -Busy $false
@@ -2020,7 +2467,7 @@ function Start-WatchdogGui {
 
     $buttonTop = 376
     $installButton = New-Object System.Windows.Forms.Button
-    $installButton.Text = 'Install && test'
+    $installButton.Text = 'Install'
     $installButton.Location = New-Object System.Drawing.Point(12, $buttonTop)
     $installButton.Size = New-Object System.Drawing.Size(150, 32)
     $installButton.Anchor = 'Top,Left'
@@ -2043,14 +2490,39 @@ function Start-WatchdogGui {
     $uninstallButton.Size = New-Object System.Drawing.Size(150, 32)
     $uninstallButton.Anchor = 'Top,Left'
 
+    # Second row: the log viewer. Its own row rather than a fifth action button, because reading a
+    # log is a different kind of act from installing or removing one and should not sit a
+    # mis-click away from Uninstall.
+    $viewTop = $buttonTop + 40
+    $viewLabel = New-Object System.Windows.Forms.Label
+    $viewLabel.Text = 'Logs:'
+    $viewLabel.Location = New-Object System.Drawing.Point(12, ($viewTop + 6))
+    $viewLabel.AutoSize = $true
+
+    $logChoiceBox = New-Object System.Windows.Forms.ComboBox
+    $logChoiceBox.Location = New-Object System.Drawing.Point(56, $viewTop)
+    $logChoiceBox.Size = New-Object System.Drawing.Size(266, 24)
+    $logChoiceBox.DropDownStyle = 'DropDownList'
+    $logChoiceBox.Anchor = 'Top,Left'
+    foreach ($choice in @(Get-WatchdogGuiLogChoice)) {
+        [void]$logChoiceBox.Items.Add($choice.Label)
+    }
+    $logChoiceBox.SelectedIndex = 0
+
+    $viewButton = New-Object System.Windows.Forms.Button
+    $viewButton.Text = 'View logs'
+    $viewButton.Location = New-Object System.Drawing.Point(332, $viewTop)
+    $viewButton.Size = New-Object System.Drawing.Size(150, 28)
+    $viewButton.Anchor = 'Top,Left'
+
     $logLabel = New-Object System.Windows.Forms.Label
     $logLabel.Text = 'Log (mirrors the underlying scripts; the function key is never shown):'
-    $logLabel.Location = New-Object System.Drawing.Point(12, 416)
+    $logLabel.Location = New-Object System.Drawing.Point(12, 452)
     $logLabel.AutoSize = $true
 
     $logBox = New-Object System.Windows.Forms.TextBox
-    $logBox.Location = New-Object System.Drawing.Point(12, 436)
-    $logBox.Size = New-Object System.Drawing.Size(900, 270)
+    $logBox.Location = New-Object System.Drawing.Point(12, 472)
+    $logBox.Size = New-Object System.Drawing.Size(900, 234)
     $logBox.Multiline = $true
     $logBox.ReadOnly = $true
     $logBox.ScrollBars = 'Both'
@@ -2065,7 +2537,8 @@ function Start-WatchdogGui {
     [void]$statusStrip.Items.Add($statusItem)
 
     $form.Controls.AddRange(@($siteLabel, $siteBox, $filterLabel, $filterBox, $countLabel, $serviceList,
-            $installButton, $testButton, $statusButton, $uninstallButton, $logLabel, $logBox, $statusStrip))
+            $installButton, $testButton, $statusButton, $uninstallButton, $viewLabel, $logChoiceBox, $viewButton,
+            $logLabel, $logBox, $statusStrip))
 
     $script:Gui = @{
         Form         = $form
@@ -2073,9 +2546,10 @@ function Start-WatchdogGui {
         FilterBox    = $filterBox
         CountLabel   = $countLabel
         ServiceList  = $serviceList
+        LogChoiceBox = $logChoiceBox
         LogBox       = $logBox
         StatusItem   = $statusItem
-        Buttons      = @($installButton, $testButton, $statusButton, $uninstallButton)
+        Buttons      = @($installButton, $testButton, $statusButton, $uninstallButton, $viewButton)
         AllServices  = @()
         CheckedNames = (New-Object System.Collections.Generic.HashSet[string] `
                 ([System.StringComparer]::OrdinalIgnoreCase))
@@ -2110,6 +2584,7 @@ function Start-WatchdogGui {
     $installButton.Add_Click({ Invoke-WatchdogGuiInstallAction })
     $testButton.Add_Click({ Invoke-WatchdogGuiTestAlertAction })
     $statusButton.Add_Click({ Invoke-WatchdogGuiStatusAction })
+    $viewButton.Add_Click({ Invoke-WatchdogGuiViewLogAction })
     $uninstallButton.Add_Click({ Invoke-WatchdogGuiUninstallAction })
     $form.Add_FormClosed({
             $script:PaneWriter = $null
@@ -2162,7 +2637,7 @@ function Start-WatchdogGui {
             }
         }
         Write-WatchdogGuiLog ("Existing install found: site '$($siteBox.Text)', $($script:Gui.CheckedNames.Count) " +
-            'service(s) already watched. Install & test rewrites the config with the current selection.')
+            'service(s) already watched. Install rewrites the config with the current selection.')
     }
     else {
         $siteBox.Text = $env:COMPUTERNAME
@@ -2190,7 +2665,7 @@ if (-not $NoGui -and $MyInvocation.InvocationName -ne '.') {
     $exitCode = 1
     try {
         Initialize-WatchdogGuiLog -Path $LogPath | Out-Null
-        Write-WatchdogGuiLog "=== Install-WinServiceWatchdogGui 1.0.0 starting on $env:COMPUTERNAME ===" -NoPane
+        Write-WatchdogGuiLog "=== Install-WinServiceWatchdogGui 1.1.0 starting on $env:COMPUTERNAME ===" -NoPane
         Write-WatchdogGuiLog ("Parameters: PackageRoot='$PackageRoot' SettingsPath='$SettingsPath' " +
             "Verbosity=$Verbosity DryRun=$($DryRun.IsPresent)") -NoPane
         $exitCode = Start-WatchdogGui -PackageRoot $PackageRoot -SettingsFile $SettingsPath

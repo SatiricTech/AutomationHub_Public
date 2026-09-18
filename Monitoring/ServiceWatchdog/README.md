@@ -301,10 +301,16 @@ The technician then:
 2. Double-clicks **`Run-ServiceWatchdog.cmd`** and accepts the UAC prompt.
 3. Checks the site name (pre-filled with the computer name) and **ticks the services** to
    watch — running services are listed first, and the filter box narrows by either name.
-4. Presses **Install & test** and waits a minute or two, then confirms the `[TEST]` email.
+4. Presses **Install** and waits a minute or two.
+5. Presses **Send test alert** and confirms the `[TEST]` email. Installing and proving
+   delivery are separate buttons, so a webhook problem never leaves a half-finished install.
+
+**View logs** then shows any of five things in the pane without leaving the window: today's
+worker log in full, the last 50 worker log lines, the last 50 `ServiceWatchdog` events from the
+Application log, the newest registrar or uninstaller log, or this launch's own GUI log.
 
 Re-running it later loads the installed config, pre-fills the site name and pre-ticks the
-services already watched, so adding or removing one is a tick and another **Install & test**.
+services already watched, so adding or removing one is a tick and another **Install**.
 The buttons, the on-device paths and the GUI's own log file are documented in
 [Docs/Reference.md](Docs/Reference.md#package).
 

@@ -22,7 +22,7 @@
 
     Nothing on the built package needs GitHub access, a PowerShell gallery module or a
     hand-edited JSON file: the technician copies the folder, double-clicks the launcher,
-    ticks services and presses Install & test.
+    ticks services, presses Install, then Send test alert.
 
     Both version stamps carry the repository's git short SHA when git is available and the
     build runs inside a working tree, so a package found on a server two years later can be
@@ -903,7 +903,7 @@ try {
         '       password over. It contains a live function key.',
         '    2. The technician copies the folder to the server (C:\Temp is fine), double-clicks',
         "       $script:LauncherFileName and accepts the UAC prompt.",
-        '    3. They check the site name, tick the services to watch, and press Install & test.',
+        '    3. They check the site name, tick the services to watch, press Install, then Send test alert.',
         '    4. They confirm the [TEST] email arrived.',
         ''
     )

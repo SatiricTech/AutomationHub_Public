@@ -13,10 +13,11 @@
     Covered: settings validation (missing file, unedited REPLACE placeholders, missing key, bad
     URL, happy path), the config merge against the public ServiceWatchdog.example.json schema,
     the service sort order, the exit-code map for all three public scripts, the log-label round
-    trip and the secret scrubber.
+    trip, the secret scrubber, and the View logs helpers (choice table, log file resolution
+    against TestDrive fixtures, tail, dump cap and event formatting).
 
 .NOTES
-    Version:    1.0.0
+    Version:    1.1.0
     Created:    2026-09-17
     Run with:   Invoke-Pester -Path .\Tests\Install-WinServiceWatchdogGui.Tests.ps1
 
@@ -658,6 +659,194 @@ Describe 'Get-WatchdogGuiPackagePath' {
         $override = Join-Path ([System.IO.Path]::GetTempPath()) 'elsewhere.json'
         $root = Join-Path ([System.IO.Path]::GetTempPath()) 'WatchdogGuiPackage'
         (Get-WatchdogGuiPackagePath -Root $root -SettingsFile $override).SettingsPath | Should -Be $override
+    }
+}
+
+Describe 'Get-WatchdogGuiLogChoice' {
+
+    It 'offers the five View logs choices in order, with the labels the drop-down shows' {
+        $choices = @(Get-WatchdogGuiLogChoice)
+        $choices.Count | Should -Be 5
+        @($choices | ForEach-Object { $_.Kind }) | Should -Be @('WorkerToday', 'WorkerTail', 'Events',
+            'RegistrarLogs', 'GuiLog')
+        @($choices | ForEach-Object { $_.Label }) | Should -Be @("Today's worker log", 'Last 50 worker log lines',
+            'Last 50 events (Application log)', 'Registrar / uninstaller logs', "This session's GUI log")
+    }
+}
+
+Describe 'Resolve-WatchdogGuiLogFile' {
+
+    BeforeEach {
+        $script:LogRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString())
+        New-Item -Path $script:LogRoot -ItemType Directory -Force | Out-Null
+    }
+
+    It 'builds the worker daily log name the worker itself writes' {
+        $resolved = Resolve-WatchdogGuiLogFile -Kind 'WorkerToday' -LogRoot $script:LogRoot `
+            -Date ([datetime]'2026-09-17 23:59:00')
+        $resolved.Path | Should -Be (Join-Path $script:LogRoot 'ServiceWatchdog-20260917.log')
+        $resolved.Exists | Should -BeFalse
+    }
+
+    It "reports today's log as present once the worker has written it" {
+        $today = Join-Path $script:LogRoot ('ServiceWatchdog-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
+        'one line' | Set-Content -LiteralPath $today -Encoding UTF8
+        (Resolve-WatchdogGuiLogFile -Kind 'WorkerToday' -LogRoot $script:LogRoot).Exists | Should -BeTrue
+    }
+
+    It 'finds no worker log in an empty Logs folder' {
+        $resolved = Resolve-WatchdogGuiLogFile -Kind 'WorkerTail' -LogRoot $script:LogRoot
+        $resolved.Path | Should -BeNullOrEmpty
+        $resolved.Exists | Should -BeFalse
+    }
+
+    It 'finds no worker log when the Logs folder does not exist at all' {
+        $absent = Join-Path $TestDrive 'no-such-logs-folder'
+        (Resolve-WatchdogGuiLogFile -Kind 'WorkerTail' -LogRoot $absent).Path | Should -BeNullOrEmpty
+        (Resolve-WatchdogGuiLogFile -Kind 'WorkerTail' -LogRoot '').Path | Should -BeNullOrEmpty
+    }
+
+    It 'takes the only worker log when there is one' {
+        $only = Join-Path $script:LogRoot 'ServiceWatchdog-20260901.log'
+        'x' | Set-Content -LiteralPath $only -Encoding UTF8
+        (Resolve-WatchdogGuiLogFile -Kind 'WorkerTail' -LogRoot $script:LogRoot).Path | Should -Be $only
+    }
+
+    It 'takes the most recently written worker log when there are several' {
+        foreach ($pair in @(@('20260901', '2026-09-01 08:00:00'), @('20260902', '2026-09-02 08:00:00'),
+                @('20260903', '2026-09-03 08:00:00'))) {
+            $path = Join-Path $script:LogRoot ('ServiceWatchdog-{0}.log' -f $pair[0])
+            'x' | Set-Content -LiteralPath $path -Encoding UTF8
+            (Get-Item -LiteralPath $path).LastWriteTime = [datetime]$pair[1]
+        }
+        $resolved = Resolve-WatchdogGuiLogFile -Kind 'WorkerTail' -LogRoot $script:LogRoot
+        $resolved.Path | Should -Be (Join-Path $script:LogRoot 'ServiceWatchdog-20260903.log')
+        $resolved.Exists | Should -BeTrue
+    }
+
+    It 'takes the newest of the registrar and uninstaller logs, ignoring worker logs' {
+        $register = Join-Path $script:LogRoot 'Register-WinServiceWatchdogTask-20260901-080000.log'
+        $unregister = Join-Path $script:LogRoot 'Unregister-WinServiceWatchdogTask-20260902-090000.log'
+        $worker = Join-Path $script:LogRoot 'ServiceWatchdog-20260903.log'
+        foreach ($pair in @(@($register, '2026-09-01 08:00:00'), @($unregister, '2026-09-02 09:00:00'),
+                @($worker, '2026-09-03 10:00:00'))) {
+            'x' | Set-Content -LiteralPath $pair[0] -Encoding UTF8
+            (Get-Item -LiteralPath $pair[0]).LastWriteTime = [datetime]$pair[1]
+        }
+        (Resolve-WatchdogGuiLogFile -Kind 'RegistrarLogs' -LogRoot $script:LogRoot).Path | Should -Be $unregister
+    }
+
+    It 'reports no registrar log before anything has been installed' {
+        'x' | Set-Content -LiteralPath (Join-Path $script:LogRoot 'ServiceWatchdog-20260903.log') -Encoding UTF8
+        (Resolve-WatchdogGuiLogFile -Kind 'RegistrarLogs' -LogRoot $script:LogRoot).Path | Should -BeNullOrEmpty
+    }
+
+    It 'has no file for the event log choice' {
+        $resolved = Resolve-WatchdogGuiLogFile -Kind 'Events' -LogRoot $script:LogRoot
+        $resolved.Path | Should -BeNullOrEmpty
+        $resolved.Exists | Should -BeFalse
+    }
+
+    It 'rejects an unknown kind' {
+        { Resolve-WatchdogGuiLogFile -Kind 'Nope' -LogRoot $script:LogRoot } | Should -Throw
+    }
+}
+
+Describe 'Get-WatchdogGuiMissingLogMessage' {
+
+    It 'says "no log for today yet" rather than reporting a missing file' {
+        Get-WatchdogGuiMissingLogMessage -Kind 'WorkerToday' | Should -Match 'No log for today yet'
+        Get-WatchdogGuiMissingLogMessage -Kind 'WorkerTail' | Should -Match 'has not run on this server yet'
+        Get-WatchdogGuiMissingLogMessage -Kind 'RegistrarLogs' | Should -Match 'installed or removed'
+        Get-WatchdogGuiMissingLogMessage -Kind 'GuiLog' | Should -Match 'GUI log file'
+        Get-WatchdogGuiMissingLogMessage -Kind 'Events' | Should -Match 'No events found'
+        Get-WatchdogGuiMissingLogMessage -Kind 'Events' | Should -Match 'ServiceWatchdog'
+    }
+}
+
+Describe 'Get-WatchdogGuiLogTail' {
+
+    BeforeEach {
+        $script:TailFile = Join-Path $TestDrive ('tail-{0}.log' -f [guid]::NewGuid())
+    }
+
+    It 'returns exactly the requested number of trailing lines' {
+        (1..120 | ForEach-Object { "line $_" }) | Set-Content -LiteralPath $script:TailFile -Encoding UTF8
+        $tail = @(Get-WatchdogGuiLogTail -Path $script:TailFile -Lines 50)
+        $tail.Count | Should -Be 50
+        $tail[0] | Should -Be 'line 71'
+        $tail[-1] | Should -Be 'line 120'
+    }
+
+    It 'returns the whole file when it is shorter than the tail' {
+        @('first', 'second') | Set-Content -LiteralPath $script:TailFile -Encoding UTF8
+        @(Get-WatchdogGuiLogTail -Path $script:TailFile -Lines 50) | Should -Be @('first', 'second')
+    }
+
+    It 'returns an empty result for a missing, empty or null path' {
+        @(Get-WatchdogGuiLogTail -Path (Join-Path $TestDrive 'nope.log')).Count | Should -Be 0
+        @(Get-WatchdogGuiLogTail -Path '').Count | Should -Be 0
+        @(Get-WatchdogGuiLogTail -Path $null).Count | Should -Be 0
+    }
+}
+
+Describe 'Limit-WatchdogGuiDumpLine' {
+
+    It 'leaves a dump under the cap untouched' {
+        $lines = @(1..10 | ForEach-Object { "line $_" })
+        @(Limit-WatchdogGuiDumpLine -Line $lines -MaxLines 2000) | Should -Be $lines
+    }
+
+    It 'keeps the newest lines and prepends a note naming the file' {
+        $lines = @(1..2500 | ForEach-Object { "line $_" })
+        $capped = @(Limit-WatchdogGuiDumpLine -Line $lines -MaxLines 2000 -Path 'C:\Logs\big.log')
+        $capped.Count | Should -Be 2001
+        $capped[0] | Should -Match 'truncated to the last 2000 lines'
+        $capped[0] | Should -Match 'C:\\Logs\\big\.log'
+        $capped[1] | Should -Be 'line 501'
+        $capped[-1] | Should -Be 'line 2500'
+    }
+
+    It 'still names the cap when no file path is supplied' {
+        $capped = @(Limit-WatchdogGuiDumpLine -Line @(1..5 | ForEach-Object { "l$_" }) -MaxLines 2)
+        $capped[0] | Should -Match 'open the file for the rest'
+        @($capped[1..2]) | Should -Be @('l4', 'l5')
+    }
+
+    It 'returns an empty result for no input' {
+        @(Limit-WatchdogGuiDumpLine -Line @()).Count | Should -Be 0
+    }
+}
+
+Describe 'Format-WatchdogGuiEvent' {
+
+    It 'renders time, id, level and the first line of the message' {
+        $record = [pscustomobject]@{
+            TimeCreated      = [datetime]'2026-09-17 08:30:05'
+            Id               = 1030
+            LevelDisplayName = 'Information'
+            Message          = "Test alert accepted by the webhook.`r`nSite: HQ`r`nServices: Spooler"
+        }
+        Format-WatchdogGuiEvent -EventRecord $record |
+            Should -Be '2026-09-17 08:30:05  Id 1030  Information  Test alert accepted by the webhook.'
+    }
+
+    It 'skips leading blank lines in the message body' {
+        $record = [pscustomobject]@{
+            TimeCreated      = [datetime]'2026-09-17 08:30:05'
+            Id               = 1050
+            LevelDisplayName = 'Warning'
+            Message          = "`r`n  Spooler is Failed after 5 attempts.  `r`nnext line"
+        }
+        Format-WatchdogGuiEvent -EventRecord $record | Should -Match 'Warning  Spooler is Failed after 5 attempts\.$'
+    }
+
+    It 'copes with an event carrying no message, level or timestamp' {
+        $record = [pscustomobject]@{ TimeCreated = $null; Id = 1; LevelDisplayName = ''; Message = '' }
+        $line = Format-WatchdogGuiEvent -EventRecord $record
+        $line | Should -Match '\(no time\)'
+        $line | Should -Match 'Unknown'
+        $line | Should -Match '\(no message text\)'
     }
 }
 
