@@ -1,0 +1,515 @@
+<h1>ServiceWatchdog: Windows service monitoring with email alerts</h1>
+
+<div class="callout callout-info">
+  <div class="callout-title">What this is</div>
+  <p>ServiceWatchdog keeps a named list of Windows services running on a server and emails
+  IT when it cannot. A scheduled task runs a PowerShell worker every 5 minutes (and 5
+  minutes after boot) as SYSTEM. The worker starts stopped services, retries inside a time
+  budget, and reports state changes to a small Azure Function that sends the email. A daily
+  heartbeat lets the Azure side notice a server whose watchdog has gone silent.</p>
+  <p>The Azure side never touches services; it only relays and correlates what each server
+  reports. Nothing on the server needs a mail account or an open SMTP port, only outbound
+  HTTPS.</p>
+</div>
+
+<div class="callout callout-accent">
+  <div class="callout-title">Source</div>
+  <p>The scripts, the deployment template and the full technical documentation are published in
+  the public repository: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog</a>. Always take the <strong>Endpoint</strong> folder
+  from there so servers get the current version.</p>
+</div>
+
+<h2>Deployment details</h2>
+
+<p>Values specific to our deployment. Replace every highlighted placeholder before
+publishing.</p>
+
+<table>
+  <thead>
+    <tr><th>Item</th><th>Value</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Alert URL (goes into <code>Webhook.Url</code> on every server)</td>
+        <td><strong>[FUNCTION URL]</strong></td></tr>
+    <tr><td>Function key storage (never paste the key into this article)</td>
+        <td><strong>[PASSWORD VAULT ENTRY OR KEY VAULT NAME]</strong></td></tr>
+    <tr><td>Alert recipients (<code>WATCHDOG_MAIL_TO</code>)</td>
+        <td><strong>[RECIPIENT LIST]</strong></td></tr>
+    <tr><td>Sender address (<code>WATCHDOG_MAIL_FROM</code>, verified in SMTP2GO)</td>
+        <td><strong>[SENDER ADDRESS]</strong></td></tr>
+    <tr><td>Azure subscription / resource group</td>
+        <td><strong>[SUBSCRIPTION] / [RESOURCE GROUP]</strong></td></tr>
+    <tr><td>Function App / Key Vault / storage account</td>
+        <td><strong>[FUNC-NAME] / [KV-NAME] / [ST-NAME]</strong></td></tr>
+    <tr><td>SMTP2GO account and API key name</td>
+        <td><strong>[SMTP2GO ACCOUNT] / [API KEY NAME]</strong></td></tr>
+    <tr><td>Stale-host digest schedule (UTC)</td>
+        <td><strong>[07:00 UTC unless changed]</strong></td></tr>
+    <tr><td>Source repository and version</td>
+        <td><a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">AutomationHub_Public</a>, <code>Monitoring/ServiceWatchdog</code>, version 1.0.0</td></tr>
+  </tbody>
+</table>
+
+<h2>How it works</h2>
+
+<table>
+  <thead>
+    <tr><th>Component</th><th>Where</th><th>Role</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>Invoke-WinServiceWatchdog.ps1</code></td><td>Each monitored server, <code>C:\ProgramData\ServiceWatchdog</code></td>
+        <td>The worker. Reads <code>ServiceWatchdog.json</code>, checks every listed service, starts stopped ones in up to <code>MaxStartAttempts</code> rounds inside <code>MaxRunSeconds</code>, compares with the previous run's state file, POSTs at most one event per run, writes a daily log and Application event log entries (source <code>ServiceWatchdog</code>).</td></tr>
+    <tr><td>Scheduled task <code>ServiceWatchdog</code></td><td>Task Scheduler root folder</td>
+        <td>Runs the worker as SYSTEM every 5 minutes and 5 minutes after boot; one instance at a time; 7-minute execution limit.</td></tr>
+    <tr><td><code>SendServiceWatchdogAlert</code></td><td>Azure Function App (PowerShell, Windows Consumption plan)</td>
+        <td>HTTP endpoint (<code>POST /api/servicewatchdog/alert</code>, function key in the <code>x-functions-key</code> header). Validates the payload strictly, deduplicates on <code>EventId</code>, rate-limits per host, renders HTML plus plain-text email, sends it, records the host's last-seen time.</td></tr>
+    <tr><td><code>SendServiceWatchdogDigest</code></td><td>Same Function App, timer</td>
+        <td>Daily digest of servers that have not reported within 26 hours (or a "no hosts have ever reported" notice).</td></tr>
+    <tr><td>Key Vault</td><td>Azure</td>
+        <td>Holds the SMTP2GO API key (or SMTP password). The Function App reads it through a Key Vault reference with its managed identity.</td></tr>
+    <tr><td>Storage tables <code>WatchdogHosts</code>, <code>WatchdogSentEvents</code></td><td>Azure storage account</td>
+        <td>Last-seen time per host, and one row per delivered <code>EventId</code> for deduplication.</td></tr>
+    <tr><td>SMTP2GO</td><td>Mail provider</td>
+        <td>Sends the email through its REST API (default) or as an authenticated SMTP relay on 587 or 2525.</td></tr>
+  </tbody>
+</table>
+
+<h3>What triggers an email</h3>
+
+<table>
+  <thead>
+    <tr><th>Event</th><th>When</th><th>Subject marker</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>alert</code></td><td>A service is newly <code>Failed</code> (could not be started after retries), <code>Missing</code> (not installed) or <code>Disabled</code> (start type Disabled; never touched)</td><td>none</td></tr>
+    <tr><td><code>reminder</code></td><td>The problem is still present after <code>ReminderMinutes</code> (default 4 hours), repeated at that cadence</td><td><code>Reminder:</code></td></tr>
+    <tr><td><code>recovered</code></td><td>A problem service is running again, whether the watchdog started it or someone else did</td><td>none</td></tr>
+    <tr><td><code>remediated</code></td><td>The watchdog itself started a stopped service. Off by default (<code>NotifyOnRemediation</code>), so routine self-healing is silent</td><td>none</td></tr>
+    <tr><td><code>flapping</code></td><td>Four transitions between healthy and a problem state inside 60 minutes; further mail for that service is suppressed for <code>ReminderMinutes</code></td><td><code>Flapping:</code></td></tr>
+    <tr><td><code>test</code></td><td><code>-TestAlert</code> on a server or <code>-SendTestEmail</code> at deployment</td><td><code>[TEST]</code></td></tr>
+    <tr><td><code>heartbeat</code></td><td>Once every 24 hours per server. Never emailed; only updates the last-seen time used by the digest</td><td>n/a</td></tr>
+  </tbody>
+</table>
+
+<p>Every email lists every monitored service on that server (name, status, start type,
+attempts, first failed, last error) with an asterisk on the ones that triggered it, plus
+the site, host, FQDN, time, run id and event id. If the webhook is unreachable the server
+keeps the event pending and re-sends it on the next run with the same event id, so an
+outage neither loses nor duplicates an email.</p>
+
+<h2>Prerequisites</h2>
+
+<ul>
+  <li><strong>Monitored server:</strong> Windows Server 2016 or later, Windows PowerShell 5.1
+  (PowerShell 7 also works), local administrator rights for the one-time install, outbound
+  HTTPS (443) to the Function App host name. If the server uses a proxy, it must be the
+  machine-wide WinHTTP proxy; SYSTEM does not use a user's browser proxy.</li>
+  <li><strong>Operator workstation (Azure deployment only):</strong> PowerShell 7.4 or later,
+  Az modules 9.7.1 or later (<code>Az.Accounts</code>, <code>Az.Resources</code>,
+  <code>Az.Websites</code>, <code>Az.KeyVault</code>), the Bicep CLI on <code>PATH</code>,
+  and Contributor plus User Access Administrator (or Owner) on the target resource group.</li>
+  <li><strong>SMTP2GO:</strong> a verified sender domain, a dedicated API key with only the
+  Emails (<code>/email/send</code>) permission and a per-key rate limit. Do not enable the
+  account-level API IP allowlist: a Consumption Function App has no fixed outbound IP.</li>
+</ul>
+
+<h2>Deploying the Azure side (once per deployment)</h2>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Do this before touching any server</div>
+  <p>The servers need the alert URL and function key that this step produces. Every step of
+  the install script is idempotent; re-run it to change recipients or to push new function
+  code.</p>
+</div>
+
+<ol>
+  <li>In SMTP2GO: verify the sender domain (three CNAME records), create the scoped API key,
+  set its rate limit (for example 60 per hour; required, not optional: the function has its
+  own global cap of 60 emails per hour, but the provider-side limit is the one that still
+  holds if the function app is misused). For an SMTP relay, apply the relay's equivalent
+  per-account limit.</li>
+  <li>From the repository folder <code>Monitoring/ServiceWatchdog/Deploy</code>:
+<pre><code>Connect-AzAccount
+$apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
+./Install-AzureServiceWatchdogFunction.ps1 `
+    -ResourceGroupName 'rg-servicewatchdog' -Location 'eastus2' -BaseName 'svcwatchdog' `
+    -MailFrom 'Service Watchdog &lt;alerts@example.com&gt;' -MailTo 'it@example.com;oncall@example.com' `
+    -Smtp2GoApiKey $apiKey -SendTestEmail -Verbosity Medium</code></pre>
+  The script deploys the Bicep template (Function App, Key Vault, storage tables, Application
+  Insights, role assignments), seeds the secret, publishes the function code, restarts the
+  app, creates a named function key (<code>watchdog</code>), prints the alert URL and
+  key to the console <strong>once</strong>, and then verifies admin endpoint isolation (a
+  failure there ends with exit 50 after the key was shown; the deployment is still
+  usable). <code>-SendTestEmail</code> sends a <code>[TEST]</code> email to the
+  recipients; a test event never creates a host row, so the workstation does not appear in
+  the stale-host digest.</li>
+  <li>Store the function key in
+  <strong>[PASSWORD VAULT ENTRY]</strong>
+  and record the alert URL in the table above. The key is never written to the log file.</li>
+  <li>For an SMTP relay instead of the REST API, pass <code>-MailProvider Smtp -SmtpHost
+  ... -SmtpPort 587 -SmtpCredential (Get-Credential)</code>. Port 25 is blocked on most
+  Azure subscriptions; implicit TLS on 465 is not supported.</li>
+</ol>
+
+<div class="callout callout-danger">
+  <div class="callout-title">Secrets</div>
+  <p>The function key and the SMTP2GO API key never go into a ticket, chat, this article or
+  the log files. The function key lives only in <strong>ServiceWatchdog.json</strong> on each
+  server (a folder restricted to SYSTEM and Administrators) and in
+  <strong>[PASSWORD VAULT ENTRY]</strong>.
+  The SMTP2GO key lives only in Key Vault (secret <strong>Smtp2GoApiKey</strong>) and in the
+  SMTP2GO console. Recipients are fixed in the Function App settings; nothing a server sends
+  can redirect mail.</p>
+</div>
+
+<h3>Changing who receives the emails</h3>
+
+<p>Recipients live in one Function App setting, <strong>WATCHDOG_MAIL_TO</strong>, as a
+semicolon-separated list. Alerts and the daily digest both go to it. Two ways to change it:</p>
+
+<ol>
+  <li><strong>Re-run the install script</strong> with the new list in <code>-MailTo</code>.
+  Everything else is reused, including the existing function key; it asks for the SMTP2GO key
+  again because it re-seeds the vault secret. Add <code>-SendTestEmail</code> to confirm the
+  new list works.</li>
+  <li><strong>Edit it in the portal</strong>: Function App <strong>[FUNCTION APP NAME]</strong>,
+  Settings, Environment variables, <code>WATCHDOG_MAIL_TO</code>, then Save. The app restarts
+  and the next email uses the new list.</li>
+</ol>
+
+<pre><code>./Install-AzureServiceWatchdogFunction.ps1 `
+    -ResourceGroupName 'rg-servicewatchdog' -Location 'eastus2' -BaseName 'svcwatchdog' `
+    -MailFrom 'Service Watchdog &lt;alerts@example.com&gt;' `
+    -MailTo 'it@example.com;helpdesk@example.com' `
+    -Smtp2GoApiKey $apiKey -SendTestEmail</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">A portal edit is wiped by the next install script run</div>
+  <p>Every run of the install script writes all settings from the template, including the
+  recipient list. If you change recipients in the portal and later run the script with a
+  different <strong>-MailTo</strong>, the portal change is lost. Whenever the script runs, pass
+  the full current list in <strong>-MailTo</strong>, and keep the list in the deployment table
+  at the top of this page up to date.</p>
+</div>
+
+<h2>Installing on a server</h2>
+
+<div class="callout callout-warning">
+  <div class="callout-title">The installer does not install where you run it from</div>
+  <p>Wherever you copied the <strong>Endpoint</strong> folder is only the <em>source</em>. The
+  installer creates and uses <strong>C:\ProgramData\ServiceWatchdog</strong> for
+  the config file, the state file, the logs and its own copy of the worker script, unless you
+  pass <strong>-InstallPath</strong> on every run. So after the first run, the file to edit is
+  <strong>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</strong>, and it
+  will not appear next to the scripts you ran. The source folder can be deleted once the
+  task is registered.</p>
+</div>
+
+<div class="callout callout-danger">
+  <div class="callout-title">Use the service Name, not the Display Name</div>
+  <p>The Services list takes the short <strong>Name</strong> that Get-Service shows:
+  <strong>Spooler</strong>, not Print Spooler; <strong>W3SVC</strong>, not World Wide Web Publishing
+  Service. A display name is resolved as a courtesy, but the short name is what the logs,
+  emails and state file key on. To look one up by its display name:</p>
+</div>
+<pre><code>(Get-Service -DisplayName 'Print Spooler').Name</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Handing registration to another team</div>
+  <p>The separate article <strong>ServiceWatchdog: registering a server</strong> covers only these
+  steps, with fill-in fields for the URL, key and site name, and can be given to the staff
+  who register servers without the rest of this page.</p>
+</div>
+
+<ol>
+  <li>Copy the repository's <code>Monitoring/ServiceWatchdog/Endpoint</code> folder to the
+  server (for example <code>C:\Temp\Endpoint</code>).</li>
+  <li>In an elevated PowerShell, run <code>.\Register-WinServiceWatchdogTask.ps1</code>.
+  The first run creates <code>C:\ProgramData\ServiceWatchdog</code>, locks it down to SYSTEM
+  and Administrators, copies an example config into it and stops with exit 2 asking for
+  the config to be edited. If that folder already exists and is owned by another account,
+  the installer refuses it (exit 2): remove the folder or take ownership first.</li>
+  <li>Edit <code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code>: set
+  <code>SiteName</code> (the customer or site as it should appear in the email),
+  <code>Services</code> (service <strong>short names</strong>, for example <code>Spooler</code>
+  rather than <code>Print Spooler</code>; <code>Get-Service | Select Name, DisplayName</code>
+  shows both), <code>Webhook.Url</code> and <code>Webhook.FunctionKey</code>. Any value still
+  containing <code>REPLACE</code> fails validation.</li>
+  <li>Run <code>.\Register-WinServiceWatchdogTask.ps1 -TestAlert -RunNow</code>
+  (add <code>-SetServiceRecovery</code> to also set Service Control Manager failure actions,
+  restart after 1 and 2 minutes, on every listed service). This re-applies the folder
+  lockdown, copies the worker, validates the config, registers the event source and the
+  task, starts it and sends a test alert.</li>
+  <li>Confirm the <code>[TEST]</code> email arrived, then run the checks under
+  "Testing an installation" further down this page.</li>
+</ol>
+
+<div class="callout callout-success">
+  <div class="callout-title">Re-running the installer is safe</div>
+  <p>Re-run it to change the interval or the execution limit; the task is always
+  re-registered. Every re-run after the first install needs the script's own
+  <strong>-Force</strong>, because the worker is already in place (the copy is idempotent and
+  also serves as the upgrade path). <strong>-DryRun</strong> shows every step without changing
+  anything. For example:</p>
+</div>
+<pre><code>.\Register-WinServiceWatchdogTask.ps1 -Force -IntervalMinutes 10</code></pre>
+
+<h3>Editing the service list later</h3>
+
+<p>Edit <code>Services</code> in <code>ServiceWatchdog.json</code> and confirm with
+<code>.\Invoke-WinServiceWatchdog.ps1 -ValidateConfig</code> from the install folder (exit 0).
+No re-registration is needed; the next run picks the change up. A service removed from the
+list while unhealthy is logged once as event 1006 and forgotten. Delete
+<code>ServiceWatchdog.state.json</code> to reset the watchdog's memory (this may produce
+one fresh <code>alert</code> for a problem that is already known).</p>
+
+<h3>Configuration keys</h3>
+
+<table>
+  <thead>
+    <tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>SiteName</code></td><td>required</td><td>1 to 64 characters; appears in every email</td></tr>
+    <tr><td><code>Services</code></td><td>required</td><td>1 to 100 service short names</td></tr>
+    <tr><td><code>MaxStartAttempts</code></td><td>5</td><td>Start rounds per run (1 to 20)</td></tr>
+    <tr><td><code>RetryDelaySeconds</code></td><td>30</td><td>Pause between rounds (0 to 300)</td></tr>
+    <tr><td><code>PostStartVerifySeconds</code></td><td>10</td><td>Wait for Running after each start (0 to 120)</td></tr>
+    <tr><td><code>StartPendingWaitSeconds</code></td><td>60</td><td>Wait for a service already starting (0 to 300)</td></tr>
+    <tr><td><code>MaxRunSeconds</code></td><td>240</td><td>Time budget for checks and starts (30 to 3600)</td></tr>
+    <tr><td><code>Webhook.Url</code></td><td>required</td><td>Alert URL, <code>https://</code> only</td></tr>
+    <tr><td><code>Webhook.FunctionKey</code></td><td>required</td><td>Named function key; sent as a header</td></tr>
+    <tr><td><code>Webhook.TimeoutSeconds</code></td><td>30</td><td>Per-attempt timeout (5 to 120); one retry after 5 s</td></tr>
+    <tr><td><code>Alerting.ReminderMinutes</code></td><td>240</td><td>Reminder cadence and flapping suppression period (5 to 10080)</td></tr>
+    <tr><td><code>Alerting.NotifyOnRemediation</code></td><td>false</td><td>Email when the watchdog itself restarted a service</td></tr>
+    <tr><td><code>Alerting.RemediationCooldownMinutes</code></td><td>60</td><td>Minimum gap between remediation emails per service</td></tr>
+    <tr><td><code>Alerting.HeartbeatHours</code></td><td>24</td><td>Heartbeat interval (1 to 168); keep below the 26-hour stale threshold</td></tr>
+    <tr><td><code>Logging.LogRoot</code></td><td><code>%ProgramData%\ServiceWatchdog\Logs</code></td><td>Daily log folder</td></tr>
+    <tr><td><code>Logging.LogRetentionDays</code></td><td>30</td><td>Old daily logs are deleted at the start of each run</td></tr>
+    <tr><td><code>Logging.EventLogHealthyRuns</code></td><td>false</td><td>Also write event 1000 on healthy runs</td></tr>
+  </tbody>
+</table>
+
+<h2>Worker exit codes and event IDs</h2>
+
+<p>Exit codes (usable as an RMM script-result check):</p>
+
+<table>
+  <thead>
+    <tr><th>Code</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>0</td><td>All monitored services healthy, or every problem remediated this run</td></tr>
+    <tr><td>1</td><td>Unexpected error (event 1099)</td></tr>
+    <tr><td>2</td><td>Configuration or parameters invalid (event 1020)</td></tr>
+    <tr><td>10</td><td>Notification or heartbeat delivery failed and is pending; no service failures</td></tr>
+    <tr><td>50</td><td>One or more services Failed, Missing or Disabled after retries (wins over 10)</td></tr>
+  </tbody>
+</table>
+
+<p>Application event log, source <code>ServiceWatchdog</code>:</p>
+
+<table>
+  <thead>
+    <tr><th>ID</th><th>Level</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1000</td><td>Information</td><td>Run completed, all healthy (only with <code>EventLogHealthyRuns</code>)</td></tr>
+    <tr><td>1001</td><td>Information</td><td>Service started successfully (attempt count in the message)</td></tr>
+    <tr><td>1002</td><td>Error</td><td>Service failed to start after retries</td></tr>
+    <tr><td>1003</td><td>Warning</td><td>Service not installed</td></tr>
+    <tr><td>1004</td><td>Warning</td><td>Service disabled, skipped</td></tr>
+    <tr><td>1005</td><td>Information</td><td>Service recovered</td></tr>
+    <tr><td>1006</td><td>Warning</td><td>Service removed from the list while unhealthy</td></tr>
+    <tr><td>1007</td><td>Warning</td><td>Service flapping; notifications suppressed until the stated time</td></tr>
+    <tr><td>1010</td><td>Information</td><td>Notification delivered</td></tr>
+    <tr><td>1011</td><td>Error</td><td>Delivery failed: network, DNS or timeout; will retry</td></tr>
+    <tr><td>1012</td><td>Information</td><td>Heartbeat delivered</td></tr>
+    <tr><td>1013</td><td>Error</td><td>Delivery failed: 401 or 403, check the function key; will retry</td></tr>
+    <tr><td>1014</td><td>Error</td><td>Delivery failed: payload rejected (other 4xx); will retry</td></tr>
+    <tr><td>1015</td><td>Error</td><td>Delivery failed: 5xx or 429 from the function; will retry</td></tr>
+    <tr><td>1020</td><td>Error</td><td>Configuration invalid</td></tr>
+    <tr><td>1021</td><td>Warning</td><td>State file unreadable, reset to empty</td></tr>
+    <tr><td>1030</td><td>Information</td><td>Test alert sent</td></tr>
+    <tr><td>1099</td><td>Error</td><td>Unexpected error</td></tr>
+  </tbody>
+</table>
+
+<p>Useful commands on the server:</p>
+
+<pre><code>Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'ServiceWatchdog' } -MaxEvents 20
+Get-Content "$env:ProgramData\ServiceWatchdog\Logs\ServiceWatchdog-$(Get-Date -Format yyyyMMdd).log" -Tail 50
+Get-ScheduledTaskInfo -TaskName ServiceWatchdog</code></pre>
+
+<h3>Checkup: has it restarted anything?</h3>
+<p>A successful restart is silent by default (no email), so this is the quickest way to see the
+watchdog doing its job. Event 1001 is written every time it starts a service:</p>
+<pre><code>Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'ServiceWatchdog'; Id = 1001 } -MaxEvents 25</code></pre>
+<p>Each entry names the service and the attempt it succeeded on. Use <code>Id = 1002</code> for
+failed starts instead, or drop the <code>Id</code> filter for the last 25 events of any kind.</p>
+
+<h2>Testing an installation</h2>
+
+<p>Run from <code>C:\ProgramData\ServiceWatchdog</code> in an elevated PowerShell.</p>
+
+<ol>
+  <li><code>.\Invoke-WinServiceWatchdog.ps1 -ValidateConfig -Verbosity High</code>: exit 0 and
+  a summary of the effective settings.</li>
+  <li><code>.\Invoke-WinServiceWatchdog.ps1 -TestAlert</code>: exit 0, a <code>[TEST]</code>
+  email, event 1030.</li>
+  <li><code>.\Invoke-WinServiceWatchdog.ps1 -DryRun -Verbosity High</code>: every service
+  listed with its status; nothing changed.</li>
+  <li>Stop a non-critical listed service (<code>Stop-Service Spooler</code>) and run
+  <code>Start-ScheduledTask -TaskName ServiceWatchdog</code>. Within a minute the service is
+  running again and event 1001 is logged; no email unless <code>NotifyOnRemediation</code>
+  is on.</li>
+  <li>Disable a listed service (<code>Set-Service Spooler -StartupType Disabled; Stop-Service
+  Spooler</code>) and start the task: an <code>alert</code> email names it as Disabled, events
+  1004 and 1010 are logged, the run exits 50. Restore it
+  (<code>Set-Service Spooler -StartupType Automatic</code>) and start the task again for the
+  <code>recovered</code> email and event 1005.</li>
+  <li><code>.\Invoke-WinServiceWatchdog.ps1 -SendHeartbeat</code>: event 1012 and a row for
+  the host in the <code>WatchdogHosts</code> table (Storage browser in the Azure portal).</li>
+</ol>
+
+<div class="callout callout-accent">
+  <div class="callout-title">Seeing the Azure side</div>
+  <p>In Application Insights on the Function App, the first query below lists every call to
+  the alert function with its status code, and the second shows the function's own log lines
+  including the run id and host name. Requests and exceptions are never sampled.</p>
+</div>
+<pre><code>requests | where name == "SendServiceWatchdogAlert"
+traces | where message has "ServiceWatchdog"</code></pre>
+
+<h2>Secrets and rotation</h2>
+
+<h3>Function key (the value in every server's <code>ServiceWatchdog.json</code>)</h3>
+
+<p>Keys are named and several can be valid at once, so rotation has no outage window.</p>
+
+<ol>
+  <li>Create a new named key: re-run the install script with
+  <code>-FunctionKeyName watchdog-2027q1</code> (everything else is reused and the new key
+  is printed once), or create it directly:
+<pre><code>$site = (Get-AzWebApp -ResourceGroupName 'rg-servicewatchdog' -Name 'func-svcwatchdog-abc123').Id
+$created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watchdog-2027q1"}}' `
+    -Path "$site/functions/SendServiceWatchdogAlert/keys/watchdog-2027q1?api-version=2024-04-01"
+($created.Content | ConvertFrom-Json).properties.value   # the new key; paste it into the vault</code></pre></li>
+  <li>Update <code>Webhook.FunctionKey</code> on every server (RMM script or by hand) and
+  verify each with <code>.\Invoke-WinServiceWatchdog.ps1 -TestAlert</code> (exit 0). Update
+  <strong>[PASSWORD VAULT ENTRY]</strong>.</li>
+  <li>Delete the old key:
+  <code>Invoke-AzRestMethod -Method DELETE -Path "$site/functions/SendServiceWatchdogAlert/keys/watchdog?api-version=2024-04-01"</code>.
+  Any server that was missed starts logging event 1013 and exit 10, which is the signal
+  to fix it.</li>
+  <li>If the rotation is because the key leaked, also review the <code>WatchdogHosts</code>
+  table (Storage browser in the portal) and delete rows for host names that are not real
+  servers; the README section "Recovering from a leaked function key" has the CLI
+  commands. A real server writes its row again on its next heartbeat.</li>
+</ol>
+
+<h3>SMTP2GO API key (or SMTP password)</h3>
+
+<ol>
+  <li>In SMTP2GO create a new API key with the same scope (Emails only) and rate limit. Do
+  not revoke the old one yet.</li>
+  <li>Store it in Key Vault (Key Vault Secrets Officer on the vault is required; the
+  deployer received it from the template):
+  <code>Set-AzKeyVaultSecret -VaultName 'kv-svcwatchdog-abc123' -Name 'Smtp2GoApiKey' -SecretValue (Read-Host -AsSecureString)</code>
+  (<code>SmtpPassword</code> for the SMTP provider).</li>
+  <li>Make the app pick it up now rather than at the next 24-hour refresh:
+  <code>Restart-AzWebApp -ResourceGroupName 'rg-servicewatchdog' -Name 'func-svcwatchdog-abc123'</code>.</li>
+  <li>Verify with <code>.\Invoke-WinServiceWatchdog.ps1 -TestAlert</code> on any server; the
+  <code>[TEST]</code> email proves the new key works end to end.</li>
+  <li>Revoke the old key in SMTP2GO and add a change-log row below.</li>
+</ol>
+
+<h2>Runtime version check</h2>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Check before 10 November 2026</div>
+  <p>The Function App runs PowerShell 7.4, whose support on Azure Functions ends on
+  <strong>10 November 2026</strong>. PowerShell 7.6 is the successor and was in preview
+  (Windows plans only) when this was written. Before that date:</p>
+  <ol>
+    <li>Read the current support table at
+    <strong>https://learn.microsoft.com/azure/azure-functions/supported-languages</strong>.</li>
+    <li>When 7.6 is generally available on Windows Consumption, re-run the install script
+    with <strong>-PowerShellVersion 7.6</strong> (or set the <strong>powerShellVersion</strong>
+    template parameter). The function ships no modules, so the bump is a parameter change
+    and nothing else.</li>
+    <li>Run the install script with <strong>-SendTestEmail</strong>, then <strong>-TestAlert</strong>
+    from one server, and add a change-log row.</li>
+  </ol>
+</div>
+
+<h2>Troubleshooting</h2>
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Install script exits 50 at the publish step with a 401 from <code>Publish-AzWebApp</code></td>
+        <td>SCM basic authentication is disabled on the app or by Azure Policy</td>
+        <td>Update Az to 9.7.1 or later, or allow basic auth on the SCM site (<code>Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"allow":true}}' -Path "$site/basicPublishingCredentialsPolicies/scm?api-version=2024-04-01"</code>) and re-run. A policy assignment may set it back.</td></tr>
+    <tr><td>Redeploy after deleting the resource group fails: a vault with the same name exists in a deleted state</td>
+        <td>Purge protection reserves the Key Vault name for 90 days</td>
+        <td>Recreate a resource group with the original name, run <code>Undo-AzKeyVaultRemoval -VaultName ... -ResourceGroupName ... -Location ...</code>, then re-run the install script; or use a different <code>-BaseName</code> or resource group name.</td></tr>
+    <tr><td>Redeploy after deleting only the Function App fails with <code>RoleAssignmentUpdateNotPermitted</code></td>
+        <td>The old role assignments for the deleted identity still exist under the same names</td>
+        <td>In Access control (IAM) on the Key Vault and on the storage account, delete the assignments showing "Identity not found", then re-run.</td></tr>
+    <tr><td><code>-TestAlert</code> works when run by hand but the scheduled task logs event 1011 (timeout)</td>
+        <td>SYSTEM uses the machine-wide WinHTTP proxy, not the signed-in user's browser proxy</td>
+        <td><code>netsh winhttp show proxy</code>; set it with <code>netsh winhttp set proxy proxy-server="proxy.example.com:8080" bypass-list="&lt;local&gt;"</code> or <code>netsh winhttp import proxy source=ie</code>. Confirm outbound 443 to the Function App host name is allowed.</td></tr>
+    <tr><td>Event 1013 on every run</td>
+        <td>401: wrong or deleted function key. 403 with <code>site_not_allowed</code>: <code>SiteName</code> not in <code>WATCHDOG_ALLOWED_SITES</code></td>
+        <td>Paste the current key from <strong>[PASSWORD VAULT ENTRY]</strong>; or add the site to the allowlist.</td></tr>
+    <tr><td>Event 1014 on every run</td>
+        <td>The function rejected the payload (the log line carries the function's error list); usually a server on a different worker version than the function</td>
+        <td>Keep the endpoint scripts and the function on the same version.</td></tr>
+    <tr><td>Function answers 500 <code>config_unresolved</code></td>
+        <td>A Key Vault reference did not resolve: secret missing, the app's identity lacks Key Vault Secrets User, or the app has not restarted since the secret was created</td>
+        <td>Re-run the install script (it seeds the secret) or <code>Restart-AzWebApp</code>. The portal's "Key Vault Application Settings Diagnostics" blade names the failing reference.</td></tr>
+    <tr><td>Alerts resume up to an hour late after a mail provider outage</td>
+        <td>The per-host rate limit (6 per hour) counts attempts, and the server re-posts its pending event every 5 minutes</td>
+        <td>Wait it out, or restart the Function App (the counter is in memory). A 429 naming the global limit (60 emails per hour across all servers) means the whole fleet sent that many emails in the hour; look at what is alerting.</td></tr>
+    <tr><td>Digest says "no hosts have ever reported"</td>
+        <td>No server has reached the function yet</td>
+        <td>On the servers: <code>Get-ScheduledTaskInfo -TaskName ServiceWatchdog</code>, the config, and events 1011/1013.</td></tr>
+    <tr><td>Digest lists a server as stale</td>
+        <td>Its task is disabled, the server is off, or every delivery fails</td>
+        <td>Check the task's last run result and the events above on that server.</td></tr>
+    <tr><td>Installer exits 1 at once with a message about elevation</td>
+        <td>Not running as administrator</td>
+        <td>Open PowerShell as administrator.</td></tr>
+    <tr><td>Installer exits 2: config outside the install folder</td>
+        <td><code>-ConfigPath</code> points outside <code>-InstallPath</code>, the only folder whose permissions are restricted</td>
+        <td>Keep the config inside the install folder.</td></tr>
+    <tr><td>Worker warns that the event source is missing</td>
+        <td>The worker was run by hand without elevation before the installer registered the source</td>
+        <td>Run the installer, or run the worker elevated once; file logging continues regardless.</td></tr>
+  </tbody>
+</table>
+
+<h2>Removing the watchdog from a server</h2>
+
+<p>Elevated: <code>.\Unregister-WinServiceWatchdogTask.ps1</code> removes the task and keeps
+the config for later re-registration; add <code>-RemoveEventSource -RemoveFiles -Force</code>
+for a complete unattended removal (the install folder, including the config with the key,
+is deleted). Service Control Manager failure actions set with
+<code>-SetServiceRecovery</code> are left in place. Then delete the host's row from the
+<code>WatchdogHosts</code> table so the digest stops listing it as stale.</p>
+
+<h2>Change log</h2>
+
+<table>
+  <thead>
+    <tr><th>Date</th><th>By</th><th>Change</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>[YYYY-MM-DD]</strong></td>
+        <td><strong>[NAME]</strong></td>
+        <td><strong>[Initial deployment: version 1.0.0, PowerShell 7.4, first servers enrolled]</strong></td></tr>
+  </tbody>
+</table>

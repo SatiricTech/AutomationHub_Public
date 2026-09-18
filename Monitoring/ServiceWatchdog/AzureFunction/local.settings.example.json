@@ -1,0 +1,26 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "powershell",
+    "FUNCTIONS_WORKER_RUNTIME_VERSION": "7.4",
+    "WATCHDOG_MAIL_PROVIDER": "Smtp2GoApi",
+    "WATCHDOG_MAIL_FROM": "Service Watchdog <alerts@example.com>",
+    "WATCHDOG_MAIL_TO": "it@example.com",
+    "WATCHDOG_MAIL_SUBJECT_PREFIX": "[Service Watchdog]",
+    "WATCHDOG_MAIL_TIMEOUT_SECONDS": "20",
+    "WATCHDOG_SMTP2GO_API_URL": "https://api.smtp2go.com/v3/email/send",
+    "WATCHDOG_SMTP2GO_API_KEY": "REPLACE_WITH_SMTP2GO_API_KEY",
+    "WATCHDOG_SMTP_HOST": "",
+    "WATCHDOG_SMTP_PORT": "587",
+    "WATCHDOG_SMTP_USERNAME": "",
+    "WATCHDOG_SMTP_PASSWORD": "",
+    "WATCHDOG_SMTP_USE_STARTTLS": "true",
+    "WATCHDOG_TABLE_ENDPOINT": "https://REPLACE-ME.table.core.windows.net/",
+    "WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR": "6",
+    "WATCHDOG_ALLOWED_SITES": "",
+    "WATCHDOG_STALE_HOURS": "26",
+    "WATCHDOG_DIGEST_SCHEDULE": "0 0 7 * * *",
+    "WATCHDOG_DIGEST_ALWAYS_SEND": "false"
+  }
+}
