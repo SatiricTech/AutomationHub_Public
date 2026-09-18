@@ -309,6 +309,31 @@ Describe 'ServiceWatchdogAlert module' {
             $config.SmtpUseStartTls | Should -BeFalse
         }
 
+        It 'falls back to the default email cap and warns instead of blocking every send (<_>)' -ForEach @(
+            '0', '-5', 'none', '60 per hour'
+        ) {
+            # Parked bug: 0 (and any non-numeric value) reached the limiters, whose -Limit
+            # starts at 1, so the binding threw and nothing was mailed at all.
+            $environment = New-TestEnvironment -Overrides @{ WATCHDOG_MAX_EMAILS_PER_HOUR = $_ }
+
+            $config = Get-WatchdogConfig -Environment $environment
+
+            $config.MaxEmailsPerHour | Should -Be 60
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'Warning' -and $Message -match 'WATCHDOG_MAX_EMAILS_PER_HOUR'
+            }
+        }
+
+        It 'keeps a valid email cap and logs no warning for it' {
+            $environment = New-TestEnvironment -Overrides @{ WATCHDOG_MAX_EMAILS_PER_HOUR = '1' }
+
+            (Get-WatchdogConfig -Environment $environment).MaxEmailsPerHour | Should -Be 1
+
+            Should -Invoke Write-WatchdogLog -ModuleName $script:ModuleName -Times 0 -ParameterFilter {
+                $Message -match 'WATCHDOG_MAX_EMAILS_PER_HOUR'
+            }
+        }
+
         It 'rejects a non-numeric numeric setting naming it' {
             $environment = New-TestEnvironment -Overrides @{ WATCHDOG_STALE_HOURS = 'soon' }
             { Get-WatchdogConfig -Environment $environment } | Should -Throw -ExpectedMessage '*WATCHDOG_STALE_HOURS*'

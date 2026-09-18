@@ -254,6 +254,11 @@ and is owned by an account other than SYSTEM or Administrators, the installer re
 (exit 2): remove the folder or take ownership as an administrator first. Add `-SetServiceRecovery` to also set Service
 Control Manager failure actions (restart after 1 and 2 minutes) on every listed service.
 
+One-pass alternative: put a filled-in `ServiceWatchdog.json` next to the script in the
+source folder and the first run seeds the install folder from it and goes straight through
+validation and registration (an existing config in the install folder is never overwritten;
+keep that source copy out of source control, it holds the function key).
+
 Check the inbox for the `[TEST]` email, then see [Testing an installation](#testing-an-installation).
 
 ## Configuration reference
@@ -468,7 +473,7 @@ install script, not only in the portal.
 | `WATCHDOG_SMTP_USE_STARTTLS` | `true` | Implicit TLS on 465 is not supported |
 | `WATCHDOG_TABLE_ENDPOINT` | from the template | Storage table endpoint, ends with `/` |
 | `WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR` | `6` | `recovered` and `heartbeat` are exempt; held in worker memory and keyed on the reported host name, so a backstop rather than a hard cap |
-| `WATCHDOG_MAX_EMAILS_PER_HOUR` | `60` | Global cap per UTC clock hour across all hosts and worker instances, counted in the `WatchdogSentEvents` table; applies to every email including `recovered` and `test` events |
+| `WATCHDOG_MAX_EMAILS_PER_HOUR` | `60` | Global cap per UTC clock hour across all hosts and worker instances, counted in the `WatchdogSentEvents` table; applies to every email including `recovered` and `test` events. Minimum 1: a value below 1 or a non-numeric one logs a warning and falls back to `60` rather than blocking every send |
 | `WATCHDOG_ALLOWED_SITES` | empty | Optional semicolon list of accepted `SiteName` values; empty allows any |
 | `WATCHDOG_STALE_HOURS` | `26` | Digest threshold |
 | `WATCHDOG_DIGEST_SCHEDULE` | `0 0 7 * * *` | NCRONTAB, UTC |

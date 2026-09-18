@@ -133,6 +133,7 @@ BeforeAll {
         param (
             [switch]$WithConfig,
             [switch]$WithInstalledWorker,
+            [switch]$WithSourceConfig,
             [string]$ConfigJson = $script:ExampleConfigJson
         )
         $id = [guid]::NewGuid().ToString('N')
@@ -141,6 +142,13 @@ BeforeAll {
         New-Item -Path $source -ItemType Directory -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $source $script:WorkerFileName) -Value '# worker source'
         Set-Content -LiteralPath (Join-Path $source $script:ExampleConfigFileName) -Value $script:ExampleConfigJson
+
+        if ($WithSourceConfig) {
+            # A pre-filled config sitting in the source folder, marked so tests can tell it
+            # apart from both the example config and an existing install-folder config.
+            Set-Content -LiteralPath (Join-Path $source 'ServiceWatchdog.json') `
+                -Value ($script:ExampleConfigJson -replace 'Example Org', 'Seeded From Source')
+        }
 
         if ($WithConfig -or $WithInstalledWorker) {
             New-Item -Path $install -ItemType Directory -Force | Out-Null
@@ -302,6 +310,63 @@ Describe 'Register-WinServiceWatchdogTask' {
             Get-Content -LiteralPath $fixture.ConfigPath -Raw | Should -Match 'REPLACE_WITH_FUNCTION_KEY'
             Get-LogText | Should -Match ([regex]::Escape($fixture.ConfigPath))
             Should -Invoke Invoke-WatchdogWorker -Times 0
+            Should -Invoke Register-ScheduledTask -Times 0
+        }
+
+        It 'seeds the config from a ServiceWatchdog.json in the source folder and registers in one pass' {
+            $fixture = New-RegisterFixture -WithSourceConfig
+
+            $exitCode = Invoke-WatchdogRegistration @fixture
+
+            $exitCode | Should -Be 0
+            Get-Content -LiteralPath $fixture.ConfigPath -Raw | Should -Match 'Seeded From Source'
+            Should -Invoke Invoke-WatchdogWorker -Times 1 -Exactly -ParameterFilter {
+                $Arguments -contains '-ValidateConfig' -and $Arguments -contains $fixture.ConfigPath
+            }
+            Should -Invoke Register-ScheduledTask -Times 1 -Exactly
+        }
+
+        It 'seeds inside the locked folder, after the ACL is applied' {
+            $fixture = New-RegisterFixture -WithSourceConfig
+
+            Invoke-WatchdogRegistration @fixture | Should -Be 0
+
+            $log = Get-LogText
+            $log.IndexOf('Restrict') | Should -BeLessThan $log.IndexOf('Copy source config')
+        }
+
+        It 'keeps an existing install config and logs that the source-folder config was ignored' {
+            $fixture = New-RegisterFixture -WithConfig -WithSourceConfig
+
+            $exitCode = Invoke-WatchdogRegistration @fixture
+
+            $exitCode | Should -Be 0
+            $config = Get-Content -LiteralPath $fixture.ConfigPath -Raw
+            $config | Should -Match 'Example Org'
+            $config | Should -Not -Match 'Seeded From Source'
+            Get-LogText | Should -Match 'ignored'
+        }
+
+        It 'still copies the example config and exits 2 when the source folder holds no real config' {
+            $fixture = New-RegisterFixture
+
+            $exitCode = Invoke-WatchdogRegistration @fixture
+
+            $exitCode | Should -Be 2
+            Get-Content -LiteralPath $fixture.ConfigPath -Raw | Should -Match 'REPLACE_WITH_FUNCTION_KEY'
+            Should -Invoke Register-ScheduledTask -Times 0
+        }
+
+        It 'copies nothing under -DryRun but validates the source config and reports exit 0' {
+            $fixture = New-RegisterFixture -WithSourceConfig
+
+            $exitCode = Invoke-WatchdogRegistration @fixture -DryRun
+
+            $exitCode | Should -Be 0
+            Test-Path -LiteralPath $fixture.ConfigPath | Should -BeFalse
+            Should -Invoke Invoke-WatchdogWorker -Times 1 -Exactly -ParameterFilter {
+                $Arguments -contains (Join-Path $fixture.SourcePath 'ServiceWatchdog.json')
+            }
             Should -Invoke Register-ScheduledTask -Times 0
         }
 

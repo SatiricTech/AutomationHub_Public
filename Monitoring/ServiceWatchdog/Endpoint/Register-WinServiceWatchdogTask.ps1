@@ -21,9 +21,13 @@
          the folder as SYSTEM. Because only this folder is protected, -ConfigPath must point
          inside it; any other folder is refused with exit 2 before anything is created.
       2. Copies the worker into the folder. An existing worker is left alone unless -Force
-         is set (exit 2 otherwise). If no ServiceWatchdog.json exists, the example config is
-         copied into the locked folder and the script stops with exit 2 so the operator can
-         edit it and re-run.
+         is set (exit 2 otherwise). The config in the install folder is seeded when it is
+         missing: a pre-filled ServiceWatchdog.json in -SourcePath is copied in and the run
+         continues straight through validation and registration, so a prepared source folder
+         installs in one pass; otherwise the example config is copied into the locked folder
+         and the script stops with exit 2 so the operator can edit it and re-run. A config
+         that already exists in the install folder is never overwritten - a source-folder
+         ServiceWatchdog.json is then logged as ignored.
       3. Validates the config by running the worker with -ValidateConfig in a fresh
          Windows PowerShell process (exit 2 on failure), then checks that
          -ExecutionTimeLimitSeconds covers the worst-case run time
@@ -52,7 +56,10 @@
 
 .PARAMETER SourcePath
     Folder containing Invoke-WinServiceWatchdog.ps1 and ServiceWatchdog.example.json to copy
-    from. Defaults to the folder this script runs from.
+    from. Defaults to the folder this script runs from. A ready-to-use ServiceWatchdog.json
+    placed here is used as the seed for a first install instead of the example config (see
+    step 2); keep that folder off source control and remove it once the task is registered,
+    because it holds the function key.
 
 .PARAMETER ConfigPath
     Config file to validate and use. Defaults to <InstallPath>\ServiceWatchdog.json. It must
@@ -106,6 +113,13 @@
 
     First run on a server: copies the worker and example config, then stops with exit 2 so
     ServiceWatchdog.json can be edited. Run again afterwards to validate and register.
+
+.EXAMPLE
+    .\Register-WinServiceWatchdogTask.ps1
+
+    Same command with a filled-in ServiceWatchdog.json sitting next to the script: that file
+    is copied into the install folder as the seed and the run continues through validation
+    and registration, so the server is installed in a single pass.
 
 .EXAMPLE
     .\Register-WinServiceWatchdogTask.ps1 -SetServiceRecovery -RunNow -TestAlert -Verbosity High
@@ -570,6 +584,14 @@ function Install-WatchdogContent {
     $installedWorker = Join-Path $InstallPath $script:WorkerFileName
     $exampleConfig = Join-Path $SourcePath $script:ExampleConfigFileName
 
+    # A pre-filled ServiceWatchdog.json in the source folder lets an operator (or an RMM
+    # push) install in one pass instead of the copy-example/edit/re-run cycle. It is only
+    # ever a seed for a missing config, never an overwrite, and it is ignored when it is the
+    # very file -ConfigPath points at (SourcePath inside InstallPath).
+    $sourceConfig = Join-Path $SourcePath $script:ConfigFileName
+    $sourceConfigExists = (Test-Path -LiteralPath $sourceConfig -PathType Leaf) -and
+        -not $sourceConfig.Equals($ConfigPath, [System.StringComparison]::OrdinalIgnoreCase)
+
     if (-not (Test-Path -LiteralPath $sourceWorker -PathType Leaf)) {
         Write-Log ("Worker script '$($script:WorkerFileName)' not found in '$SourcePath'. " +
             'Use -SourcePath to point at the folder that contains it.') -Level 'ERROR'
@@ -582,9 +604,10 @@ function Install-WatchdogContent {
     }
 
     $configExists = Test-Path -LiteralPath $ConfigPath -PathType Leaf
-    if (-not $configExists -and -not (Test-Path -LiteralPath $exampleConfig -PathType Leaf)) {
-        Write-Log ("No config at '$ConfigPath' and no '$($script:ExampleConfigFileName)' in '$SourcePath' " +
-            'to copy from.') -Level 'ERROR'
+    if (-not $configExists -and -not $sourceConfigExists -and
+        -not (Test-Path -LiteralPath $exampleConfig -PathType Leaf)) {
+        Write-Log ("No config at '$ConfigPath' and neither '$($script:ConfigFileName)' nor " +
+            "'$($script:ExampleConfigFileName)' in '$SourcePath' to copy from.") -Level 'ERROR'
         return 2
     }
 
@@ -611,18 +634,30 @@ function Install-WatchdogContent {
     }
 
     if (-not $configExists) {
-        # Nothing else is touched until a real config exists, so a first run leaves only the
-        # example config behind, inside the locked folder, for the operator to edit.
-        Invoke-Action -Description "Copy example config to '$ConfigPath'" -Action {
+        # Either seed the real config from the source folder and carry on, or fall back to the
+        # example config and stop: nothing else is touched until a real config exists, so that
+        # first run leaves only the example behind, inside the locked folder, to be edited.
+        $seedConfig = if ($sourceConfigExists) { $sourceConfig } else { $exampleConfig }
+        $seedLabel = if ($sourceConfigExists) { "source config '$sourceConfig'" } else { 'example config' }
+        Invoke-Action -Description "Copy $seedLabel to '$ConfigPath'" -Action {
             $configDir = Split-Path -Path $ConfigPath -Parent
             if ($configDir -and -not (Test-Path -LiteralPath $configDir)) {
                 New-Item -Path $configDir -ItemType Directory -Force | Out-Null
             }
-            Copy-Item -LiteralPath $exampleConfig -Destination $ConfigPath
+            Copy-Item -LiteralPath $seedConfig -Destination $ConfigPath
         }
-        Write-Log ("Config file created at '$ConfigPath'. Edit it (Services, Webhook.Url, Webhook.FunctionKey) " +
-            'and re-run this script.') -Level 'ERROR'
-        return 2
+        if (-not $sourceConfigExists) {
+            Write-Log ("Config file created at '$ConfigPath'. Edit it (Services, Webhook.Url, Webhook.FunctionKey) " +
+                'and re-run this script.') -Level 'ERROR'
+            return 2
+        }
+        Write-Log ("Seeded '$ConfigPath' from '$sourceConfig'; continuing with validation and registration.") `
+            -Level 'INFO'
+    }
+    elseif ($sourceConfigExists) {
+        Write-Log ("A '$($script:ConfigFileName)' is present in '$SourcePath' but was ignored: the config at " +
+            "'$ConfigPath' already exists and is never overwritten. Edit that file instead, or remove it first " +
+            'to seed from the source folder.') -Level 'INFO'
     }
 
     Invoke-Action -Description "Copy worker '$sourceWorker' to '$installedWorker'" -Action {
@@ -937,7 +972,16 @@ function Invoke-WatchdogRegistration {
         if (-not (Test-Path -LiteralPath $workerPath -PathType Leaf)) {
             $validationWorker = Join-Path $SourcePath $script:WorkerFileName
         }
-        $configExit = Test-WatchdogInstallConfig -WorkerPath $validationWorker -ConfigPath $ConfigPath `
+        # Under -DryRun a seed copy from the source folder was suppressed too, so the config
+        # to read is the source one; the task action still names the install-folder path.
+        $readableConfig = $ConfigPath
+        if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+            $sourceConfig = Join-Path $SourcePath $script:ConfigFileName
+            if (Test-Path -LiteralPath $sourceConfig -PathType Leaf) {
+                $readableConfig = $sourceConfig
+            }
+        }
+        $configExit = Test-WatchdogInstallConfig -WorkerPath $validationWorker -ConfigPath $readableConfig `
             -ExecutionTimeLimitSeconds $ExecutionTimeLimitSeconds
         if ($configExit -ne 0) {
             return $configExit
@@ -951,7 +995,7 @@ function Invoke-WatchdogRegistration {
 
         $exitCode = 0
         if ($SetServiceRecovery) {
-            $recoveryFailures = Set-WatchdogServiceRecovery -ConfigPath $ConfigPath
+            $recoveryFailures = Set-WatchdogServiceRecovery -ConfigPath $readableConfig
             if ($recoveryFailures -gt 0) {
                 Write-Log ("Task registered, but SCM failure actions could not be set on $recoveryFailures " +
                     'service(s); see the log') -Level 'ERROR'

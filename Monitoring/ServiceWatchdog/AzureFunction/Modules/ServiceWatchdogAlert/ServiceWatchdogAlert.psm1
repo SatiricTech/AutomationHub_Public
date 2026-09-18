@@ -301,6 +301,49 @@ function ConvertTo-WatchdogSettingInt {
     return $parsed
 }
 
+function ConvertTo-WatchdogSettingLimit {
+    <#
+    .SYNOPSIS
+        Converts a rate-limit setting to a positive [int], falling back to its documented
+        default with a warning rather than blocking every send.
+
+    .DESCRIPTION
+        A limit below 1 (0 is the one people reach for when they mean "stop mailing") or a
+        non-numeric value used to reach the limiters, whose -Limit starts at 1: the parameter
+        binding threw and no email left the app at all, alerts included. Such a value is
+        logged as a Warning and the documented default is used instead, so alerting keeps
+        working while the setting is corrected. Turning alerting off is a job for the
+        function app's state, not for a cap of zero.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param (
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Value,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$Default
+    )
+
+    $parsed = 0
+    if (-not [int]::TryParse($Value, [ref]$parsed)) {
+        Write-WatchdogLog -Level Warning -Message ("App setting $Name is not an integer (got '$Value'); " +
+            "using the default of $Default")
+        return $Default
+    }
+    if ($parsed -lt 1) {
+        Write-WatchdogLog -Level Warning -Message ("App setting $Name must be at least 1 (got $parsed); " +
+            "using the default of $Default. A cap of 0 would block every email, alerts included")
+        return $Default
+    }
+    return $parsed
+}
+
 function ConvertTo-WatchdogSettingBool {
     <#
     .SYNOPSIS
@@ -969,8 +1012,10 @@ function Get-WatchdogConfig {
         TableEndpoint           = $tableEndpoint
         MaxAlertsPerHostPerHour = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR' `
             -Value $setting['WATCHDOG_MAX_ALERTS_PER_HOST_PER_HOUR']
-        MaxEmailsPerHour        = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_MAX_EMAILS_PER_HOUR' `
-            -Value $setting['WATCHDOG_MAX_EMAILS_PER_HOUR']
+        # Guarded rather than strict: a 0 or a typo here would otherwise stop every email.
+        MaxEmailsPerHour        = ConvertTo-WatchdogSettingLimit -Name 'WATCHDOG_MAX_EMAILS_PER_HOUR' `
+            -Value $setting['WATCHDOG_MAX_EMAILS_PER_HOUR'] `
+            -Default ([int]$defaults['WATCHDOG_MAX_EMAILS_PER_HOUR'])
         AllowedSites            = ConvertTo-WatchdogSettingList -Value $setting['WATCHDOG_ALLOWED_SITES']
         StaleHours              = ConvertTo-WatchdogSettingInt -Name 'WATCHDOG_STALE_HOURS' `
             -Value $setting['WATCHDOG_STALE_HOURS']
