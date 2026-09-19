@@ -30,6 +30,8 @@ Describe 'ConvertTo-MigrationSafeCell' {
 
     It 'leaves a pure signed number alone, even though it starts with + or -' -ForEach @(
         '+15551234567', '-42', '+3.14', '-3.14', '15551234567'
+        # The extension-qualified line URI shape Split-MigrationTeamsLineUri produces.
+        '+15551110000;ext=524'
     ) {
         ConvertTo-MigrationSafeCell -Value $_ | Should -Be $_
     }
@@ -39,6 +41,8 @@ Describe 'ConvertTo-MigrationSafeCell' {
         # without spaces (Format-MigrationE164), so a spaced-out number reaching this
         # function is not the phone-number case the numeric carve-out exists for.
         '+1 555 123'
+        # A non-digit extension is not the ';ext=<digits>' shape the carve-out allows.
+        '+1555;ext=abc'
         # A non-digit payload after the sign is exactly the injection shape the sanitiser
         # exists to defuse.
         "-1+cmd|' /C calc'!A0"

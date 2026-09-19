@@ -178,10 +178,7 @@ Describe 'DryRun over a CSV of assignments' {
     It 'Plans a user extension whose base number a different target holds, instead of reporting a false conflict' {
         $row = $script:dryRows['mary.jones@newco.onmicrosoft.com']
         $row.Status | Should -BeExactly 'Planned'
-        # The results file runs every cell through ConvertTo-MigrationSafeCell. A pure E.164
-        # number is exempt from the leading-character check, but this value carries an
-        # ';ext=524' suffix, so it is not a pure number and still gets the leading apostrophe.
-        $row.PhoneNumber | Should -Be "'+15551110000;ext=524"
+        $row.PhoneNumber | Should -Be '+15551110000;ext=524'
         $row.Detail | Should -Not -Match 'already assigned'
     }
 
