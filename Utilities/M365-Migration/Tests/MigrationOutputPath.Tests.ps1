@@ -92,6 +92,18 @@ Describe 'ConvertFrom-MigrationOutputPath' {
         ConvertFrom-MigrationOutputPath -Path 'SkuMap.csv' | Should -BeNullOrEmpty
     }
 
+    It 'returns $null for a digit-shaped stamp that is not a date' -ForEach @(
+        # The shape matches - eight digits, a hyphen, six digits - but no such moment
+        # exists, so ParseExact would throw. A caller scanning a folder expects an
+        # unreadable name to be skipped, exactly as a .bak is.
+        'Contoso_IdentityPlan_20261399-000000.csv'
+        'Contoso_IdentityPlan_20260918-996100.csv'
+        'Contoso_IdentityPlan_00000000-000000.csv'
+        'Contoso_IdentityPlan_20260230-101500.csv'
+    ) {
+        ConvertFrom-MigrationOutputPath -Path $_ | Should -BeNullOrEmpty
+    }
+
     It 'round-trips what Get-MigrationOutputPath builds for a results file' {
         $ts = [datetime]'2026-09-18T10:15:00'
         $path = Get-MigrationOutputPath -Directory $TestDrive -Prefix 'Contoso' -Name 'New-Users' `

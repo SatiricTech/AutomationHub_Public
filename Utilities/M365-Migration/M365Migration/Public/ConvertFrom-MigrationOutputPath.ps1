@@ -13,7 +13,10 @@ function ConvertFrom-MigrationOutputPath {
         '.bak' file (Save-MigrationPlan's backup convention) and any name that does not
         match the '<Prefix>_<Name>_<timestamp>.<ext>' shape (with the prefix segment
         optional) return $null rather than throwing, because a caller scanning a folder
-        expects to skip files that are not part of the contract, not to stop on them.
+        expects to skip files that are not part of the contract, not to stop on them. So
+        does a name whose stamp is digit-shaped but names no real moment - a hand-edited
+        or truncated '..._20261399-000000.csv' - since that is an unreadable name, not a
+        reason to abandon the scan.
 
         Name and Prefix never contain an underscore - it is the contract's separator -
         but a hyphen is common in Name (as in 'Set-Identity' or 'Migration-Inventory').
@@ -70,7 +73,16 @@ function ConvertFrom-MigrationOutputPath {
     $prefix = if ($Matches.ContainsKey('prefix')) { $Matches['prefix'] } else { '' }
     $rawName = $Matches['name']
     $extension = $Matches['ext']
-    $timestamp = [datetime]::ParseExact($Matches['ts'], 'yyyyMMdd-HHmmss', $null)
+
+    # The pattern only proves the stamp is digit-shaped, not that it names a real moment:
+    # '20261399-000000' passes it and makes ParseExact throw. A caller scanning a folder
+    # expects an unreadable name to be skipped, the same as a .bak, so it is $null here too.
+    try {
+        $timestamp = [datetime]::ParseExact($Matches['ts'], 'yyyyMMdd-HHmmss', $null)
+    }
+    catch {
+        return $null
+    }
 
     $name = $rawName
     $suffix = ''
