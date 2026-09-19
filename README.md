@@ -123,7 +123,7 @@ Mirrors the top-level structure for cross-platform parity. Add Mac scripts in th
 | | `Remove-MigrationDomainReferences.ps1` | Release a vanity domain in the source tenant: report every reference and blocker, then move objects off the domain |
 | | `Set-MigrationIdentity.ps1` | Apply the plan's target UPN, primary SMTP, aliases, X500, mail nickname and GAL visibility (also the in-place UPN redesign tool) |
 | | `Set-MigrationMailboxPermissions.ps1` | Re-apply FullAccess, SendAs, SendOnBehalf, calendar permissions and forwarding to the migrated mailboxes |
-| | `Reset-MigrationCutoverPasswords.ps1` | Cutover password reset to unique passphrases (plan, CSV, group or single user), change-at-next-sign-in, credential log |
+| | `Reset-MigrationCutoverPasswords.ps1` | Cutover password reset to unique passphrases (plan, CSV, group or single user), change-at-next-sign-in, credentials to the results CSV and never to the log |
 | | `Set-MigrationTeamsPhoneAssignments.ps1` | Bulk-assign Teams phone numbers in the destination tenant from a CSV (auto-detects number type, grants voice routing policy) |
 | | `Remove-MigrationTeamsPhoneAssignments.ps1` | Bulk-unassign Teams phone numbers in the source tenant, logging each removal as a reassignment-ready CSV |
 | | `Import-MigrationVivaLearningHistory.ps1` | Replay exported Viva Learning learner history into the destination tenant under a custom provider (idempotent re-runs) |

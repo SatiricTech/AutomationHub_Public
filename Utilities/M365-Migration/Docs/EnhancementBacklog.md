@@ -42,3 +42,69 @@ in one place, turns a per-command discipline into a property of the run.
 
 **Also worth checking when this is picked up.** Exchange Online is a separate session with its
 own lifetime and a noticeably slower connect, so any session strategy needs to cover both.
+
+---
+
+## 2. Deferred from the 1.2.0 hardening pass
+
+Every item below was raised, weighed and consciously left out of 1.2.0 — either because the
+fix is larger than the finding, or because it belongs with the workbench work rather than
+ahead of it. None is a defect; each is written so it can be picked up cold.
+
+### Behaviour
+
+- **Hand-added plan columns are dropped on write-back.** `Import-MigrationPlan` and
+  `Save-MigrationPlan` carry only the canonical schema, so an operator's own column — a ticket
+  reference, a note to the service desk — survives being read but not being written back by a
+  writer. Either round-trip unknown columns or say plainly in the README that the plan is
+  schema-fixed.
+- **OneDrive and calendar read errors in `Get-MigrationInventory` are hidden.** They are logged
+  at DEBUG and do not set exit 2, so a tenant whose OneDrive reads all failed looks like a
+  tenant with no OneDrive. Surface them as rows, or at least raise the level.
+- **Credentials CSV naming and ACL.** The file holding `GeneratedPassword` is named like every
+  other results file and inherits the folder's permissions. A distinct name and owner-only
+  permissions would make it obvious and harder to leak — the rescue copy in the temp folder
+  especially.
+- **Graph scope trims.** `Set-MigrationIdentity` asks for `Directory.ReadWrite.All` it may not
+  need; `Reset-MigrationCutoverPasswords` carries scopes that are redundant given the others;
+  and three writers still request `ReadWrite` scopes under `-DryRun`. Each trim is small, each
+  needs its own proof that nothing else used the scope.
+- **Seat pre-check counts users who already hold the licence** (KnownDocGaps #12). Subtract the
+  rows whose target user already has the SKU, or report planned and net-new side by side.
+- **`-RecomputeLicenses` on a re-plan** (KnownDocGaps #11). `-ExistingPlanPath` freezes the
+  licence column along with the identity, so a corrected SKU map never reaches an override row.
+  A switch that preserves identity while recomputing licences is the smallest honest fix.
+- **Mapping export should refuse, or make you acknowledge, in-scope rows that are `Skipped`**
+  (KnownDocGaps #10). An incomplete mapping file is worse than no mapping file, and today it
+  looks complete.
+- **`Remove-MigrationTeamsPhoneAssignments` resolves users before the row loop.** One transient
+  Teams error therefore aborts the whole wave before a single number is released. Per-row
+  resolution fails one row instead. The current shape is the safe direction, which is why it
+  shipped, but it is not the right one.
+- **`-ReportOnly` as an alias of `-DryRun`**, `-User` as `[string[]]` in the Teams scripts, and
+  `-ScriptName` taken from `$MyInvocation` instead of a literal. Three small consistency wins
+  that each touch several files.
+
+### Structure and tests
+
+- **Main-region extractions.** `New-MigrationIdentityPlan`, `New-MigrationRecipients`,
+  `Get-MigrationInventory` and `Import-MigrationVivaLearningHistory` still carry long `Main`
+  regions that can only be tested end to end. Pulling the decisions out, as the other scripts
+  now have, is what makes them unit-testable.
+- **Line-length reflow of pre-existing over-120-character lines**, then turn on the
+  `PSAvoidLongLines` analyzer rule so they cannot come back.
+- **Result-row builder consolidation.** A `New-MigrationResultRow` helper, and promoting the
+  three duplicated `Private/` converters, would remove the copy-paste that every script repeats.
+- **`Import-OptionalPlanCsv`: unify the three empty-CSV catch shapes.** The planner catches the
+  same "no data rows" condition in three places with three slightly different shapes.
+- **Behavioural `-DryRun` end-to-end harness for `Get-MigrationInventory`**, and driving the
+  `RecipientAddress` → `UpdateAddresses` path in the domain-references harness. Both are
+  currently proved structurally rather than by running them.
+- **Duplicate "could not confirm" warning in `Get-MigrationInventory`**, alongside the one
+  `Assert-MigrationTenant` already emits. Cosmetic, but it reads like two different problems.
+
+### Bigger
+
+- **Phase batching in one child process** (workbench v2). Running several phases in a single
+  child would keep one set of sessions alive across them, which is the real answer to the
+  re-authentication friction item 1 describes.

@@ -9,6 +9,11 @@ wrong decision.
 Resolve these the next time the docs are revised. Where a fix belongs in code rather than
 prose, that is called out.
 
+The 1.2.0 hardening pass closed **#2, #3, #4, #6, #7 and #9**; each carries a
+**Resolved in 1.2.0** line naming how, and its heading says so. **#1, #5, #8, #10, #11 and
+#12 are still open** — #11 and #12 are code changes now recorded in `EnhancementBacklog.md`,
+#10 is both, and the rest are prose still to be written.
+
 ---
 
 ## 1. Example values are indistinguishable from values to substitute
@@ -22,7 +27,7 @@ them as placeholders.
 run this, replace these" list to the top of the runbook naming every value that is
 environment-specific. Real-looking domains in examples are the trap.
 
-## 2. Runbook examples use wildcards that only one parameter supports
+## 2. Runbook examples use wildcards that only one parameter supports — resolved
 
 **What happens.** Every runbook example writes CSV inputs as `.\Source_Users_*.csv`. Only
 `-PlanPath` resolves a wildcard. Every other CSV parameter is read literally, so each of those
@@ -33,7 +38,14 @@ the CSV parameters resolve a unique wildcard the way `-PlanPath` already does. T
 the better fix: the filenames carry a timestamp, so a wildcard is the natural way to name
 them and operators will keep reaching for it.
 
-## 3. Relative paths in the examples cannot work as written
+**Resolved in 1.2.0** (docs only): the first fix. Every runbook example now names its file, and
+a `*` appears only on `-PlanPath`. The README's Runbook preamble says which parameters resolve
+a wildcard — `-PlanPath`, and `-ExistingPlanPath` in the planner, both through
+`Import-MigrationPlan` — and that everything else is read with `-LiteralPath`. The behaviour
+itself is unchanged; making the other CSV parameters resolve wildcards is still open, and sits
+in `EnhancementBacklog.md` territory rather than here.
+
+## 3. Relative paths in the examples cannot work as written — resolved
 
 **What happens.** Examples use `.\` for every input, but the source and destination
 inventories are written into two different folders under the output root, and neither is the
@@ -42,7 +54,12 @@ folder the scripts are run from. No single working directory makes an example ru
 **Suggested fix.** Show full paths in the runbook, or show the variables that build them.
 State plainly that the two inventories do not share a folder.
 
-## 4. An empty optional CSV is fatal, and nothing says so
+**Resolved in 1.2.0** (docs only): the README gained "Where output lands, and the paths in
+these examples", which defines `$Root`, `$SourceDir`, `$DestDir` and `$RunDir`, says outright
+that each `-Prefix` gets its own folder so no single working directory works, and every example
+now builds an absolute path from those variables.
+
+## 4. An empty optional CSV is fatal, and nothing says so — resolved
 
 **What happens.** A tenant with no shared mailboxes, or no mail contacts, still gets a
 header-only CSV from the inventory. Passing that file to the planner aborts the run with
@@ -51,6 +68,18 @@ header-only CSV from the inventory. Passing that file to the planner aborts the 
 **Suggested fix.** Best fixed in code: an optional input that exists but holds no rows should
 log a warning and contribute nothing, not end the run. Until then the docs must say to omit
 inputs whose CSV is empty, and the error text should name the parameter to drop.
+
+**Resolved in 1.2.0** (code, for the planner): `New-MigrationIdentityPlan` reads every optional
+input through `Import-OptionalPlanCsv`, which treats a header-with-no-rows file as empty and
+warns `<parameter> '<file>' has a header but no rows; nothing was taken from it.` — naming the
+parameter, as asked. That covers `-UserMailboxesCsv`, `-SharedMailboxesCsv`, `-GroupsCsv`,
+`-ContactsCsv`, `-ExclusionRulesPath` and `-WaveMapPath`; `-SkuMapPath` and
+`-ReservedAddressesPath` do their own reading and catch the same case with the same warning.
+The required `-UsersCsv` still
+refuses an empty file, correctly. **Scope to know:** no other script got this treatment, so a
+header-only CSV handed to `New-MigrationRecipients` or `Set-MigrationMailboxPermissions` still
+aborts with "contains no data rows" — the README's Runbook preamble says to drop the argument
+there.
 
 ## 5. No rule for choosing the target domain
 
@@ -63,7 +92,7 @@ may put every user's sign-in address on the parent domain regardless of origin.
 use the domain its existing accounts actually sign in on. Say explicitly that the migrating
 company's own domain is often the wrong answer.
 
-## 6. No rule for deciding whether an interim domain is needed at all
+## 6. No rule for deciding whether an interim domain is needed at all — resolved
 
 **What happens.** The runbook always passes `-InterimDomain`, so it reads as mandatory. It is
 only needed when the target domain is still held by the source tenant and therefore cannot be
@@ -74,7 +103,13 @@ destination, passing an interim domain adds a pointless provision-then-rename cy
 destination inventory's domains file, omit `-InterimDomain`. Show the runbook's main example
 without it, and treat the interim case as the variant.
 
-## 7. Sign-in and mail addresses always share one domain
+**Resolved in 1.2.0** (docs only): the README's "Interim vs target domain" section now leads
+with the test in bold — if `-TargetDomain` already appears in the destination inventory's
+`Domains` CSV, omit `-InterimDomain`. Runbook step 3 is written without it, and the interim
+case is a blockquote variant naming the three commands that change (`-InterimDomain` on the
+planner, `-UseInterim` in steps 4 and 6).
+
+## 7. Sign-in and mail addresses always share one domain — resolved
 
 **What happens.** The planner builds both the target UPN and the target primary SMTP address
 from `-TargetDomain`, so they are always in the same domain. The `UpnSmtpDiverge` section
@@ -87,6 +122,15 @@ for a split — build the plan on the sign-in domain, then edit the primary SMTP
 those rows as an operator override — and note that the mail side cannot take effect until the
 mail domain is released from the source tenant and verified in the destination. If the split
 is common enough, a separate SMTP domain parameter belongs on the backlog.
+
+**Resolved in 1.2.0** (code + docs): the planner gained `-SmtpDomain`, so the split no longer
+needs a hand edit. The UPN is built in `-TargetDomain`, the primary SMTP address in
+`-SmtpDomain`; those rows are marked `UpnSmtpDiverge`; collisions and reserved addresses are
+judged per domain; and `-InterimDomain` then applies to the sign-in address only, with
+`InterimPrimarySmtp` equal to `TargetPrimarySmtp` and a warning saying so. The README's "One
+domain, or two" subsection states the default — one domain drives both columns — shows the
+two-domain example and lists those consequences. Both domains still have to be verified in the
+destination before the addresses can be applied.
 
 ## 8. A collision may not be a collision
 
@@ -102,13 +146,19 @@ department or company attribute naming the migrating organisation. Note that the
 script adopts an existing account rather than duplicating it, so the correct repair is to put
 the un-suffixed address back on the row and mark it as an operator override.
 
-## 9. A runbook does not say which version of the toolkit it describes
+## 9. A runbook does not say which version of the toolkit it describes — resolved
 
 **What happens.** A published runbook described scripts that existed only on an unmerged
 branch. Someone following it against the released code found the script was not there.
 
 **Suggested fix.** Stamp each runbook with the release or merge it corresponds to, and do not
 publish one describing unreleased scripts without marking it as pending.
+
+**Resolved in 1.2.0** (code + docs): every one of the 17 scripts now carries `Version: 1.2.0`
+in its `.NOTES` block, the module manifest is `1.2.0`, and the README states the toolkit
+version in "What this is". A runbook can therefore name the version it was written against and
+an operator can check what they have. Publishing discipline for the Hudu article stays a human
+habit, not something the code can enforce.
 
 ## 10. A skipped row in the mapping export means content will not migrate
 
@@ -157,4 +207,4 @@ Every item here was found by running the toolkit against real tenants, and none 
 docs. The examples are internally consistent and describe the parameters accurately; what they
 lack is the operator's decision context — which value comes from where, which argument to drop,
 and which choice needs a human. A worked first-run walkthrough against a realistic pair of
-tenants would have caught all nine.
+tenants would have caught every one of them.
