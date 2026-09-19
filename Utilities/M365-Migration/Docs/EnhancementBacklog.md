@@ -102,6 +102,18 @@ ahead of it. None is a defect; each is written so it can be picked up cold.
   currently proved structurally rather than by running them.
 - **Duplicate "could not confirm" warning in `Get-MigrationInventory`**, alongside the one
   `Assert-MigrationTenant` already emits. Cosmetic, but it reads like two different problems.
+- **`Assert-MigrationTenant -FallbackTenantId` to own the four-script expected-tenant block.**
+  `Get-MigrationInventory`, `Remove-MigrationDomainReferences`, `Set-MigrationIdentity` and
+  `Test-MigrationReadiness` each carry the same
+  `$expectedTenant = if ($TenantId) { $TenantId } else { $graphTenantId }` line, plus the same
+  "this run was not pinned" warning around it. A `-FallbackTenantId` parameter would let the
+  guard make that choice itself, so the fallback rule and its warning live in one place
+  instead of four.
+- **The Hudu article still uses relative paths.** `Docs/Hudu-M365Migration.html` writes
+  `-PlanPath .\Contoso_IdentityPlan_<ts>.csv` and its siblings, the shape the README dropped
+  in 1.2.0 because each `-Prefix` gets its own folder and no single working directory makes
+  a relative path work. The article is published, so rewriting it to the `$RunDir`-style
+  absolute paths is the owner's call and waits on their go.
 
 ### Bigger
 

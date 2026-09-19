@@ -133,13 +133,13 @@ function Connect-MigrationExchange {
     $connectedUpn = Get-MigrationProperty -InputObject $information -Name 'UserPrincipalName' -Default ''
     $connectedTenantId = Get-MigrationProperty -InputObject $information -Name 'TenantId' -Default ''
 
-    # A cached session can be dropped and reconnected only to land right back in the
-    # wrong tenant if the interactive sign-in picks a different cached account (the
-    # account chooser), so the freshly established session is checked too rather than
-    # trusting that a fresh Connect-ExchangeOnline call always honours -TenantId. The
-    # comparison itself lives in Assert-MigrationTenant, so every connector and script
-    # shares one implementation of "does this session match the tenant I was told to
-    # expect".
+    # Nothing above told Connect-ExchangeOnline which tenant to use: on the interactive
+    # path it has no -TenantId to honour, and the account chooser can land the session in
+    # any tenant the technician holds an account in - including the one the cached session
+    # was just dropped for. So the freshly established session is checked as well, which is
+    # the only place the expected tenant can be enforced at all. The comparison itself lives
+    # in Assert-MigrationTenant, so every connector and script shares one implementation of
+    # "does this session match the tenant I was told to expect".
     if ($expectedTenantId) {
         try {
             $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenantId -ExchangeConnection $information `
