@@ -37,6 +37,7 @@ BeforeAll {
         'Get-InventoryGroupType'
         'Test-InventoryTrustee'
         'ConvertTo-InventoryFolderTrustee'
+        'Get-InventoryTabColumn'
     )
 
     $tokens = $null
@@ -660,10 +661,12 @@ Describe 'The tab writer' {
 
     <#
         Structural, like the tenant-guard block above: the script is tenant-bound so there is no
-        offline harness to run the nine-tab write for real. This proves the local writers
-        (Export-InventoryTab, Get-InventoryTabColumn) are gone, that every tab is written through
-        Export-MigrationReport sharing one run timestamp, and that the resulting name parses back
-        with ConvertFrom-MigrationOutputPath.
+        offline harness to run the nine-tab write for real. This proves the local CSV writer
+        (Export-InventoryTab) is gone, that every tab is written through Export-MigrationReport
+        sharing one run timestamp, that the resulting name parses back with
+        ConvertFrom-MigrationOutputPath, and that an empty tab's header still matches a populated
+        tab's - the whole reason Get-InventoryTabColumn was kept (feeding -Columns) rather than
+        retired with Export-InventoryTab.
     #>
 
     # Built here, at Describe scope rather than inside BeforeAll, because -ForEach needs it during
@@ -673,19 +676,19 @@ Describe 'The tab writer' {
         'Groups', 'Contacts', 'Domains', 'Licenses', 'Summary'
     )
 
-    It 'No longer defines the retired local writers' {
+    It 'No longer defines the retired Export-InventoryTab writer' {
         $names = @($ast.FindAll($predicate, $true) | ForEach-Object { $_.Name })
         $names | Should -Not -Contain 'Export-InventoryTab'
-        $names | Should -Not -Contain 'Get-InventoryTabColumn'
     }
 
-    It 'Writes every tab through Export-MigrationReport, suppressed in a dry run' {
+    It 'Writes every tab through Export-MigrationReport, with its columns, suppressed in a dry run' {
         $calls = @($ast.FindAll(
                 { $args[0] -is [System.Management.Automation.Language.CommandAst] -and
                     $args[0].GetCommandName() -eq 'Export-MigrationReport' }, $true) |
             ForEach-Object { $_.Extent.Text })
         $calls.Count | Should -Be 1
         $calls[0] | Should -Match '-Name \$tab\b'
+        $calls[0] | Should -Match '-Columns \$columns\b'
         $calls[0] | Should -Match '-Timestamp \$runTimestamp'
         $calls[0] | Should -Match '-SuppressInDryRun'
     }
@@ -701,5 +704,22 @@ Describe 'The tab writer' {
         $parsed.Name | Should -BeExactly $_
         $parsed.Suffix | Should -BeExactly ''
         $parsed.Prefix | Should -BeExactly 'Contoso'
+    }
+
+    It 'Writes the <_> tab''s empty header the same as its populated header' -ForEach $inventoryTabNames {
+        $null = Initialize-MigrationRun -ScriptName 'Get-MigrationInventory' -OutputPath $TestDrive -Verbosity Low
+
+        $columns = @(Get-InventoryTabColumn -Name $_)
+        $columns.Count | Should -BeGreaterThan 0 -Because "$_ needs a known column list to test"
+
+        $sample = [ordered]@{}
+        foreach ($column in $columns) { $sample[$column] = 'sample' }
+        $populatedPath = Export-MigrationReport -Rows @([pscustomobject]$sample) -Name $_
+        $populatedHeader = Get-Content -LiteralPath $populatedPath -TotalCount 1
+
+        $emptyPath = Export-MigrationReport -Rows @() -Name $_ -Columns $columns -Suffix 'Empty'
+        $emptyHeader = Get-Content -LiteralPath $emptyPath -TotalCount 1
+
+        $emptyHeader | Should -BeExactly $populatedHeader
     }
 }

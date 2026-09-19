@@ -428,6 +428,32 @@ Describe 'New-MigrationIdentityPlan' {
             }
         }
 
+        It 'Accepts an empty SharedMailboxes tab produced by Export-MigrationReport -Columns' {
+            <#
+                The real round trip: Get-MigrationInventory writes an empty optional tab through
+                Export-MigrationReport -Columns (Task 18/19 correction), and the planner has to
+                read that file the same way it reads a hand-built header-only CSV. The column
+                list comes from the real populated fixture's own header, not a hardcoded copy, so
+                this cannot silently drift from what Get-MigrationInventory actually produces.
+            #>
+            $realHeader = (Get-Content -LiteralPath (Join-Path $script:Fixtures 'SharedMailboxes.csv') `
+                    -TotalCount 1) -replace '"', '' -split ','
+
+            $reportDir = Join-Path $TestDrive 'export-migration-report-shared'
+            $null = New-Item -Path $reportDir -ItemType Directory -Force
+            $null = Initialize-MigrationRun -ScriptName 'Get-MigrationInventory' -OutputPath $reportDir -Verbosity Low
+            $emptySharedPath = Export-MigrationReport -Rows @() -Name 'SharedMailboxes' -Columns $realHeader
+
+            $parameters = @{} + $script:FullParameters
+            $parameters['SharedMailboxesCsv'] = $emptySharedPath
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'emptyshared-viareport') -Parameter $parameters
+
+            $result.ExitCode | Should -Be 0
+            $result.Log | Should -Match ([regex]::Escape(
+                    "-SharedMailboxesCsv '$emptySharedPath' has a header but no rows; nothing was taken from it."))
+            @($result.Rows | Where-Object { $_.ObjectType -eq 'Shared' }) | Should -HaveCount 0
+        }
+
         It 'Still fails the run when the required users CSV is the empty one' {
             $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'emptyusers') -Parameter @{
                 UsersCsv = $script:EmptySharedCsv

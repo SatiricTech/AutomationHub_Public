@@ -19,9 +19,13 @@ function Export-MigrationReport {
         Without a run context the module's default output root is used, which is what lets
         these functions be exercised in tests without standing up a run.
 
-        An empty report still produces a file with one informational row: the file is
-        evidence that the enumeration ran and found nothing, and a downstream Import-Csv
-        does not fall over on a zero-byte file.
+        An empty report still produces a file: with -Columns, a header-only CSV carrying
+        exactly those columns (nothing under the header) - so a caller whose header names
+        are a contract with a downstream reader (New-MigrationIdentityPlan's optional-CSV
+        columns, say) never sees the shape of that contract change just because the tenant
+        had nothing of that kind. Without -Columns the file gets one informational row
+        instead: evidence that the enumeration ran and found nothing, so a downstream
+        Import-Csv does not fall over on a zero-byte file either way.
 
         The file is written in a dry run as well, because DryRun means 'change nothing in
         the tenant' and a report is a read: suppressing it would leave the rehearsal with
@@ -39,6 +43,12 @@ function Export-MigrationReport {
     .PARAMETER Suffix
         An optional qualifier appended to the name after a hyphen, for example 'Unassigned'
         or 'Blockers'.
+
+    .PARAMETER Columns
+        The column names to use when -Rows is empty. When given, an empty report is a
+        header-only CSV with exactly these columns instead of the single Info row - use
+        this when the file's header is itself a contract a downstream reader checks. Ignored
+        when -Rows has at least one row: the row's own properties are the header then.
 
     .PARAMETER SuppressInDryRun
         Writes nothing and returns an empty string when the active run is a dry run. Use
@@ -58,6 +68,12 @@ function Export-MigrationReport {
         Export-MigrationReport -Rows $spare -Name 'TeamsPhoneNumbers' -Suffix 'Unassigned'
 
         Writes <Prefix>_TeamsPhoneNumbers-Unassigned_<timestamp>.csv.
+
+    .EXAMPLE
+        Export-MigrationReport -Rows @() -Name 'SharedMailboxes' -Columns @('PrimarySmtpAddress', 'DisplayName')
+
+        Writes a header-only CSV ("PrimarySmtpAddress","DisplayName" and nothing under it)
+        instead of a single Info row.
 
     .EXAMPLE
         Export-MigrationReport -Rows $postMoveOnly -Name 'PostMove' -SuppressInDryRun
@@ -85,6 +101,10 @@ function Export-MigrationReport {
         [AllowEmptyString()]
         [string]$Suffix,
 
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]]$Columns,
+
         [switch]$SuppressInDryRun,
 
         [datetime]$Timestamp
@@ -93,11 +113,14 @@ function Export-MigrationReport {
     $run = Get-MigrationRunContext
     $data = @($Rows)
     $count = $data.Count
+    $headerColumns = @($Columns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $headerOnly = ($count -eq 0 -and $headerColumns.Count -gt 0)
 
     # Checked, and returned from, before the output directory is created: a dry run that
     # suppresses this report must not leave behind a folder it never wrote into.
     if ($SuppressInDryRun -and $run -and $run.DryRun) {
-        Write-MigrationLog -Message "[DRYRUN] Would write $Name report ($count row(s))" -Level WARNING
+        $shape = if ($headerOnly) { "$count row(s), header only" } else { "$count row(s)" }
+        Write-MigrationLog -Message "[DRYRUN] Would write $Name report ($shape)" -Level WARNING
         return ''
     }
 
@@ -113,6 +136,21 @@ function Export-MigrationReport {
         catch {
             throw "Could not create the report directory '$directory': $($_.Exception.Message)"
         }
+    }
+
+    if ($headerOnly) {
+        # The header line Export-Csv would have written for a typed, empty collection whose
+        # columns were $headerColumns - so a populated and an empty run of the same report
+        # are one Import-Csv contract, never two.
+        $headerLine = '"' + ($headerColumns -join '","') + '"'
+        try {
+            Set-Content -LiteralPath $filePath -Value $headerLine -Encoding utf8 -ErrorAction Stop
+        }
+        catch {
+            throw "Could not write the report '$filePath': $($_.Exception.Message)"
+        }
+        Write-MigrationLog -Message "$Name report written to $filePath ($count row(s), header only)" -Level SUCCESS
+        return $filePath
     }
 
     if ($count -eq 0) {

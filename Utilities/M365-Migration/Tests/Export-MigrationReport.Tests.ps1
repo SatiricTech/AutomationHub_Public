@@ -110,6 +110,21 @@ Describe 'Export-MigrationReport' {
             $written[0].Info | Should -BeExactly 'No Blockers records found.'
         }
 
+        It 'Writes a header-only CSV for an empty report when -Columns is given, not an Info row' {
+            $null = Initialize-MigrationRun -ScriptName 'Remove-DomainReferences' -OutputPath $script:workspace
+            $path = Export-MigrationReport -Rows @() -Name 'HeaderOnly' -Columns @('A', 'B')
+            (Get-Content -LiteralPath $path -TotalCount 1) | Should -BeExactly '"A","B"'
+            @(Import-Csv -LiteralPath $path) | Should -HaveCount 0
+        }
+
+        It 'Ignores -Columns when -Rows has at least one row' {
+            $null = Initialize-MigrationRun -ScriptName 'Remove-DomainReferences' -OutputPath $script:workspace
+            $path = Export-MigrationReport -Rows $script:sampleRows -Name 'ColumnsIgnored' -Columns @('X', 'Y')
+            $written = @(Import-Csv -LiteralPath $path)
+            $written | Should -HaveCount 2
+            @($written[0].PSObject.Properties.Name) | Should -Be @('Recipient', 'Reference', 'Domain')
+        }
+
         It 'Returns the full path' {
             $null = Initialize-MigrationRun -ScriptName 'Remove-DomainReferences' -OutputPath $script:workspace
             $path = Export-MigrationReport -Rows $script:sampleRows -Name 'Returned'

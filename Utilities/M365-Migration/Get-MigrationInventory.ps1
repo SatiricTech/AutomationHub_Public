@@ -736,6 +736,60 @@ function Write-InventoryProgress {
     Write-Progress -Activity "Inventory: $Tab" -Status "$Current of $Total $Status" -PercentComplete $percent
 }
 
+function Get-InventoryTabColumn {
+    <#
+        The column names of one tab, taken from the same row-shaping code that fills it, so an
+        empty tab's header (passed to Export-MigrationReport's -Columns) never drifts from a
+        populated one. Groups, Domains, Licenses and Summary are shaped inline in the main block
+        rather than by a dedicated ConvertTo-* function, so they are listed here by name instead.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
+        [switch]$IncludeAuthMethodColumn,
+        [switch]$IncludeOneDriveColumn
+    )
+
+    $blank = [pscustomobject]@{}
+    $row = switch ($Name) {
+        'Users' {
+            ConvertTo-InventoryUserRow -User $blank -IncludeAuthMethodColumn:$IncludeAuthMethodColumn `
+                -IncludeOneDriveColumn:$IncludeOneDriveColumn
+        }
+        'UserMailboxes' { ConvertTo-InventoryMailboxRow -Mailbox $blank }
+        'SharedMailboxes' { ConvertTo-InventoryMailboxRow -Mailbox $blank }
+        'MailboxPermissions' { ConvertTo-InventoryPermissionRow -Trustee '' -Permission '' -IsInherited $false }
+        'Contacts' { ConvertTo-InventoryContactRow -MailContact $blank }
+        default { $null }
+    }
+    if ($row) { return @($row.PSObject.Properties.Name) }
+
+    switch ($Name) {
+        'Groups' {
+            return @(
+                'ObjectId', 'DisplayName', 'PrimarySmtpAddress', 'GroupType', 'Alias', 'EmailAddresses',
+                'LegacyExchangeDN', 'ManagedBy', 'Members', 'MemberCount', 'Owners', 'HiddenFromAddressLists',
+                'RequireSenderAuthenticationEnabled', 'AcceptMessagesOnlyFrom', 'ModerationEnabled', 'ModeratedBy',
+                'ReportToManagerEnabled', 'GrantSendOnBehalfTo', 'MemberJoinRestriction', 'MemberDepartRestriction',
+                'RecipientFilter', 'IsSynced', 'Visibility', 'TeamEnabled'
+            )
+        }
+        'Domains' {
+            return @('DomainName', 'IsDefault', 'IsInitial', 'IsVerified', 'AuthenticationType', 'SupportedServices')
+        }
+        'Licenses' {
+            return @(
+                'SkuPartNumber', 'FriendlyName', 'SkuId', 'Enabled', 'Consumed', 'Available',
+                'ServicePlansDisabledCommon'
+            )
+        }
+        'Summary' { return @('Item', 'Value') }
+    }
+
+    return @()
+}
+
 function ConvertTo-InventoryFolderTrustee {
     <#
         The trustee of a Get-EXOMailboxFolderPermission entry as a plain string. The REST cmdlet
@@ -1727,7 +1781,14 @@ try {
     $csvPaths = [ordered]@{}
     foreach ($tab in $inventoryTabs) {
         $rows = @($tabData[$tab])
-        $csvPaths[$tab] = Export-MigrationReport -Rows $rows -Name $tab -Timestamp $runTimestamp -SuppressInDryRun
+        # -Columns is what lets an empty tab keep the same header a populated one has: without it,
+        # an empty optional tab would be a single Info row, and New-MigrationIdentityPlan's
+        # required-column check (via Import-OptionalPlanCsv) would see that as a missing column
+        # rather than as nothing of that kind to plan.
+        $columns = @(Get-InventoryTabColumn -Name $tab -IncludeAuthMethodColumn:$IncludeAuthMethods `
+                -IncludeOneDriveColumn:$IncludeOneDrive)
+        $csvPaths[$tab] = Export-MigrationReport -Rows $rows -Name $tab -Columns $columns `
+            -Timestamp $runTimestamp -SuppressInDryRun
 
         if ($useExcel) {
             # Export-Excel cannot write a sheet from an empty pipeline, so an empty tab gets the
