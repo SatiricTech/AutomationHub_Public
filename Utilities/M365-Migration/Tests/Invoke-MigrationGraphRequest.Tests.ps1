@@ -5,6 +5,24 @@ BeforeAll {
     Set-StrictMode -Version Latest
 
     Import-Module (Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1') -Force
+
+    # Mock needs a command to replace, and Microsoft.Graph.Authentication is not installed on a
+    # build agent, so the one SDK cmdlet this file mocks is stubbed into the module scope first.
+    # The stub stands aside when the real cmdlet exists.
+    InModuleScope M365Migration {
+        if (-not (Get-Command -Name 'Invoke-MgGraphRequest' -ErrorAction SilentlyContinue)) {
+            function script:Invoke-MgGraphRequest {
+                [CmdletBinding()]
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+                    Justification = 'Signature-only stub; the parameters exist to be matched by -ParameterFilter.')]
+                param(
+                    [string]$Method, [string]$Uri, $Body,
+                    [hashtable]$Headers, [string]$ContentType, [string]$OutputType
+                )
+                return $null
+            }
+        }
+    }
 }
 
 Describe 'Invoke-MigrationGraphRequest' {

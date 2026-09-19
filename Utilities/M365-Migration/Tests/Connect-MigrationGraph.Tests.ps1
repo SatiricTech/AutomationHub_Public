@@ -5,6 +5,76 @@ BeforeAll {
     Set-StrictMode -Version Latest
 
     Import-Module (Join-Path $PSScriptRoot '..' 'M365Migration' 'M365Migration.psd1') -Force
+
+    # Mock needs a command to replace, and neither SDK is installed on a build agent, so every
+    # Graph and Exchange cmdlet this file mocks is stubbed into the module scope first. Without
+    # these the file only passes on a machine that happens to have Microsoft.Graph.Authentication
+    # and ExchangeOnlineManagement installed. Each stub stands aside when the real cmdlet exists.
+    InModuleScope M365Migration {
+        if (-not (Get-Command -Name 'Get-MgContext' -ErrorAction SilentlyContinue)) {
+            function script:Get-MgContext {
+                [CmdletBinding()]
+                param()
+                return $null
+            }
+        }
+
+        if (-not (Get-Command -Name 'Connect-MgGraph' -ErrorAction SilentlyContinue)) {
+            function script:Connect-MgGraph {
+                [CmdletBinding()]
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+                    Justification = 'Signature-only stub; the parameters exist to be bound, not read.')]
+                param([string[]]$Scopes, [string]$TenantId, [switch]$NoWelcome)
+            }
+        }
+
+        if (-not (Get-Command -Name 'Disconnect-MgGraph' -ErrorAction SilentlyContinue)) {
+            function script:Disconnect-MgGraph {
+                [CmdletBinding()]
+                param()
+            }
+        }
+
+        if (-not (Get-Command -Name 'Invoke-MgGraphRequest' -ErrorAction SilentlyContinue)) {
+            function script:Invoke-MgGraphRequest {
+                [CmdletBinding()]
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+                    Justification = 'Signature-only stub; the parameters exist to be matched by -ParameterFilter.')]
+                param(
+                    [string]$Method, [string]$Uri, $Body,
+                    [hashtable]$Headers, [string]$ContentType, [string]$OutputType
+                )
+                return $null
+            }
+        }
+
+        if (-not (Get-Command -Name 'Get-ConnectionInformation' -ErrorAction SilentlyContinue)) {
+            function script:Get-ConnectionInformation {
+                [CmdletBinding()]
+                param()
+                return $null
+            }
+        }
+
+        if (-not (Get-Command -Name 'Connect-ExchangeOnline' -ErrorAction SilentlyContinue)) {
+            function script:Connect-ExchangeOnline {
+                [CmdletBinding()]
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+                    Justification = 'Signature-only stub; the parameters exist to be bound, not read.')]
+                param([string]$DelegatedOrganization, [switch]$ShowBanner)
+            }
+        }
+
+        if (-not (Get-Command -Name 'Disconnect-ExchangeOnline' -ErrorAction SilentlyContinue)) {
+            # SupportsShouldProcess so the module's own '-Confirm:$false' still binds against the stub.
+            function script:Disconnect-ExchangeOnline {
+                [CmdletBinding(SupportsShouldProcess)]
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '',
+                    Justification = 'The attribute is here only so -Confirm binds; the stub does nothing.')]
+                param()
+            }
+        }
+    }
 }
 
 Describe 'Connect-MigrationGraph' {
