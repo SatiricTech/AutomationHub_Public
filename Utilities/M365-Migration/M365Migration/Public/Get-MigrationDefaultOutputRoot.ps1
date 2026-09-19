@@ -9,6 +9,10 @@ function Get-MigrationDefaultOutputRoot {
         ~/Migration-Automations. The folder is not created here - Initialize-MigrationRun
         owns creation so that a caller can inspect the path without side effects.
 
+        Exported so a caller can preview or validate where a run will land before
+        Initialize-MigrationRun exists to ask - previously this was only reachable from
+        inside the module.
+
     .EXAMPLE
         Get-MigrationDefaultOutputRoot
 
@@ -16,7 +20,7 @@ function Get-MigrationDefaultOutputRoot {
 
     .NOTES
         Author: AutomationHub
-        Private module helper - not exported.
+        Written with assistance from Claude (Anthropic).
     #>
     [CmdletBinding()]
     [OutputType([string])]
