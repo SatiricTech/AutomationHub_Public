@@ -12,9 +12,11 @@ function Show-MigrationWorkbench {
         suite drive a whole session with scripted answers and no console at all.
 
         A workspace with no settings - or with settings the loader will not accept - opens the
-        settings form first. There is nothing useful to show before that: without a label the
-        scanner cannot attribute a single file to a step, and without the tenant GUIDs no run
-        can assert which tenant it reached.
+        settings form first, and the session ends there if the form cannot produce a valid
+        document. There is nothing useful to show before that: without a label the scanner
+        cannot attribute a single file to a step, and without the tenant GUIDs no run can
+        assert which tenant it reached, so a board drawn anyway would be a confident-looking
+        picture of nothing.
 
         The keys, from any screen: a number picks the step (or, in the all-tools view, the
         script) at that position, A shows all tools, P the phases, S the settings, R the runs,
@@ -79,7 +81,18 @@ function Show-MigrationWorkbench {
     if (-not $workspace.SettingsResult.IsValid) {
         Write-Host ''
         foreach ($problem in @($workspace.SettingsResult.Errors)) { Write-Host "  $problem" -ForegroundColor Yellow }
-        Edit-MigrationSettingsInteractive -Workspace $workspace | Out-Null
+
+        # The board is drawn from the settings: without a label the scanner cannot attribute a
+        # single file to a step, and without the tenant GUIDs no run can assert where it wrote.
+        # A board drawn anyway would be a confident-looking picture of nothing, so the form
+        # either succeeds or the session ends here.
+        if ($null -eq (Edit-MigrationSettingsInteractive -Workspace $workspace)) {
+            Write-Host ''
+            Write-Host 'The workbench needs valid settings before it can show anything.' -ForegroundColor Yellow
+            Write-Host "Edit $($workspace.SettingsPath) by hand, or run the workbench again."
+            if ($hasRunContext) { Write-MigrationLog -Message 'Workbench closed without settings' -Level INFO }
+            return $null
+        }
         $workspace = Get-MigrationWorkspace -Path $Path
     }
 
@@ -110,6 +123,14 @@ function Show-MigrationWorkbench {
         $number = 0
         if (-not [int]::TryParse($answer, [ref]$number)) {
             Write-Host "  '$answer' is not a step number or one of A, P, S, R, Q." -ForegroundColor Yellow
+            continue
+        }
+
+        # The results screen's footer offers no numbers, so a number must not quietly run the
+        # step at that position in a list this screen is not showing.
+        if ($view -eq 'Results') {
+            Write-Host '  The results view has no numbered entries. Press P for the phases.' `
+                -ForegroundColor Yellow
             continue
         }
 

@@ -51,6 +51,44 @@ Describe 'Resolve-MigrationSettings' {
         ($r.Errors -join ' ') | Should -Match 'Source.TenantId'
     }
 
+    It 'names the schema key each error is about, so a form can re-ask by key not by prose' {
+        $s = New-MigrationSettings -Label 'X'
+        $s['Bogus'] = 1
+        $s.Source.TenantId = 'not-a-guid'
+        $s.Domains.Target = 'not a domain'
+        $p = Join-Path $TestDrive 'keys.json'
+        ($s | ConvertTo-Json -Depth 6) | Set-Content $p
+        $r = Resolve-MigrationSettings -Path $p
+
+        $byKey = @{}
+        foreach ($e in @($r.Errors)) { $byKey[[string]$e.Key] = [string]$e.Message }
+        $byKey.Keys | Should -Contain 'Source.TenantId'
+        $byKey.Keys | Should -Contain 'Domains.Target'
+        # A key the schema does not define is about the document, not about a field a form
+        # could ask again, so it carries no key at all.
+        $byKey.Keys | Should -Contain ''
+        $byKey[''] | Should -Match "Unknown key 'Bogus'"
+    }
+
+    It 'still reads as its own message wherever a string used to' {
+        $p = Join-Path $TestDrive 'missing-entirely.json'
+        $r = Resolve-MigrationSettings -Path $p
+        # -join, interpolation and Should -Match all go through ToString.
+        ($r.Errors -join '; ') | Should -BeExactly 'No settings file yet.'
+        "$($r.Errors[0])" | Should -BeExactly 'No settings file yet.'
+        $r.Errors[0].Key | Should -BeExactly ''
+    }
+
+    It 'marks Label errors with the Label key' {
+        $s = New-MigrationSettings -Label 'X'
+        $s['Label'] = 'Not A Label!'
+        $p = Join-Path $TestDrive 'label.json'
+        ($s | ConvertTo-Json -Depth 6) | Set-Content $p
+        $r = Resolve-MigrationSettings -Path $p
+        $r.IsValid | Should -BeFalse
+        @(@($r.Errors) | Where-Object { $_.Key -eq 'Label' }).Count | Should -Be 1
+    }
+
     It 'fills keys missing from an older file with defaults' {
         $p = Join-Path $TestDrive 'old.json'
         '{"SchemaVersion":1,"Label":"X","Scenario":"TenantToTenant"}' | Set-Content $p

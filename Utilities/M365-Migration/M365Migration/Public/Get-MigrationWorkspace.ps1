@@ -38,6 +38,13 @@ function Get-MigrationWorkspace {
         clients rewrite mtimes. Reading a results file reads only its Status column, so the
         GeneratedPassword column a provisioning run writes is never touched.
 
+        Each step state also names the run its state is about - StateSource ('Artefact',
+        'Ledger' or 'None'), StateRun (that artefact or that ledger entry) and StateDryRun.
+        LastRun is the newest thing the step left behind, log or report included, which is not
+        always the run the state and the counts came from; a front end that dated its summary
+        from LastRun would put an 11:00 result's counts beside a 12:00 log's timestamp, and
+        would show nothing at all for a run recorded in the ledger that left no file behind.
+
     .PARAMETER Path
         The workspace folder - the same folder every step is given as -OutputPath.
 
@@ -425,10 +432,32 @@ function Get-MigrationWorkspace {
             $state = 'Stale'
         }
 
+        # Which run this state is actually about. LastRun is the newest thing the step left
+        # behind, log or report included, and that is not always the run the state and the
+        # counts came from: a log written an hour after the results file would otherwise date a
+        # summary it has nothing to do with, and a run recorded in the ledger that left no file
+        # at all would have no date whatsoever. Both front ends render the run named here, so
+        # the stamp and the counts on one line can only ever describe the same run.
+        # The results file the counts were read from where there is one; otherwise the
+        # inventory or plan artefact that made the step Done, which is dated but counts
+        # nothing; otherwise the ledger. Never a log or a report - those say something was
+        # written, not that a run happened.
+        $stateArtefact = if ($summarySource) { $summarySource } elseif ($liveArtefact) { $liveArtefact }
+        else { $null }
+        $stateSource = if ($stateArtefact) { 'Artefact' }
+        elseif ($newestEntry) { 'Ledger' }
+        else { 'None' }
+        $stateRun = if ($stateSource -eq 'Artefact') { $stateArtefact }
+        elseif ($stateSource -eq 'Ledger') { $newestEntry }
+        else { $null }
+
         $stateById[$step.Id] = $state
         $stepStates.Add([pscustomobject]@{
                 Id             = $step.Id
                 State          = $state
+                StateSource    = $stateSource
+                StateRun       = $stateRun
+                StateDryRun    = $isDryRun
                 LastRun        = $lastRun
                 LastDryRun     = $lastDryRun
                 Files          = @($files)

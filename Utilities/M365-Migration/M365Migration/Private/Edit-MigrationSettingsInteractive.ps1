@@ -23,9 +23,12 @@ function Edit-MigrationSettingsInteractive {
 
         Validation is the same engine the loader and the writer use, so the form cannot accept
         a document Resolve-MigrationSettings would later reject. When it fails, only the keys
-        the errors name are asked again: re-walking the whole form to fix one domain is how an
-        operator comes to dread the settings screen. Five rounds of that and the form gives up
-        rather than trapping them in it.
+        the errors name are asked again - by each error's own Key, never by matching the
+        wording of its message: re-walking the whole form to fix one domain is how an operator
+        comes to dread the settings screen, and a re-prompt that depended on a sentence would
+        stop happening the day the sentence was reworded. Five rounds of that, or an error
+        about the document rather than a field, and the form gives up rather than trapping
+        them in it.
 
         Nothing is written until the document validates, and then it goes through
         Save-MigrationSettings, which writes atomically and keeps the previous version.
@@ -182,10 +185,16 @@ function Edit-MigrationSettingsInteractive {
         foreach ($problem in @($validated.Errors)) { Write-Host "  - $problem" -ForegroundColor Yellow }
 
         $round++
-        $failing = @($asked | Where-Object {
-                $key = [string]$_.Key
-                @(@($validated.Errors) | Where-Object { $_ -like "*'$key'*" -or $_ -like "$key *" }).Count -gt 0
-            })
+        # By Key, not by matching the wording of the message: a re-prompt that depended on a
+        # sentence would stop happening the day the sentence was reworded, and nothing would
+        # say so. An error whose Key is '' is about the document rather than a field, and no
+        # question this form can ask would fix it.
+        $failingKeys = [System.Collections.Generic.HashSet[string]]::new(
+            [string[]]@(@($validated.Errors) |
+                    ForEach-Object { [string](Get-MigrationProperty -InputObject $_ -Name 'Key' -Default '') } |
+                    Where-Object { $_ }),
+            [System.StringComparer]::OrdinalIgnoreCase)
+        $failing = @($asked | Where-Object { $failingKeys.Contains([string]$_.Key) })
 
         # Five rounds, or an error that names no key at all: the form has stopped being the
         # way out and the operator should be allowed to leave and edit the file by hand.

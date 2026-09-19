@@ -29,9 +29,11 @@
         A synopsis costs a Get-Help parse of the whole script, so they are memoised for the
         session.
 
-        Results is the ledger, newest first and capped at 20 - the last 20 runs is a screen,
-        and a migration's whole history is a file the operator can open. Each entry names its
-        run folder, because the driver, the stdout and the stderr of that run are in it.
+        Results is the ledger the scan already read, newest first and capped at 20 - the last
+        20 runs is a screen, and a migration's whole history is a file the operator can open.
+        Each entry names its run folder, because the driver, the stdout and the stderr of that
+        run are in it. It is the scan's copy rather than a fresh read of the file so that the
+        board and this screen can only ever describe the same moment.
 
     .PARAMETER Workspace
         The scan from Get-MigrationWorkspace.
@@ -159,7 +161,12 @@
             $lines.Add('Results & logs · newest first')
             $lines.Add('')
 
-            $entries = @(@(Get-MigrationRunLedger -Workspace $Workspace) | Select-Object -First 20)
+            # The scan's own ledger, not a second read of the file: the board and the results
+            # screen must describe the same moment, and re-reading would let a run appear on
+            # one and not the other. Newest first, which is the question the screen answers.
+            $entries = @(@($Workspace.Ledger) |
+                    Sort-Object -Property Started, LineNumber -Descending |
+                    Select-Object -First 20)
             if ($entries.Count -eq 0) {
                 $lines.Add('  No runs recorded yet.')
             }

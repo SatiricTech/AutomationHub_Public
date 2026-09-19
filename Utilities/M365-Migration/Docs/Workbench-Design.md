@@ -240,8 +240,8 @@ Artefacts      every parsed file: { Path; Folder; Prefix; Name; Suffix; Timestam
 Plan           { Path; Pinned; Timestamp; RowCount; Waves = [ordered] @{ '1' = 90; '2' = 52 };
                  Statuses = [ordered] @{ Planned = 134; Collision = 3; ... }; DivergentRows } or $null
 Steps          one entry per step instance:
-               { Id; State; LastRun; LastDryRun; Files; Summary = @{ Succeeded; Failed; Skipped; Planned };
-                 ExitCode; TenantVerified }
+               { Id; State; StateSource; StateRun; StateDryRun; LastRun; LastDryRun; Files;
+                 Summary = @{ Succeeded; Failed; Skipped; Planned }; ExitCode; TenantVerified }
 Ledger         the run-ledger entries (7.4), in the order they were appended
 NextStepId     the step to do next, or $null
 Warnings       header-only CSVs, an unreadable plan, a plan newer than the pinned one, a damaged
@@ -320,6 +320,14 @@ the step that would have produced it has run here. A `Requires` entry that is ne
 step in the scanned scenario, not a kind in the `Produces` vocabulary — can never be met, so
 it blocks its step and is reported in `Warnings` naming both.
 
+`StateSource`, `StateRun` and `StateDryRun` name the run the state is *about*: the artefact the
+summary was counted from (`Artefact`), the newest ledger entry when the run left no file behind
+(`Ledger`), or `None`. `LastRun` is the newest artefact of any kind, log and report included,
+and is deliberately not the same thing — a front end that dated its summary from `LastRun`
+would print an 11:00 result's counts beside a 12:00 log's timestamp, and would show no date at
+all for a child that died before writing anything. Both front ends render `StateRun`, so the
+stamp and the counts on one line always describe one run.
+
 Reading a results CSV for the summary reads only the `Status` column; the `GeneratedPassword`
 column is never read, rendered or persisted by the workbench.
 
@@ -379,7 +387,7 @@ judge the run that would actually happen.
 | Gate | Applies to | Behaviour |
 |---|---|---|
 | `DryRunFirst` | `Impact = Write` and `Destructive`, live runs only | Soft: satisfied by a dry-run ledger entry for that step whose waves match the ones requested (as sets: order and repeats do not count, and two blanks match), whose `Started` is after the plan's timestamp, that was not `Aborted` and whose `ExitCode` is 0 or 2 — an aborted or exit-1 rehearsal proved nothing, while exit 2 is a rehearsal doing its job. Where the ledger records no rehearsal of that step, a `-DryRun_` results file newer than the plan counts instead — a run made from the command line is still a run. With no plan in the workspace, any rehearsal counts. Override allowed, recorded in the ledger. |
-| `TypedConfirmation` | `Impact = Destructive`, and any `Side = Source` step whose `Impact` is not `Read` | Hard: the operator must type `RequiredInput` — the effective release domain (`Domains.Release`, else `Domains.Target`) for a source-side step, otherwise the word `REMOVE`, and `REMOVE` as the fallback where no domain is configured. A keypress/button is not accepted, so the gate is never returned satisfied. Asked for on a rehearsal too: a rehearsal still signs in to the source tenant. |
+| `TypedConfirmation` | `Impact = Destructive`, and any `Side = Source` step whose `Impact` is not `Read` | Hard: the operator must type `RequiredInput` — the effective release domain (`Domains.Release`, else `Domains.Target`) for a source-side step, otherwise the word `REMOVE`, and `REMOVE` as the fallback where no domain is configured. A keypress/button is not accepted, so the gate is never returned satisfied. Asked for on a rehearsal too: a rehearsal still signs in to the source tenant. A domain is matched without case, because DNS has none and an operator who typed `NewCo.com` typed the domain; anything else — `REMOVE` — is matched with case, because shouting it is the point. A gate that names no `RequiredInput` at all is refused rather than auto-accepted: "nothing to type" must never become "anything is accepted". |
 | `Prerequisite` | steps with `Requires` | Soft: lists what is not in hand. A requirement naming an artefact kind is met by the artefact existing, whoever produced it. |
 | `TenantMismatch` | any connecting step | Hard, post-run: the "Connected to ... tenant <guid>" lines in the child's log are compared with the expected side's GUID; a mismatch is flagged regardless of exit code. Not produced by `Test-MigrationStepGate` — it cannot be known until the child has run, so `Invoke-MigrationStep` (7.3) appends it. |
 | `WaveRequired` | plan consumers | Soft: a blank wave means the whole plan; confirmed explicitly for writers — live runs of a `Write` or `Destructive` step whose chosen parameter set takes `-Wave`. Satisfied once a wave is named. |

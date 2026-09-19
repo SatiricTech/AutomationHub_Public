@@ -39,7 +39,11 @@ function Resolve-MigrationSettingsData {
         $Data
     )
 
-    $errors = [System.Collections.Generic.List[string]]::new()
+    # Objects rather than strings, each naming the schema key it is about (or '' for a problem
+    # with the document rather than a key), so the settings form can re-ask exactly the failing
+    # fields instead of matching the wording of a sentence. They render as their message
+    # everywhere a string used to, so every existing reader is unaffected.
+    $errors = [System.Collections.Generic.List[object]]::new()
 
     # ConvertFrom-Json -AsHashtable already returns nested hashtables, but -Settings may
     # arrive as a [pscustomobject] tree (New-MigrationSettings' own shape mutated by a
@@ -77,7 +81,7 @@ function Resolve-MigrationSettingsData {
 
     $parsed = ConvertTo-MigrationSettingsPlainNode -Node $Data
     if ($null -eq $parsed -or $parsed -isnot [System.Collections.IDictionary]) {
-        $errors.Add('Settings must be a JSON object.')
+        $errors.Add((New-MigrationSettingsError -Message 'Settings must be a JSON object.'))
         $parsed = [ordered]@{}
     }
 
@@ -102,7 +106,8 @@ function Resolve-MigrationSettingsData {
     $validTopKeys = @($sections.Keys)
     foreach ($key in @($parsed.Keys)) {
         if (-not $sections.Contains([string]$key)) {
-            $errors.Add("Unknown key '$key'. Valid keys: $($validTopKeys -join ', ').")
+            $errors.Add((New-MigrationSettingsError -Message ("Unknown key '$key'. Valid keys: " +
+                        "$($validTopKeys -join ', ').")))
         }
     }
 
@@ -113,14 +118,15 @@ function Resolve-MigrationSettingsData {
 
         $section = $parsed[$top]
         if ($section -isnot [System.Collections.IDictionary]) {
-            $errors.Add("$top must be an object.")
+            $errors.Add((New-MigrationSettingsError -Message "$top must be an object."))
             continue
         }
 
         $validChildKeys = @($children | ForEach-Object { "$top.$_" })
         foreach ($childKey in @($section.Keys)) {
             if ($children -notcontains [string]$childKey) {
-                $errors.Add("Unknown key '$top.$childKey'. Valid keys: $($validChildKeys -join ', ').")
+                $errors.Add((New-MigrationSettingsError -Message ("Unknown key '$top.$childKey'. Valid keys: " +
+                        "$($validChildKeys -join ', ').")))
             }
         }
     }
@@ -145,7 +151,8 @@ function Resolve-MigrationSettingsData {
             foreach ($key in @($Node.Keys)) {
                 $dotted = if ($Prefix) { "$Prefix.$key" } else { [string]$key }
                 if (([string]$key) -match $secretPattern -and -not $knownPaths.Contains($dotted)) {
-                    $errors.Add("Key '$dotted' looks like a secret and must not be stored in settings.")
+                    $errors.Add((New-MigrationSettingsError -Message (
+                                "Key '$dotted' looks like a secret and must not be stored in settings.")))
                 }
                 Find-MigrationSettingsSecretKey -Node $Node[$key] -Prefix $dotted
             }
@@ -243,23 +250,24 @@ function Resolve-MigrationSettingsData {
         if ($segments.Count -eq 1) { $ordered[$top] = $value } else { $ordered[$top][$segments[1]] = $value }
 
         $entryError = Test-MigrationSettingsEntryValue -Entry $entry -Value $value
-        if ($entryError) { $errors.Add($entryError) }
+        if ($entryError) { $errors.Add((New-MigrationSettingsError -Message $entryError -Key $entry.Key)) }
     }
 
     if ($ordered['SchemaVersion'] -ne 1) {
-        $errors.Add("Key 'SchemaVersion' must be 1 (got '$($ordered['SchemaVersion'])').")
+        $errors.Add((New-MigrationSettingsError -Key 'SchemaVersion' -Message (
+                "Key 'SchemaVersion' must be 1 (got '$($ordered['SchemaVersion'])').")))
     }
 
     $label = [string]$ordered['Label']
     if ([string]::IsNullOrWhiteSpace($label)) {
-        $errors.Add("Key 'Label' must not be empty.")
+        $errors.Add((New-MigrationSettingsError -Key 'Label' -Message "Key 'Label' must not be empty."))
     }
     else {
         $formattedLabel = Format-MigrationPrefix -Value $label
         if ($formattedLabel -ne $label) {
-            $errors.Add(
-                "Key 'Label' must equal Format-MigrationPrefix -Value Label " +
-                "(got '$label', expected '$formattedLabel').")
+            $errors.Add((New-MigrationSettingsError -Key 'Label' -Message (
+                        "Key 'Label' must equal Format-MigrationPrefix -Value Label " +
+                        "(got '$label', expected '$formattedLabel').")))
         }
     }
 

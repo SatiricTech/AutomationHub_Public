@@ -282,6 +282,17 @@ Describe 'Show-MigrationWorkbench' {
             Get-ConsoleText | Should -BeLike "*'Z'*"
             Get-ConsoleText | Should -BeLike '*99*'
         }
+
+        It 'does not run a step from the results view, whose footer offers no numbers' {
+            # The results screen lists runs, not steps. A number there must not quietly run
+            # whatever sits at that position in a list this screen is not showing.
+            $path = Copy-FixtureWorkspace -Name 'ResultsNumber'
+            Set-ScriptedAnswer -Answer @('R', '6', 'Q')
+            Show-MigrationWorkbench -Path $path -Version '1.0.0' | Should -BeNullOrEmpty
+
+            @($global:MigrationStepRuns).Count | Should -Be 0
+            Get-ConsoleText | Should -BeLike '*no numbered entries*'
+        }
     }
 
     Context 'a workspace with no settings yet' {
@@ -313,6 +324,20 @@ Describe 'Show-MigrationWorkbench' {
         It 'asks for the scenario as a choice and the booleans as confirmations' {
             ($script:GreenfieldAsked -join "`n") | Should -BeLike '*Choice|Scenario*'
             ($script:GreenfieldAsked -join "`n") | Should -BeLike '*Confirm|Plan.PreserveAliases*'
+        }
+
+        It 'does not draw a board it has no settings for when the form is abandoned' {
+            # A label the validator rejects, answered the same way every round: the form gives
+            # up, and the session must end there rather than showing a confident picture of
+            # nothing. The scripted menu holds no keys at all, so a board would throw.
+            $path = New-EmptyWorkspace -Name 'Abandoned'
+            Set-FormAnswer -Answer @{ 'Label' = 'Not A Label!' } -Menu @()
+            $result = Show-MigrationWorkbench -Path $path -Version '1.0.0'
+
+            $result | Should -BeNullOrEmpty
+            Get-ConsoleText | Should -BeLike '*needs valid settings*'
+            Get-ConsoleText | Should -Not -BeLike '*M365 Migration Workbench 1.0.0*'
+            Test-Path -LiteralPath (Join-Path $path 'M365Migration.settings.json') | Should -BeFalse
         }
     }
 
@@ -609,6 +634,126 @@ Describe 'Invoke-MigrationWorkbenchStep' {
         $driver | Should -Match 'ConvertTo-SecureString \$env:M365MIGRATION_CLIENT_SECRET'
         $driver | Should -Not -Match 'not-a-real-secret'
         Get-ConsoleText | Should -Not -BeLike '*not-a-real-secret*'
+    }
+
+    Context 'the mode the operator chose is the mode that runs' {
+
+        <#
+            The form draws itself before the operator has said whether this is a rehearsal, so
+            the arguments it first resolves are a guess at the answer. Everything after the
+            answer - the gates, the driver, the command preview and the ledger - has to read a
+            resolution made for the mode actually chosen. Resolving once at the top and reading
+            the key afterwards is how a driver ends up rehearsing while the ledger records a
+            live run, and, worse, how a live run gets through on a rehearsal's gate list.
+        #>
+
+        It 'writes a live driver for a live run, and records it as live' {
+            # all, run, override the wave gate, run now.
+            Set-ScriptedAnswer -Answer @('all', 'R', 'y', 'y')
+            Invoke-TestStep -Id 'New-Users' -Path (Copy-FixtureWorkspace -Name 'ModeLive') | Out-Null
+
+            $run = @($global:MigrationStepRuns)[0]
+            $run.DryRun | Should -BeFalse
+            $driver = Get-Content -LiteralPath ([string]$run.Driver.DriverPath) -Raw
+            $driver | Should -Not -Match 'DryRun\s+= \$true'
+            $run.Driver.DisplayLine | Should -Not -BeLike '*-DryRun*'
+        }
+
+        It 'writes a rehearsal driver when a refused live run is followed by a dry run' {
+            # all, run, decline the wave gate (refused, back to the form), dry run, run now.
+            Set-ScriptedAnswer -Answer @('all', 'R', 'n', 'D', 'y')
+            Invoke-TestStep -Id 'New-Users' -Path (Copy-FixtureWorkspace -Name 'ModeRefusedThenDry') | Out-Null
+
+            $run = @($global:MigrationStepRuns)[0]
+            $run.DryRun | Should -BeTrue
+            $driver = Get-Content -LiteralPath ([string]$run.Driver.DriverPath) -Raw
+            $driver | Should -Match 'DryRun\s+= \$true'
+            $run.Driver.DisplayLine | Should -BeLike '*-DryRun*'
+            # The rehearsal cleared the rehearsal's gates, so nothing was overridden; the live
+            # pass's declined override must not have followed it here.
+            @($run.GateOverrides).Count | Should -Be 0
+        }
+
+        It 'lets a destructive live run through on the right typed confirmation, live' {
+            # run, override DryRunFirst, override Prerequisite, type the release domain, run now.
+            Set-ScriptedAnswer -Answer @('R', 'y', 'y', 'newco.com', 'y')
+            Invoke-TestStep -Id 'DomainReferences-Remediate' `
+                -Path (Copy-FixtureWorkspace -Name 'ModeDestructive') -Live | Out-Null
+
+            @($global:MigrationStepRuns).Count | Should -Be 1
+            $run = @($global:MigrationStepRuns)[0]
+            $run.DryRun | Should -BeFalse
+            $driver = Get-Content -LiteralPath ([string]$run.Driver.DriverPath) -Raw
+            $driver | Should -Not -Match 'DryRun'
+        }
+
+        It 'accepts the release domain whatever case it was typed in' {
+            Set-ScriptedAnswer -Answer @('R', 'y', 'y', 'NewCo.COM', 'y')
+            Invoke-TestStep -Id 'DomainReferences-Remediate' `
+                -Path (Copy-FixtureWorkspace -Name 'ModeDomainCase') -Live | Out-Null
+
+            @($global:MigrationStepRuns).Count | Should -Be 1
+        }
+
+        It 'refuses a hard gate that names nothing to type rather than accepting anything' {
+            Mock -ModuleName M365Migration -CommandName Test-MigrationStepGate -MockWith {
+                return @([pscustomobject]@{
+                        Kind = 'TypedConfirmation'; Severity = 'Hard'; Satisfied = $false
+                        Message = 'This gate forgot to say what to type.'; RequiredInput = ''
+                    })
+            }
+            # No answer is scripted for a typed confirmation: the queue would throw if one were
+            # asked for, and the run must not start either way.
+            Set-ScriptedAnswer -Answer @('all', 'D', 'B')
+            Invoke-TestStep -Id 'New-Users' -Path (Copy-FixtureWorkspace -Name 'EmptyRequired') | Out-Null
+
+            @($global:MigrationStepRuns).Count | Should -Be 0
+            Get-ConsoleText | Should -BeLike '*names no input*'
+        }
+    }
+
+    Context 'the command-only preview' {
+
+        It 'leaves nothing behind when the operator backs out' {
+            $path = Copy-FixtureWorkspace -Name 'PreviewDiscarded'
+            Set-ScriptedAnswer -Answer @('all', 'C', 'C', 'B')
+            Invoke-TestStep -Id 'New-Users' -Path $path | Out-Null
+
+            $runs = Join-Path $path 'Workbench' 'Runs'
+            @(Get-ChildItem -LiteralPath $runs -Directory -ErrorAction SilentlyContinue).Count | Should -Be 0
+        }
+
+        It 'reuses the previewed driver for the run it previewed' {
+            $path = Copy-FixtureWorkspace -Name 'PreviewReused'
+            Set-ScriptedAnswer -Answer @('all', 'C', 'D', 'y')
+            Invoke-TestStep -Id 'New-Users' -Path $path | Out-Null
+
+            $runs = Join-Path $path 'Workbench' 'Runs'
+            @(Get-ChildItem -LiteralPath $runs -Directory).Count | Should -Be 1
+            $run = @($global:MigrationStepRuns)[0]
+            [string]$run.Driver.RunFolder | Should -BeLike (Join-Path $runs '*')
+        }
+
+        It 'throws away a preview the operator then edited' {
+            $path = Copy-FixtureWorkspace -Name 'PreviewStale'
+            Set-ScriptedAnswer -Answer @('all', 'C', 'E', 'DefaultUsageLocation', 'GB', 'D', 'y')
+            Invoke-TestStep -Id 'New-Users' -Path $path | Out-Null
+
+            @(Get-ChildItem -LiteralPath (Join-Path $path 'Workbench' 'Runs') -Directory).Count | Should -Be 1
+            @($global:MigrationStepRuns)[0].Driver.DisplayLine | Should -BeLike '*-DefaultUsageLocation GB*'
+        }
+    }
+
+    It 'survives an engine call that throws and hands the operator back to the board' {
+        Mock -ModuleName M365Migration -CommandName New-MigrationStepDriver -MockWith {
+            throw 'The run folder could not be written.'
+        }
+        Set-ScriptedAnswer -Answer @('all', 'D')
+        $result = Invoke-TestStep -Id 'New-Users' -Path (Copy-FixtureWorkspace -Name 'EngineThrew')
+
+        $result | Should -BeNullOrEmpty
+        @($global:MigrationStepRuns).Count | Should -Be 0
+        Get-ConsoleText | Should -BeLike '*could not be run*run folder could not be written*'
     }
 
     It 'lists the mandatory parameters a run is still missing' {

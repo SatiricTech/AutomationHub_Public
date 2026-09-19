@@ -179,6 +179,73 @@ Describe 'Format-MigrationWorkbenchView' {
             @($rendered | Select-Object -First 7) | Should -Be $expected
         }
 
+        It 'dates the run its counts came from, not the newest file the step left behind' {
+            <#
+                A live run at 11:00 and a rehearsal at 12:00 that failed. The scanner's state
+                and its counts are about the 12:00 rehearsal; dating that line from the newest
+                non-rehearsal artefact would put the rehearsal's counts on the live run's
+                timestamp, with nothing to say a rehearsal was involved at all.
+            #>
+            $path = Join-Path $TestDrive 'LaterRehearsal'
+            Copy-Item -LiteralPath $script:FixtureRoot -Destination $path -Recurse -Force
+            $folder = Join-Path $path 'Contoso'
+            Set-Content -LiteralPath (Join-Path $folder 'Contoso_Set-Licenses-DryRun_20260918-120000.csv') `
+                -Value @(
+                '"Identity","Action","Status","Detail"'
+                '"ada.lovelace@newco.com","Set-Licence","Failed","The SKU has no seats left"'
+            ) -Encoding utf8
+            Add-Content -LiteralPath (Join-Path $path 'Workbench' 'Runs.jsonl') -Encoding utf8 -Value (
+                [ordered]@{
+                    Started = '2026-09-18T12:00:00'; Ended = '2026-09-18T12:00:30'; StepId = 'Set-Licenses'
+                    Script = 'Set-MigrationLicenses'; Side = 'Destination'; DryRun = $true; Wave = @()
+                    ExitCode = 2; Meaning = 'Some rows failed'; Aborted = $false; Files = @()
+                } | ConvertTo-Json -Depth 6 -Compress)
+
+            $scan = Get-MigrationWorkspace -Path $path
+            $state = @($scan.Steps | Where-Object { $_.Id -eq 'Set-Licenses' })[0]
+            $state.StateSource | Should -BeExactly 'Artefact'
+            $state.StateDryRun | Should -BeTrue
+            $state.StateRun.Timestamp | Should -Be ([datetime]'2026-09-18T12:00:00')
+
+            $lines = @(InModuleScope M365Migration -Parameters @{ Workspace = $scan } {
+                    param($Workspace)
+                    Format-MigrationWorkbenchView -Workspace $Workspace -Version '1.0.0'
+                })
+            $line = Get-StepLine -Line $lines -Title 'Assign licences'
+            $line | Should -BeLike '*dry run 18 Sep 12:00: 1 Failed*'
+            $line | Should -Not -BeLike '*11:00*'
+        }
+
+        It 'dates a run that left nothing behind from the ledger entry that recorded it' {
+            $path = Join-Path $TestDrive 'LedgerOnly'
+            Copy-Item -LiteralPath $script:FixtureRoot -Destination $path -Recurse -Force
+            Add-Content -LiteralPath (Join-Path $path 'Workbench' 'Runs.jsonl') -Encoding utf8 -Value (
+                [ordered]@{
+                    Started = '2026-09-18T13:45:00'; Ended = '2026-09-18T13:45:10'
+                    StepId = 'New-Recipients'; Script = 'New-MigrationRecipients'; Side = 'Destination'
+                    DryRun = $false; Wave = @(); ExitCode = 1; Meaning = 'Failed'; Aborted = $false
+                    Files = @(); Summary = @{ Succeeded = 0; Failed = 4; Skipped = 0; Planned = 0 }
+                } | ConvertTo-Json -Depth 6 -Compress)
+
+            $scan = Get-MigrationWorkspace -Path $path
+            $state = @($scan.Steps | Where-Object { $_.Id -eq 'New-Recipients' })[0]
+            $state.StateSource | Should -BeExactly 'Ledger'
+
+            $lines = @(InModuleScope M365Migration -Parameters @{ Workspace = $scan } {
+                    param($Workspace)
+                    Format-MigrationWorkbenchView -Workspace $Workspace -Version '1.0.0'
+                })
+            $line = Get-StepLine -Line $lines -Title 'Create mail recipients'
+            $line | Should -Match '^\s+\[!\]\s'
+            $line | Should -BeLike '*18 Sep 13:45: 4 Failed*'
+        }
+
+        It 'says a step has never run when nothing on disk or in the ledger mentions it' {
+            $state = @($script:Workspace.Steps | Where-Object { $_.Id -eq 'New-Recipients' })[0]
+            $state.StateSource | Should -BeExactly 'None'
+            $state.StateRun | Should -BeNullOrEmpty
+        }
+
         It 'lists the scan warnings under their own heading' {
             $damaged = Join-Path $TestDrive 'Damaged'
             Copy-Item -LiteralPath $script:FixtureRoot -Destination $damaged -Recurse -Force
@@ -225,6 +292,21 @@ Describe 'Format-MigrationWorkbenchView' {
 
         It 'names the run folder under each entry' {
             ($script:ResultLines -join "`n") | Should -BeLike '*Workbench/Runs/20260918-110000_Set-Licenses*'
+        }
+
+        It 'renders the ledger the scan already read, not a second read of the file' {
+            # The board and this screen must describe the same moment: a screen that re-read
+            # the file could show a run the board it was drawn beside knows nothing about.
+            $path = Join-Path $TestDrive 'LedgerFromScan'
+            Copy-Item -LiteralPath $script:FixtureRoot -Destination $path -Recurse -Force
+            $scan = Get-MigrationWorkspace -Path $path
+            Remove-Item -LiteralPath (Join-Path $path 'Workbench' 'Runs.jsonl') -Force
+
+            $lines = @(InModuleScope M365Migration -Parameters @{ Workspace = $scan } {
+                    param($Workspace)
+                    Format-MigrationWorkbenchView -Workspace $Workspace -View 'Results' -Version '1.0.0'
+                })
+            ($lines -join "`n") | Should -BeLike '*Set-Licenses*exit 2*'
         }
 
         It 'says so when the workspace has no runs on record' {

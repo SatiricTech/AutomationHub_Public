@@ -30,6 +30,13 @@ function Resolve-MigrationSettings {
         Settings is populated only when the document is valid, so a caller never has to
         check IsValid before deciding whether Settings is trustworthy.
 
+        Each entry of Errors carries the sentence an operator reads and, as Key, the dotted
+        schema key it is about - or '' where the problem is with the document rather than one
+        key. A settings form re-asks by Key rather than by matching the wording of a message,
+        which is the difference between a re-prompt that survives a reworded sentence and one
+        that silently stops happening. An error renders as its own message wherever a string
+        would, so '-join', Write-Warning and string interpolation all read as they always did.
+
     .PARAMETER Path
         The settings file to read.
 
@@ -63,7 +70,7 @@ function Resolve-MigrationSettings {
             Path     = $Path
             Exists   = $false
             IsValid  = $false
-            Errors   = @('No settings file yet.')
+            Errors   = @(New-MigrationSettingsError -Message 'No settings file yet.')
             Settings = $null
         }
     }
@@ -83,7 +90,8 @@ function Resolve-MigrationSettings {
             Path     = $Path
             Exists   = $true
             IsValid  = $false
-            Errors   = @("'$Path' could not be read as settings JSON: $($_.Exception.Message)")
+            Errors   = @(New-MigrationSettingsError -Message (
+                    "'$Path' could not be read as settings JSON: $($_.Exception.Message)"))
             Settings = $null
         }
     }
