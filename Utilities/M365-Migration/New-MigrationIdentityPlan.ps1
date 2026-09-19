@@ -340,6 +340,11 @@ function Import-OptionalPlanCsv {
         -UsersCsv and wrong for everything else: an empty optional inventory means there is
         nothing of that kind to plan, not that the operator made a mistake. Every other import
         error - a missing file, a missing required column - still propagates.
+
+        Import-MigrationCsv counts the rows before it looks at the columns, so a header-only file
+        whose columns are wrong, and a zero-byte file, are both reported here as having a header
+        and no rows rather than as a column problem. Supply a file with at least one row to see
+        the column error.
     .PARAMETER Path
         The file to read. An empty or unsupplied path returns an empty set without reading
         anything, so a caller can hand over an optional parameter unguarded.
@@ -726,6 +731,15 @@ try {
     elseif ($interimDomainName -and $interimDomainName -notlike '*.onmicrosoft.com') {
         Write-MigrationLog -Message ("-InterimDomain '$interimDomainName' is not an onmicrosoft.com routing domain. " +
             'It is used as given; make sure it is verified in the destination tenant before cutover.') -Level WARNING
+    }
+
+    # Said out loud because the plan then shows InterimPrimarySmtp identical to TargetPrimarySmtp
+    # while the UPN columns differ, which reads like a bug unless the operator knows the interim
+    # domain never applied to the mail address in the first place.
+    if ($interimDomainName -and $smtpDomainName -ne $targetDomainName) {
+        Write-MigrationLog -Message ('-InterimDomain applies to the sign-in address only: the primary SMTP ' +
+            "address is planned directly on $smtpDomainName because -SmtpDomain differs from -TargetDomain.") `
+            -Level WARNING
     }
 
     if ($PreserveAliases -and (-not $AliasDomainMap -or $AliasDomainMap.Count -eq 0)) {

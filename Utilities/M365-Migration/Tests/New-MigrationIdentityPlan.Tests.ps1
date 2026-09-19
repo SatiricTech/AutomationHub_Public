@@ -135,7 +135,7 @@ Describe 'New-MigrationIdentityPlan' {
         }
 
         It 'Plans one row per source object' {
-            $script:Full.Rows.Count | Should -Be 17
+            $script:Full.Rows.Count | Should -Be 18
         }
 
         It 'Gives the first John Smith the unsuffixed name' {
@@ -476,6 +476,20 @@ Describe 'New-MigrationIdentityPlan' {
                 Should -BeExactly 'john.smith@mail.newco.com'
         }
 
+        It 'Warns that the interim domain covers the sign-in address only' {
+            # Interim and target SMTP being identical while the UPNs differ reads like a bug unless
+            # the log says why, and this is the run where an operator would notice it.
+            $script:MailDomain.Log | Should -Match ([regex]::Escape(
+                    '[WARNING] -InterimDomain applies to the sign-in address only: the primary SMTP address ' +
+                    'is planned directly on mail.newco.com because -SmtpDomain differs from -TargetDomain.'))
+        }
+
+        It 'Says nothing of the sort when mail stays in the target domain' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-quiet') `
+                -Parameter $script:FullParameters
+            $result.Log | Should -Not -BeLike '*applies to the sign-in address only*'
+        }
+
         It 'Resolves a collision against the mail domain, where the address will actually exist' {
             $listPath = Join-Path $TestDrive 'reserved-mail-domain.txt'
             @('# already live in the destination', 'john.smith@mail.newco.com') |
@@ -525,16 +539,44 @@ Describe 'New-MigrationIdentityPlan' {
 
     Context 'The shipped templates' {
 
-        It 'Plans with the sample exclusion rules and wave map as shipped' {
+        BeforeAll {
+            # The samples are run for real against the fixture inventory: shipping a template that
+            # the planner cannot act on is exactly the kind of rot a test has to catch.
             $templates = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Templates')).ProviderPath
-            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'templates') -Parameter @{
+            $script:Templated = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'templates') -Parameter @{
+                SharedMailboxesCsv = (Join-Path $script:Fixtures 'SharedMailboxes.csv')
+                GroupsCsv          = (Join-Path $script:Fixtures 'Groups.csv')
                 ExclusionRulesPath = (Join-Path $templates 'ExclusionRules.sample.csv')
                 WaveMapPath        = (Join-Path $templates 'WaveMap.sample.csv')
             }
+        }
 
-            $result.ExitCode | Should -Be 0
-            (Get-PlanRow -Result $result -Identity 'break-glass-admin@contoso.com').PlanStatus |
-                Should -BeExactly 'Excluded'
+        It 'Runs with the samples as shipped' {
+            $script:Templated.ExitCode | Should -Be 0
+            $script:Templated.Path | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Gives each mapped recipient the wave the sample names, not -DefaultWave' {
+            (Get-PlanRow -Result $script:Templated -Identity 'accounts@contoso.com').Wave | Should -BeExactly '2'
+            (Get-PlanRow -Result $script:Templated -Identity 'allstaff@contoso.com').Wave | Should -BeExactly '3'
+            # Unlisted recipients fall back to the default, so the two above are the wave map working.
+            (Get-PlanRow -Result $script:Templated -Identity 'rdubois@contoso.com').Wave | Should -BeExactly '1'
+        }
+
+        It 'Excludes by the sample wildcard rule' {
+            $row = Get-PlanRow -Result $script:Templated -Identity 'break-glass-admin@contoso.com'
+            $row.PlanStatus | Should -BeExactly 'Excluded'
+            $row.ExcludeReason | Should -BeExactly (
+                'Emergency access account - must never be migrated or have its password reset')
+        }
+
+        It 'Excludes by the sample Regex rule, which the wildcard rules cannot match' {
+            # ops.breakglass@contoso.com is in the inventory precisely because only
+            # '^.+\.breakglass@.+$' catches it - 'break-glass*' does not.
+            $row = Get-PlanRow -Result $script:Templated -Identity 'ops.breakglass@contoso.com'
+            $row.PlanStatus | Should -BeExactly 'Excluded'
+            $row.ExcludeReason | Should -BeExactly (
+                'Emergency access account held outside the normal naming scheme')
         }
 
         It 'Offers MatchType in the exclusion rules sample and uses it at least once' {
