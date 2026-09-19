@@ -48,6 +48,16 @@ function New-MigrationStepDriver {
         the certificate, accepted here exactly as the settings validator accepts it.
         -ClientSecret, -ApiKey and anything else carrying a string still refuse.
 
+        Which leaves the question the refusal does not answer: how a secret that genuinely has
+        to be passed ever reaches the script. -SecretEnvironmentVariable is that join. The
+        driver is the only thing in the chain that runs inside the child, so it is the only
+        place a SecureString can be built - a SecureString cannot cross a process boundary,
+        and -Environment can only carry text. Given 'ClientSecret=M365MIGRATION_CLIENT_SECRET'
+        the driver reads $env:M365MIGRATION_CLIENT_SECRET and converts it, inside the try
+        block so an unset variable exits 1 rather than binding nothing, and the value itself
+        is never written: it exists in the child's environment for the life of that process
+        and nowhere else.
+
     .PARAMETER Step
         The step instance from Get-MigrationStep.
 
@@ -68,6 +78,11 @@ function New-MigrationStepDriver {
         The pwsh the runner will start. Defaults to the one this process is running, which is
         what keeps a workbench started from 7.4 from handing its step to some other pwsh on
         PATH; passed in only by the tests and by a launcher that pins its own.
+
+    .PARAMETER SecretEnvironmentVariable
+        'ParameterName=ENVIRONMENT_VARIABLE' pairs. The driver builds each named parameter
+        from that environment variable in the child rather than from a value written here.
+        The parameter must be one the script declares and must take a SecureString.
 
     .EXAMPLE
         $resolved = Resolve-MigrationStepArguments -Step $step -Workspace $ws -DryRun
@@ -107,7 +122,11 @@ function New-MigrationStepDriver {
         [string]$Version,
 
         [ValidateNotNullOrEmpty()]
-        [string]$PwshPath
+        [string]$PwshPath,
+
+        [AllowEmptyCollection()]
+        [ValidatePattern('^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z_][A-Za-z0-9_]*$')]
+        [string[]]$SecretEnvironmentVariable = @()
     )
 
     if (-not $PSBoundParameters.ContainsKey('Version')) {
@@ -130,6 +149,24 @@ function New-MigrationStepDriver {
     # Checked before anything is created: a refusal must leave no run folder behind, or the
     # workspace fills with empty evidence of runs that never happened.
     Assert-MigrationDriverArgumentSafe -Argument $emitted
+
+    # Same rule for the secret mappings: a mapping naming a parameter the script does not have,
+    # or one that does not take a SecureString, would produce a driver that fails in the child
+    # with a binding error, long after the operator has typed the secret.
+    $secretBindings = [System.Collections.Generic.List[object]]::new()
+    foreach ($mapping in @($SecretEnvironmentVariable)) {
+        $pair = ([string]$mapping -split '=', 2)
+        $parameter = @(@($Step.Parameters) | Where-Object { $_.Name -eq $pair[0] })
+        if ($parameter.Count -eq 0) {
+            throw ("'$($pair[0])' is not a parameter of $($Step.Script), so its secret cannot be " +
+                'passed through the environment.')
+        }
+        if ([string]$parameter[0].TypeName -ne 'SecureString') {
+            throw ("-SecretEnvironmentVariable only builds SecureString parameters, and " +
+                "$($Step.Script)'s -$($pair[0]) is a $($parameter[0].TypeName).")
+        }
+        $secretBindings.Add([pscustomobject]@{ Name = $pair[0]; Variable = $pair[1] })
+    }
 
     # Run ids are stamped to the second because that is what the ledger and the filenames carry.
     # Two runs of one step inside the same second would otherwise share a folder and overwrite
@@ -178,6 +215,15 @@ function New-MigrationStepDriver {
     $lines.Add('')
     $lines.Add('$ErrorActionPreference = ''Stop''')
     $lines.Add('try {')
+    if ($secretBindings.Count -gt 0) {
+        # Inside the try, so an environment variable that never arrived exits 1 with a message
+        # rather than reaching the script with nothing bound.
+        $lines.Add('    # The secret comes from this process''s own environment, never from this file.')
+        foreach ($binding in $secretBindings) {
+            $lines.Add(('    $parameters.{0} = ConvertTo-SecureString $env:{1} -AsPlainText -Force' -f
+                    $binding.Name, $binding.Variable))
+        }
+    }
     $lines.Add(('    & {0} @parameters' -f (ConvertTo-MigrationPowerShellLiteral -Value ([string]$Step.ScriptPath))))
     $lines.Add('}')
     $lines.Add('catch {')
@@ -199,12 +245,19 @@ function New-MigrationStepDriver {
         (ConvertTo-MigrationPowerShellLiteral -Value $PwshPath),
     (ConvertTo-MigrationPowerShellLiteral -Value $driverPath)
 
+    # The display line has to account for the secret too: an operator reading a preview with no
+    # -ClientSecret on it would reasonably conclude the step was about to run without one.
+    $displayLine = Format-MigrationStepCommandLine -Step $Step -Argument $emitted
+    foreach ($binding in $secretBindings) {
+        $displayLine = '{0} -{1} $env:{2}' -f $displayLine, $binding.Name, $binding.Variable
+    }
+
     return [pscustomobject]@{
         RunId       = $runId
         RunFolder   = $runFolder
         DriverPath  = $driverPath
         PwshPath    = $PwshPath
         CommandLine = $commandLine
-        DisplayLine = Format-MigrationStepCommandLine -Step $Step -Argument $emitted
+        DisplayLine = $displayLine
     }
 }

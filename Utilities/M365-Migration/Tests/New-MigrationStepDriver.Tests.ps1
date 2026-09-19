@@ -361,6 +361,73 @@ Describe 'New-MigrationStepDriver' {
         }
     }
 
+    Context 'a secret the child reads from its own environment' {
+
+        <#
+            The one secret the toolkit takes - the Viva Learning client secret - cannot be
+            written into the driver, and the child cannot be handed a SecureString across a
+            process boundary either. -SecretEnvironmentVariable is the join: the driver reads
+            the environment variable Invoke-MigrationStep sets on the child alone, turns it
+            into a SecureString in the child's own memory, and the value never touches disk.
+        #>
+
+        BeforeAll {
+            $script:Workspace = New-TestWorkspace -Name 'DriverSecretEnvironment'
+            $script:SecretResult = New-MigrationStepDriver -Step $script:EchoStep `
+                -Arguments (Get-TestArgumentSet -Argument @(
+                    (Get-TestArgument -Name 'Prefix' -Value 'Contoso')
+                )) -Workspace $script:Workspace -Timestamp $script:Stamp `
+                -SecretEnvironmentVariable 'ClientSecret=M365MIGRATION_CLIENT_SECRET'
+            $script:SecretDriver = Get-Content -LiteralPath $script:SecretResult.DriverPath -Raw
+        }
+
+        It 'converts the environment variable into a SecureString before the call' {
+            $expected = '\$parameters\.ClientSecret = ConvertTo-SecureString ' +
+            '\$env:M365MIGRATION_CLIENT_SECRET -AsPlainText -Force'
+            $script:SecretDriver | Should -Match $expected
+        }
+
+        It 'never writes the secret itself into the driver' {
+            $script:SecretDriver | Should -Not -Match 'not-a-real-secret'
+            $script:SecretDriver | Should -Not -Match "ClientSecret\s+= '"
+        }
+
+        It 'still parses as PowerShell' {
+            Test-DriverParse -Path $script:SecretResult.DriverPath | Should -BeTrue
+        }
+
+        It 'says on the display line where the secret comes from' {
+            $script:SecretResult.DisplayLine | Should -Match '-ClientSecret \$env:M365MIGRATION_CLIENT_SECRET'
+        }
+
+        It 'refuses a mapping for a parameter the script does not declare' {
+            { New-MigrationStepDriver -Step $script:EchoStep -Arguments (Get-TestArgumentSet -Argument @()) `
+                    -Workspace $script:Workspace -Timestamp $script:Stamp `
+                    -SecretEnvironmentVariable 'NoSuchParameter=M365MIGRATION_CLIENT_SECRET' } |
+                Should -Throw '*NoSuchParameter*'
+        }
+
+        It 'binds the secret in a real child pwsh, as a SecureString, without it reaching disk' {
+            $pwshPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            $previous = $env:M365MIGRATION_CLIENT_SECRET
+            try {
+                $env:M365MIGRATION_CLIENT_SECRET = 'not-a-real-secret'
+                $output = @(& $pwshPath -NoProfile -NonInteractive -File $script:SecretResult.DriverPath)
+            }
+            finally {
+                $env:M365MIGRATION_CLIENT_SECRET = $previous
+            }
+
+            ($output -join "`n") | Should -Match 'ClientSecretType=SecureString'
+            ($output -join "`n") | Should -Match 'ClientSecretLength=17'
+            # The echo fixture must not print the secret back, and nothing may have been
+            # written beside the driver either.
+            ($output -join "`n") | Should -Not -Match 'not-a-real-secret'
+            (Get-Content -LiteralPath $script:SecretResult.DriverPath -Raw) |
+                Should -Not -Match 'not-a-real-secret'
+        }
+    }
+
     Context 'against a real workspace scan' {
 
         It 'accepts the object Get-MigrationWorkspace returns' {

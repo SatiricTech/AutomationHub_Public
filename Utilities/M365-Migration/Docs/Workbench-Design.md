@@ -421,6 +421,15 @@ unset `$LASTEXITCODE` exits 0. A driver that exited 0 for a step that never ran 
 workbench record `Completed` and the folder scanner show the step as done. A script that exits
 with a code of its own still propagates it, so 2 and 3 keep their meaning.
 
+A secret never appears in the file, and a `SecureString` cannot cross a process boundary, so
+the driver builds it in the child instead:
+`New-MigrationStepDriver -SecretEnvironmentVariable 'ClientSecret=M365MIGRATION_CLIENT_SECRET'`
+emits `$parameters.ClientSecret = ConvertTo-SecureString $env:M365MIGRATION_CLIENT_SECRET
+-AsPlainText -Force` inside the `try`, against the variable `Invoke-MigrationStep -Environment`
+sets on that process alone. The mapping is refused unless the script declares the parameter and
+declares it as a `SecureString`. The command preview shows `-ClientSecret
+$env:M365MIGRATION_CLIENT_SECRET`, never a value.
+
 `Invoke-MigrationStep` runs `<same pwsh as the parent> -NoProfile -NonInteractive
 -ExecutionPolicy Bypass -File driver.ps1` with stdout/stderr redirected to the run folder,
 polls every 250 ms (`[Threading.Thread]::Sleep`, not `Start-Sleep`), reads new complete lines
@@ -445,8 +454,10 @@ it newest first.
 ## 8. Console workbench
 
 Pure PowerShell, no third-party modules. Every prompt goes through one seam
-(`$script:MigrationPrompt`, a scriptblock defaulting to `Read-Host`/`PromptForChoice`) so the
-Pester suite drives the whole flow with scripted answers on macOS.
+(`Read-MigrationPrompt`, whose implementation `Set-MigrationPromptHandler` replaces; the
+default is `Read-Host`/`PromptForChoice`/`Read-Host -AsSecureString`) so the Pester suite
+drives the whole flow with scripted answers on macOS. `Read-MigrationPrompt.ps1` is the one
+file in the toolkit allowed to prompt, and a test asserts that of every other file.
 
 Screens: workspace pick (folders under the default root + recent list kept in
 `~/.config/M365Migration/recent.json` on macOS/Linux, `%APPDATA%\M365Migration\recent.json`
@@ -455,6 +466,14 @@ GUID resolved inline) → phase view (default) / all tools / settings / results 
 form (each parameter with value and provenance; wave pick-list from the plan; file
 parameters offer the resolver's candidates) → gates → command preview → live output → exit
 meaning, Succeeded/Failed/Skipped counts, file paths.
+
+`Show-MigrationWorkbench -Path [-Version]` is the loop; `Format-MigrationWorkbenchView` renders
+each screen as `string[]` so the board can be asserted without a console. Two rules the screens
+above do not spell out. A rehearsal clears only the **hard** gates: the soft ones exist to stop
+a live run going ahead of its evidence, and demanding them of a dry run would leave an operator
+with nothing safe to do. And the settings form asks for every schema key **except**
+`SchemaVersion` — the file format's own version is not a choice an operator has — re-asking only
+the keys a failed validation names.
 
 ## 9. WinForms workbench
 
