@@ -64,6 +64,7 @@
         'Save-MigrationPlan'
         'Save-MigrationSettings'
         'Select-MigrationPlanRows'
+        'Set-MigrationPromptHandler'
         'Split-MigrationList'
         'Split-MigrationProxyAddress'
         'Split-MigrationTeamsLineUri'

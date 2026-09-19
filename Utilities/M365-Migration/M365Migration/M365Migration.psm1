@@ -28,6 +28,13 @@ $script:MigrationStepCatalogCache = @{}
 # Which settings keys the schema types as Path. Read once on first use rather than rebuilding
 # the whole schema for every settings value a step resolves.
 $script:MigrationSettingsPathKeys = $null
+# The console front end's single prompt seam (Set-MigrationPromptHandler). $null means "ask the
+# operator through Read-Host"; a scriptblock answers instead, which is how the Pester suite
+# drives the whole console flow on a machine with no console.
+$script:MigrationPromptHandler = $null
+# A script's synopsis costs Get-Help a parse of the whole file, so the all-tools view memoises
+# them for the session by path and modification time.
+$script:MigrationScriptSynopsisCache = @{}
 
 $privateFiles = @(Get-ChildItem -Path (Join-Path $PSScriptRoot 'Private') -Filter '*.ps1' -ErrorAction SilentlyContinue | Sort-Object Name)
 $publicFiles = @(Get-ChildItem -Path (Join-Path $PSScriptRoot 'Public') -Filter '*.ps1' -ErrorAction SilentlyContinue | Sort-Object Name)

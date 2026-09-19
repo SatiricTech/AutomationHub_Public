@@ -123,14 +123,22 @@ Describe 'No interactive prompts' {
         $Host.UI.Prompt/PromptForChoice call. Tests/ is excluded: its stub functions are named
         Read-Host on purpose, to shadow a real prompt in the script under test.
 
+        Read-MigrationPrompt is the single exception, and the reason this rule stays affordable.
+        The console workbench asks its questions there and nowhere else (Docs/Workbench-Design.md,
+        section 8), so one file holds every Read-Host and PromptForChoice in the toolkit and
+        Set-MigrationPromptHandler can replace all of them at once - which is what lets the
+        suite drive the console flow with scripted answers instead of a console.
+
         The file list is built here, at Describe scope rather than inside BeforeAll, because
         -ForEach needs it during Pester's discovery pass; a BeforeAll only runs later, during Run.
     #>
 
     $toolkitRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
     $moduleRoot = Join-Path $toolkitRoot 'M365Migration'
+    $promptSeam = 'Read-MigrationPrompt.ps1'
     $topLevelScripts = @(Get-ChildItem -LiteralPath $toolkitRoot -Filter '*.ps1' -File)
-    $moduleScripts = @(Get-ChildItem -LiteralPath $moduleRoot -Filter '*.ps1' -File -Recurse)
+    $moduleScripts = @(Get-ChildItem -LiteralPath $moduleRoot -Filter '*.ps1' -File -Recurse |
+            Where-Object { $_.Name -ne $promptSeam })
 
     $scannedFiles = @(($topLevelScripts + $moduleScripts) | ForEach-Object {
             @{ Path = $_.FullName; Name = $_.Name }
@@ -176,6 +184,16 @@ Describe 'No interactive prompts' {
         $survey = Get-InteractivePromptSurvey -Path $Path
         $survey.ReadHostCalls | Should -BeNullOrEmpty -Because "$Name must not call Read-Host"
         $survey.HostUiPrompts | Should -BeNullOrEmpty -Because "$Name must not call `$Host.UI.Prompt or PromptForChoice"
+    }
+
+    It 'Keeps every prompt in the one seam the console front end goes through' {
+        # The exclusion above is only safe while the seam really is where the prompts live: a
+        # Read-MigrationPrompt.ps1 that had stopped prompting would mean they had moved
+        # somewhere the scan no longer covers.
+        $seamPath = Join-Path $PSScriptRoot '..' 'M365Migration' 'Private' 'Read-MigrationPrompt.ps1'
+        $survey = Get-InteractivePromptSurvey -Path $seamPath
+        $survey.ReadHostCalls | Should -Not -BeNullOrEmpty
+        $survey.HostUiPrompts | Should -Not -BeNullOrEmpty
     }
 
     It 'Flags a module-qualified Read-Host call, so the guard is proven against qualification, not assumed' {
