@@ -113,3 +113,49 @@ Describe 'Promoted helpers behave the same as exported functions' {
         Get-MigrationGraphErrorStatusCode -ErrorRecord $record | Should -Be 404
     }
 }
+
+Describe 'No interactive prompts' {
+
+    <#
+        Every script in the toolkit has to run unattended - an RMM job or a pipeline cannot answer
+        a prompt. This parses every .ps1 the toolkit ships (the top-level scripts and the module's
+        Public and Private functions) and asserts none of them contain a Read-Host call or a
+        $Host.UI.Prompt/PromptForChoice call. Tests/ is excluded: its stub functions are named
+        Read-Host on purpose, to shadow a real prompt in the script under test.
+
+        The file list is built here, at Describe scope rather than inside BeforeAll, because
+        -ForEach needs it during Pester's discovery pass; a BeforeAll only runs later, during Run.
+    #>
+
+    $toolkitRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $topLevelScripts = @(Get-ChildItem -LiteralPath $toolkitRoot -Filter '*.ps1' -File)
+    $moduleScripts = @(Get-ChildItem -LiteralPath (Join-Path $toolkitRoot 'M365Migration') -Filter '*.ps1' -File -Recurse)
+
+    $scannedFiles = @(($topLevelScripts + $moduleScripts) | ForEach-Object {
+            @{ Path = $_.FullName; Name = $_.Name }
+        })
+
+    It 'Never prompts interactively in <Name>' -ForEach $scannedFiles {
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$parseErrors)
+        if ($parseErrors -and @($parseErrors).Count -gt 0) {
+            throw "$Name does not parse: $(@($parseErrors)[0].Message)"
+        }
+
+        $readHostCalls = @($ast.FindAll(
+            {
+                $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+                $args[0].GetCommandName() -ieq 'Read-Host'
+            }, $true))
+        $readHostCalls | Should -BeNullOrEmpty -Because "$Name must not call Read-Host"
+
+        $hostUiPrompts = @($ast.FindAll(
+            {
+                $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                $args[0].Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                $args[0].Member.Value -in @('PromptForChoice', 'Prompt') -and
+                $args[0].Expression.Extent.Text -ieq '$Host.UI'
+            }, $true))
+        $hostUiPrompts | Should -BeNullOrEmpty -Because "$Name must not call `$Host.UI.Prompt or PromptForChoice"
+    }
+}

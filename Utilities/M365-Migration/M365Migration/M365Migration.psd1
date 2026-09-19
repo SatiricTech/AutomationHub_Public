@@ -35,7 +35,6 @@
         'Get-MigrationProperty'
         'Get-MigrationRunContext'
         'Get-MigrationSkuCatalog'
-        'Get-MigrationTargetDomain'
         'Get-MigrationTeamsPolicyName'
         'Import-MigrationCsv'
         'Import-MigrationPlan'

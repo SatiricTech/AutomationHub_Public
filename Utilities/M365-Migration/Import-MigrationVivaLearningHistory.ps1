@@ -87,7 +87,9 @@
 .PARAMETER LogoUrl
     Publicly reachable image URL used for every provider logo slot that isn't
     given its own parameter. Viva Learning copies the image to its own storage.
-    Required (or prompted) only when the provider doesn't exist yet.
+    Required only when the provider doesn't exist yet and this is a real (not
+    -DryRun) run; the run throws immediately if it is missing rather than
+    prompting for one.
 
 .PARAMETER SquareLogoUrl
     Square logo for light theme. Falls back to -LogoUrl.
@@ -104,11 +106,14 @@
 .PARAMETER TargetDomain
     UPN domain of the destination tenant (e.g. newco.com). Each source UPN's
     local part is mapped to this domain unless the row has a
-    TargetUserPrincipalName or the plan covers it. If omitted (and neither
-    -KeepCsvDomains nor -PlanPath is set) you are prompted once.
+    TargetUserPrincipalName or the plan covers it. One of -TargetDomain,
+    -KeepCsvDomains or -PlanPath must be supplied; the run throws immediately
+    if none of the three is given, rather than prompting for one.
 
 .PARAMETER KeepCsvDomains
-    Use the CSV UPNs unchanged instead of mapping to -TargetDomain.
+    Use the CSV UPNs unchanged instead of mapping to -TargetDomain. Also
+    satisfies the requirement, described under -TargetDomain, that the
+    destination mapping be stated explicitly.
 
 .PARAMETER DefaultLanguageTag
     Language tag applied to catalog items whose CourseLanguage column is empty.
@@ -127,9 +132,9 @@
     Preview - signs in and resolves everything read-only (provider match, user
     mapping, per-row plan), creates and changes nothing, and writes a -DryRun_
     results file whose rows all carry Status Planned. The delegated provider
-    step requests LearningProvider.Read only and raises no confirmation or
-    logo prompt: a provider that does not exist yet is simply reported as one
-    the live run would register.
+    step requests LearningProvider.Read only and raises no confirmation prompt
+    and no missing -LogoUrl error: a provider that does not exist yet is
+    simply reported as one the live run would register.
 
 .PARAMETER Verbosity
     Console detail: Low (errors and successes), Medium (adds warnings) or High
@@ -467,13 +472,11 @@ try {
         Write-MigrationLog -Message "Identity plan supplies $($planUpnMap.Count) source-to-target address mapping(s)." -Level INFO
     }
 
-    # Asked once when no mapping was chosen, so hand-off runs don't silently import
-    # source-domain UPNs. A TargetUserPrincipalName column doesn't suppress the
-    # prompt: it may cover only some rows, and blank cells fall back to this mapping.
+    # A TargetUserPrincipalName column doesn't make this optional: it may cover only
+    # some rows, and blank cells fall back to this mapping - so a hand-off run must
+    # state it explicitly rather than silently import source-domain UPNs.
     if (-not $TargetDomain -and -not $KeepCsvDomains -and -not $PlanPath) {
-        $answer = ((Read-Host 'Destination UPN domain to map users to (blank = keep the CSV domains)') ?? '').Trim()
-        if ($answer) { $TargetDomain = $answer.TrimStart('@') }
-        else { $KeepCsvDomains = $true }
+        throw 'Pass -TargetDomain, -KeepCsvDomains or -PlanPath so the destination UPN mapping is explicit.'
     }
 
     $providerId = $LearningProviderId
@@ -521,7 +524,7 @@ try {
         }
         else {
             # Explicit if/else rather than ??: an unbound [string] parameter is '' not
-            # $null, so null-coalescing never fell back to -LogoUrl and always prompted.
+            # $null, so null-coalescing never fell back to -LogoUrl.
             $square = if ($SquareLogoUrl) { $SquareLogoUrl } else { $LogoUrl }
             $squareDark = if ($SquareLogoDarkUrl) { $SquareLogoDarkUrl } else { $LogoUrl }
             $long = if ($LongLogoUrl) { $LongLogoUrl } else { $LogoUrl }
@@ -529,21 +532,14 @@ try {
 
             if (-not ($square -and $squareDark -and $long -and $longDark)) {
                 if ($DryRun) {
-                    # A rehearsal registers nothing, so it must not block on a prompt for a
-                    # value it never sends. Supplied URLs are still carried so the DryRun
-                    # validates the same parameters the live run will use.
+                    # A rehearsal registers nothing, so it must not block on a value it never
+                    # sends. Supplied URLs are still carried so the DryRun validates the same
+                    # parameters the live run will use.
                     Write-MigrationLog -Message ("[DRYRUN] Provider '$ProviderDisplayName' does not exist yet; the live run " +
-                        'needs logo image URLs (-LogoUrl or the prompt) to register it.') -Level WARNING
+                        'needs logo image URLs (-LogoUrl) to register it.') -Level WARNING
                 }
                 else {
-                    Write-MigrationLog -Message ("Provider '$ProviderDisplayName' does not exist yet and registering one requires " +
-                        'logo image URLs (publicly reachable - Viva Learning copies the image to its own storage).') -Level WARNING
-                    $answer = ((Read-Host 'Image URL to use for all logo slots (e.g. your company logo PNG)') ?? '').Trim()
-                    if (-not $answer) { throw 'A logo URL is required to register a learning provider.' }
-                    if (-not $square) { $square = $answer }
-                    if (-not $squareDark) { $squareDark = $answer }
-                    if (-not $long) { $long = $answer }
-                    if (-not $longDark) { $longDark = $answer }
+                    throw 'Registering a learning provider needs -LogoUrl (used for every logo slot not given individually).'
                 }
             }
 

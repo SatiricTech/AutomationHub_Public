@@ -576,6 +576,73 @@ Describe 'Import-MigrationVivaLearningHistory - unattended import under a suppli
     }
 }
 
+Describe 'Import-MigrationVivaLearningHistory - the destination mapping cannot be left to a prompt' {
+
+    BeforeAll {
+        $script:noDomainWorkspace = New-VivaWorkspace -Label 'NoDomain'
+        Reset-VivaCallLog
+        $global:vivaProviders = @()
+        $global:vivaExistingActivityIds = @()
+
+        # No -TargetDomain, -KeepCsvDomains or -PlanPath: the destination mapping is
+        # ambiguous and must fail fast rather than fall back to a prompt.
+        & $script:scriptPath -CsvPath (Join-Path $script:noDomainWorkspace 'VivaLearningHistory.csv') `
+            -TenantId $script:tenantId -ClientId $script:clientId -ClientSecret $script:clientSecret `
+            -OutputPath $script:noDomainWorkspace -Verbosity Low -DryRun
+        $script:noDomainExitCode = $LASTEXITCODE
+        $script:noDomainLog = Get-VivaLogText -Workspace $script:noDomainWorkspace
+    }
+
+    AfterAll {
+        if ($script:noDomainWorkspace -and (Test-Path -LiteralPath $script:noDomainWorkspace)) {
+            Remove-Item -LiteralPath $script:noDomainWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits 1 rather than prompting for a domain mapping' {
+        $script:noDomainExitCode | Should -Be 1
+    }
+
+    It 'Logs the fatal reason' {
+        $script:noDomainLog | Should -Match (
+            'Fatal: Pass -TargetDomain, -KeepCsvDomains or -PlanPath so the destination UPN mapping is explicit\.')
+    }
+}
+
+Describe 'Import-MigrationVivaLearningHistory - a new provider needs -LogoUrl up front' {
+
+    BeforeAll {
+        $script:noLogoWorkspace = New-VivaWorkspace -Label 'NoLogo'
+        Reset-VivaCallLog
+        $global:vivaProviders = @()
+        $global:vivaExistingActivityIds = @()
+
+        # No provider exists and none of the logo URLs were supplied, on a real run
+        # (not -DryRun): registration must fail fast rather than fall back to a prompt.
+        & $script:scriptPath -CsvPath (Join-Path $script:noLogoWorkspace 'VivaLearningHistory.csv') `
+            -TenantId $script:tenantId -ClientId $script:clientId -ClientSecret $script:clientSecret `
+            -PlanPath (Join-Path $script:noLogoWorkspace 'IdentityPlan.csv') `
+            -OutputPath $script:noLogoWorkspace -Verbosity Low
+        $script:noLogoExitCode = $LASTEXITCODE
+        $script:noLogoLog = Get-VivaLogText -Workspace $script:noLogoWorkspace
+    }
+
+    AfterAll {
+        if ($script:noLogoWorkspace -and (Test-Path -LiteralPath $script:noLogoWorkspace)) {
+            Remove-Item -LiteralPath $script:noLogoWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits 1 rather than prompting for a logo URL' {
+        $script:noLogoExitCode | Should -Be 1
+    }
+
+    It 'Logs the fatal reason' {
+        $script:noLogoLog | Should -Match (
+            'Fatal: Registering a learning provider needs -LogoUrl \(used for every logo slot not given individually\)\.')
+    }
+}
+
 Describe 'Import-MigrationVivaLearningHistory - rows the CSV cannot describe fail individually' {
 
     BeforeAll {
