@@ -688,9 +688,15 @@ Describe 'New-MigrationRecipients - a mail contact is created with PrimarySmtpAd
 Describe 'New-MigrationRecipients - a mismatched -TenantId stops the run before any row' {
 
     BeforeAll {
+        # Both tenants are GUIDs so the module's real Assert-MigrationTenant - deliberately not
+        # shadowed here, because the throw is the behaviour under test - compares them without
+        # Resolve-MigrationTenantId reaching the network to look a domain up.
         function Connect-MigrationExchange {
-            param([string]$DelegatedOrganization, [switch]$Reconnect)
-            return [pscustomobject]@{ Organization = 'contoso.onmicrosoft.com'; TenantId = 'contoso-tenant-id' }
+            param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{
+                Organization = 'contoso.onmicrosoft.com'
+                TenantId     = '00000000-0000-0000-0000-0000000000c2'
+            }
         }
 
         $script:wrongTenantWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "M365Migration-Recipients-WrongTenant-$([guid]::NewGuid())"
@@ -702,7 +708,8 @@ Describe 'New-MigrationRecipients - a mismatched -TenantId stops the run before 
         $global:recipientMutations.Clear()
         $global:recipientReads.Clear()
 
-        & $script:scriptPath -PlanPath $script:wrongTenantPlan -Wave '1' -TenantId 'newco.onmicrosoft.com' `
+        & $script:scriptPath -PlanPath $script:wrongTenantPlan -Wave '1' `
+            -TenantId '00000000-0000-0000-0000-0000000000c1' `
             -OutputPath $script:wrongTenantWorkspace -Verbosity Low -DryRun
         $script:wrongTenantExitCode = $LASTEXITCODE
     }
@@ -718,10 +725,12 @@ Describe 'New-MigrationRecipients - a mismatched -TenantId stops the run before 
         $global:recipientReads | Should -BeNullOrEmpty
     }
 
-    It 'Logs which organisation it connected to instead' {
+    It 'Logs which tenant it connected to instead' {
         $log = @(Get-ChildItem -LiteralPath $script:wrongTenantWorkspace -Filter 'New-MigrationRecipients_*.log')
         $log.Count | Should -Be 1
-        (Get-Content -LiteralPath $log[0].FullName -Raw) | Should -Match "contoso\.onmicrosoft\.com.*-TenantId asked for 'newco\.onmicrosoft\.com'"
+        (Get-Content -LiteralPath $log[0].FullName -Raw) |
+            Should -Match ('Recipient creation: Exchange Online is connected to tenant ' +
+                '00000000-0000-0000-0000-0000000000c2')
     }
 }
 
@@ -781,5 +790,61 @@ Describe 'New-MigrationRecipients - an alias hit with a mismatched type is not a
 
     It 'Calls no Exchange write cmdlet - only the plan write-back records the failure' {
         @($global:recipientMutations | Where-Object { $_ -notlike 'Save-MigrationPlan*' }) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'New-MigrationRecipients - the tenant guard runs once over the Exchange session' {
+
+    <#
+        Assert-MigrationTenant is shadowed rather than mocked so the call can be recorded without
+        the module's real resolver touching the network, and so a matching tenant lets the run
+        carry on into the rows - the mismatch case is covered by the block above.
+    #>
+
+    BeforeAll {
+        $script:guardTenantId = '00000000-0000-0000-0000-0000000000c3'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        # The literal is repeated rather than read from $script: because a function defined in
+        # BeforeAll does not share the $script: scope Pester gives the It blocks.
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{
+                TenantId     = '00000000-0000-0000-0000-0000000000c3'
+                Organization = 'newco.onmicrosoft.com'
+            }
+        }
+
+        $script:guardWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "M365Migration-Recipients-Guard-$([guid]::NewGuid())"
+        New-Item -Path $script:guardWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:guardPlan = Join-Path $script:guardWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:guardPlan
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+        if ($script:guardWorkspace -and (Test-Path -LiteralPath $script:guardWorkspace)) {
+            Remove-Item -LiteralPath $script:guardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Asserts the -TenantId it was given against the Exchange connection exactly once' {
+        & $script:scriptPath -PlanPath $script:guardPlan -Wave '1' -TenantId $script:guardTenantId `
+            -OutputPath $script:guardWorkspace -Verbosity Low -DryRun
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Recipient creation'
+        $global:AssertCalls[0].ExchangeConnection.TenantId | Should -BeExactly $script:guardTenantId
     }
 }

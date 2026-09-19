@@ -94,9 +94,9 @@
 .PARAMETER TenantId
     Pins the run to the destination tenant: its onmicrosoft.com domain or its tenant ID.
     Exchange Online has no sign-in pin outside GDAP, so the check happens after the session
-    is established or reused - when the connected organisation is not this tenant the run
-    stops before the first row instead of creating recipients in whatever tenant a leftover
-    session belongs to. Pass it on every run.
+    is established or reused - when the connected session is not this tenant the run stops
+    before the first row instead of creating recipients in whatever tenant a leftover session
+    belongs to. Pass it on every run.
 
 .PARAMETER DelegatedOrganization
     The customer tenant for GDAP delegated access, for example 'newco.onmicrosoft.com'.
@@ -987,23 +987,19 @@ catch {
 # Connect-MigrationExchange reuses whatever Exchange Online session is already open in the
 # shell, and nothing in this toolkit disconnects one - a source-tenant session left behind by
 # Get-MigrationInventory would otherwise be reused here silently. -DelegatedOrganization is
-# already checked by Connect-MigrationExchange itself; -TenantId is the same check for the
-# primary, non-GDAP path. Connect-MigrationExchange now accepts its own -TenantId (GUID form)
-# and would reconnect silently on a mismatch, but a live recipient-creation run is kept as a
-# hard stop instead - re-run after confirming the tenant rather than having the script pick a
-# session for you.
-if ($TenantId -and $exchangeConnection) {
-    $connectedOrganization = Get-MigrationCsvValue -Row $exchangeConnection -Name 'Organization' -Default ''
-    $connectedTenantId = Get-MigrationCsvValue -Row $exchangeConnection -Name 'TenantId' -Default ''
-    $tenantMatches = ($connectedOrganization -and $connectedOrganization -eq $TenantId) -or
-        ($connectedTenantId -and $connectedTenantId -eq $TenantId)
-    if (-not $tenantMatches -and ($connectedOrganization -or $connectedTenantId)) {
-        $connectedAs = if ($connectedOrganization) { $connectedOrganization } else { $connectedTenantId }
-        Write-MigrationLog -Message ("Connected to '$connectedAs' but -TenantId asked for '$TenantId'. Stopping before " +
-            'the first row rather than creating recipients in the wrong tenant. Disconnect-ExchangeOnline and re-run.') `
-            -Level ERROR
-        exit (Complete-MigrationRun -ExitCode 1)
-    }
+# already checked by Connect-MigrationExchange itself; Assert-MigrationTenant is the same check
+# for the primary, non-GDAP path, and the one implementation every connecting script shares.
+# -TenantId is deliberately not handed to the connector: it would reconnect silently on a
+# mismatch, and a live recipient-creation run is kept as a hard stop instead - re-run after
+# confirming the tenant rather than having the script pick a session for you. Calling the assert
+# unconditionally is also what produces the WARNING banner when no -TenantId was given.
+try {
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -ExchangeConnection $exchangeConnection `
+        -Purpose 'Recipient creation'
+}
+catch {
+    Write-MigrationLog -Message $_.Exception.Message -Level ERROR
+    exit (Complete-MigrationRun -ExitCode 1)
 }
 
 $planChanged = $false

@@ -1212,6 +1212,14 @@ try {
         if ($exoMismatch) { throw "$exoMismatch. Disconnect-ExchangeOnline and sign in to the source tenant." }
     }
 
+    # Get-DomainExchangeSessionMismatch above is the stronger check here - it knows about
+    # -DelegatedOrganization and about the domain being released - and it is kept. This is the
+    # toolkit-wide guard on top of it: it compares both sessions against the -TenantId the
+    # operator named, and with no -TenantId it writes the WARNING banner naming the tenant this
+    # destructive cleanup is about to run against.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+        -ExchangeConnection $exoContext -Purpose 'Domain release'
+
     $organization = @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/organization?$select=id,displayName')
     $tenantName = if ($organization.Count -gt 0) {
         [string](Get-MigrationProperty $organization[0] 'displayName' '(unknown)')

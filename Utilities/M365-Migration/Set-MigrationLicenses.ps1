@@ -823,7 +823,12 @@ try {
         Write-MigrationLog -Message 'No eligible plan rows; skipping the tenant connection entirely.' -Level WARNING
     }
     else {
-        $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+        $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+        # The guard, called unconditionally: with no -TenantId it writes the WARNING banner naming
+        # the tenant whose seats are about to be consumed, which is the only notice an operator
+        # gets that nothing verified it.
+        $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+            -Purpose 'License assignment'
         $catalog = @(Get-MigrationSkuCatalog)
 
         # Every identifier the row offers goes into the lookup: the live UPN is the interim one until

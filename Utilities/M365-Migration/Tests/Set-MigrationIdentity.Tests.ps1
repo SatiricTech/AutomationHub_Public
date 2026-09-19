@@ -23,6 +23,9 @@
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
     Justification = 'The stubs must accept every parameter the script under test binds, including ones a particular test does not read; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+    Justification = 'The stubs run inside the script under test, whose scope chain does not reach
+    this file''s script scope. The calls they record go in a global list, removed again in AfterAll.')]
 param()
 
 BeforeAll {
@@ -321,5 +324,90 @@ Describe 'A declined confirmation is a Skip, not a Plan' {
 
     It 'Leaves no row claiming an outcome the tenant never saw' {
         @($script:WhatIfRows | Where-Object { $_.Status -in @('Planned', 'Succeeded') }).Count | Should -Be 0
+    }
+}
+
+Describe 'The tenant guard runs once over both connections' {
+
+    <#
+        Same shadowing technique as the block above. -Apply PrimarySmtp is chosen so the Exchange
+        branch is exercised too: the point of the guard here is that Graph and Exchange Online are
+        signed in to the same tenant, which only means anything when both sessions exist.
+        Assert-MigrationTenant is shadowed rather than mocked so the call is recorded without the
+        module's real resolver touching the network.
+    #>
+
+    BeforeAll {
+        $script:GuardTenantId = '00000000-0000-0000-0000-0000000000b2'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = $TenantId; Account = 'tech@newco.onmicrosoft.com' }
+        }
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
+            $global:GuardConnectTenantIds += $TenantId
+            return [pscustomobject]@{ TenantId = $TenantId; UserPrincipalName = 'tech@newco.onmicrosoft.com' }
+        }
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            return [pscustomobject]@{
+                id                    = 'bbbbbbbb-0000-0000-0000-000000000001'
+                userPrincipalName     = 'jsmith@contoso.com'
+                mail                  = 'jsmith@contoso.com'
+                mailNickname          = 'jsmith'
+                displayName           = 'John Q. Smith'
+                onPremisesSyncEnabled = $false
+                proxyAddresses        = @('SMTP:jsmith@contoso.com')
+            }
+        }
+        function Get-EXOMailbox {
+            param($Identity, $Properties, $ErrorAction)
+            return [pscustomobject]@{
+                PrimarySmtpAddress = 'jsmith@contoso.com'
+                EmailAddresses     = @('SMTP:jsmith@contoso.com')
+                Alias              = 'jsmith'
+            }
+        }
+
+        $script:GuardWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "SetIdentity-Guard-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:GuardWorkspace -ItemType Directory -Force
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+        $global:GuardConnectTenantIds = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls, GuardConnectTenantIds -Scope Global -ErrorAction SilentlyContinue
+        if ($script:GuardWorkspace -and (Test-Path -LiteralPath $script:GuardWorkspace)) {
+            Remove-Item -LiteralPath $script:GuardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Asserts the expected tenant once, naming both the Graph and the Exchange connection' {
+        & $script:ScriptPath -PlanPath (Join-Path -Path $script:FixtureRoot -ChildPath 'IdentityPlan.csv') `
+            -Wave '1' -Apply 'PrimarySmtp' -TenantId $script:GuardTenantId `
+            -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:GuardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Identity cutover'
+        $global:AssertCalls[0].GraphContext.TenantId | Should -BeExactly $script:GuardTenantId
+        $global:AssertCalls[0].ExchangeConnection.TenantId | Should -BeExactly $script:GuardTenantId
+    }
+
+    It 'Hands the Graph tenant to the Exchange connector so a cached session cannot differ' {
+        & $script:ScriptPath -PlanPath (Join-Path -Path $script:FixtureRoot -ChildPath 'IdentityPlan.csv') `
+            -Wave '1' -Apply 'PrimarySmtp' -TenantId $script:GuardTenantId `
+            -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $global:GuardConnectTenantIds | Should -Be @($script:GuardTenantId)
     }
 }

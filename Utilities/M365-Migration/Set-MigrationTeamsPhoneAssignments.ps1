@@ -215,6 +215,11 @@ try {
     }
 
     $teamsTenant = Connect-MigrationTeams -TenantId $TenantId
+    # The guard, called unconditionally: with no -TenantId it writes the WARNING banner naming
+    # the tenant the numbers are about to be assigned in, which is the only notice an operator
+    # gets that nothing verified it.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -TeamsTenant $teamsTenant `
+        -Purpose 'Teams phone assignment'
     # Connect-MigrationTeams silently reuses whatever Teams session is already live when
     # -TenantId is omitted, so the connected tenant is surfaced here - before any prompt -
     # rather than trusting the operator to notice a bare GUID buried in an earlier log line.

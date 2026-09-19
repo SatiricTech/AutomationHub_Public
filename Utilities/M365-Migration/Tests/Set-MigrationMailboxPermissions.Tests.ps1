@@ -23,6 +23,9 @@
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
     Justification = 'The stubs must accept every parameter the script under test binds, including ones a particular test does not read; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+    Justification = 'The stubs run inside the script under test, whose scope chain does not reach
+    this file''s script scope. The calls they record go in a global list, removed again in AfterAll.')]
 param()
 
 BeforeAll {
@@ -637,5 +640,86 @@ Describe 'An unmapped forwarding target is not passed through into the source te
         $row = $script:ForwardingRows | Where-Object { $_.SourceMailbox -eq 'adean@contoso.com' }
         $row.Status | Should -BeExactly 'Planned'
         $row.Detail | Should -Match 'team@fabrikam.com'
+    }
+}
+
+Describe 'The tenant guard runs once with the -TenantId the run was given' {
+
+    <#
+        -TenantId is the gate on re-applying permissions into the wrong tenant, so two things
+        have to hold: the value reaches Connect-MigrationExchange (which drops a cached session
+        pointed somewhere else) and it reaches Assert-MigrationTenant, which is what compares the
+        session that was actually established. Assert-MigrationTenant is shadowed rather than
+        mocked so the call is recorded without the module's real resolver touching the network.
+    #>
+
+    BeforeAll {
+        $script:GuardTenantId = '00000000-0000-0000-0000-0000000000a1'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
+            $global:GuardConnectTenantIds += $TenantId
+            return [pscustomobject]@{ TenantId = $TenantId; Organization = 'newco.onmicrosoft.com' }
+        }
+        function Get-AcceptedDomain {
+            param($ErrorAction)
+            return @(
+                [pscustomobject]@{ DomainName = 'newco.com' }
+                [pscustomobject]@{ DomainName = 'newco.onmicrosoft.com' }
+            )
+        }
+        function Get-EXOMailboxPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-EXORecipientPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-MailboxFolderPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-EXOMailbox {
+            param($Identity, $Properties, $ErrorAction)
+            return [pscustomobject]@{
+                PrimarySmtpAddress    = [string]$Identity
+                GrantSendOnBehalfTo   = @()
+                ForwardingAddress     = ''
+                ForwardingSmtpAddress = ''
+            }
+        }
+
+        $script:GuardWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "SetMailboxPermissions-Guard-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:GuardWorkspace -ItemType Directory -Force
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+        $global:GuardConnectTenantIds = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls, GuardConnectTenantIds -Scope Global -ErrorAction SilentlyContinue
+        if ($script:GuardWorkspace -and (Test-Path -LiteralPath $script:GuardWorkspace)) {
+            Remove-Item -LiteralPath $script:GuardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Binds -TenantId, hands it to the connector and asserts the tenant exactly once' {
+        & $script:ScriptPath -PlanPath $script:PlanFixture -MailboxPermissionsCsv $script:PermissionFixture `
+            -TenantId $script:GuardTenantId -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $global:GuardConnectTenantIds | Should -Be @($script:GuardTenantId)
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:GuardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Mailbox permissions'
+        $global:AssertCalls[0].ExchangeConnection.TenantId | Should -BeExactly $script:GuardTenantId
     }
 }

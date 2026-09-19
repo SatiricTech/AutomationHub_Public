@@ -349,6 +349,11 @@ try {
     # Microsoft.Graph.Users / .Groups submodule - and the version-matching failure they can
     # trigger against an already-loaded Microsoft.Graph.Authentication - ever enters the picture.
     $context = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    # The guard, called unconditionally: with no -TenantId it writes the WARNING banner naming the
+    # tenant whose passwords are about to change, which is the only notice an operator gets that
+    # nothing verified it.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $context `
+        -Purpose 'Cutover password reset'
     # Connect-MigrationGraph logs a reused cached session at INFO, which the default verbosity
     # hides; a credential reset must show the tenant it is about to act on at every verbosity.
     Write-MigrationLog -Message "Target tenant: $($context.TenantId) as $($context.Account)" -Level SUCCESS

@@ -391,6 +391,13 @@ Describe 'Get-MigrationTeamsPhoneAssignments - tenant pin' {
                 DisplayName = 'Contoso Source'
             }
         }
+        # The documented pin is a domain, which the real Assert-MigrationTenant would resolve over
+        # the network. The guard has its own block at the end of this file; here it is shadowed so
+        # this test stays offline and keeps its subject - what the connector was handed.
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
 
         $script:pinWorkspace = New-TeamsPhoneTestWorkspace
         & $script:scriptPath -OutputPath $script:pinWorkspace -Verbosity Low -TenantId 'contoso.onmicrosoft.com'
@@ -412,5 +419,44 @@ Describe 'Get-MigrationTeamsPhoneAssignments - tenant pin' {
 
     It 'Names the tenant the connection returned, not the pin, at SUCCESS' {
         $script:pinLog | Should -Match '\[SUCCESS\] Reading tenant 22222222-2222-2222-2222-222222222222 \(Contoso Source\)'
+    }
+}
+
+Describe 'Get-MigrationTeamsPhoneAssignments - the tenant guard runs once over the Teams session' {
+
+    <#
+        A read against the wrong tenant is a wasted inventory that then misleads every later
+        phase, so the guard runs here too. Assert-MigrationTenant is shadowed rather than mocked
+        so the call can be recorded without the module's real resolver touching the network.
+    #>
+
+    BeforeAll {
+        $script:guardTenantId = '00000000-0000-0000-0000-0000000000f3'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+
+        $script:guardWorkspace = New-TeamsPhoneTestWorkspace
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+    }
+
+    AfterAll {
+        Remove-TeamsPhoneTestWorkspace -Path $script:guardWorkspace
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'Asserts the -TenantId it was given against the Teams tenant exactly once' {
+        & $script:scriptPath -OutputPath $script:guardWorkspace -Verbosity Low -TenantId $script:guardTenantId
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Teams phone inventory'
+        $global:AssertCalls[0].TeamsTenant | Should -Not -BeNullOrEmpty
     }
 }

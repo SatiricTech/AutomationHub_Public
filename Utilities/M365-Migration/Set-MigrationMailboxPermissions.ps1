@@ -66,6 +66,14 @@
     Also act on mailboxes whose plan row has PlanStatus Collision. By default only Planned,
     ManualOverride and UpnSmtpDiverge rows are actioned.
 
+.PARAMETER TenantId
+    Pins the run to the destination tenant: its onmicrosoft.com domain or its tenant ID. This is
+    the gate. Exchange Online has no sign-in pin outside GDAP, so the check happens after the
+    session is established or reused - when the connected session is not this tenant the run stops
+    before the first grant instead of writing permissions into whatever tenant a leftover session
+    belongs to. The accepted-domain check further down is only a second opinion. Pass it on every
+    run.
+
 .PARAMETER DelegatedOrganization
     Customer tenant for Exchange Online, e.g. newco.onmicrosoft.com. Required when running as a
     partner against a customer tenant.
@@ -161,6 +169,11 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$IncludeCollisions,
+
+    [Parameter(Mandatory = $false)]
+    [AllowNull()]
+    [AllowEmptyString()]
+    [string]$TenantId,
 
     [Parameter(Mandatory = $false)]
     [Alias('Tenant')]
@@ -873,17 +886,25 @@ try {
 
     Write-MigrationLog -Message "$($wanted.Count) permission(s) to evaluate." -Level INFO
 
-    $connection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+    $connection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization -TenantId $TenantId
+
+    # The gate. Connect-MigrationExchange reuses whatever session is already live, which in a
+    # chained cutover shell can be the source tenant's session left open by an earlier script;
+    # -TenantId is what turns that into a stop. Passing it unconditionally is deliberate: with no
+    # -TenantId the assert writes the WARNING banner naming the tenant this run is about to write
+    # into, which is the only signal an operator gets that nothing verified it.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -ExchangeConnection $connection `
+        -Purpose 'Mailbox permissions'
+
     $connectedOrganization = if ($connection -and $connection.PSObject.Properties['Organization']) {
         [string]$connection.Organization
     } else { '' }
 
-    # Connect-MigrationExchange reuses whatever session is already live, which in a chained
-    # cutover shell can be the source tenant's session left open by an earlier script. Confirming
-    # the connected organisation actually accepts a destination domain is a cheap check against
-    # writing into the wrong tenant; it degrades to a warning rather than a hard stop when the
-    # read itself is unavailable, so a permissions gap on Get-AcceptedDomain does not block a run
-    # the operator can see is fine.
+    # A second opinion, not the gate: the connected organisation accepting a destination domain
+    # is corroboration that this is the right tenant, but -TenantId above is what actually stops
+    # a wrong-tenant run. So a disagreement here is logged and the run continues - the accepted
+    # domain list is only as good as the plan's first mapped address, and a legitimate run
+    # against a tenant that has not yet added the vanity domain must not be blocked by it.
     $targetDomain = ''
     foreach ($value in $addressMap.Values) {
         $at = ([string]$value).LastIndexOf('@')
@@ -899,9 +920,9 @@ try {
                 "it is the destination tenant: $($_.Exception.Message)") -Level WARNING
         }
         if ($acceptedDomains.Count -gt 0 -and -not ($acceptedDomains | Where-Object { $_ -ieq $targetDomain })) {
-            throw ("Connected to '$connectedOrganization', which does not accept mail for '$targetDomain' - is " +
-                'this the destination tenant? Pass -DelegatedOrganization for the customer tenant, or sign in ' +
-                'directly to it.')
+            Write-MigrationLog -Message ("Connected to '$connectedOrganization', which does not accept mail for " +
+                "'$targetDomain' - is this the destination tenant? Pass -TenantId to make this a hard stop, " +
+                '-DelegatedOrganization for a customer tenant, or sign in directly to it.') -Level WARNING
         }
         Write-MigrationLog -Message "Connected to Exchange Online organisation '$connectedOrganization'." -Level INFO
     }

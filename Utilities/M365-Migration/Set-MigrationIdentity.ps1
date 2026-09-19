@@ -493,12 +493,22 @@ try {
     $planRows = @(Import-MigrationPlan -Path $PlanPath -Wave $Wave)
     Write-MigrationLog -Message "Loaded $($planRows.Count) plan row(s) from $PlanPath" -Level INFO
 
-    $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
 
+    # Graph's own tenant is what Exchange Online is pinned to, because a cutover writes both sides
+    # of the same object: the tenant Graph signed in to is by definition the one the mailbox edits
+    # have to land in, whether or not the operator passed -TenantId.
     $needsExchange = @($requestedActions | Where-Object { $exchangeActions -contains $_ }).Count -gt 0
+    $exoConnection = $null
     if ($needsExchange) {
-        $null = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+        $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
+            -TenantId $graphContext.TenantId
     }
+
+    # One check over whatever this run connected. With no -TenantId it writes the WARNING banner
+    # naming the tenant instead, which is the only notice an operator gets that nothing verified it.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+        -ExchangeConnection $exoConnection -Purpose 'Identity cutover'
 
     $index = 0
     foreach ($row in $planRows) {

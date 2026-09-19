@@ -19,6 +19,9 @@
     Justification = 'Remove-CsPhoneNumberAssignment here is a stand-in named after the real cmdlet so the script under test resolves it. It changes nothing, so ShouldProcess would be meaningless.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
     Justification = 'Connect-MigrationTeams mirrors the module function it shadows; Teams is a product name.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+    Justification = 'The stubs run inside the script under test, whose scope chain does not reach
+    this file''s script scope. The calls they record go in a global list, removed again in AfterAll.')]
 param()
 
 BeforeAll {
@@ -296,6 +299,14 @@ Describe 'A live run with the prompt suppressed' {
 Describe 'The -All set' {
 
     BeforeAll {
+        # -All requires a pin and the documented one is a domain, which the real
+        # Assert-MigrationTenant would resolve over the network. The guard has its own block at
+        # the end of this file; here it is shadowed so these tests stay offline.
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+
         $script:all = Invoke-ScriptUnderTest -Arguments @{ All = $true; TenantId = 'contoso.onmicrosoft.com'; DryRun = $true }
         $script:allRows = @{}
         foreach ($row in $script:all.Rows) { $script:allRows[$row.Identity] = $row }
@@ -334,5 +345,45 @@ Describe 'The -All set' {
             $identities | Should -Not -Contain 'no.number@contoso.com'
             $script:fallback.Rows.Count | Should -Be $script:all.Rows.Count
         }
+    }
+}
+
+Describe 'The tenant guard runs once over the Teams session' {
+
+    <#
+        Assert-MigrationTenant is shadowed rather than mocked so the call can be recorded without
+        the module's real resolver touching the network. Releasing numbers from the wrong tenant
+        is unrecoverable, so what matters is that the pin reaches the guard, not just the connector.
+    #>
+
+    BeforeAll {
+        $script:guardTenantId = '00000000-0000-0000-0000-0000000000f2'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'Asserts the -TenantId it was given against the Teams tenant exactly once' {
+        $null = Invoke-ScriptUnderTest -Arguments @{
+            CsvPath  = $script:fixtureCsv
+            DryRun   = $true
+            TenantId = $script:guardTenantId
+        }
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Teams phone removal'
+        $global:AssertCalls[0].TeamsTenant.TenantId | Should -BeExactly 'contoso.onmicrosoft.com'
     }
 }

@@ -173,6 +173,12 @@ try {
 
     $tenant = Connect-MigrationTeams -TenantId $TenantId
 
+    # The guard, called unconditionally: -TenantId is only mandatory for -All, so on the User and
+    # Csv paths this is also what writes the WARNING banner naming the tenant the numbers are
+    # about to come off when no pin was given.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -TeamsTenant $tenant `
+        -Purpose 'Teams phone removal'
+
     # Name the tenant at WARNING so it shows at the default verbosity even when a cached
     # session was reused (Connect-MigrationTeams logs that reuse at INFO only). This is the
     # last thing the operator sees before numbers start coming off.

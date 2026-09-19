@@ -159,6 +159,12 @@ try {
 
     $tenant = Connect-MigrationTeams -TenantId $TenantId
 
+    # The guard runs on a read too: an inventory taken from the wrong tenant is not just wasted,
+    # it becomes the input every later phase trusts. With no -TenantId it writes the WARNING
+    # banner naming the tenant instead of stopping.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -TeamsTenant $tenant `
+        -Purpose 'Teams phone inventory'
+
     # Name the tenant at SUCCESS, which every verbosity shows on the console. A session reused
     # from an earlier script in the same console is logged by Connect-MigrationTeams at INFO
     # only, so without this line a 'Source' export could silently read the destination tenant.

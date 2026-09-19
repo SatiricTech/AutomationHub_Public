@@ -886,24 +886,6 @@ function ConvertTo-InventoryFolderTrustee {
     return ([string]$User).Trim()
 }
 
-function Test-InventoryTenantMatch {
-    <#
-        True when the Graph and Exchange Online sessions belong to the same tenant. Both sides
-        expose the tenant as a GUID (Get-MgContext.TenantId and Get-ConnectionInformation.TenantID)
-        so the comparison is exact; a blank on either side cannot be verified and is treated as a
-        match, with the caller expected to log it.
-    #>
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param(
-        [AllowNull()][AllowEmptyString()][string]$GraphTenantId,
-        [AllowNull()][AllowEmptyString()][string]$ExchangeTenantId
-    )
-
-    if ([string]::IsNullOrWhiteSpace($GraphTenantId) -or [string]::IsNullOrWhiteSpace($ExchangeTenantId)) { return $true }
-    return ($GraphTenantId.Trim() -ieq $ExchangeTenantId.Trim())
-}
-
 function Get-InventoryGraphUser {
     <#
         Reads every user in one paged Graph call - $select plus $expand=manager replaces the
@@ -1305,10 +1287,15 @@ try {
     # tenant's Graph tabs with the old tenant's Exchange tabs, silently.
     $exchangeInformation = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization -TenantId $graphTenantId
     $exchangeTenantId = [string](Get-InventoryValue $exchangeInformation 'TenantID' '')
-    if (-not (Test-InventoryTenantMatch -GraphTenantId $graphTenantId -ExchangeTenantId $exchangeTenantId)) {
-        throw ("Graph (tenant $graphTenantId) and Exchange Online (tenant $exchangeTenantId) are signed in to " +
-            'different tenants. Run Disconnect-ExchangeOnline, sign in to the right tenant and re-run.')
-    }
+
+    # The guard runs on a read too: an inventory taken from the wrong tenant is not just wasted,
+    # it becomes the input every later phase trusts. One implementation, shared with every other
+    # connecting script. With no -TenantId it writes the WARNING banner naming both sessions
+    # rather than stopping - Graph and Exchange Online are still held together, because the
+    # connector above was pinned to Graph's own tenant.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+        -ExchangeConnection $exchangeInformation -Purpose 'Tenant inventory'
+
     if (-not $graphTenantId -or -not $exchangeTenantId) {
         Write-MigrationLog -Level WARNING -Message ('Could not confirm that Graph and Exchange Online target the same ' +
             "tenant (Graph '$graphTenantId', Exchange '$exchangeTenantId'). Check the TenantId row of the Summary tab.")

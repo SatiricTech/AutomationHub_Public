@@ -604,3 +604,58 @@ Describe 'A live -Group run enumerates members over REST and PATCHes the passwor
         $script:liveRows[0].GeneratedPassword | Should -Not -BeNullOrEmpty
     }
 }
+
+Describe 'The tenant guard runs once over the Graph session' {
+
+    <#
+        A password reset is the most destructive thing in the toolkit to aim at the wrong
+        tenant, so the guard is checked here the same way as everywhere else: Assert-MigrationTenant
+        is shadowed rather than mocked, so the call is recorded without the module's real resolver
+        touching the network.
+    #>
+
+    BeforeAll {
+        $script:guardTenantId = '00000000-0000-0000-0000-0000000000e1'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        # Echoes the tenant back so the test can tell the assert was handed the connection this
+        # run established, not some other object.
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = $TenantId; Account = 'tech@newco.onmicrosoft.com' }
+        }
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Method -eq 'PATCH') { throw 'A PATCH was reached, which -DryRun must have prevented.' }
+            return New-StubGraphUser -Uri $Uri
+        }
+
+        $script:guardWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "ResetCutover-Guard-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:guardWorkspace -ItemType Directory -Force
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+        if ($script:guardWorkspace -and (Test-Path -LiteralPath $script:guardWorkspace)) {
+            Remove-Item -LiteralPath $script:guardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Asserts the -TenantId it was given against the Graph context exactly once' {
+        & $script:scriptPath -TestUser 'john.smith@newco.com' -TenantId $script:guardTenantId `
+            -OutputPath $script:guardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Cutover password reset'
+        $global:AssertCalls[0].GraphContext.TenantId | Should -BeExactly $script:guardTenantId
+    }
+}

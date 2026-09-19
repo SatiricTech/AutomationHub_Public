@@ -640,6 +640,10 @@ try {
     }
     else {
         $context = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+        # The guard runs on a read too: a history export taken from the wrong tenant is not just
+        # wasted, it becomes the input Import-MigrationVivaLearningHistory writes back from.
+        $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $context `
+            -Purpose 'Viva Learning export'
         $grantedLearningScopes = @(@($context.Scopes) | Where-Object { $_ -like 'Learning*' })
         Write-MigrationLog -Message "Granted learning scopes: $($grantedLearningScopes -join ', ')" -Level INFO
 

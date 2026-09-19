@@ -959,3 +959,56 @@ Describe 'New-MigrationUsers - a planned SKU the tenant does not own fails the l
         $script:skuMissExit | Should -Be 2
     }
 }
+
+Describe 'New-MigrationUsers - the tenant guard runs once over the Graph session' {
+
+    <#
+        Assert-MigrationTenant is shadowed rather than mocked so the call can be recorded without
+        the module's real resolver touching the network. The GUID is what the assert has to be
+        handed: a run that connects to the wrong tenant creates real users in it.
+    #>
+
+    BeforeAll {
+        $script:guardTenantId = '00000000-0000-0000-0000-0000000000d1'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        # Echoes the tenant back so the test can tell the assert was handed the connection this
+        # run established, not some other object.
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = $TenantId; Account = 'tech@newco.onmicrosoft.com' }
+        }
+
+        $script:guardWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "M365Migration-Users-Guard-$([guid]::NewGuid())"
+        New-Item -Path $script:guardWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:guardPlan = Join-Path $script:guardWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:guardPlan
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+        if ($script:guardWorkspace -and (Test-Path -LiteralPath $script:guardWorkspace)) {
+            Remove-Item -LiteralPath $script:guardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Asserts the -TenantId it was given against the Graph context exactly once' {
+        & $script:scriptPath -PlanPath $script:guardPlan -Wave '1' -TenantId $script:guardTenantId `
+            -OutputPath $script:guardWorkspace -Verbosity Low -DryRun
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'User creation'
+        $global:AssertCalls[0].GraphContext.TenantId | Should -BeExactly $script:guardTenantId
+    }
+}

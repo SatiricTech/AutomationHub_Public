@@ -247,3 +247,43 @@ Describe 'A single unresolvable -LocationId fails the row instead of being silen
         $script:badLocationUser.Rows[0].Detail | Should -Match "LocationId 'loc-bad' does not exist"
     }
 }
+
+Describe 'The tenant guard runs once over the Teams session' {
+
+    <#
+        Assert-MigrationTenant is shadowed rather than mocked so the call can be recorded without
+        the module's real resolver touching the network. A GUID -TenantId is used because that is
+        what the assert compares against; the script's job is only to hand it over unchanged.
+    #>
+
+    BeforeAll {
+        $script:guardTenantId = '00000000-0000-0000-0000-0000000000f1'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'Asserts the -TenantId it was given against the Teams tenant exactly once' {
+        $null = Invoke-ScriptUnderTest -Arguments @{
+            CsvPath  = $script:fixtureCsv
+            DryRun   = $true
+            TenantId = $script:guardTenantId
+        }
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Teams phone assignment'
+        $global:AssertCalls[0].TeamsTenant.TenantId | Should -BeExactly 'newco-tenant-guid'
+    }
+}

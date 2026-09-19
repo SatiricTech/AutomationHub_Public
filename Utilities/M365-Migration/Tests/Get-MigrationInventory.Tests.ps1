@@ -37,7 +37,6 @@ BeforeAll {
         'Get-InventoryGroupType'
         'Test-InventoryTrustee'
         'ConvertTo-InventoryFolderTrustee'
-        'Test-InventoryTenantMatch'
     )
 
     $tokens = $null
@@ -610,21 +609,5 @@ Describe 'ConvertTo-InventoryFolderTrustee' {
 
     It 'Returns empty for a null User' {
         ConvertTo-InventoryFolderTrustee -User $null | Should -BeExactly ''
-    }
-}
-
-Describe 'Test-InventoryTenantMatch' {
-
-    It 'Matches identical tenant GUIDs case-insensitively' {
-        Test-InventoryTenantMatch -GraphTenantId 'AAAA-1111' -ExchangeTenantId 'aaaa-1111' | Should -BeTrue
-    }
-
-    It 'Detects a mismatch' {
-        Test-InventoryTenantMatch -GraphTenantId 'aaaa-1111' -ExchangeTenantId 'bbbb-2222' | Should -BeFalse
-    }
-
-    It 'Treats a blank side as unverifiable, not a mismatch' {
-        Test-InventoryTenantMatch -GraphTenantId '' -ExchangeTenantId 'bbbb-2222' | Should -BeTrue
-        Test-InventoryTenantMatch -GraphTenantId 'aaaa-1111' -ExchangeTenantId '' | Should -BeTrue
     }
 }

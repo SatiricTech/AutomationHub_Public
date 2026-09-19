@@ -630,3 +630,48 @@ Describe 'Import-MigrationVivaLearningHistory - rows the CSV cannot describe fai
         $row.Detail | Should -Match 'Missing CourseTitle or CourseWebUrl'
     }
 }
+
+Describe 'Import-MigrationVivaLearningHistory - the tenant guard runs once over the app-only session' {
+
+    <#
+        The app-only session is the one every catalog and activity write goes through, so that is
+        what the guard checks. Assert-MigrationTenant is shadowed rather than mocked so the call
+        can be recorded without the module's real resolver touching the network.
+    #>
+
+    BeforeAll {
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+
+        $script:guardWorkspace = New-VivaWorkspace -Label 'Guard'
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+        Reset-VivaCallLog
+        $global:vivaProviders = @()
+        $global:vivaExistingActivityIds = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+        if ($script:guardWorkspace -and (Test-Path -LiteralPath $script:guardWorkspace)) {
+            Remove-Item -LiteralPath $script:guardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Asserts the -TenantId it was given against the app-only context exactly once' {
+        & $script:scriptPath -CsvPath (Join-Path $script:guardWorkspace 'VivaLearningHistory.csv') `
+            -TenantId $script:tenantId -ClientId $script:clientId -ClientSecret $script:clientSecret `
+            -PlanPath (Join-Path $script:guardWorkspace 'IdentityPlan.csv') `
+            -OutputPath $script:guardWorkspace -Verbosity Low -DryRun
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:tenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Viva Learning import'
+        $global:AssertCalls[0].GraphContext.TenantId | Should -BeExactly $script:tenantId
+    }
+}

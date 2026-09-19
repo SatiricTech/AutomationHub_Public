@@ -590,7 +590,13 @@ try {
         throw ("App-only sign-in to tenant $TenantId failed: $($_.Exception.Message). Check the client id, the " +
             'secret/certificate, and that the application permissions listed in the script NOTES have admin consent.')
     }
-    Write-MigrationLog -Message "Connected app-only to tenant $((Get-MgContext).TenantId)" -Level SUCCESS
+    # The app-only session is what every catalog and activity write goes through, so it is the
+    # connection the guard checks. -TenantId is mandatory here, so this never degrades to the
+    # warning-only path - a client-credential token for another tenant stops the run.
+    $appContext = Get-MgContext
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $appContext `
+        -Purpose 'Viva Learning import'
+    Write-MigrationLog -Message "Connected app-only to tenant $($appContext.TenantId)" -Level SUCCESS
 
     # One catalog item per distinct course, keyed by the source catalog's own
     # external ID, then the source content GUID, then the URL (hand-built CSVs).

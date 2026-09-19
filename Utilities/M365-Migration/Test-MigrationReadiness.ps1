@@ -964,16 +964,16 @@ try {
     $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
 
     # Connect-MigrationExchange reuses a live EXO session whenever -DelegatedOrganization is
-    # omitted, which is exactly how every documented -TenantId-only run is invoked. Without this
-    # check a leftover session to the source tenant runs every Exchange-backed check against the
-    # wrong tenant while Graph correctly targets the destination.
+    # omitted, which is exactly how every documented -TenantId-only run is invoked - a leftover
+    # session to the source tenant would otherwise run every Exchange-backed check against the
+    # wrong tenant while Graph correctly targets the destination. The comparison itself lives in
+    # Assert-MigrationTenant, so every connecting script shares one implementation. With no
+    # -TenantId to compare against it writes the WARNING banner naming each session instead, and
+    # two different tenant GUIDs in that banner are what the operator has to notice.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+        -ExchangeConnection $exoConnection -Purpose 'Readiness checks'
+
     $graphTenantId = [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '')
-    $exoTenantId = [string](Get-MigrationProperty -InputObject $exoConnection -Name 'TenantID' -Default '')
-    if ($graphTenantId -and $exoTenantId -and $graphTenantId -ne $exoTenantId) {
-        throw ("Microsoft Graph is connected to tenant $graphTenantId but Exchange Online is connected to " +
-            "tenant $exoTenantId. Re-run with -DelegatedOrganization for the same destination tenant, or run " +
-            "Disconnect-ExchangeOnline first so a fresh session is established.")
-    }
     Write-MigrationLog -Message ("Checking destination tenant $graphTenantId (Graph as " +
         "$(Get-MigrationProperty -InputObject $graphContext -Name 'Account' -Default '?'), EXO as " +
         "$(Get-MigrationProperty -InputObject $exoConnection -Name 'UserPrincipalName' -Default '?')).") -Level INFO

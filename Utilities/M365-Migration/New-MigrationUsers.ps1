@@ -626,7 +626,12 @@ if ($waveRows.Count -eq 0) {
 Write-MigrationLog -Message "Processing $($waveRows.Count) plan row(s)." -Level INFO
 
 try {
-    $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    # One check over whatever this run connected, called unconditionally: with no -TenantId the
+    # assert writes the WARNING banner naming the tenant about to receive new user objects, which
+    # is the only notice an operator gets that nothing verified it.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+        -Purpose 'User creation'
 }
 catch {
     Write-MigrationLog -Message $_.Exception.Message -Level ERROR
