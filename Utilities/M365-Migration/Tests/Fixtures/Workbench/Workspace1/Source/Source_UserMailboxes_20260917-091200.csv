@@ -1,0 +1,3 @@
+"UserPrincipalName","DisplayName","PrimarySmtpAddress","Alias","RecipientTypeDetails","EmailAddresses","LegacyExchangeDN","X500Addresses","TotalItemSizeGB","ItemCount"
+"ada.lovelace@contoso.com","Ada Lovelace","ada.lovelace@contoso.com","ada.lovelace","UserMailbox","SMTP:ada.lovelace@contoso.com","/o=Contoso/ou=Exchange Administrative Group/cn=Recipients/cn=ada","","1.25","842"
+"grace.hopper@contoso.com","Grace Hopper","grace.hopper@contoso.com","grace.hopper","UserMailbox","SMTP:grace.hopper@contoso.com","/o=Contoso/ou=Exchange Administrative Group/cn=Recipients/cn=grace","","2.10","1503"

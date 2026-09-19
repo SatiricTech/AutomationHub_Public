@@ -1,0 +1,16 @@
+{
+  "SchemaVersion": 1,
+  "Label": "Contoso",
+  "Scenario": "TenantToTenant",
+  "Source":      { "TenantId": "00000000-0000-0000-0000-000000000000", "DisplayName": "", "OnMicrosoftDomain": "contoso.onmicrosoft.com", "DelegatedOrganization": "" },
+  "Destination": { "TenantId": "00000000-0000-0000-0000-000000000000", "DisplayName": "", "OnMicrosoftDomain": "newco.onmicrosoft.com",   "DelegatedOrganization": "" },
+  "Domains":     { "Target": "newco.com", "Smtp": "", "Interim": "" },
+  "Plan":        { "UpnFormat": "First.Last", "SmtpFormat": "", "MailNicknameFormat": "", "DefaultWave": "1",
+                   "DefaultUsageLocation": "US", "SkuMapPath": "", "ExclusionRulesPath": "", "WaveMapPath": "",
+                   "PreserveAliases": false, "AliasDomainMap": {}, "IncludeDisabled": false, "IncludeGuests": false,
+                   "IncludeSynced": false },
+  "Defaults":    { "Verbosity": "Medium", "IncludeCollisions": false, "UseInterim": false, "Tool": "AvePoint",
+                   "PasswordLength": 16, "WordCount": 3 },
+  "Pinned":      { "PlanPath": "" },
+  "VivaLearning": { "ClientId": "", "CertificateThumbprint": "", "LearningProviderId": "" }
+}

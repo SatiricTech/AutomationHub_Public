@@ -1,0 +1,3 @@
+"Identity","Action","Status","Detail","Sku"
+"ada.lovelace@newco.com","Set-License","Succeeded","Assigned ENTERPRISEPACK","ENTERPRISEPACK"
+"grace.hopper@newco.com","Set-License","Failed","No seats left in ENTERPRISEPACK","ENTERPRISEPACK"

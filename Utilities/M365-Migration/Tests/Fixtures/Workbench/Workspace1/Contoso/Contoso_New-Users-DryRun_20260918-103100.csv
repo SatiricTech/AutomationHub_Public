@@ -1,0 +1,4 @@
+"Identity","Action","Status","Detail","Wave","GeneratedPassword"
+"ada.lovelace@newco.com","New-User","Planned","Would create the account","1","NotARealPassword-DryRun"
+"grace.hopper@newco.com","New-User","Planned","Would create the account","1","NotARealPassword-DryRun"
+"alan.turing@newco.com","New-User","Skipped","PlanStatus Collision is not actionable","2",""

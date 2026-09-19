@@ -1,0 +1,4 @@
+"Identity","Action","Status","Detail","Check"
+"newco.com","Test-Domain","Succeeded","Domain is verified in the destination tenant","Domain"
+"ENTERPRISEPACK","Test-License","Succeeded","3 seat(s) available for 3 planned row(s)","Licenses"
+"ada.lovelace@newco.com","Test-Address","Succeeded","Target address is free","Addresses"
