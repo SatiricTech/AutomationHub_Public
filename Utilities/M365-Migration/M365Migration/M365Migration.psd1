@@ -55,6 +55,7 @@
         'Resolve-MigrationPlanAddress'
         'Resolve-MigrationSettings'
         'Resolve-MigrationSkuMap'
+        'Resolve-MigrationStepArguments'
         'Resolve-MigrationTeamsUser'
         'Resolve-MigrationTenantId'
         'Save-MigrationPlan'

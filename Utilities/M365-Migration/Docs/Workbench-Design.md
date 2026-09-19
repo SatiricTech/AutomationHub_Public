@@ -191,11 +191,22 @@ unaccounted for — each is bound, resolved, fixed, operator-entered, or listed 
 ### 5.3 Resolvers
 
 Named, pure functions over the workspace scan: `Plan` (pinned or newest plan),
-`Inventory:<Prefix>:<Tab>` (newest `<Prefix>_<Tab>_*.csv`), `Export:<Id>` (newest results
-of another step, e.g. the Teams `Get-` export for `Remove-`), `Settings:<key>` (a path
+`Inventory:<Prefix>:<Tab>` (newest `<Prefix>_<Tab>_*.csv`), `Export:<Id>` (another step's
+export, e.g. the Teams `Get-` export for `Remove-`), `Settings:<key>` (a path
 stored in settings), `ExistingPlan` (pinned plan, for the planner re-run). A resolver returns
 `{ Value; Source; Candidates }` so the UI can show where a value came from and offer the
-alternatives.
+alternatives; `Value` is always `Candidates[0]`, and every path is absolute — a settings path
+stored relative is resolved against the workspace.
+
+`Export:<Id>` takes either a step id or one of a step's result tokens, and prefers that
+step's report over its results file where it publishes both: `Get-MigrationTeamsPhoneAssignments`
+writes `Source_Get-TeamsPhoneAssignments-Results_<ts>.csv` (what the export did) and
+`Source_TeamsPhoneAssignments_<ts>.csv` (`Report:TeamsPhoneAssignments` — the number, its type
+and the routing policy). Only the second round-trips into `-CsvPath`, so it is the value and the
+results file stays on the candidate list. The report's name is the token without its leading
+verb, and the preference only applies where the producing step's `Produces` declares it.
+`Settings:<key>` answers with nothing for a blank string or an empty map, so "not configured"
+never reaches a command line, and with a boolean's own value, `$false` included.
 
 ### 5.4 Non-catalog knowledge that lives here, not in the scripts
 
@@ -308,12 +319,36 @@ column is never read, rendered or persisted by the workbench.
 
 ### 7.1 Resolve
 
-`Resolve-MigrationStepArguments -Step -Workspace [-Override <hashtable>]` builds an ordered
-list of `{ Name; Value; Source = Fixed|Settings|Resolved|Default|Operator; Warnings }`.
-Common parameters are always set explicitly: `-OutputPath <workspace>`, `-Prefix <Label or
-instance prefix>`, `-Verbosity <settings>`, `-DryRun` when requested, `-Confirm:$false` when
-the script's `ConfirmImpact` is High. `-TenantId` is always passed to any script that takes
-it; `-DelegatedOrganization` only when the settings hold one for that side.
+`Resolve-MigrationStepArguments -Step -Workspace [-Override <hashtable>] [-DryRun]
+[-Wave <string[]>]` returns `{ Arguments; ParameterSet; MissingMandatory; Warnings }`, where
+`Arguments` is an ordered list — the script's own declaration order — of
+`{ Name; Value; Source; Warning; Candidates }`.
+
+`Source` is the rung of the precedence ladder that decided the value, highest first:
+`Fixed` (the instance is only that step because of it), `Operator` (`-Override`; a key that is
+not a parameter of the script is dropped and reported in `Warnings`), `Settings` (the `Bind`
+map — a blank setting is not a value and is left out, a boolean always is one),
+`Resolved` (the `Resolve` map, keeping the resolver's `Candidates`), and `Default` — the
+script's own default, **recorded so a form can show it and deliberately not passed**, because
+a default is the script's business and re-stating it would freeze today's value into a driver
+file that outlives the script. A driver emits every argument whose `Source` is not `Default`.
+
+Common parameters are always set explicitly, under the source `Common`: `-OutputPath
+<workspace>`, `-Prefix <instance prefix or Label>` (offline steps take the label too),
+`-Verbosity <settings>`, `-DryRun` when requested, `-Wave` when one is requested and the
+script takes it, and `-Confirm:$false` when the script's `ConfirmImpact` is High (the
+catalogue's `Confirm` flag), because an unattended child cannot answer a prompt. `-LogPath` is
+never passed: every script derives it from `-OutputPath`. `-TenantId` is passed to any script
+that takes it, from the side's settings block where the catalogue does not bind it;
+`-DelegatedOrganization` only when the settings hold one for that side.
+
+`ParameterSet` is the first set the script declares whose mandatory parameters are all
+present, and `MissingMandatory` lists what that set still needs; where no set is satisfiable,
+the closest one is chosen and its gap listed. A value the operator or the instance supplied
+narrows the sets under consideration to the ones that hold it first — which is what makes
+`-TestUser` select the `TestUser` set even though the plan would also have resolved — and
+arguments outside the chosen set are then dropped, because a command line that mixes two sets
+cannot bind at all.
 
 ### 7.2 Gates — `Test-MigrationStepGate`
 
