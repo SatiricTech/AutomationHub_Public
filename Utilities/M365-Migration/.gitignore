@@ -1,0 +1,2 @@
+# Real per-migration settings hold tenant IDs and paths; only the example template is committed.
+M365Migration.settings.json
