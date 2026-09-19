@@ -541,3 +541,50 @@ Describe 'Get-VerifiedDomain' {
         $domains | Should -Be @('newco.com', 'newco.onmicrosoft.com')
     }
 }
+
+Describe 'The tenant guard is wired into the Main region' {
+
+    <#
+        A structural test, not a behavioural one. Everything else in this file exercises lifted
+        functions, and Test-MigrationReadiness has no end-to-end harness to run its Main region
+        against - so this asserts on the shape of the source instead: that the Exchange connector
+        and Assert-MigrationTenant are both handed $expectedTenant, and that $expectedTenant falls
+        back to the Graph context's tenant when no -TenantId was given. It would not catch a
+        runtime regression, only the wiring being removed or renamed.
+    #>
+
+    BeforeAll {
+        $script:mainScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Test-MigrationReadiness.ps1')).Path
+        $script:mainAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:mainScriptPath, [ref]$null, [ref]$null)
+        $script:mainText = Get-Content -LiteralPath $script:mainScriptPath -Raw
+
+        $script:commandText = @($script:mainAst.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            ForEach-Object { $_.Extent.Text })
+    }
+
+    It 'Pins the Exchange connector to the expected tenant' {
+        $calls = @($script:commandText | Where-Object { $_ -like 'Connect-MigrationExchange*' })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-TenantId \$expectedTenant'
+    }
+
+    It 'Asserts that expected tenant over both connections' {
+        $calls = @($script:commandText | Where-Object { $_ -like 'Assert-MigrationTenant*' })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-ExpectedTenantId \$expectedTenant'
+        $calls[0] | Should -Match '-GraphContext \$graphContext'
+        $calls[0] | Should -Match '-ExchangeConnection \$exoConnection'
+    }
+
+    It 'Falls back to the Graph tenant so the cross-check runs on an unpinned run too' {
+        $script:mainText | Should -Match '\$expectedTenant = if \(\$TenantId\) \{ \$TenantId \}'
+        $script:mainText |
+            Should -Match "Get-MigrationProperty -InputObject \`$graphContext -Name 'TenantId' -Default ''"
+    }
+
+    It 'Still says out loud that an unpinned run was not verified' {
+        $script:mainText | Should -Match 'No -TenantId was given; this run acts on tenant \$expectedTenant'
+    }
+}

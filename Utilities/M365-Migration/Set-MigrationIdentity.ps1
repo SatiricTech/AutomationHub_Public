@@ -495,19 +495,29 @@ try {
 
     $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
 
-    # Graph's own tenant is what Exchange Online is pinned to, because a cutover writes both sides
-    # of the same object: the tenant Graph signed in to is by definition the one the mailbox edits
-    # have to land in, whether or not the operator passed -TenantId.
+    # What both sides are held to. -TenantId when the operator named one; otherwise Graph's own
+    # tenant, because a cutover writes both sides of the same object: the tenant Graph signed in
+    # to is by definition the one the mailbox edits have to land in, pinned or not.
+    $expectedTenant = if ($TenantId) { $TenantId }
+    else { [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '') }
+
     $needsExchange = @($requestedActions | Where-Object { $exchangeActions -contains $_ }).Count -gt 0
     $exoConnection = $null
     if ($needsExchange) {
         $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
-            -TenantId $graphContext.TenantId
+            -TenantId $expectedTenant
     }
 
-    # One check over whatever this run connected. With no -TenantId it writes the WARNING banner
-    # naming the tenant instead, which is the only notice an operator gets that nothing verified it.
-    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+    # Falling back to Graph's tenant means the assert always has something to compare, so it
+    # never reaches its own "no tenant was specified" branch. That branch's warning still has to
+    # be said out loud, because an unpinned run is exactly the one an operator should notice.
+    if (-not $TenantId) {
+        Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
+            'Pass -TenantId to guard against a cached session.') -Level WARNING
+    }
+
+    # One check over whatever this run connected.
+    $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenant -GraphContext $graphContext `
         -ExchangeConnection $exoConnection -Purpose 'Identity cutover'
 
     $index = 0

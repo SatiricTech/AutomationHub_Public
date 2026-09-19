@@ -1280,20 +1280,32 @@ try {
     $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
     $graphTenantId = [string](Get-InventoryValue $graphContext 'TenantId' '')
 
-    # Connect-MigrationExchange now accepts -TenantId and drops/reconnects a cached session
-    # that targets a different tenant, the same guard -DelegatedOrganization already gave it -
-    # so passing Graph's resolved tenant GUID here closes the gap for the primary, non-GDAP
-    # path. Running Source then Destination in one console would otherwise pair the new
-    # tenant's Graph tabs with the old tenant's Exchange tabs, silently.
-    $exchangeInformation = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization -TenantId $graphTenantId
+    # What both sides are held to. -TenantId when the operator named one; otherwise Graph's own
+    # tenant, which keeps Exchange Online pinned to whatever Graph signed in to even on a run
+    # that was given no pin at all. Running Source then Destination in one console would
+    # otherwise pair the new tenant's Graph tabs with the old tenant's Exchange tabs, silently.
+    $expectedTenant = if ($TenantId) { $TenantId }
+    else { [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '') }
+
+    # Connect-MigrationExchange drops and reconnects a cached session that targets a different
+    # tenant, the same guard -DelegatedOrganization already gave it, closing the gap for the
+    # primary, non-GDAP path.
+    $exchangeInformation = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
+        -TenantId $expectedTenant
     $exchangeTenantId = [string](Get-InventoryValue $exchangeInformation 'TenantID' '')
+
+    # Falling back to Graph's tenant means the assert always has something to compare, so it
+    # never reaches its own "no tenant was specified" branch. That branch's warning still has to
+    # be said out loud, because an unpinned run is exactly the one an operator should notice.
+    if (-not $TenantId) {
+        Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
+            'Pass -TenantId to guard against a cached session.') -Level WARNING
+    }
 
     # The guard runs on a read too: an inventory taken from the wrong tenant is not just wasted,
     # it becomes the input every later phase trusts. One implementation, shared with every other
-    # connecting script. With no -TenantId it writes the WARNING banner naming both sessions
-    # rather than stopping - Graph and Exchange Online are still held together, because the
-    # connector above was pinned to Graph's own tenant.
-    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+    # connecting script.
+    $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenant -GraphContext $graphContext `
         -ExchangeConnection $exchangeInformation -Purpose 'Tenant inventory'
 
     if (-not $graphTenantId -or -not $exchangeTenantId) {

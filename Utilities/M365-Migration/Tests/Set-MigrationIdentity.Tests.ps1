@@ -275,9 +275,15 @@ Describe 'A declined confirmation is a Skip, not a Plan' {
     #>
 
     BeforeAll {
+        # A GUID, as Get-MgContext really reports: this run passes no -TenantId, so the script
+        # falls back to the Graph context's tenant and the real Assert-MigrationTenant compares
+        # against it. A domain here would send Resolve-MigrationTenantId to the network.
         function Connect-MigrationGraph {
             param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
-            return [pscustomobject]@{ TenantId = 'newco.onmicrosoft.com'; Account = 'tech@newco.onmicrosoft.com' }
+            return [pscustomobject]@{
+                TenantId = '00000000-0000-0000-0000-0000000000ba'
+                Account  = 'tech@newco.onmicrosoft.com'
+            }
         }
 
         function Invoke-MigrationGraphRequest {
@@ -339,15 +345,22 @@ Describe 'The tenant guard runs once over both connections' {
 
     BeforeAll {
         $script:GuardTenantId = '00000000-0000-0000-0000-0000000000b2'
+        # What the stub sign-in reports when the run pinned nothing. The literal is repeated in
+        # the stub because a function defined in BeforeAll does not share the $script: scope
+        # Pester gives the It blocks.
+        $script:GuardSignedInTenantId = '00000000-0000-0000-0000-0000000000b9'
 
         function Assert-MigrationTenant {
             param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
             $global:AssertCalls += , $PSBoundParameters
             [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
         }
+        # Echoes a requested tenant back, and otherwise reports the tenant the session is actually
+        # signed in to - which is what the no--TenantId fallback has to pick up.
         function Connect-MigrationGraph {
             param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
-            return [pscustomobject]@{ TenantId = $TenantId; Account = 'tech@newco.onmicrosoft.com' }
+            $connected = if ($TenantId) { $TenantId } else { '00000000-0000-0000-0000-0000000000b9' }
+            return [pscustomobject]@{ TenantId = $connected; Account = 'tech@newco.onmicrosoft.com' }
         }
         function Connect-MigrationExchange {
             param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
@@ -409,5 +422,31 @@ Describe 'The tenant guard runs once over both connections' {
             -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
 
         $global:GuardConnectTenantIds | Should -Be @($script:GuardTenantId)
+    }
+
+    It 'Falls back to the Graph tenant when no -TenantId was given, so the cross-check still runs' {
+        # Without the fallback both the connector and the assert are handed an empty expected
+        # tenant and compare nothing at all, which is how a leftover source-tenant Exchange
+        # session survives an unpinned run.
+        & $script:ScriptPath -PlanPath (Join-Path -Path $script:FixtureRoot -ChildPath 'IdentityPlan.csv') `
+            -Wave '1' -Apply 'PrimarySmtp' `
+            -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $global:GuardConnectTenantIds | Should -Be @($script:GuardSignedInTenantId)
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:GuardSignedInTenantId
+    }
+
+    It 'Says out loud that an unpinned run was not verified' {
+        & $script:ScriptPath -PlanPath (Join-Path -Path $script:FixtureRoot -ChildPath 'IdentityPlan.csv') `
+            -Wave '1' -Apply 'PrimarySmtp' `
+            -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $log = @(Get-ChildItem -LiteralPath $script:GuardWorkspace -Filter 'Set-MigrationIdentity_*.log' |
+            Sort-Object -Property LastWriteTime -Descending)
+        $log.Count | Should -BeGreaterThan 0
+        (Get-Content -LiteralPath $log[0].FullName -Raw) |
+            Should -Match ('\[WARNING\] No -TenantId was given; this run acts on tenant ' +
+                "$($script:GuardSignedInTenantId)\. Pass -TenantId to guard against a cached session\.")
     }
 }

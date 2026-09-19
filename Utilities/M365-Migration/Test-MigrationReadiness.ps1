@@ -961,16 +961,30 @@ try {
     }
 
     $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
-    $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
 
-    # Connect-MigrationExchange reuses a live EXO session whenever -DelegatedOrganization is
-    # omitted, which is exactly how every documented -TenantId-only run is invoked - a leftover
-    # session to the source tenant would otherwise run every Exchange-backed check against the
-    # wrong tenant while Graph correctly targets the destination. The comparison itself lives in
-    # Assert-MigrationTenant, so every connecting script shares one implementation. With no
-    # -TenantId to compare against it writes the WARNING banner naming each session instead, and
-    # two different tenant GUIDs in that banner are what the operator has to notice.
-    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+    # What both sides are held to. -TenantId when the operator named one; otherwise Graph's own
+    # tenant, so the Graph-vs-Exchange cross-check happens on every run and not only on pinned
+    # ones. Connect-MigrationExchange reuses a live EXO session whenever -DelegatedOrganization
+    # is omitted, which is exactly how every documented -TenantId-only run is invoked, so a
+    # leftover session to the source tenant would otherwise run every Exchange-backed check
+    # against the wrong tenant while Graph correctly targets the destination.
+    $expectedTenant = if ($TenantId) { $TenantId }
+    else { [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '') }
+
+    $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
+        -TenantId $expectedTenant
+
+    # Falling back to Graph's tenant means the assert always has something to compare, so it
+    # never reaches its own "no tenant was specified" branch. That branch's warning still has to
+    # be said out loud, because an unpinned run is exactly the one an operator should notice.
+    if (-not $TenantId) {
+        Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
+            'Pass -TenantId to guard against a cached session.') -Level WARNING
+    }
+
+    # The comparison itself lives in Assert-MigrationTenant, so every connecting script shares
+    # one implementation of "are these sessions the tenant I was told to expect".
+    $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenant -GraphContext $graphContext `
         -ExchangeConnection $exoConnection -Purpose 'Readiness checks'
 
     $graphTenantId = [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '')

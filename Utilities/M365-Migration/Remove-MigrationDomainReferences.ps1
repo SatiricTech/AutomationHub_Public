@@ -1198,26 +1198,39 @@ try {
     $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
     $graphTenantId = [string](Get-MigrationProperty $graphContext 'TenantId' '')
 
+    # What both sides are held to. -TenantId when the operator named one; otherwise Graph's own
+    # tenant, so a run given no pin is still held to one tenant rather than none.
+    $expectedTenant = if ($TenantId) { $TenantId } else { $graphTenantId }
+
     # Exchange Online sessions are reused between phase scripts, so the one found here may belong
     # to the destination tenant. It is compared with the Graph tenant before anything is read or
     # written, reconnected once, and the run aborts if the two still disagree.
-    $exoContext = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+    $exoContext = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
+        -TenantId $expectedTenant
     $exoMismatch = Get-DomainExchangeSessionMismatch -ExchangeContext $exoContext `
         -GraphTenantId $graphTenantId -DelegatedOrganization $DelegatedOrganization
     if ($exoMismatch) {
         Write-MigrationLog -Message "$exoMismatch; reconnecting Exchange Online once." -Level WARNING
-        $exoContext = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization -Reconnect
+        $exoContext = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
+            -TenantId $expectedTenant -Reconnect
         $exoMismatch = Get-DomainExchangeSessionMismatch -ExchangeContext $exoContext `
             -GraphTenantId $graphTenantId -DelegatedOrganization $DelegatedOrganization
         if ($exoMismatch) { throw "$exoMismatch. Disconnect-ExchangeOnline and sign in to the source tenant." }
     }
 
+    # Falling back to Graph's tenant means the assert always has something to compare, so it
+    # never reaches its own "no tenant was specified" branch. That branch's warning still has to
+    # be said out loud, because an unpinned destructive cleanup is exactly the run an operator
+    # should notice.
+    if (-not $TenantId) {
+        Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
+            'Pass -TenantId to guard against a cached session.') -Level WARNING
+    }
+
     # Get-DomainExchangeSessionMismatch above is the stronger check here - it knows about
     # -DelegatedOrganization and about the domain being released - and it is kept. This is the
-    # toolkit-wide guard on top of it: it compares both sessions against the -TenantId the
-    # operator named, and with no -TenantId it writes the WARNING banner naming the tenant this
-    # destructive cleanup is about to run against.
-    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+    # toolkit-wide guard on top of it, the same one every connecting script calls.
+    $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenant -GraphContext $graphContext `
         -ExchangeConnection $exoContext -Purpose 'Domain release'
 
     $organization = @(Invoke-MigrationGraphRequest -Method GET -Uri '/v1.0/organization?$select=id,displayName')
