@@ -923,6 +923,20 @@ Describe 'Remove-MigrationDomainReferences' {
             $remaining | Should -HaveCount 1
         }
     }
+
+    Context 'Exit code decision' {
+
+        It 'Returns <Expected> for <RemainingCount> remaining, ScanIncomplete=<ScanIncomplete>, <FailedRowCount> failed' -ForEach @(
+            @{ RemainingCount = 0; ScanIncomplete = $false; FailedRowCount = 0; Expected = 0 }
+            @{ RemainingCount = 3; ScanIncomplete = $false; FailedRowCount = 0; Expected = 3 }
+            @{ RemainingCount = 0; ScanIncomplete = $true; FailedRowCount = 0; Expected = 3 }
+            @{ RemainingCount = 3; ScanIncomplete = $false; FailedRowCount = 1; Expected = 2 }
+            @{ RemainingCount = 0; ScanIncomplete = $false; FailedRowCount = 2; Expected = 2 }
+        ) {
+            Get-DomainRunExitCode -RemainingCount $RemainingCount -ScanIncomplete $ScanIncomplete `
+                -FailedRowCount $FailedRowCount | Should -Be $Expected
+        }
+    }
 }
 
 Describe 'The tenant guard is wired into the Main region' {
@@ -967,5 +981,13 @@ Describe 'The tenant guard is wired into the Main region' {
 
     It 'Still says out loud that an unpinned run was not verified' {
         $script:mainText | Should -Match 'No -TenantId was given; this run acts on tenant \$expectedTenant'
+    }
+
+    It 'Computes the exit code once from Get-DomainRunExitCode' {
+        $calls = @($script:commandText | Where-Object { $_ -like 'Get-DomainRunExitCode*' })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-RemainingCount @\(\$remaining\)\.Count'
+        $calls[0] | Should -Match '-ScanIncomplete \$script:domainScanIncomplete'
+        $calls[0] | Should -Match '-FailedRowCount \$failedRowCount'
     }
 }

@@ -29,11 +29,12 @@
     map to a supported object. A guest whose #EXT# UPN merely embeds the domain in its generated
     local part is informational - Entra owns that form and rewriting it would break the guest.
 
-    After remediation the domain is re-enumerated. The script exits 2 while any reference remains -
-    blockers, or fixable references a report-mode run did not apply - and when any row failed, so a
-    pipeline can tell "domain is clear" from "domain still has references". A -ReportOnly or -DryRun
-    run therefore exits 2 whenever there is anything left to do; exit 0 means the domain can be
-    removed now.
+    After remediation the domain is re-enumerated. The script exits 3 while any reference remains -
+    blockers, or fixable references a report-mode run did not apply - or the enumeration itself did
+    not finish, so a pipeline can tell "domain is clear" from "domain still has references". A
+    -ReportOnly or -DryRun run therefore exits 3 whenever there is anything left to do. Exit 2 is
+    judged last and always wins: any row that failed is more actionable than "references remain",
+    so a run with both reports 2. Exit 0 means the domain can be removed now.
 
 .PARAMETER Domain
     The vanity domain being released, for example contoso.com. Must be a custom domain on the
@@ -133,8 +134,9 @@
     ("out of the current user's write scope"). Those are reported as blockers - fix proxyAddresses
     on-premises and let Entra Connect sync the change.
 
-    Exit codes: 0 clear, 1 fatal, 2 completed with references remaining (blockers, or fixable
-    references a report-mode run did not apply) or rows failed.
+    Exit codes: 0 clear, 1 fatal, 3 references remain (blockers, or fixable references a
+    report-mode run did not apply) or the enumeration was incomplete, 2 one or more rows failed -
+    judged last, so a run with both remaining references and a row failure reports 2.
 #>
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
@@ -1167,6 +1169,32 @@ function Get-DomainReferenceAssessment {
     }
 }
 
+function Get-DomainRunExitCode {
+    <#
+        The exit-code decision, pulled out of Main so it is unit-testable without an end-to-end
+        harness. References remaining - or an enumeration that did not finish - mean the domain
+        cannot be removed yet: exit 3. A row failure is judged last and always wins over that,
+        because "something the run tried to do did not happen" is more actionable than "there is
+        still cleanup to do": exit 2. Nothing left and nothing failed is exit 0.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory)]
+        [int]$RemainingCount,
+
+        [Parameter(Mandatory)]
+        [bool]$ScanIncomplete,
+
+        [Parameter(Mandatory)]
+        [int]$FailedRowCount
+    )
+
+    $exitCode = if ($RemainingCount -gt 0 -or $ScanIncomplete) { 3 } else { 0 }
+    if ($FailedRowCount -gt 0) { $exitCode = 2 }
+    return $exitCode
+}
+
 #endregion Functions
 
 #region Main
@@ -1392,7 +1420,6 @@ try {
         Write-MigrationLog -Level ERROR -Message (
             "No remaining references to $Domain were found, but part of the enumeration failed - see " +
             'the warnings above. Re-run once the failing pass succeeds before trying to remove the domain.')
-        $exitCode = 2
     }
     elseif (@($remaining).Count -eq 0) {
         Write-MigrationLog -Level SUCCESS -Message (
@@ -1414,10 +1441,11 @@ try {
             Write-MigrationLog -Message ("  {0,-45} {1} - {2}" -f $item.Reference.Identity,
                 $item.Classification.Reason, $item.Classification.Detail) -Level WARNING
         }
-        $exitCode = 2
     }
 
-    if (@($results | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0) { $exitCode = 2 }
+    $failedRowCount = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+    $exitCode = Get-DomainRunExitCode -RemainingCount @($remaining).Count `
+        -ScanIncomplete $script:domainScanIncomplete -FailedRowCount $failedRowCount
 }
 catch {
     Write-MigrationLog -Message "Fatal: $($_.Exception.Message)" -Level ERROR
