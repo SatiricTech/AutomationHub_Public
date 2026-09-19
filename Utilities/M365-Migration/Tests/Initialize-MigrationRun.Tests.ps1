@@ -152,6 +152,16 @@ Describe 'Invoke-MigrationAction' {
             Should -Throw -ExpectedMessage '*boom*'
         (Get-Content -LiteralPath $run.LogPath -Raw) | Should -Match '\[ERROR\] Failed: explode - boom'
     }
+
+    It 'throws when no run context exists instead of executing the action' {
+        InModuleScope M365Migration {
+            $script:MigrationRun = $null
+            $ran = $false
+            { Invoke-MigrationAction -Description 'x' -Action { $script:ran = $true } } |
+                Should -Throw '*outside a run*'
+            $ran | Should -BeFalse
+        }
+    }
 }
 
 Describe 'Complete-MigrationRun' {

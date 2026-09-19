@@ -298,4 +298,10 @@ Describe 'Save-MigrationPlan' {
             (Import-Csv -LiteralPath $path)[0].SourceUserPrincipalName | Should -BeExactly 'first@contoso.com'
         }
     }
+
+    It 'refuses to overwrite an existing plan with zero rows' {
+        $plan = Join-Path $TestDrive 'plan.csv'; 'a,b' | Set-Content $plan; 'x,y' | Add-Content $plan
+        { Save-MigrationPlan -Path $plan -Rows @() -Confirm:$false } | Should -Throw '*no rows were supplied*'
+        (Get-Item $plan).Length | Should -BeGreaterThan 0
+    }
 }

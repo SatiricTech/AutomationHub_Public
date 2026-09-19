@@ -57,6 +57,12 @@ function Save-MigrationPlan {
         Write-MigrationLog -Message "Plan file '$Path' does not exist yet; it will be created." -Level DEBUG
     }
 
+    # [AllowEmptyCollection()] lets an empty [object[]] bind, so a caller that lost its rows to a bug
+    # would otherwise sail through and Export-Csv would happily erase the plan. Refuse explicitly.
+    if (@($Rows).Count -eq 0) {
+        throw "The plan write was refused: no rows were supplied, and writing an empty plan would erase '$fullPath'."
+    }
+
     if ($null -eq $script:MigrationPlanBackups) {
         $script:MigrationPlanBackups = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     }
