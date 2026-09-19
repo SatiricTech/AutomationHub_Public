@@ -598,3 +598,71 @@ reference; the root README's Utilities table gains the workbench row in the same
 
 Module `1.1.1 → 1.2.0`. `Start-MigrationWorkbench.ps1` carries `$script:Version = '1.0.0'`
 (one constant, used in the banner, the driver header and the ledger).
+
+## 15. First Windows run
+
+The WinForms region (§9) is written on macOS, where it cannot be executed: WinForms does not
+exist there, so the region is verified structurally — the script dot-sources with `-NoGui`, the
+pure helpers behind every decision the window makes are under test, and an AST test proves
+`Add-Type` is reached only inside the builder and only after the platform check. The first run
+on Windows is therefore the acceptance test, and this is what to click.
+
+Run it on a Windows box with PowerShell 7.4+ and a throwaway workspace — a copy of a real
+migration folder, or a new one with a plan that names a test user and nothing else. Nothing
+below needs a tenant except where it says so.
+
+1. **It opens.** Double-click `Start-MigrationWorkbench.cmd`, or run
+   `pwsh -File Start-MigrationWorkbench.ps1`. The window appears with no workspace, the status
+   strip asking for one, and the banner grey.
+2. **The STA relaunch.** Close it and start it again from an explicitly multi-threaded host:
+   `pwsh -MTA -File .\Start-MigrationWorkbench.ps1`. It should relaunch itself once and the
+   window should open exactly as before. Close the window; the original console must return the
+   child's exit code (`$LASTEXITCODE` = 0), not start a second window.
+3. **Browse.** File ▸ Open workspace, pick the folder. The tree fills with the runbook, the
+   glyphs match what `-Console` shows for the same folder, one step carries `<- next` in bold,
+   and the pane lists any scanner warnings.
+4. **Settings.** Settings ▸ the dialog. Every schema key has a row; `SchemaVersion` does not.
+   Type a domain into `Source.TenantId` and press **Resolve** — it becomes a GUID (this one
+   needs the internet, nothing else does). Clear `Label`, press Save: the dialog stays open and
+   the message beside `Label` turns red. Put it back, Save: the dialog closes, the pane says
+   where the file went, and `M365Migration.settings.json.bak` is beside it.
+5. **A step form.** Select **New-Users**. The banner turns blue and names the destination
+   tenant. Each row shows a value and its provenance (`Settings`, `Resolved`, `Fixed`,
+   `Operator`); a `Fixed` row is greyed out. Hover a row — the script's own `.PARAMETER` text is
+   the tooltip. `-PlanPath` has a `...` button that opens a file dialog.
+6. **Waves.** `(all waves)` is unticked for New-Users (a writer) and the plan's waves are listed
+   under it. Tick wave 1.
+7. **Copy command.** Press it: the preview box fills with the two lines, the clipboard holds the
+   `pwsh ... -File "...driver.ps1"` line, and the status strip says so. Paste it into Notepad and
+   check it names the driver, not a script.
+8. **Dry run.** Press it. The gate list appears in the pane, the preview shows the driver that
+   is about to run, output streams into the pane while the window stays responsive (drag it
+   around mid-run), Cancel is the only enabled button, and the summary dialog names the exit
+   code, the counts, the files and the tenant line. The tree redraws with the rehearsal's glyph.
+9. **Cancel.** Start a dry run of a long step (an inventory) and press **Cancel**. The pane says
+   it is cancelling, the run ends, the summary says `Aborted by the operator`, and
+   `Workbench/Runs.jsonl` records `"Aborted": true`.
+10. **The soft gate.** Select a writer that has not been rehearsed and press **Run**. A Yes/No
+    box names the `DryRunFirst` gate. Answer No — nothing runs. Answer Yes on a second attempt
+    and the ledger line for that run carries the override in `GateOverrides`.
+11. **The typed confirmation.** Select **DomainReferences-Remediate** and press **Dry run**. The
+    modal dialog appears; **Continue** stays disabled until the box holds the release domain
+    exactly (case-insensitively — try `NEWCO.COM`). Cancel it and nothing runs.
+12. **Tenant mismatch.** Point `Destination.TenantId` at a GUID that is not the tenant the run
+    will reach and run a connecting step. A red `TENANT MISMATCH` box must appear *before* the
+    summary, whatever the exit code was.
+13. **Open folder.** After a run, it opens that run's folder — `driver.ps1`, `stdout.txt`,
+    `stderr.txt`. Before any run, it opens the workspace.
+14. **Results & logs.** The menu item writes the console's own results view into the pane,
+    newest first, with each run's folder under it.
+15. **The pane cap.** Run an inventory with `Verbosity` High. Past 2000 lines the pane trims its
+    oldest half and says so; the complete output is still in `stdout.txt`.
+16. **DPI.** Set the display to 150% and reopen the window (`PerMonitorV2` applies at start).
+    Nothing is clipped, the tree text stays readable, and the form scrolls rather than truncating.
+17. **Closing mid-run.** Start a run and try to close the window: it refuses and points at
+    Cancel.
+18. **The workbench log.** `<workspace>/Workbench/` holds this session's own `.log` beside
+    `Runs.jsonl`.
+
+Anything that fails here is a finding against §9, not a change of design: the engine is already
+under test on macOS, so a fault found on this list belongs in the window.

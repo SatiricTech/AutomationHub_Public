@@ -621,3 +621,351 @@ Describe 'Start-MigrationWorkbench Main - a wave-limited run' {
         @($script:WaveResult.Runs[0].Wave) | Should -Be @('1')
     }
 }
+
+Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
+
+    <#
+        The WinForms region cannot be run on macOS, and it is not meant to be: the window is
+        built by exactly one function and everything it decides is decided by a pure helper that
+        can. These are those helpers.
+
+        Every variable here is deliberately named something the entry script's own param block
+        does not declare. Dot-sourcing a script brings its parameters into this scope with their
+        declared types, so a $step of our own would be coerced to [string] by the script's
+        -Step and every property read off it would then fail.
+    #>
+
+    BeforeAll {
+        . $script:ScriptPath -NoGui
+
+        $script:GuiWorkspace = Get-MigrationWorkspace -Path $script:FixtureRoot
+
+        # The shape Get-MigrationScriptParameter returns, built by hand so the corner cases the
+        # 17 scripts do not happen to contain - a folder parameter, an array with a ValidateSet -
+        # are still covered.
+        function New-GuiParameterStub {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Pester helper that builds an in-memory parameter object.')]
+            param(
+                [string]$Name,
+                [string]$TypeName = 'String',
+                [bool]$IsSwitch = $false,
+                [bool]$IsBool = $false,
+                [bool]$IsArray = $false,
+                [bool]$IsHashtable = $false,
+                [string[]]$ValidValues = @()
+            )
+
+            return [pscustomobject]@{
+                Name          = $Name
+                TypeName      = $TypeName
+                IsSwitch      = $IsSwitch
+                IsBool        = $IsBool
+                IsArray       = $IsArray
+                IsHashtable   = $IsHashtable
+                Mandatory     = $false
+                MandatoryIn   = @()
+                ParameterSets = @()
+                ValidValues   = @($ValidValues)
+                Pattern       = $null
+                Range         = $null
+                Default       = $null
+                Aliases       = @()
+                Help          = ''
+                Common        = $false
+            }
+        }
+    }
+
+    Context 'The -NoGui guard' {
+
+        It 'Loads the GUI helpers without building anything' {
+            foreach ($name in @('Start-MigrationWorkbenchGui', 'Get-WorkbenchGuiStepList',
+                    'ConvertTo-WorkbenchGuiControlKind', 'Format-WorkbenchGuiBanner',
+                    'ConvertTo-WorkbenchGuiOverride', 'Test-WorkbenchGuiTypedConfirmation')) {
+                Get-Command -Name $name -CommandType Function | Should -Not -BeNullOrEmpty
+            }
+        }
+
+        It 'Leaves the window state empty, because no window was built' {
+            $script:Gui | Should -BeNullOrEmpty
+            $script:PaneWriter | Should -BeNullOrEmpty
+            $script:UiPump | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'ConvertTo-WorkbenchGuiControlKind' {
+
+        It 'Offers a tick for a switch and for a [bool]' {
+            ConvertTo-WorkbenchGuiControlKind -Parameter (
+                New-GuiParameterStub -Name 'Force' -TypeName 'SwitchParameter' -IsSwitch $true) |
+                Should -BeExactly 'CheckBox'
+            ConvertTo-WorkbenchGuiControlKind -Parameter (
+                New-GuiParameterStub -Name 'AutoMapping' -TypeName 'Boolean' -IsBool $true) |
+                Should -BeExactly 'CheckBox'
+        }
+
+        It 'Offers the script''s own list rather than a box to type it into' {
+            ConvertTo-WorkbenchGuiControlKind -Parameter (
+                New-GuiParameterStub -Name 'Stage' -ValidValues @('Pre', 'Provisioned', 'Post')) |
+                Should -BeExactly 'ComboBox'
+        }
+
+        It 'Offers a checked list when the list takes several values' {
+            ConvertTo-WorkbenchGuiControlKind -Parameter (
+                New-GuiParameterStub -Name 'Scope' -TypeName 'String[]' -IsArray $true `
+                    -ValidValues @('Users', 'Groups')) |
+                Should -BeExactly 'CheckedListBox'
+        }
+
+        It 'Offers a file picker for a path, a CSV and a file parameter' {
+            foreach ($name in @('PlanPath', 'UsersCsv', 'ReferenceFile')) {
+                ConvertTo-WorkbenchGuiControlKind -Parameter (New-GuiParameterStub -Name $name) |
+                    Should -BeExactly 'FilePicker'
+            }
+        }
+
+        It 'Offers a folder picker for -OutputPath, which ends in Path but is a folder' {
+            ConvertTo-WorkbenchGuiControlKind -Parameter (New-GuiParameterStub -Name 'OutputPath') |
+                Should -BeExactly 'FolderPicker'
+            ConvertTo-WorkbenchGuiControlKind -Parameter (New-GuiParameterStub -Name 'ReportFolder') |
+                Should -BeExactly 'FolderPicker'
+        }
+
+        It 'Offers the two-column editor for a hashtable' {
+            ConvertTo-WorkbenchGuiControlKind -Parameter (
+                New-GuiParameterStub -Name 'AliasDomainMap' -TypeName 'Hashtable' -IsHashtable $true) |
+                Should -BeExactly 'MapEditor'
+        }
+
+        It 'Falls back to a text box' {
+            ConvertTo-WorkbenchGuiControlKind -Parameter (New-GuiParameterStub -Name 'TargetDomain') |
+                Should -BeExactly 'TextBox'
+        }
+
+        It 'Maps every non-common parameter of all 17 scripts to a control it knows' {
+            $kinds = @('CheckBox', 'ComboBox', 'CheckedListBox', 'FilePicker', 'FolderPicker',
+                'MapEditor', 'TextBox')
+            foreach ($entry in @(Get-MigrationStep)) {
+                foreach ($parameter in @($entry.Parameters | Where-Object { -not $_.Common })) {
+                    ConvertTo-WorkbenchGuiControlKind -Parameter $parameter | Should -BeIn $kinds
+                }
+            }
+        }
+    }
+
+    Context 'Get-WorkbenchGuiStepList' {
+
+        It 'Lists exactly the steps the engine lists for the workspace''s scenario' {
+            $guiIds = @((Get-WorkbenchGuiStepList -Workspace $script:GuiWorkspace).Steps.Id)
+            $engineIds = @((Get-MigrationStep -Scenario 'TenantToTenant').Id)
+            $guiIds | Should -Be $engineIds
+        }
+
+        It 'Groups them by phase, in the runbook''s order' {
+            $phases = @((Get-WorkbenchGuiStepList -Workspace $script:GuiWorkspace).Phase)
+            $phases | Should -Be @('Discover', 'Plan', 'Prepare', 'Cutover')
+        }
+
+        It 'Carries the console''s own glyph and last-run line for each step' {
+            $entries = @((Get-WorkbenchGuiStepList -Workspace $script:GuiWorkspace).Steps)
+            $inventory = @($entries | Where-Object { $_.Id -eq 'Inventory-Source' })[0]
+            $inventory.Glyph | Should -BeExactly '[x]'
+            $inventory.LastRun | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Marks exactly the step the scanner called next' {
+            $entries = @((Get-WorkbenchGuiStepList -Workspace $script:GuiWorkspace).Steps)
+            $flagged = @($entries | Where-Object { $_.IsNext } | ForEach-Object { $_.Id })
+            $flagged | Should -Be @($script:GuiWorkspace.NextStepId)
+        }
+    }
+
+    Context 'Format-WorkbenchGuiBanner' {
+
+        It 'Paints a source-side step amber and names the tenant' {
+            $banner = Format-WorkbenchGuiBanner -Step (Get-MigrationStep -Id 'DomainReferences-Remediate') `
+                -Settings $script:GuiWorkspace.Settings
+            $banner.Colour | Should -BeExactly 'Amber'
+            $banner.Text | Should -BeLike 'SOURCE*contoso.onmicrosoft.com*'
+        }
+
+        It 'Paints a destination-side step blue' {
+            $banner = Format-WorkbenchGuiBanner -Step (Get-MigrationStep -Id 'New-Users') `
+                -Settings $script:GuiWorkspace.Settings
+            $banner.Colour | Should -BeExactly 'Blue'
+            $banner.Text | Should -BeLike 'DESTINATION*newco.onmicrosoft.com*'
+        }
+
+        It 'Paints an offline step grey and says it signs in to nothing' {
+            $banner = Format-WorkbenchGuiBanner -Step (Get-MigrationStep -Id 'New-IdentityPlan') `
+                -Settings $script:GuiWorkspace.Settings
+            $banner.Colour | Should -BeExactly 'Grey'
+            $banner.Text | Should -BeLike 'OFFLINE*'
+        }
+
+        It 'Says so plainly when the settings hold no tenant for that side' {
+            $banner = Format-WorkbenchGuiBanner -Step (Get-MigrationStep -Id 'New-Users') -Settings $null
+            $banner.Colour | Should -BeExactly 'Blue'
+            $banner.Text | Should -BeLike '*not set*'
+        }
+
+        It 'Has something to show before a step is picked' {
+            (Format-WorkbenchGuiBanner -Step $null -Settings $null).Colour | Should -BeExactly 'Grey'
+        }
+    }
+
+    Context 'ConvertTo-WorkbenchGuiOverride' {
+
+        It 'Reads a tick as a boolean, whichever way it was written' {
+            $tick = New-GuiParameterStub -Name 'Force' -TypeName 'SwitchParameter' -IsSwitch $true
+            ConvertTo-WorkbenchGuiOverride -Parameter $tick -Text 'True' | Should -BeTrue
+            ConvertTo-WorkbenchGuiOverride -Parameter $tick -Text 'yes' | Should -BeTrue
+            ConvertTo-WorkbenchGuiOverride -Parameter $tick -Text 'False' | Should -BeFalse
+            ConvertTo-WorkbenchGuiOverride -Parameter $tick -Text '' | Should -BeFalse
+        }
+
+        It 'Splits a list on lines and on commas, dropping the blanks' {
+            $list = New-GuiParameterStub -Name 'Wave' -TypeName 'String[]' -IsArray $true
+            @(ConvertTo-WorkbenchGuiOverride -Parameter $list -Text "1`n2") | Should -Be @('1', '2')
+            @(ConvertTo-WorkbenchGuiOverride -Parameter $list -Text '1, 2 ,') | Should -Be @('1', '2')
+        }
+
+        It 'Reads one old=new rewrite per line into a map' {
+            $map = New-GuiParameterStub -Name 'AliasDomainMap' -TypeName 'Hashtable' -IsHashtable $true
+            $parsed = ConvertTo-WorkbenchGuiOverride -Parameter $map -Text "old.com=new.com`nnot a pair"
+            $parsed | Should -BeOfType [System.Collections.Specialized.OrderedDictionary]
+            @($parsed.Keys) | Should -Be @('old.com')
+            $parsed['old.com'] | Should -BeExactly 'new.com'
+        }
+
+        It 'Reads a whole number as a number' {
+            $number = New-GuiParameterStub -Name 'PasswordLength' -TypeName 'Int32'
+            ConvertTo-WorkbenchGuiOverride -Parameter $number -Text ' 20 ' | Should -Be 20
+        }
+
+        It 'Keeps a number that will not parse as typed, so the validator names it' {
+            $number = New-GuiParameterStub -Name 'PasswordLength' -TypeName 'Int32'
+            ConvertTo-WorkbenchGuiOverride -Parameter $number -Text 'twenty' | Should -BeExactly 'twenty'
+        }
+
+        It 'Treats a cleared box as no override at all rather than as an empty value' {
+            $text = New-GuiParameterStub -Name 'TargetDomain'
+            ConvertTo-WorkbenchGuiOverride -Parameter $text -Text '   ' | Should -BeNullOrEmpty
+        }
+
+        It 'Trims what was typed' {
+            $text = New-GuiParameterStub -Name 'TargetDomain'
+            ConvertTo-WorkbenchGuiOverride -Parameter $text -Text '  newco.com ' | Should -BeExactly 'newco.com'
+        }
+    }
+
+    Context 'Test-WorkbenchGuiTypedConfirmation' {
+
+        It 'Accepts a domain without case, because DNS has none' {
+            Test-WorkbenchGuiTypedConfirmation -Answer 'NEWCO.COM' -Required 'newco.com' | Should -BeTrue
+            Test-WorkbenchGuiTypedConfirmation -Answer '  newco.com  ' -Required 'newco.com' | Should -BeTrue
+        }
+
+        It 'Demands the case of a keyword, because shouting it is the point' {
+            Test-WorkbenchGuiTypedConfirmation -Answer 'REMOVE' -Required 'REMOVE' | Should -BeTrue
+            Test-WorkbenchGuiTypedConfirmation -Answer 'remove' -Required 'REMOVE' | Should -BeFalse
+        }
+
+        It 'Refuses a gate that names nothing to type rather than treating it as satisfied' {
+            Test-WorkbenchGuiTypedConfirmation -Answer '' -Required '' | Should -BeFalse
+            Test-WorkbenchGuiTypedConfirmation -Answer 'anything' -Required '' | Should -BeFalse
+        }
+
+        It 'Agrees with the unattended path on the same fixture gate' {
+            # The rule this helper applies is the one Invoke-WorkbenchNonInteractive applies, and
+            # the fixture's release domain is what the hard gate asks for there.
+            Test-WorkbenchGuiTypedConfirmation -Answer 'NEWCO.COM' -Required 'newco.com' | Should -BeTrue
+        }
+    }
+}
+
+Describe 'Start-MigrationWorkbench - WinForms is never loaded before the platform is known' {
+
+    <#
+        The one ordering rule the whole cross-platform story rests on: the WinForms assembly does
+        not exist on macOS or Linux, and loading it to find that out would end the session on the
+        platforms the console mode is the entire point of. Asserted against the parse tree rather
+        than by running anything, because on this machine running it is exactly what must not
+        happen.
+    #>
+
+    BeforeAll {
+        $parseErrors = $null
+        $script:WorkbenchAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$null, [ref]$parseErrors)
+        @($parseErrors) | Should -HaveCount 0
+
+        function Get-WorkbenchCommandAst {
+            [CmdletBinding()]
+            param([Parameter(Mandatory)]$Ast, [Parameter(Mandatory)][string]$Name)
+
+            return @($Ast.FindAll({
+                        if ($args[0] -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+                        $called = $args[0].GetCommandName()
+                        $called -and (($called -split '\\')[-1] -ieq $Name)
+                    }, $true))
+        }
+
+        function Get-WorkbenchEnclosingFunction {
+            [CmdletBinding()]
+            param([Parameter(Mandatory)]$Ast)
+
+            $node = $Ast
+            while ($null -ne $node) {
+                if ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $node }
+                $node = $node.Parent
+            }
+            return $null
+        }
+    }
+
+    It 'Calls Add-Type only from the function that builds the window' {
+        $calls = @(Get-WorkbenchCommandAst -Ast $script:WorkbenchAst -Name 'Add-Type')
+        $calls | Should -Not -BeNullOrEmpty -Because 'the window has to load WinForms somewhere'
+
+        foreach ($call in $calls) {
+            $owner = Get-WorkbenchEnclosingFunction -Ast $call
+            $owner | Should -Not -BeNullOrEmpty -Because 'an Add-Type at script level would run on every platform'
+            $owner.Name | Should -BeLike 'Start-*Gui*'
+        }
+    }
+
+    It 'Checks the platform before it loads WinForms' {
+        $builder = @($script:WorkbenchAst.FindAll({
+                    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $args[0].Name -eq 'Start-MigrationWorkbenchGui'
+                }, $true))
+        $builder | Should -HaveCount 1
+
+        $platform = @(Get-WorkbenchCommandAst -Ast $builder[0] -Name 'Test-WorkbenchWindows')
+        $addType = @(Get-WorkbenchCommandAst -Ast $builder[0] -Name 'Add-Type')
+        $platform | Should -Not -BeNullOrEmpty
+        $addType | Should -Not -BeNullOrEmpty
+
+        $platform[0].Extent.StartOffset |
+            Should -BeLessThan $addType[0].Extent.StartOffset -Because 'the refusal comes first'
+    }
+
+    It 'Builds no window and loads no assembly at load time: the GUI region is functions only' {
+        # Everything between the region markers has to be a function definition. A statement there
+        # would run the moment the script is dot-sourced - which is what -NoGui exists to make
+        # safe on a machine with no WinForms at all.
+        $lines = @(Get-Content -LiteralPath $script:ScriptPath)
+        $start = (1..$lines.Count | Where-Object { $lines[$_ - 1] -match '^#region GUI\s*$' })[0]
+        $end = (1..$lines.Count | Where-Object { $lines[$_ - 1] -match '^#endregion GUI\s*$' })[0]
+        $start | Should -Not -BeNullOrEmpty
+        $end | Should -BeGreaterThan $start
+
+        $stray = @($script:WorkbenchAst.EndBlock.Statements | Where-Object {
+                $_.Extent.StartLineNumber -gt $start -and $_.Extent.EndLineNumber -lt $end -and
+                $_ -isnot [System.Management.Automation.Language.FunctionDefinitionAst]
+            })
+        $stray | Should -BeNullOrEmpty
+    }
+}
