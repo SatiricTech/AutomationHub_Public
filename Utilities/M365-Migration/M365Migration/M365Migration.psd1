@@ -10,6 +10,7 @@
     CompatiblePSEditions = @('Core')
 
     FunctionsToExport    = @(
+        'Assert-MigrationTenant'
         'Complete-MigrationRun'
         'Connect-MigrationExchange'
         'Connect-MigrationGraph'
