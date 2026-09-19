@@ -24,9 +24,12 @@ function ConvertTo-MigrationPowerShellLiteral {
           $null       '$null' - the driver writer drops the argument instead of passing it, but
                       that is its decision to make, not this function's.
 
-        Anything else - a GUID, a datetime, an enum - is rendered as its string form in a
-        single-quoted literal: every toolkit parameter that takes one declares [string] or
-        parses the string itself, so the quoted form is what binds.
+        A GUID, a datetime or an enum - any value type - is rendered as its invariant string
+        form in a single-quoted literal: every toolkit parameter that takes one declares
+        [string] or parses the string itself, so the quoted form is what binds. Anything else
+        throws. A [pscustomobject] or a Graph model has no literal form, and stringifying one
+        would write its type name into a driver for the child to bind as a value - a failure
+        the operator would only discover from the results.
 
     .PARAMETER Value
         The value to render.
@@ -94,5 +97,20 @@ function ConvertTo-MigrationPowerShellLiteral {
         return '@(' + ($items -join ', ') + ')'
     }
 
-    return "'" + ([string]$Value -replace "'", "''") + "'"
+    # A GUID, a datetime, an enum: a value type whose string form is what a [string] parameter
+    # binds from. IFormattable is asked in the invariant culture so a European operator's
+    # decimal comma or day-first date cannot change what the child receives.
+    if ($Value.GetType().IsValueType) {
+        $text = if ($Value -is [System.IFormattable]) {
+            $Value.ToString($null, [cultureinfo]::InvariantCulture)
+        }
+        else { [string]$Value }
+        return "'" + ($text -replace "'", "''") + "'"
+    }
+
+    # Anything else - a [pscustomobject], a scriptblock, a Graph SDK model - has no literal
+    # form. Stringifying it would write 'System.Management.Automation.PSCustomObject' into a
+    # driver and the child would bind that as a value, so this fails where it can be seen.
+    throw ("A [$($Value.GetType().FullName)] has no PowerShell literal form and cannot be " +
+        'written into a driver. Pass a string, a number, a boolean, an array or a hashtable.')
 }

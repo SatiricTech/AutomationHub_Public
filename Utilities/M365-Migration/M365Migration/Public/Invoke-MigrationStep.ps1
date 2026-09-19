@@ -92,6 +92,13 @@ function Invoke-MigrationStep {
     .NOTES
         Author: AutomationHub
         Written with assistance from Claude (Anthropic).
+
+        Start-Process redirection holds the run's stdout.txt and stderr.txt open for the life of
+        the session: two file handles per run that are not released when the child exits
+        (observed on macOS, and inherent to redirecting to files rather than to captured
+        streams). A workbench session that runs the whole 17-step runbook several times over
+        therefore accumulates handles until it closes - well inside any per-process limit, but
+        worth knowing before the run folder is deleted or moved while the workbench is open.
     #>
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
@@ -157,11 +164,11 @@ function Invoke-MigrationStep {
     else { { param($Line) Write-Host $Line } }
 
     # The pwsh the driver was written for, which is the one the workbench is running in: a
-    # workbench started from 7.4 must not hand its step to whatever 'pwsh' is on PATH.
-    $executable = [string]$Driver.CommandLine
-    $split = $executable.IndexOf(' -NoProfile')
-    $executable = if ($split -gt 0) { $executable.Substring(0, $split) }
-    else { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
+    # workbench started from 7.4 must not hand its step to whatever 'pwsh' is on PATH. It is a
+    # field on the driver object rather than something parsed back out of the display command
+    # line, which is quoted for reading and cannot be split on reliably.
+    $executable = [string](Get-MigrationProperty -InputObject $Driver -Name 'PwshPath' -Default '')
+    if (-not $executable) { $executable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
 
     # Start-Process joins ArgumentList with spaces and quotes nothing, so the one argument that
     # can hold a space is quoted here.
@@ -182,16 +189,22 @@ function Invoke-MigrationStep {
 
     $stdoutLines = [System.Collections.Generic.List[string]]::new()
 
+    # Which front-end scriptblocks have already thrown. A hashtable rather than three variables
+    # because the drain below mutates it from inside a nested scope.
+    $broken = @{ OutputWriter = $false; Pump = $false; CancelIf = $false }
+
     # Takes its offsets as references so the loop and the final read share one position in each
     # file; everything else it needs is read from the enclosing scope.
     $drain = {
         param([ref]$OutOffset, [ref]$ErrOffset, [switch]$Final)
         foreach ($line in @(Read-MigrationFileTail -Path $stdoutPath -Offset $OutOffset -Flush:$Final)) {
+            # Collected whatever the writer does with it: the tenant scan below reads these.
             $stdoutLines.Add($line)
-            & $writer $line
+            Invoke-MigrationStepSeam -Name 'OutputWriter' -Seam $writer -Argument @($line) -State $broken | Out-Null
         }
         foreach ($line in @(Read-MigrationFileTail -Path $stderrPath -Offset $ErrOffset -Flush:$Final)) {
-            & $writer "  ! $line"
+            Invoke-MigrationStepSeam -Name 'OutputWriter' -Seam $writer -Argument @("  ! $line") `
+                -State $broken | Out-Null
         }
     }
 
@@ -199,15 +212,26 @@ function Invoke-MigrationStep {
     $stderrOffset = [long]0
     $aborted = $false
     $started = Get-Date
+    $result = $null
 
     $process = Start-Process @startParameters
     try {
         while (-not $process.HasExited) {
             [System.Threading.Thread]::Sleep($PollMilliseconds)
             & $drain ([ref]$stdoutOffset) ([ref]$stderrOffset)
-            if ($PSBoundParameters.ContainsKey('Pump')) { & $Pump }
 
-            if ($PSBoundParameters.ContainsKey('CancelIf') -and [bool](& $CancelIf)) {
+            if ($PSBoundParameters.ContainsKey('Pump')) {
+                Invoke-MigrationStepSeam -Name 'Pump' -Seam $Pump -State $broken | Out-Null
+            }
+
+            if ($PSBoundParameters.ContainsKey('CancelIf') -and
+                [bool](Invoke-MigrationStepSeam -Name 'CancelIf' -Seam $CancelIf -State $broken)) {
+
+                # The child can finish while the loop is asleep, and then there is nothing to
+                # cancel: recording that as an abort would tell the next reader of the
+                # workspace that a step which completed never ran.
+                if ($process.HasExited) { break }
+
                 $aborted = $true
                 # The whole tree: a step that has started EXO or Teams has children of its own.
                 try { $process.Kill($true) }
@@ -221,106 +245,131 @@ function Invoke-MigrationStep {
         if ($aborted) { [void]$process.WaitForExit(5000) } else { $process.WaitForExit() }
     }
     finally {
+        # Everything from here runs even if the loop threw, because the two things that must
+        # never be skipped are killing a child nobody is watching any more and recording that
+        # the run happened at all.
+        if (-not $process.HasExited) {
+            try { $process.Kill($true) }
+            catch { Write-Warning "The run could not be killed cleanly: $($_.Exception.Message)" }
+            [void]$process.WaitForExit(5000)
+        }
+
         # The child can exit between two polls, and its last line can arrive without a newline.
         & $drain ([ref]$stdoutOffset) ([ref]$stderrOffset) -Final
-    }
 
-    $ended = Get-Date
+        $ended = Get-Date
 
-    $exitCode = $null
-    try { $exitCode = [int]$process.ExitCode }
-    catch { $exitCode = $null }
-    # A killed process on some platforms reports no exit code at all; 130 is the shell's own
-    # word for "interrupted", which is what happened.
-    if ($null -eq $exitCode -and $aborted) { $exitCode = 130 }
+        $exitCode = $null
+        try { $exitCode = [int]$process.ExitCode }
+        catch { $exitCode = $null }
+        # A killed process on some platforms reports no exit code at all; 130 is the shell's
+        # own word for "interrupted", which is what happened.
+        if ($null -eq $exitCode -and $aborted) { $exitCode = 130 }
 
-    $meaning = 'See the log'
-    if ($null -ne $exitCode) {
-        $codes = Get-MigrationProperty -InputObject $Step -Name 'ExitCodes' -Default @{}
-        $named = Get-MigrationProperty -InputObject $codes -Name ([string]$exitCode) -Default ''
-        if ($named) { $meaning = [string]$named }
-    }
-    if ($aborted) { $meaning = 'Aborted by the operator' }
+        $meaning = 'See the log'
+        if ($null -ne $exitCode) {
+            $codes = Get-MigrationProperty -InputObject $Step -Name 'ExitCodes' -Default @{}
+            $named = Get-MigrationProperty -InputObject $codes -Name ([string]$exitCode) -Default ''
+            if ($named) { $meaning = [string]$named }
+        }
+        if ($aborted) { $meaning = 'Aborted by the operator' }
 
-    # The connection lines Connect-MigrationGraph, -Exchange and -Teams print, whether the
-    # session was opened now or reused from an earlier step in the same process.
-    $tenantPatterns = @(
-        'Connected to (?:Microsoft Graph|Exchange Online|Microsoft Teams).*?tenant ([0-9a-f-]{36})',
-        'Reusing the (?:existing|cached) .*?session for tenant ([0-9a-f-]{36})'
-    )
-    $connected = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in $stdoutLines) {
-        foreach ($pattern in $tenantPatterns) {
-            if ($line -match $pattern -and -not $connected.Contains($Matches[1])) { $connected.Add($Matches[1]) }
+        # The connection lines Connect-MigrationGraph, -Exchange and -Teams print, whether the
+        # session was opened now or reused from an earlier step in the same process. GUIDs are
+        # lowercased on the way in: the same tenant written two ways is one tenant.
+        $tenantPatterns = @(
+            'Connected to (?:Microsoft Graph|Exchange Online|Microsoft Teams).*?tenant ([0-9a-f-]{36})',
+            'Reusing the (?:existing|cached) .*?session for tenant ([0-9a-f-]{36})'
+        )
+        $connected = [System.Collections.Generic.List[string]]::new()
+        foreach ($line in $stdoutLines) {
+            foreach ($pattern in $tenantPatterns) {
+                if ($line -notmatch $pattern) { continue }
+                $guid = ([string]$Matches[1]).ToLowerInvariant()
+                if (-not $connected.Contains($guid)) { $connected.Add($guid) }
+            }
+        }
+
+        $tenantVerified = $null
+        if ($ExpectedTenantId) {
+            $expected = $ExpectedTenantId.Trim().ToLowerInvariant()
+            $wrong = @($connected | Where-Object { $_ -ne $expected })
+            $tenantVerified = ($connected.Count -gt 0) -and ($wrong.Count -eq 0)
+        }
+
+        # Offline steps take the workspace label too, so every step has one output folder.
+        $fixed = Get-MigrationProperty -InputObject $Step -Name 'Fixed' -Default @{}
+        $prefix = [string](Get-MigrationProperty -InputObject $fixed -Name 'Prefix' -Default '')
+        if (-not $prefix) {
+            $prefix = [string](Get-MigrationProperty -InputObject $Workspace -Name 'Label' -Default '')
+        }
+        if (-not $prefix) { $prefix = Split-Path -Path $workspacePath -Leaf }
+        $produced = Get-MigrationRunArtefact -Folder (Join-Path $workspacePath $prefix) -Since $started
+
+        $summary = $null
+        if ($produced.Summary) {
+            $summary = [ordered]@{
+                Succeeded = $produced.Summary.Succeeded
+                Failed    = $produced.Summary.Failed
+                Skipped   = $produced.Summary.Skipped
+                Planned   = $produced.Summary.Planned
+            }
+        }
+
+        # Paths are recorded relative to the workspace: the folder is synced and copied between
+        # machines, and an absolute path from somebody else's laptop tells the next reader
+        # nothing.
+        $relative = {
+            param([string]$FullPath)
+            return ([System.IO.Path]::GetRelativePath($workspacePath, $FullPath) -replace '\\', '/')
+        }
+
+        $entry = [ordered]@{
+            Started        = $started.ToString('s')
+            Ended          = $ended.ToString('s')
+            StepId         = [string]$Step.Id
+            Script         = [string]$Step.Script
+            Side           = [string]$Step.Side
+            TenantId       = [string]$ExpectedTenantId
+            DryRun         = [bool]$DryRun
+            Wave           = @($Wave | Where-Object { $_ })
+            ExitCode       = $exitCode
+            Meaning        = $meaning
+            Aborted        = $aborted
+            TenantVerified = $tenantVerified
+            GateOverrides  = @($GateOverrides | Where-Object { $_ })
+            Driver         = (& $relative $driverPath)
+            Files          = @(@($produced.Files) | ForEach-Object { & $relative $_ })
+            Summary        = $summary
+        }
+
+        # A ledger that cannot be written is worth a warning, never the run's exception: the
+        # caller still gets the result, and LedgerEntry still says what would have been recorded.
+        try {
+            Add-MigrationRunLedgerEntry -Path (Join-Path $workspacePath 'Workbench' 'Runs.jsonl') `
+                -Entry $entry | Out-Null
+        }
+        catch {
+            Write-Warning "The run could not be recorded in the ledger: $($_.Exception.Message)"
+        }
+
+        $result = [pscustomobject]@{
+            RunId              = [string]$Driver.RunId
+            StepId             = [string]$Step.Id
+            ExitCode           = $exitCode
+            Meaning            = $meaning
+            Aborted            = $aborted
+            Started            = $started
+            Ended              = $ended
+            StdoutPath         = $stdoutPath
+            StderrPath         = $stderrPath
+            ConnectedTenantIds = $connected.ToArray()
+            TenantVerified     = $tenantVerified
+            Files              = @($produced.Files)
+            Summary            = $produced.Summary
+            LedgerEntry        = [pscustomobject]$entry
         }
     }
 
-    $tenantVerified = $null
-    if ($ExpectedTenantId) {
-        $expected = $ExpectedTenantId.Trim().ToLowerInvariant()
-        $wrong = @($connected | Where-Object { $_.ToLowerInvariant() -ne $expected })
-        $tenantVerified = ($connected.Count -gt 0) -and ($wrong.Count -eq 0)
-    }
-
-    # Offline steps take the workspace label too, so every step has exactly one output folder.
-    $fixed = Get-MigrationProperty -InputObject $Step -Name 'Fixed' -Default @{}
-    $prefix = [string](Get-MigrationProperty -InputObject $fixed -Name 'Prefix' -Default '')
-    if (-not $prefix) { $prefix = [string](Get-MigrationProperty -InputObject $Workspace -Name 'Label' -Default '') }
-    if (-not $prefix) { $prefix = Split-Path -Path $workspacePath -Leaf }
-    $produced = Get-MigrationRunArtefact -Folder (Join-Path $workspacePath $prefix) -Since $started
-
-    $summary = $null
-    if ($produced.Summary) {
-        $summary = [ordered]@{
-            Succeeded = $produced.Summary.Succeeded
-            Failed    = $produced.Summary.Failed
-            Skipped   = $produced.Summary.Skipped
-            Planned   = $produced.Summary.Planned
-        }
-    }
-
-    # Paths are recorded relative to the workspace: the folder is synced and copied between
-    # machines, and an absolute path from somebody else's laptop tells the next reader nothing.
-    $relative = {
-        param([string]$FullPath)
-        return ([System.IO.Path]::GetRelativePath($workspacePath, $FullPath) -replace '\\', '/')
-    }
-
-    $entry = [ordered]@{
-        Started        = $started.ToString('s')
-        Ended          = $ended.ToString('s')
-        StepId         = [string]$Step.Id
-        Script         = [string]$Step.Script
-        Side           = [string]$Step.Side
-        TenantId       = [string]$ExpectedTenantId
-        DryRun         = [bool]$DryRun
-        Wave           = @($Wave | Where-Object { $_ })
-        ExitCode       = $exitCode
-        Meaning        = $meaning
-        Aborted        = $aborted
-        TenantVerified = $tenantVerified
-        GateOverrides  = @($GateOverrides | Where-Object { $_ })
-        Driver         = (& $relative $driverPath)
-        Files          = @(@($produced.Files) | ForEach-Object { & $relative $_ })
-        Summary        = $summary
-    }
-
-    Add-MigrationRunLedgerEntry -Path (Join-Path $workspacePath 'Workbench' 'Runs.jsonl') -Entry $entry | Out-Null
-
-    return [pscustomobject]@{
-        RunId              = [string]$Driver.RunId
-        StepId             = [string]$Step.Id
-        ExitCode           = $exitCode
-        Meaning            = $meaning
-        Aborted            = $aborted
-        Started            = $started
-        Ended              = $ended
-        StdoutPath         = $stdoutPath
-        StderrPath         = $stderrPath
-        ConnectedTenantIds = $connected.ToArray()
-        TenantVerified     = $tenantVerified
-        Files              = @($produced.Files)
-        Summary            = $produced.Summary
-        LedgerEntry        = [pscustomobject]$entry
-    }
+    return $result
 }

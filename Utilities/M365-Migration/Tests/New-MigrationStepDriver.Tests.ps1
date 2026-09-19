@@ -120,10 +120,59 @@ Describe 'New-MigrationStepDriver' {
             Test-Path -LiteralPath $script:Result.DriverPath -PathType Leaf | Should -BeTrue
         }
 
-        It 'returns the exact pwsh command line the runner will use' {
+        It 'returns the pwsh the workbench is running and the command line that starts it' {
             $pwshPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-            $script:Result.CommandLine | Should -BeExactly ("$pwshPath -NoProfile -NonInteractive " +
+            $script:Result.PwshPath | Should -BeExactly $pwshPath
+            $script:Result.CommandLine | Should -BeExactly ("& '$pwshPath' -NoProfile -NonInteractive " +
                 "-ExecutionPolicy Bypass -File '$($script:Result.DriverPath)'")
+        }
+    }
+
+    Context 'paths that hold a quote or a space' {
+
+        It 'returns a command line that still parses when both are awkward' {
+            # 'C:\Program Files\PowerShell\7\pwsh.exe' holds a space and a workspace can hold an
+            # apostrophe. A command line the operator cannot paste back is worse than none.
+            $workspace = New-TestWorkspace -Name "Ren's Workspace"
+            $result = New-MigrationStepDriver -Step $script:EchoStep -Arguments (Get-TestCanonicalArgumentSet) `
+                -Workspace $workspace -Timestamp $script:Stamp `
+                -PwshPath 'C:\Program Files\PowerShell\7\pwsh.exe'
+
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($result.CommandLine,
+                [ref]$null, [ref]$errors)
+            @($errors).Count | Should -Be 0
+
+            $result.CommandLine | Should -Match ([regex]::Escape("& 'C:\Program Files\PowerShell\7\pwsh.exe'"))
+            $result.CommandLine | Should -Match ([regex]::Escape("Ren''s Workspace"))
+            $result.PwshPath | Should -BeExactly 'C:\Program Files\PowerShell\7\pwsh.exe'
+        }
+
+        It 'still parses the driver it wrote into that folder' {
+            $workspace = New-TestWorkspace -Name "Ren's Second Workspace"
+            $result = New-MigrationStepDriver -Step $script:EchoStep -Arguments (Get-TestCanonicalArgumentSet) `
+                -Workspace $workspace -Timestamp $script:Stamp
+            Test-DriverParse -Path $result.DriverPath | Should -BeTrue
+        }
+    }
+
+    Context 'two runs of one step in the same second' {
+
+        It 'gives the second run a folder of its own' {
+            $workspace = New-TestWorkspace -Name 'DriverSameSecond'
+            $first = New-MigrationStepDriver -Step $script:EchoStep -Arguments (Get-TestCanonicalArgumentSet) `
+                -Workspace $workspace -Timestamp $script:Stamp
+            $second = New-MigrationStepDriver -Step $script:EchoStep -Arguments (Get-TestCanonicalArgumentSet) `
+                -Workspace $workspace -Timestamp $script:Stamp
+            $third = New-MigrationStepDriver -Step $script:EchoStep -Arguments (Get-TestCanonicalArgumentSet) `
+                -Workspace $workspace -Timestamp $script:Stamp
+
+            $first.RunId | Should -BeExactly '20260918-143005_Echo-Step'
+            $second.RunId | Should -BeExactly '20260918-143005_Echo-Step-2'
+            $third.RunId | Should -BeExactly '20260918-143005_Echo-Step-3'
+            $second.DriverPath | Should -Not -BeExactly $first.DriverPath
+            Test-Path -LiteralPath $first.DriverPath | Should -BeTrue
+            Test-Path -LiteralPath $second.DriverPath | Should -BeTrue
         }
     }
 
@@ -366,6 +415,17 @@ Describe 'ConvertTo-MigrationPowerShellLiteral' {
     It 'renders $null as $null so a caller can decide to drop it' {
         InModuleScope M365Migration {
             ConvertTo-MigrationPowerShellLiteral -Value $null | Should -BeExactly '$null'
+        }
+    }
+
+    It 'refuses a value that has no literal form rather than writing its type name' {
+        InModuleScope M365Migration {
+            # Stringifying this would put 'System.Management.Automation.PSCustomObject' in a
+            # driver and the child would bind that as a value.
+            { ConvertTo-MigrationPowerShellLiteral -Value ([pscustomobject]@{ Wave = '1' }) } |
+                Should -Throw '*no PowerShell literal form*'
+            { ConvertTo-MigrationPowerShellLiteral -Value { 'a scriptblock' } } |
+                Should -Throw '*no PowerShell literal form*'
         }
     }
 

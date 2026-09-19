@@ -253,6 +253,16 @@ Describe 'Invoke-MigrationStep' {
             $result.TenantVerified | Should -BeFalse
         }
 
+        It 'treats the same tenant written two ways as one tenant' {
+            $workspace = New-TestWorkspace -Name 'TenantCase'
+            $upper = $script:SyntheticTenant.ToUpperInvariant()
+            $result = Invoke-TestEchoStep -Workspace $workspace -Value @{ TenantId = $upper } `
+                -Runner @{ ExpectedTenantId = $script:SyntheticTenant }
+            @($result.ConnectedTenantIds).Count | Should -Be 1
+            @($result.ConnectedTenantIds)[0] | Should -BeExactly $script:SyntheticTenant
+            $result.TenantVerified | Should -BeTrue
+        }
+
         It 'has no opinion when nothing was expected' {
             $workspace = New-TestWorkspace -Name 'TenantNone'
             $result = Invoke-TestEchoStep -Workspace $workspace -Value @{ TenantId = $script:SyntheticTenant }
@@ -273,6 +283,17 @@ Describe 'Invoke-MigrationStep' {
             $result.ExitCode | Should -Be 0
             # The whole point of the seam: a secret handed to one child is gone afterwards.
             [Environment]::GetEnvironmentVariable('M365MIGRATION_TEST') | Should -BeNullOrEmpty
+        }
+
+        It 'survives a workspace path with an apostrophe in it' {
+            # The driver path reaches the child through Start-Process -ArgumentList, which
+            # quotes nothing, and reaches the operator through CommandLine, which is a literal.
+            $workspace = New-TestWorkspace -Name "Ren's Run"
+            $captured = [System.Collections.Generic.List[string]]::new()
+            $result = Invoke-TestEchoStep -Workspace $workspace -Captured $captured `
+                -Value @{ Prefix = 'Contoso' }
+            $result.ExitCode | Should -Be 0
+            $captured.Count | Should -BeGreaterThan 0
         }
 
         It 'survives a workspace path with a space in it' {
@@ -297,6 +318,23 @@ Describe 'Invoke-MigrationStep' {
             $result.Aborted | Should -BeTrue
             $result.Meaning | Should -BeExactly 'Aborted by the operator'
             $stopwatch.Elapsed.TotalSeconds | Should -BeLessThan 5
+        }
+
+        It 'does not call a run that finished during the poll an abort' {
+            # The child exits while the loop is asleep, so by the time -CancelIf is asked there
+            # is nothing left to kill. Recording that as "aborted by the operator" would tell
+            # the next reader of the workspace that a step which completed never ran.
+            $workspace = New-TestWorkspace -Name 'RunCancelRace'
+            $result = Invoke-TestEchoStep -Workspace $workspace -Value @{ ExitWith = 2 } `
+                -Runner @{ CancelIf = { $true }; PollMilliseconds = 2000 }
+
+            $result.Aborted | Should -BeFalse
+            $result.ExitCode | Should -Be 2
+            $result.Meaning | Should -BeExactly 'Some rows failed'
+
+            $entry = @(Get-MigrationRunLedger -Workspace $workspace)[0]
+            $entry.Aborted | Should -BeFalse
+            $entry.Meaning | Should -BeExactly 'Some rows failed'
         }
 
         It 'records the abort in the ledger too' {
@@ -335,6 +373,67 @@ Describe 'Invoke-MigrationStep' {
             @($result.Files) | Should -Contain $script:PumpResultPath
             $result.Summary.Succeeded | Should -Be 1
             $result.Summary.Failed | Should -Be 1
+        }
+    }
+
+    Context 'a front end whose seams throw' {
+
+        It 'survives a writer that throws, records the run and leaves no child behind' {
+            # The WinForms writer touches a form: a disposed control, a closed window or a
+            # cross-thread call throws. That must cost the live log, not the run - and above
+            # all it must not leave a child process writing to a tenant with nobody watching
+            # and no ledger line to say it happened.
+            $workspace = New-TestWorkspace -Name 'RunWriterThrows'
+            $script:WriterCalls = 0
+            $before = @(Get-Process -Name 'pwsh' -ErrorAction SilentlyContinue).Count
+
+            $result = Invoke-TestEchoStep -Workspace $workspace -Value @{ Prefix = 'Contoso' } `
+                -Runner @{
+                OutputWriter     = { param($Line) $script:WriterCalls++; throw "the log pane is gone: $Line" }
+                PollMilliseconds = 100
+                WarningAction    = 'SilentlyContinue'
+            }
+
+            $result.ExitCode | Should -Be 0
+            $result.Meaning | Should -BeExactly 'Completed'
+            # Called once, then disabled for the rest of the run.
+            $script:WriterCalls | Should -Be 1
+            @(Get-MigrationRunLedger -Workspace $workspace).Count | Should -Be 1
+            @(Get-Process -Name 'pwsh' -ErrorAction SilentlyContinue).Count | Should -BeLessOrEqual $before
+        }
+
+        It 'survives a cancel check that throws and keeps polling' {
+            $workspace = New-TestWorkspace -Name 'RunCancelThrows'
+            $script:CancelCalls = 0
+            $before = @(Get-Process -Name 'pwsh' -ErrorAction SilentlyContinue).Count
+
+            $result = Invoke-TestEchoStep -Workspace $workspace -Value @{ SleepSeconds = 1 } `
+                -Runner @{
+                CancelIf         = { $script:CancelCalls++; throw 'the cancel button is gone' }
+                PollMilliseconds = 100
+                WarningAction    = 'SilentlyContinue'
+            }
+
+            $result.ExitCode | Should -Be 0
+            $result.Aborted | Should -BeFalse
+            $script:CancelCalls | Should -Be 1
+            @(Get-MigrationRunLedger -Workspace $workspace).Count | Should -Be 1
+            @(Get-Process -Name 'pwsh' -ErrorAction SilentlyContinue).Count | Should -BeLessOrEqual $before
+        }
+
+        It 'survives a pump that throws' {
+            $workspace = New-TestWorkspace -Name 'RunPumpThrows'
+            $script:PumpThrowCalls = 0
+            $result = Invoke-TestEchoStep -Workspace $workspace -Value @{ SleepSeconds = 1 } `
+                -Runner @{
+                Pump             = { $script:PumpThrowCalls++; throw 'DoEvents on a disposed form' }
+                PollMilliseconds = 100
+                WarningAction    = 'SilentlyContinue'
+            }
+
+            $result.ExitCode | Should -Be 0
+            $script:PumpThrowCalls | Should -Be 1
+            @(Get-MigrationRunLedger -Workspace $workspace).Count | Should -Be 1
         }
     }
 

@@ -88,7 +88,8 @@ function Connect-MigrationExchange {
         # actually be checked against. Get-MigrationProperty is used throughout because a
         # mocked or thin Get-ConnectionInformation object may not carry every property, and
         # the module runs under Set-StrictMode -Version Latest.
-        $existingDelegatedOrganization = Get-MigrationProperty -InputObject $existing -Name 'DelegatedOrganization' -Default ''
+        $existingDelegatedOrganization = Get-MigrationProperty -InputObject $existing `
+            -Name 'DelegatedOrganization' -Default ''
         $existingTenantId = Get-MigrationProperty -InputObject $existing -Name 'TenantId' -Default ''
         $existingUpn = Get-MigrationProperty -InputObject $existing -Name 'UserPrincipalName' -Default ''
 
@@ -132,7 +133,9 @@ function Connect-MigrationExchange {
     }
 
     $connectedOrganization = Get-MigrationProperty -InputObject $information -Name 'DelegatedOrganization' -Default ''
-    if (-not $connectedOrganization) { $connectedOrganization = Get-MigrationProperty -InputObject $information -Name 'Organization' -Default '' }
+    if (-not $connectedOrganization) {
+        $connectedOrganization = Get-MigrationProperty -InputObject $information -Name 'Organization' -Default ''
+    }
     $connectedUpn = Get-MigrationProperty -InputObject $information -Name 'UserPrincipalName' -Default ''
     $connectedTenantId = Get-MigrationProperty -InputObject $information -Name 'TenantId' -Default ''
 

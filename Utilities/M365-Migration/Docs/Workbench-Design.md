@@ -427,7 +427,9 @@ polls every 250 ms (`[Threading.Thread]::Sleep`, not `Start-Sleep`), reads new c
 from a byte offset and hands them to an injected writer scriptblock (console: `Write-Host`;
 WinForms: the log pane + `DoEvents` pump). Cancel kills the process tree and records
 `Aborted`. The exit code is read from the process object. Files produced are the files in the
-step's prefix folder that did not exist when the run started.
+step's prefix folder whose **filename** timestamp is at or after the second the run started —
+names, never mtimes, since a sync client rewrites those — plus any `.log` in that folder
+touched since the run began, because a script opens its log once and appends to it throughout.
 
 Exit-code meaning comes from the overlay; the shared vocabulary is 0 completed, 1 failed,
 2 some rows failed (amber), 3 work remains (amber, domain release), other = see the log.

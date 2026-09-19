@@ -23,6 +23,11 @@ function New-MigrationStepDriver {
         business; re-stating it here would freeze today's value into a file that outlives the
         script. An argument with no value is left out for the same reason.
 
+        The run folder is named for the second the run started, which is the same resolution the
+        ledger and the toolkit's filenames use. A second run of the same step inside that second
+        would otherwise land in the same folder and overwrite the first one's driver, so it is
+        given the next free suffix instead: -2, then -3.
+
         Failure. The driver does not end at the call: it sets $ErrorActionPreference to Stop,
         wraps the splat in try/catch and exits 1 from the catch, then exits [int]$LASTEXITCODE.
         A call that never reaches the script - an unknown parameter, a value its ValidateSet
@@ -59,12 +64,17 @@ function New-MigrationStepDriver {
     .PARAMETER Version
         The workbench version recorded in the header. Defaults to the module's version.
 
+    .PARAMETER PwshPath
+        The pwsh the runner will start. Defaults to the one this process is running, which is
+        what keeps a workbench started from 7.4 from handing its step to some other pwsh on
+        PATH; passed in only by the tests and by a launcher that pins its own.
+
     .EXAMPLE
         $resolved = Resolve-MigrationStepArguments -Step $step -Workspace $ws -DryRun
         New-MigrationStepDriver -Step $step -Arguments $resolved -Workspace $ws
 
-        Writes the rehearsal driver and returns { RunId; RunFolder; DriverPath; CommandLine;
-        DisplayLine }.
+        Writes the rehearsal driver and returns { RunId; RunFolder; DriverPath; PwshPath;
+        CommandLine; DisplayLine }.
 
     .EXAMPLE
         (New-MigrationStepDriver -Step $step -Arguments $resolved -Workspace $ws).DisplayLine
@@ -94,12 +104,21 @@ function New-MigrationStepDriver {
         [datetime]$Timestamp = [datetime]::Now,
 
         [ValidateNotNullOrEmpty()]
-        [string]$Version
+        [string]$Version,
+
+        [ValidateNotNullOrEmpty()]
+        [string]$PwshPath
     )
 
     if (-not $PSBoundParameters.ContainsKey('Version')) {
         $moduleVersion = $MyInvocation.MyCommand.Module.Version
         $Version = if ($moduleVersion) { [string]$moduleVersion } else { 'unknown' }
+    }
+
+    # The same pwsh the workbench is running in: a workbench started from 7.4 must not hand its
+    # step to whatever 'pwsh' resolves to on PATH.
+    if (-not $PSBoundParameters.ContainsKey('PwshPath')) {
+        $PwshPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     }
 
     $workspacePath = [string]$Workspace.Path
@@ -112,8 +131,19 @@ function New-MigrationStepDriver {
     # workspace fills with empty evidence of runs that never happened.
     Assert-MigrationDriverArgumentSafe -Argument $emitted
 
-    $runId = '{0}_{1}' -f $Timestamp.ToString('yyyyMMdd-HHmmss', [cultureinfo]::InvariantCulture), $Step.Id
-    $runFolder = Join-Path $workspacePath 'Workbench' 'Runs' $runId
+    # Run ids are stamped to the second because that is what the ledger and the filenames carry.
+    # Two runs of one step inside the same second would otherwise share a folder and overwrite
+    # each other's driver, so the second one is -2, the third -3.
+    $runsRoot = Join-Path $workspacePath 'Workbench' 'Runs'
+    $baseId = '{0}_{1}' -f $Timestamp.ToString('yyyyMMdd-HHmmss', [cultureinfo]::InvariantCulture), $Step.Id
+    $runId = $baseId
+    $attempt = 1
+    while (Test-Path -LiteralPath (Join-Path $runsRoot $runId) -PathType Container) {
+        $attempt++
+        $runId = '{0}-{1}' -f $baseId, $attempt
+    }
+
+    $runFolder = Join-Path $runsRoot $runId
     $driverPath = Join-Path $runFolder 'driver.ps1'
 
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -161,15 +191,20 @@ function New-MigrationStepDriver {
         Set-Content -LiteralPath $driverPath -Value $lines.ToArray() -Encoding utf8 -ErrorAction Stop
     }
 
-    # The same pwsh the workbench is running in: a workbench started from 7.4 must not hand its
-    # step to whatever 'pwsh' resolves to on PATH.
-    $pwshPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    # Both paths are rendered as literals rather than interpolated: 'C:\Program Files\PowerShell\
+    # 7\pwsh.exe' holds a space and an operator's workspace can hold an apostrophe, and a command
+    # line an operator cannot paste back into a prompt is worse than no command line at all. The
+    # runner reads PwshPath rather than splitting this string back apart.
+    $commandLine = '& {0} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {1}' -f
+        (ConvertTo-MigrationPowerShellLiteral -Value $PwshPath),
+    (ConvertTo-MigrationPowerShellLiteral -Value $driverPath)
 
     return [pscustomobject]@{
         RunId       = $runId
         RunFolder   = $runFolder
         DriverPath  = $driverPath
-        CommandLine = "$pwshPath -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '$driverPath'"
+        PwshPath    = $PwshPath
+        CommandLine = $commandLine
         DisplayLine = Format-MigrationStepCommandLine -Step $Step -Argument $emitted
     }
 }
