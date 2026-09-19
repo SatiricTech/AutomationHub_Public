@@ -65,6 +65,12 @@ mismatch: `-Step` exits `1` whatever the step returned, because an unattended ca
 nothing but the exit code and a step that exited `0` against the wrong tenant must not read as
 a reason to run the next one. An aborted run still exits `130`.
 
+Every refusal, and the tenant-mismatch line, is written once as a plain line on the process's
+standard error stream and once more to the run log. A scheduler or shell that redirects stderr
+captures them; a PowerShell caller that runs the script in-process with `2>&1` does not (that
+operator redirects PowerShell's error stream, not the process's) — read the exit code and the
+log instead.
+
 ### The workspace
 
 One migration per workspace folder, and that folder is `-OutputPath` for every step — files

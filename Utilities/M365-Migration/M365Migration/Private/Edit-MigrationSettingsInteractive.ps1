@@ -124,14 +124,9 @@ function Edit-MigrationSettingsInteractive {
                 $answer = [string](Read-MigrationPrompt -Kind 'Text' -Message "$message (old=new;old2=new2)" `
                         -Default ($pairs -join ';'))
 
-                $map = [ordered]@{}
-                foreach ($pair in @($answer -split ';')) {
-                    $parts = $pair -split '=', 2
-                    if ($parts.Count -ne 2) { continue }
-                    $left = $parts[0].Trim()
-                    if (-not $left) { continue }
-                    $map[$left] = $parts[1].Trim()
-                }
+                # One parser for every map the workbench takes in (settings form, console
+                # override, window override): a rule with two homes ends up with two meanings.
+                $map = ConvertFrom-MigrationMapText -Text $answer
                 Set-MigrationFormValue -Document $document -Key $key -Value $map
             }
 

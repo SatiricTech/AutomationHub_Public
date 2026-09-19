@@ -407,11 +407,9 @@
                     $typed = ([string](Read-MigrationPrompt -Kind 'Text' `
                                 -Message "Type '$required' exactly to continue")).Trim()
 
-                    # A domain is compared without case, because DNS has none and an operator
-                    # who typed NewCo.com has typed the domain; a keyword such as REMOVE is
-                    # compared with case, because shouting it is the point.
-                    $accepted = if ($required -like '*.*') { $typed -ieq $required } else { $typed -ceq $required }
-                    if ($accepted) { continue }
+                    # The engine owns the match rule (domain without case, anything else with
+                    # case); the window and the unattended path judge through the same call.
+                    if (Test-MigrationTypedConfirmation -Typed $typed -Required $required) { continue }
 
                     Write-Host "  The run was not started: '$required' was expected, not '$typed'." `
                         -ForegroundColor Red

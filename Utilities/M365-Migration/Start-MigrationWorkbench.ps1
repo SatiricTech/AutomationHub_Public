@@ -118,6 +118,12 @@
     exited 0 against the wrong tenant must not read as a reason to run the next one. An aborted
     run still exits 130, because "I stopped this" is the fact the caller needs first.
 
+    Every refusal and the tenant-mismatch line are written once to the process's standard
+    error stream as a plain line, and once more to the run log. A scheduler or shell that
+    redirects stderr captures them; a PowerShell caller that runs this script in-process with
+    2>&1 does not, because that operator redirects PowerShell's error stream, not the
+    process's - read the exit code and the log in that case.
+
     No secret ever reaches the driver file or the settings file. A step that takes a
     -ClientSecret and has no certificate thumbprint configured reads the secret from
     $env:M365MIGRATION_CLIENT_SECRET and passes it to the child process's environment block only.
