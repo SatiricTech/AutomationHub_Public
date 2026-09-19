@@ -154,7 +154,7 @@ Keyed by script basename. Every key below is optional except `Phase`, `Side`, `T
     }
     Resolve   = @{ PlanPath = 'Plan' }    # parameter -> resolver name (see 5.3)
     Requires  = @('Plan', 'Readiness-Pre')
-    Produces  = @('Results')              # artefact kinds the scanner looks for: Results | Report | Inventory | Plan | Mapping | Log | Export:<name>
+    Produces  = @('Results')              # artefact kinds the scanner looks for: Results | Report:<name> | Inventory | Plan | Mapping | Log
     ExitCodes = @{ 0 = 'Completed'; 1 = 'Failed'; 2 = 'Some rows failed' }
     Confirm   = $true                     # pass -Confirm:$false (ConfirmImpact High)
     Instances = @()                       # see readiness/inventory entries for the shape
@@ -235,7 +235,9 @@ State per step instance:
 | `Stale` | done, but the plan it consumed is older than the pinned plan |
 
 "Next step" is the lowest-ordered instance whose `Requires` are all `Done` and whose own
-state is not `Done`.
+state is not `Done`. A `Requires` entry that names an artefact kind rather than a step
+instance (see 5.2) is satisfied when that artefact exists in the workspace, whether or not
+the step that would have produced it has run here.
 
 Reading a results CSV for the summary reads only the `Status` column; the `GeneratedPassword`
 column is never read, rendered or persisted by the workbench.

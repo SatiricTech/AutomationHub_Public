@@ -105,16 +105,21 @@ function Get-MigrationStep {
         $scriptPath = Join-Path $ToolkitPath "$name.ps1"
         $introspection = Get-MigrationScriptParameter -ScriptPath $scriptPath
 
+        # The default id is the script's name with the 'Migration' noun prefix removed:
+        # New-MigrationUsers -> New-Users. Anchored to the verb so it can only ever strip the
+        # one after the leading verb, never a 'Migration' that appears later in a noun.
+        $defaultId = $name -replace '^(\w+)-Migration', '$1-'
+
         $definitions = @(Get-MigrationCatalogValue -Entry $entry -Instance $null -Key 'Instances' -Default @())
         if ($definitions.Count -eq 0) {
             # No instances declared: the script is one step, named after itself.
-            $definitions = @(@{ Id = ($name -replace 'Migration', '') })
+            $definitions = @(@{ Id = $defaultId })
         }
 
         $scriptInstances = [System.Collections.Generic.List[object]]::new()
         foreach ($definition in $definitions) {
             $instanceId = [string](Get-MigrationCatalogValue -Entry $definition -Instance $null -Key 'Id' `
-                    -Default ($name -replace 'Migration', ''))
+                    -Default $defaultId)
             $scriptInstances.Add((New-MigrationStepObject -Entry $entry -Instance $definition -Id $instanceId `
                         -Script $name -ScriptPath $scriptPath -Introspection $introspection))
         }

@@ -18,6 +18,49 @@ Describe 'StepCatalog drift guard' {
             Where-Object { $_.Name -ne 'Start-MigrationWorkbench.ps1' })
     $scriptCases = @($scriptFiles | ForEach-Object { @{ Name = $_.BaseName; Path = $_.FullName } })
 
+    <#
+        The ruled runbook, pinned row by row. This is the one place the catalogue is not
+        allowed to be self-consistent: renaming an instance, moving it in the runbook, pointing
+        it at the other tenant or changing what it is allowed to do to that tenant are all
+        decisions taken outside this file, so each has to be restated here to be changed.
+    #>
+    $ruledInstances = @(
+        @{ Id = 'Inventory-Source'; Order = 1; Side = 'Source'; Impact = 'Read' }
+        @{ Id = 'Inventory-Destination'; Order = 2; Side = 'Destination'; Impact = 'Read' }
+        @{ Id = 'New-IdentityPlan'; Order = 3; Side = 'Offline'; Impact = 'Read' }
+        @{ Id = 'Export-MappingFile'; Order = 4; Side = 'Offline'; Impact = 'Read' }
+        @{ Id = 'Readiness-Pre'; Order = 5; Side = 'Destination'; Impact = 'Read' }
+        @{ Id = 'New-Users'; Order = 6; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'Set-Licenses'; Order = 7; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'New-Recipients'; Order = 8; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'Readiness-Provisioned'; Order = 9; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'DomainReferences-Report'; Order = 11; Side = 'Source'; Impact = 'Read' }
+        @{ Id = 'DomainReferences-Remediate'; Order = 11.5; Side = 'Source'; Impact = 'Destructive' }
+        @{ Id = 'Set-Identity'; Order = 12; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'Set-Identity-InPlace'; Order = 12; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'Set-MailboxPermissions'; Order = 13; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'Reset-CutoverPasswords'; Order = 14; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'TeamsPhone-Export'; Order = 15.1; Side = 'Source'; Impact = 'Read' }
+        @{ Id = 'TeamsPhone-Remove'; Order = 15.2; Side = 'Source'; Impact = 'Destructive' }
+        @{ Id = 'TeamsPhone-ListUnassigned'; Order = 15.3; Side = 'Destination'; Impact = 'Read' }
+        @{ Id = 'TeamsPhone-Assign'; Order = 15.4; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'VivaLearning-Export'; Order = 16.1; Side = 'Source'; Impact = 'Read' }
+        @{ Id = 'VivaLearning-Import'; Order = 16.2; Side = 'Destination'; Impact = 'Write' }
+        @{ Id = 'Readiness-Post'; Order = 17; Side = 'Destination'; Impact = 'Read' }
+        @{ Id = 'Inventory-Post'; Order = 18; Side = 'Destination'; Impact = 'Read' }
+        @{ Id = 'Compare-Plan'; Order = 18.5; Side = 'Offline'; Impact = 'Read' }
+    )
+    $ruledIdCase = @(@{ Ids = @($ruledInstances | ForEach-Object { $_.Id }) })
+
+    # The scenario views, exactly. An 'is not in the list' assertion alone would pass against
+    # an empty view, so both lists are stated in full.
+    $inPlaceIdCase = @(@{
+            Ids = @(
+                'Inventory-Source', 'New-IdentityPlan', 'Readiness-Pre', 'Readiness-Provisioned',
+                'Set-Identity-InPlace', 'Set-MailboxPermissions', 'Readiness-Post', 'Inventory-Post',
+                'Compare-Plan')
+        })
+
     BeforeAll {
         # Match the scripts, which run under Set-StrictMode -Version Latest.
         Set-StrictMode -Version Latest
@@ -89,6 +132,26 @@ Describe 'StepCatalog drift guard' {
             }
 
             return @($names | Sort-Object -Unique)
+        }
+
+        # Read as calls, not as text: a raw regex over the source would also match the word
+        # inside a comment or a help block, so a connector nobody calls could still "pass".
+        function script:Get-MigrationConnectorCall {
+            [CmdletBinding()]
+            [OutputType([string[]])]
+            param([Parameter(Mandatory)][string]$Path)
+
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+            $calls = @($ast.FindAll({
+                        $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+                        $args[0].GetCommandName() -match '^Connect-Migration(Graph|Exchange|Teams)$'
+                    }, $true))
+
+            $connectors = foreach ($call in $calls) {
+                ($call.GetCommandName() -replace '^Connect-Migration', '')
+            }
+
+            return @($connectors | Sort-Object -Unique)
         }
 
         function script:Test-MigrationScriptConfirmImpactHigh {
@@ -184,8 +247,11 @@ Describe 'StepCatalog drift guard' {
     It '<Name>: Fixed values satisfy ValidateSet' -ForEach $scriptCases {
         foreach ($inst in (Get-MigrationStep -Script $Name).Instances) {
             foreach ($k in @($inst.Fixed.Keys)) {
-                $p = (Get-MigrationStep -Script $Name).Parameters | Where-Object Name -eq $k
-                if ($p.ValidValues) { $p.ValidValues | Should -Contain $inst.Fixed[$k] }
+                # Matched to an array first: a key that names no parameter must fail saying so,
+                # not throw a PropertyNotFoundException off $null under strict mode.
+                $p = @((Get-MigrationStep -Script $Name).Parameters | Where-Object Name -eq $k)
+                $p.Count | Should -Be 1 -Because "$($inst.Id) fixes -$k, which must be a real parameter"
+                if ($p[0].ValidValues) { $p[0].ValidValues | Should -Contain $inst.Fixed[$k] }
             }
         }
     }
@@ -194,10 +260,41 @@ Describe 'StepCatalog drift guard' {
         $step = Get-MigrationStep -Script $Name
         foreach ($inst in $step.Instances) {
             foreach ($k in @($inst.Fixed.Keys)) {
-                $p = @($step.Parameters | Where-Object Name -eq $k)[0]
-                if ($p.IsSwitch -or $p.IsBool) {
+                $p = @($step.Parameters | Where-Object Name -eq $k)
+                $p.Count | Should -Be 1 -Because "$($inst.Id) fixes -$k, which must be a real parameter"
+                if ($p[0].IsSwitch -or $p[0].IsBool) {
                     $inst.Fixed[$k] | Should -BeOfType [bool] -Because "$($inst.Id) fixes -$k"
                 }
+            }
+        }
+    }
+
+    It '<Name>: a side-scoped Bind source matches the step''s own side' -ForEach $scriptCases {
+        # A Destination-side writer that reads the source tenant's GUID would connect to the
+        # wrong tenant and the run would look entirely normal, so the side and the settings
+        # section a binding draws from have to agree. Offline steps bind neither section.
+        $steps = @(Get-MigrationStep -Script $Name) + @((Get-MigrationStep -Script $Name).Instances)
+        foreach ($step in $steps) {
+            foreach ($key in @($step.Bind.Keys)) {
+                if ($key -like 'Source.*') {
+                    $step.Side | Should -BeExactly 'Source' `
+                        -Because "$($step.Id) binds $key -> -$($step.Bind[$key])"
+                }
+                elseif ($key -like 'Destination.*') {
+                    $step.Side | Should -BeExactly 'Destination' `
+                        -Because "$($step.Id) binds $key -> -$($step.Bind[$key])"
+                }
+            }
+        }
+    }
+
+    It '<Name>: no parameter is both fixed and bound' -ForEach $scriptCases {
+        # Two sources for one parameter is a silent precedence question. Where every instance
+        # fixes a parameter, the script's entry must not also bind it.
+        foreach ($inst in (Get-MigrationStep -Script $Name).Instances) {
+            foreach ($k in @($inst.Fixed.Keys)) {
+                @($inst.Bind.Values) | Should -Not -Contain $k `
+                    -Because "$($inst.Id) fixes -$k, so nothing may bind it as well"
             }
         }
     }
@@ -239,10 +336,9 @@ Describe 'StepCatalog drift guard' {
     }
 
     It '<Name>: Connects names the connectors the script actually calls' -ForEach $scriptCases {
-        $source = Get-Content -LiteralPath $Path -Raw
-        $expected = @('Graph', 'Exchange', 'Teams') | Where-Object { $source -match "Connect-Migration$_\b" }
+        $expected = @(Get-MigrationConnectorCall -Path $Path)
         $declared = @((Get-MigrationStep -Script $Name).Connects)
-        ($declared | Sort-Object) -join ',' | Should -BeExactly (($expected | Sort-Object) -join ',')
+        ($declared | Sort-Object) -join ',' | Should -BeExactly ($expected -join ',')
     }
 
     It 'gives every instance a unique Id and a title' {
@@ -304,6 +400,40 @@ Describe 'StepCatalog drift guard' {
         }
     }
 
+    It 'gives <Id> exit <Code> the ruled meaning "<Meaning>"' -ForEach @(
+        @{ Id = 'DomainReferences-Report'; Code = 3; Meaning = 'References remain' }
+        @{ Id = 'DomainReferences-Remediate'; Code = 3; Meaning = 'References remain' }
+        @{ Id = 'Compare-Plan'; Code = 2; Meaning = 'Differences found' }
+        @{ Id = 'Readiness-Pre'; Code = 2; Meaning = 'Checks failed' }
+        @{ Id = 'Readiness-Provisioned'; Code = 2; Meaning = 'Checks failed' }
+        @{ Id = 'Readiness-Post'; Code = 2; Meaning = 'Checks failed' }
+        @{ Id = 'Set-Licenses'; Code = 1; Meaning = 'Failed or seat shortfall' }
+    ) {
+        (Get-MigrationStep -Id $Id).ExitCodes[$Code] | Should -BeExactly $Meaning
+    }
+
+    It 'leaves every other step on the shared 0/1/2 vocabulary' {
+        $overridden = @(
+            'DomainReferences-Report', 'DomainReferences-Remediate', 'Compare-Plan',
+            'Readiness-Pre', 'Readiness-Provisioned', 'Readiness-Post', 'Set-Licenses')
+        foreach ($step in (Get-MigrationStep | Where-Object { $overridden -notcontains $_.Id })) {
+            @($step.ExitCodes.Keys | Sort-Object) | Should -Be @(0, 1, 2) -Because "$($step.Id)"
+            $step.ExitCodes[1] | Should -BeExactly 'Failed'
+            $step.ExitCodes[2] | Should -BeExactly 'Some rows failed'
+        }
+    }
+
+    It 'pins <Id> at order <Order>, side <Side>, impact <Impact>' -ForEach $ruledInstances {
+        $step = Get-MigrationStep -Id $Id
+        $step.Order | Should -Be $Order
+        $step.Side | Should -BeExactly $Side
+        $step.Impact | Should -BeExactly $Impact
+    }
+
+    It 'has exactly the ruled instances and no others' -ForEach $ruledIdCase {
+        @((Get-MigrationStep).Id | Sort-Object) | Should -Be @($Ids | Sort-Object)
+    }
+
     It 'orders the phase view like the runbook' {
         $ids = (Get-MigrationStep | Sort-Object Order).Id
         $ids[0] | Should -Be 'Inventory-Source'
@@ -313,6 +443,16 @@ Describe 'StepCatalog drift guard' {
 
     It 'hides tenant-to-tenant-only steps for InPlaceRedesign' {
         (Get-MigrationStep -Scenario 'InPlaceRedesign').Id | Should -Not -Contain 'DomainReferences-Report'
+    }
+
+    It 'shows exactly the nine in-place steps, in runbook order' -ForEach $inPlaceIdCase {
+        @((Get-MigrationStep -Scenario 'InPlaceRedesign') | Sort-Object Order | ForEach-Object Id) |
+            Should -Be $Ids
+    }
+
+    It 'shows every instance but the in-place identity cutover for TenantToTenant' -ForEach $ruledIdCase {
+        $expected = @($Ids | Where-Object { $_ -ne 'Set-Identity-InPlace' } | Sort-Object)
+        @((Get-MigrationStep -Scenario 'TenantToTenant').Id | Sort-Object) | Should -Be $expected
     }
 
     It 'keeps <Id> out of the InPlaceRedesign phase view' -ForEach @(

@@ -41,7 +41,20 @@
     An instance may override any key above. Bind, Resolve and Fixed are merged with the
     script's, the instance winning - Bind by target parameter, so an instance that binds the
     destination tenant to -TenantId replaces the script's source-tenant binding rather than
-    leaving both in place.
+    leaving both in place. A parameter has exactly one source: where every instance of a
+    script fixes a parameter, the script's entry does not also bind it.
+
+    Shared artefacts. When two instances of one script write results under the same token -
+    the domain-release report and remediation both write Remove-DomainReferences results - a
+    results file belongs to the instance named in that run's ledger entry. With no ledger
+    entry (a file copied in, or a run made from the command line) it is attributed to the
+    lowest-ordered instance of that script. Where the two instances write to different
+    -Prefix folders instead, the folder alone tells them apart and no attribution is needed.
+
+    That is why the two source-side exports fix -Prefix to 'Source' rather than binding Label:
+    the Export:<StepId> resolver looks for another step's results in the producing instance's
+    own prefix folder, so the Teams Phone export in Source/ can never be confused with the
+    destination-side unassigned-number listing that the same toolkit writes to <Label>/.
 
     Author: AutomationHub
     Written with assistance from Claude (Anthropic).
@@ -223,9 +236,10 @@
                 Id      = 'Readiness-Provisioned'
                 Title   = 'Readiness - provisioned'
                 Order   = 9
+                Impact  = 'Write'
                 Fixed   = @{ Stage = 'Provisioned' }
                 Resolve = @{ SourceMailboxesCsv = 'Inventory:Source:UserMailboxes' }
-                Notes   = 'Writes MailboxProvisioned and OneDriveProvisioned back to the plan.'
+                Notes   = 'Writes MailboxProvisioned/OneDriveProvisioned to the plan; a drive read can provision one.'
             }
             @{
                 Id    = 'Readiness-Post'
@@ -498,8 +512,8 @@
             'Report:TeamsPhoneNumbers-Unassigned'
             'Log'
         )
+        # Every instance fixes -Prefix, so the entry does not also bind Label to it.
         Bind      = @{
-            'Label'              = 'Prefix'
             'Defaults.Verbosity' = 'Verbosity'
             'Source.TenantId'    = 'TenantId'
         }
@@ -512,7 +526,8 @@
                 Id    = 'TeamsPhone-Export'
                 Title = 'Teams Phone - export the source assignments'
                 Order = 15.1
-                Notes = 'Run this before anything releases a number.'
+                Fixed = @{ Prefix = 'Source' }
+                Notes = 'Run before anything releases a number. Files land in Source/, where Export: looks.'
             }
         )
     }
@@ -604,8 +619,8 @@
         ResultId  = 'Get-VivaLearningHistory'
         Requires  = @()
         Produces  = @('Results', 'Report:VivaLearningHistory', 'Log')
+        # Every instance fixes -Prefix, so the entry does not also bind Label to it.
         Bind      = @{
-            'Label'              = 'Prefix'
             'Defaults.Verbosity' = 'Verbosity'
             'Source.TenantId'    = 'TenantId'
         }
@@ -618,6 +633,8 @@
                 Id    = 'VivaLearning-Export'
                 Title = 'Viva Learning - export the source history'
                 Order = 16.1
+                Fixed = @{ Prefix = 'Source' }
+                Notes = 'Files land in Source/, where Export: looks when the import resolves -CsvPath.'
             }
         )
     }
