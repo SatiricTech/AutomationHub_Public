@@ -9,6 +9,10 @@ BeforeAll {
     # Mock needs a command to replace, and Microsoft.Graph.Authentication is not installed on a
     # build agent, so the one SDK cmdlet this file mocks is stubbed into the module scope first.
     # The stub stands aside when the real cmdlet exists.
+    #
+    # The body throws: a stub that returned $null would let an unmocked call sail past here while
+    # the same test reached the real cmdlet (and a real network call) on a machine with the SDK
+    # installed, so the file would behave differently in the two places. Throwing makes that loud.
     InModuleScope M365Migration {
         if (-not (Get-Command -Name 'Invoke-MgGraphRequest' -ErrorAction SilentlyContinue)) {
             function script:Invoke-MgGraphRequest {
@@ -19,7 +23,7 @@ BeforeAll {
                     [string]$Method, [string]$Uri, $Body,
                     [hashtable]$Headers, [string]$ContentType, [string]$OutputType
                 )
-                return $null
+                throw 'Unmocked SDK call: Invoke-MgGraphRequest'
             }
         }
     }

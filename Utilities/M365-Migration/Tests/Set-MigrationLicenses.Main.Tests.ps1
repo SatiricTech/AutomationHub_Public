@@ -142,6 +142,9 @@ BeforeAll {
 
         $global:licenseConnectCalls = 0
         $global:licenseGraphCalls.Clear()
+        # Reset to the stated default - 5 spare SPE_E3 seats, enough for both licensed rows - so a
+        # Describe that does not set it cannot silently inherit the shortfall from the one before.
+        $global:licenseSeatsAvailable = 5
 
         return [pscustomobject]@{ Workspace = $workspace; PlanPath = $planPath }
     }

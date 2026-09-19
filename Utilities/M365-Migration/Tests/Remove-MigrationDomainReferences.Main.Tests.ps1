@@ -190,15 +190,41 @@ Describe 'Remove-MigrationDomainReferences Main - a report run with references s
 Describe 'Remove-MigrationDomainReferences Main - a tenant with nothing left on the domain' {
 
     BeforeAll {
-        $workspace = New-DomainWorkspace -Root $TestDrive -Name 'Clean'
+        $script:cleanWorkspace = New-DomainWorkspace -Root $TestDrive -Name 'Clean'
         $global:domainUsers = @()
 
-        & $script:scriptPath -Domain 'contoso.com' -OutputPath $workspace -Verbosity Low
+        & $script:scriptPath -Domain 'contoso.com' -OutputPath $script:cleanWorkspace -Verbosity Low
         $script:cleanExitCode = $LASTEXITCODE
+        $script:cleanFiles = @(Get-ChildItem -LiteralPath $script:cleanWorkspace -Filter 'DomainReferences_*.csv')
+        $script:cleanRows = if ($script:cleanFiles.Count -eq 1) {
+            @(Import-Csv -LiteralPath $script:cleanFiles[0].FullName)
+        }
+        else { @() }
     }
 
     It 'Exits 0' {
         $script:cleanExitCode | Should -Be 0
+    }
+
+    # Exit 0 on its own would also be what a run that never enumerated anything produced, so the
+    # next two assertions are what separate 'scanned, found nothing' from 'never scanned'.
+    It 'Ran the directory pass exactly once' {
+        $global:domainUserQueryCount | Should -Be 1
+    }
+
+    It 'Wrote the DomainReferences report with no reference in it' {
+        $script:cleanFiles.Count | Should -Be 1
+        $script:cleanRows.Count | Should -Be 1
+        $script:cleanRows[0].Info | Should -BeExactly 'No DomainReferences records found.'
+    }
+
+    It 'Read the domain list, the soft-deleted users and domainNameReferences as well' {
+        # 'isInitial' appears only in the domain-list query, so it identifies that pass without a
+        # pattern that '?' (a single-character wildcard to -like) could blur into a different URI.
+        foreach ($fragment in @('isInitial', 'deletedItems', 'domainNameReferences')) {
+            @($global:domainGraphCalls | Where-Object { $_.Uri -like "*$fragment*" }).Count |
+                Should -BeGreaterThan 0 -Because "the $fragment pass has to have run for exit 0 to mean anything"
+        }
     }
 }
 

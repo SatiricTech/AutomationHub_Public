@@ -10,12 +10,17 @@ BeforeAll {
     # Graph and Exchange cmdlet this file mocks is stubbed into the module scope first. Without
     # these the file only passes on a machine that happens to have Microsoft.Graph.Authentication
     # and ExchangeOnlineManagement installed. Each stub stands aside when the real cmdlet exists.
+    #
+    # Every stub body throws. A stub that returned $null would let an unmocked call sail past on a
+    # machine without the SDKs while the same test reached the real cmdlet (and a real network
+    # call) on a machine with them - the file would then behave differently in the two places,
+    # which is exactly what stubbing was supposed to rule out. Throwing makes the gap loud.
     InModuleScope M365Migration {
         if (-not (Get-Command -Name 'Get-MgContext' -ErrorAction SilentlyContinue)) {
             function script:Get-MgContext {
                 [CmdletBinding()]
                 param()
-                return $null
+                throw 'Unmocked SDK call: Get-MgContext'
             }
         }
 
@@ -25,6 +30,7 @@ BeforeAll {
                 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
                     Justification = 'Signature-only stub; the parameters exist to be bound, not read.')]
                 param([string[]]$Scopes, [string]$TenantId, [switch]$NoWelcome)
+                throw 'Unmocked SDK call: Connect-MgGraph'
             }
         }
 
@@ -32,6 +38,7 @@ BeforeAll {
             function script:Disconnect-MgGraph {
                 [CmdletBinding()]
                 param()
+                throw 'Unmocked SDK call: Disconnect-MgGraph'
             }
         }
 
@@ -44,7 +51,7 @@ BeforeAll {
                     [string]$Method, [string]$Uri, $Body,
                     [hashtable]$Headers, [string]$ContentType, [string]$OutputType
                 )
-                return $null
+                throw 'Unmocked SDK call: Invoke-MgGraphRequest'
             }
         }
 
@@ -52,7 +59,7 @@ BeforeAll {
             function script:Get-ConnectionInformation {
                 [CmdletBinding()]
                 param()
-                return $null
+                throw 'Unmocked SDK call: Get-ConnectionInformation'
             }
         }
 
@@ -62,6 +69,7 @@ BeforeAll {
                 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
                     Justification = 'Signature-only stub; the parameters exist to be bound, not read.')]
                 param([string]$DelegatedOrganization, [switch]$ShowBanner)
+                throw 'Unmocked SDK call: Connect-ExchangeOnline'
             }
         }
 
@@ -70,8 +78,9 @@ BeforeAll {
             function script:Disconnect-ExchangeOnline {
                 [CmdletBinding(SupportsShouldProcess)]
                 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '',
-                    Justification = 'The attribute is here only so -Confirm binds; the stub does nothing.')]
+                    Justification = 'The attribute is here only so -Confirm binds; the stub never mutates.')]
                 param()
+                throw 'Unmocked SDK call: Disconnect-ExchangeOnline'
             }
         }
     }

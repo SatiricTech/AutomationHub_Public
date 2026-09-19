@@ -93,7 +93,11 @@ BeforeAll {
         # has no slash after 'users' and so does not match this pattern.
         if ($Uri -like '/v1.0/users/*') {
             $id = ($Uri -split '\?')[0].Split('/')[-1]
-            $name = @($global:readinessUserIds.Keys | Where-Object { $global:readinessUserIds[$_] -eq $id })[0]
+            # Select-Object, not [0]: indexing an empty array throws under Set-StrictMode -Version
+            # Latest, which would make the not-found guard below unreachable.
+            $name = $global:readinessUserIds.Keys |
+                Where-Object { $global:readinessUserIds[$_] -eq $id } |
+                Select-Object -First 1
             if (-not $name) { return $null }
             return [pscustomobject]@{
                 id                = $id
