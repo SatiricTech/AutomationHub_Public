@@ -21,6 +21,9 @@ $ErrorActionPreference = 'Stop'
 $script:MigrationRun = $null
 $script:SkuCatalog = $null
 $script:MigrationPlanBackups = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+# Script introspection is expensive (Get-Command parses the file, Get-Help parses it again),
+# so Get-MigrationScriptParameter memoises per path + LastWriteTimeUtc for the session.
+$script:MigrationScriptParameterCache = @{}
 
 $privateFiles = @(Get-ChildItem -Path (Join-Path $PSScriptRoot 'Private') -Filter '*.ps1' -ErrorAction SilentlyContinue | Sort-Object Name)
 $publicFiles = @(Get-ChildItem -Path (Join-Path $PSScriptRoot 'Public') -Filter '*.ps1' -ErrorAction SilentlyContinue | Sort-Object Name)
