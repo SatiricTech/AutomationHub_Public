@@ -367,6 +367,48 @@ Describe 'Resolve-MigrationStepArguments against the committed fixture' {
             $result.Warnings | Should -BeNullOrEmpty
         }
     }
+
+    Context 'the parameters the workbench owns' {
+
+        <#
+            An Operator rung that could set -DryRun, -Wave, -OutputPath or -TenantId is a second
+            source of truth that outranks the first silently: the ledger would record the wave
+            the run was told to use while the driver ran the wave that was typed, and the
+            scanner would then read that line as a live run of a step nothing provisioned.
+        #>
+
+        It 'drops every parameter the engine says it owns, and names each one' {
+            $step = Get-MigrationStep -Id 'New-Users'
+            $result = Resolve-MigrationStepArguments -Step $step -Workspace $script:Workspace -Wave '1' `
+                -Override @{ Wave = '3'; DryRun = $true; TenantId = '22222222-2222-2222-2222-222222222222' }
+
+            (Get-Argument $result 'Wave').Value | Should -Be @('1')
+            (Get-Argument $result 'Wave').Source | Should -BeExactly 'Common'
+            Test-HasArgument $result 'DryRun' | Should -BeFalse
+            (Get-Argument $result 'TenantId').Value |
+                Should -BeExactly '00000000-0000-0000-0000-000000000000'
+
+            $warnings = @($result.Warnings) -join ' '
+            foreach ($name in @('Wave', 'DryRun', 'TenantId')) {
+                $warnings | Should -Match "$name is set by the workbench, not by an override"
+            }
+        }
+
+        It 'keeps a live run live even when the override asked for a rehearsal' {
+            $step = Get-MigrationStep -Id 'New-Users'
+            $result = Resolve-MigrationStepArguments -Step $step -Workspace $script:Workspace `
+                -Override @{ DryRun = $true }
+            Test-HasArgument $result 'DryRun' | Should -BeFalse
+        }
+
+        It 'refuses an owned name whatever case it was typed in' {
+            $step = Get-MigrationStep -Id 'New-Users'
+            $result = Resolve-MigrationStepArguments -Step $step -Workspace $script:Workspace `
+                -Override @{ outputpath = '/tmp/elsewhere' }
+            (Get-Argument $result 'OutputPath').Value | Should -BeExactly $script:Workspace.Path
+            @($result.Warnings) -join ' ' | Should -Match 'OutputPath is set by the workbench'
+        }
+    }
 }
 
 Describe 'Resolve-MigrationStepArguments on workspaces that are not the happy path' {

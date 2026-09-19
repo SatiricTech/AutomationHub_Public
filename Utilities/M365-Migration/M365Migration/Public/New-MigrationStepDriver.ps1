@@ -23,6 +23,11 @@ function New-MigrationStepDriver {
         business; re-stating it here would freeze today's value into a file that outlives the
         script. An argument with no value is left out for the same reason.
 
+        The returned object carries the DryRun and Wave the file will actually run with, taken
+        from those same emitted arguments. Invoke-MigrationStep records them in the ledger from
+        here rather than from its own caller's switches, so the ledger describes the run that
+        happened and not the run the front end thought it was asking for.
+
         The run folder is named for the second the run started, which is the same resolution the
         ledger and the toolkit's filenames use. A second run of the same step inside that second
         would otherwise land in the same folder and overwrite the first one's driver, so it is
@@ -89,7 +94,7 @@ function New-MigrationStepDriver {
         New-MigrationStepDriver -Step $step -Arguments $resolved -Workspace $ws
 
         Writes the rehearsal driver and returns { RunId; RunFolder; DriverPath; PwshPath;
-        CommandLine; DisplayLine }.
+        CommandLine; DisplayLine; DryRun; Wave }.
 
     .EXAMPLE
         (New-MigrationStepDriver -Step $step -Arguments $resolved -Workspace $ws).DisplayLine
@@ -149,6 +154,20 @@ function New-MigrationStepDriver {
     # Checked before anything is created: a refusal must leave no run folder behind, or the
     # workspace fills with empty evidence of runs that never happened.
     Assert-MigrationDriverArgumentSafe -Argument $emitted
+
+    # The mode and the waves this driver will actually run with, read off the arguments it
+    # emits rather than taken from whatever the caller believes it asked for. Invoke-MigrationStep
+    # records these in the ledger, and the ledger is the only account of the run that outlives
+    # the workspace's files: a line saying 'rehearsal' for a live run is what the DryRunFirst
+    # gate reads the next time somebody asks whether this step was practised.
+    $driverDryRun = $false
+    $driverWave = @()
+    foreach ($argument in $emitted) {
+        switch ([string]$argument.Name) {
+            'DryRun' { $driverDryRun = [bool]$argument.Value }
+            'Wave' { $driverWave = @(@($argument.Value) | ForEach-Object { [string]$_ } | Where-Object { $_ }) }
+        }
+    }
 
     # Same rule for the secret mappings: a mapping naming a parameter the script does not have,
     # or one that does not take a SecureString, would produce a driver that fails in the child
@@ -259,5 +278,7 @@ function New-MigrationStepDriver {
         PwshPath    = $PwshPath
         CommandLine = $commandLine
         DisplayLine = $displayLine
+        DryRun      = $driverDryRun
+        Wave        = @($driverWave)
     }
 }

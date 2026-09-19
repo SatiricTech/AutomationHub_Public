@@ -65,6 +65,13 @@ function Read-MigrationPrompt {
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
         Justification = 'This is the console prompt seam; re-asking an unanswered question is host output by design.')]
+    # The justification is one string literal rather than a concatenation: PSScriptAnalyzer
+    # refuses to read a suppression whose arguments are not string constants, and a suppression
+    # it cannot read is a suppression that does not apply.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'This is the prompt seam coercing a handler''s answer (a test''s scripted string) to
+        the SecureString the Secret kind promises; the value never comes from a file, an argument or a log,
+        and the host branch uses Read-Host -AsSecureString.')]
     [OutputType([object])]
     param(
         [Parameter(Mandatory)]

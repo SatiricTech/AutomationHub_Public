@@ -19,7 +19,13 @@ function Resolve-MigrationStepArguments {
                     -Prefix Source, -AcknowledgeSourceTenant. They are not negotiable.
           Operator  What the operator typed, through -Override. A key that is not a parameter
                     of the script is dropped with a warning rather than passed on to fail in
-                    the child, where the error would be a parameter-binding stack trace.
+                    the child, where the error would be a parameter-binding stack trace. A key
+                    the workbench owns (Get-MigrationWorkbenchOwnedParameter: the mode, the
+                    waves, the workspace, the expected tenant, the log path and the common
+                    parameters the driver sets) is dropped with a warning too, and for a
+                    stronger reason - the value is already decided somewhere the operator can
+                    see, and a second source of truth that outranks the first silently is how a
+                    ledger comes to record a rehearsal for a run that changed the tenant.
           Settings  The catalogue's Bind map, settings key -> parameter. A blank setting is
                     not a value and is left out, so an unset domain never arrives as
                     -SmtpDomain ''. A boolean is always a value: settings that say "do not
@@ -73,7 +79,8 @@ function Resolve-MigrationStepArguments {
 
     .PARAMETER Override
         Operator input, parameter name -> value. Matched case-insensitively against the
-        script's parameters; an unknown name is dropped and reported in Warnings.
+        script's parameters; an unknown name, and any name the workbench owns, is dropped and
+        reported in Warnings.
 
     .PARAMETER DryRun
         Resolve the arguments for a rehearsal, which adds -DryRun.
@@ -149,10 +156,24 @@ function Resolve-MigrationStepArguments {
         $fixedValues[$byName[$name].Name] = $Step.Fixed[$key]
     }
 
+    # The workbench decides these for every run, so an override is dropped before anything else
+    # looks at it - see Get-MigrationWorkbenchOwnedParameter for why each one is owned. Dropped
+    # and never silently: an operator who typed one is told which control actually sets it,
+    # because a value that vanished without a word is how a run comes to be recorded as the wave
+    # that was ticked while the driver runs the wave that was typed.
+    $ownedNames = @(Get-MigrationWorkbenchOwnedParameter)
+
     $operatorValues = [ordered]@{}
     if ($Override) {
         foreach ($key in @($Override.Keys)) {
             $name = [string]$key
+            # -eq on strings is case-insensitive, which is what a parameter name is compared by;
+            # the declared spelling is reported back rather than whatever was typed.
+            $owned = @($ownedNames | Where-Object { $_ -eq $name })
+            if ($owned.Count -gt 0) {
+                $warnings.Add("$($owned[0]) is set by the workbench, not by an override.")
+                continue
+            }
             if (-not $byName.ContainsKey($name)) {
                 $warnings.Add("'$name' is not a parameter of $($Step.Script).ps1, so it was ignored.")
                 continue

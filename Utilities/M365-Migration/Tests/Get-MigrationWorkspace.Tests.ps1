@@ -497,6 +497,38 @@ Describe 'Get-MigrationWorkspace tells a rehearsal from a live run' {
         $step.Summary.Succeeded | Should -Be 2
         $workspace.NextStepId | Should -BeExactly 'Set-Licenses'
     }
+
+    It 'lets a live results file newer than the rehearsal ledger line outrank it' {
+        # The ledger outranks the filenames because it knows what a run was - but only while it
+        # is the newer account of the step. A live run made from the command line after the
+        # rehearsal leaves a newer artefact and no ledger line of its own, and a workbench that
+        # still showed DryRun would be counting the rehearsal's rows and offering the step again.
+        $workspacePath = Copy-FixtureWorkspace -Name 'live-after-ledger-dryrun'
+        Add-Content -LiteralPath (Join-Path $workspacePath 'Workbench' 'Runs.jsonl') -Encoding utf8 -Value (
+            '{"Started":"2026-09-18T10:31:00","Ended":"2026-09-18T10:31:40","StepId":"New-Users",' +
+            '"DryRun":true,"ExitCode":0,"Meaning":"Completed","TenantVerified":true,"Files":[]}')
+        New-ResultFile -Status @('Succeeded', 'Succeeded', 'Succeeded') -Path (
+            Join-Path $workspacePath 'Contoso' 'Contoso_New-Users-Results_20260918-104500.csv')
+
+        $step = Get-WorkspaceStep -Workspace (Get-MigrationWorkspace -Path $workspacePath) -Id 'New-Users'
+        $step.State | Should -BeExactly 'Done'
+        $step.Summary.Succeeded | Should -Be 3
+    }
+
+    It 'does not call a step Done on an older results file when the newest run was aborted' {
+        # Spec section 6: Done needs exit code 0. A run that ended 130 and left nothing behind
+        # is masked by whatever the last successful run wrote unless the ledger's own code is
+        # consulted - and 'the step I just stopped is done' is the worst thing a board can say.
+        $workspacePath = Copy-FixtureWorkspace -Name 'aborted-over-older-results'
+        New-ResultFile -Status @('Succeeded') -Path (Join-Path $workspacePath 'Contoso' `
+                'Contoso_New-Users-Results_20260918-104500.csv')
+        Add-Content -LiteralPath (Join-Path $workspacePath 'Workbench' 'Runs.jsonl') -Encoding utf8 -Value (
+            '{"Started":"2026-09-18T11:00:00","Ended":"2026-09-18T11:00:10","StepId":"New-Users",' +
+            '"DryRun":false,"ExitCode":130,"Meaning":"Aborted by the operator","Aborted":true,"Files":[]}')
+
+        (Get-WorkspaceStep -Workspace (Get-MigrationWorkspace -Path $workspacePath) -Id 'New-Users').State |
+            Should -BeExactly 'Failed'
+    }
 }
 
 Describe 'Get-MigrationWorkspace and the next step' {

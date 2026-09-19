@@ -439,12 +439,16 @@ Describe 'Invoke-MigrationStep' {
 
     Context 'the ledger' {
 
+        # -Value and -Runner carry the same mode and waves on purpose: the ledger's DryRun and
+        # Wave come from the driver, and a caller that asserts anything else is refused before
+        # the child starts (the Context below proves that).
         BeforeAll {
             $script:Workspace = New-TestWorkspace -Name 'RunLedger'
-            Invoke-TestEchoStep -Workspace $script:Workspace -Value @{ ExitWith = 0 } `
+            Invoke-TestEchoStep -Workspace $script:Workspace -Value @{ ExitWith = 0; Wave = @('1'); DryRun = $true } `
                 -Runner @{ Wave = @('1'); DryRun = $true; ExpectedTenantId = $script:SyntheticTenant } | Out-Null
             Start-Sleep -Milliseconds 1100
-            $script:Second = Invoke-TestEchoStep -Workspace $script:Workspace -Value @{ ExitWith = 2 } `
+            $script:Second = Invoke-TestEchoStep -Workspace $script:Workspace `
+                -Value @{ ExitWith = 2; Wave = @('1', '2') } `
                 -Runner @{ Wave = @('1', '2'); GateOverrides = @('DryRunFirst') }
             $script:Lines = Get-LedgerText -Workspace $script:Workspace
         }
@@ -503,6 +507,47 @@ Describe 'Invoke-MigrationStep' {
             Invoke-TestEchoStep -Workspace $workspace `
                 -Runner @{ Environment = @{ M365MIGRATION_TEST = 'synthetic-not-a-secret' } } | Out-Null
             (Get-LedgerText -Workspace $workspace) -join "`n" | Should -Not -Match 'synthetic-not-a-secret'
+        }
+    }
+
+    Context 'the ledger records the driver, not the caller' {
+
+        <#
+            The Operator rung used to be able to outrank the run's own mode and waves, and the
+            ledger took its word for both from the front end's variables. Both halves are closed
+            here: the driver carries what it will run, and a caller that disagrees is refused
+            before the child starts rather than after the tenant has changed.
+        #>
+
+        It 'takes DryRun and Wave from the driver when the caller passes neither' {
+            $workspace = New-TestWorkspace -Name 'RunLedgerFromDriver'
+            Invoke-TestEchoStep -Workspace $workspace -Value @{ ExitWith = 0; DryRun = $true; Wave = @('2') } |
+                Out-Null
+            $line = @(Get-LedgerText -Workspace $workspace)[0]
+            $line | Should -Match '"DryRun":true'
+            $line | Should -Match '"Wave":\["2"\]'
+        }
+
+        It 'refuses a caller whose -DryRun disagrees with the driver, before any child starts' {
+            $workspace = New-TestWorkspace -Name 'RunLedgerModeClash'
+            { Invoke-TestEchoStep -Workspace $workspace -Value @{ ExitWith = 0 } -Runner @{ DryRun = $true } } |
+                Should -Throw '*Resolve the arguments for the mode you are running.*'
+            Get-LedgerText -Workspace $workspace | Should -HaveCount 0
+        }
+
+        It 'refuses a caller whose -Wave disagrees with the driver' {
+            $workspace = New-TestWorkspace -Name 'RunLedgerWaveClash'
+            { Invoke-TestEchoStep -Workspace $workspace -Value @{ ExitWith = 0; Wave = @('1') } `
+                    -Runner @{ Wave = @('3') } } |
+                Should -Throw '*Resolve the arguments for the waves you are running.*'
+            Get-LedgerText -Workspace $workspace | Should -HaveCount 0
+        }
+
+        It 'accepts waves that differ only in order or repeats, which select the same rows' {
+            $workspace = New-TestWorkspace -Name 'RunLedgerWaveSet'
+            Invoke-TestEchoStep -Workspace $workspace -Value @{ ExitWith = 0; Wave = @('2', '1') } `
+                -Runner @{ Wave = @('1', '2', '1') } | Out-Null
+            @(Get-LedgerText -Workspace $workspace)[0] | Should -Match '"Wave":\["2","1"\]'
         }
     }
 

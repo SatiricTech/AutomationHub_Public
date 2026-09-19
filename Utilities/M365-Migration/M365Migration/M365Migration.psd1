@@ -15,6 +15,7 @@
         'Connect-MigrationExchange'
         'Connect-MigrationGraph'
         'Connect-MigrationTeams'
+        'ConvertFrom-MigrationMapText'
         'ConvertFrom-MigrationOutputPath'
         'ConvertFrom-MigrationSafeCell'
         'ConvertTo-MigrationLocalPart'
@@ -27,6 +28,7 @@
         'Format-MigrationE164'
         'Format-MigrationStepGlyph'
         'Format-MigrationStepLastRun'
+        'Format-MigrationTenantVerdict'
         'Format-MigrationWorkbenchView'
         'Get-MigrationAddressChangeSet'
         'Get-MigrationCsvValue'
@@ -44,6 +46,7 @@
         'Get-MigrationSkuCatalog'
         'Get-MigrationStep'
         'Get-MigrationTeamsPolicyName'
+        'Get-MigrationWorkbenchOwnedParameter'
         'Get-MigrationWorkspace'
         'Import-MigrationCsv'
         'Import-MigrationPlan'
@@ -78,6 +81,8 @@
         'Test-MigrationPlanRowActionable'
         'Test-MigrationProtectedAddress'
         'Test-MigrationStepGate'
+        'Test-MigrationTypedConfirmation'
+        'Test-MigrationWorkspaceRunnable'
         'Write-MigrationLog'
     )
     CmdletsToExport      = @()

@@ -367,11 +367,26 @@ function Get-MigrationWorkspace {
 
         # The ledger knows whether a run was a rehearsal; the filenames only imply it. A line
         # that did not record DryRun leaves the field $null, and then the files decide.
+        #
+        # It only outranks the files while it is the newer account. The ruling that put the
+        # ledger first was about the log a rehearsal writes in the same second as its results
+        # file - two records of one run - not about a live run made from the command line after
+        # the rehearsal, which leaves a newer artefact and no ledger line of its own. Comparing
+        # the entry's own Started against the newest live artefact settles both: same run, the
+        # ledger wins; later run, the file does.
         $recordedDryRun = if ($newestEntry) {
             Get-MigrationProperty -InputObject $newestEntry -Name 'DryRun' -Default $null
         }
         else { $null }
-        $isDryRun = if ($null -ne $recordedDryRun) {
+        $entryStarted = if ($newestEntry) {
+            Get-MigrationProperty -InputObject $newestEntry -Name 'Started' -Default $null
+        }
+        else { $null }
+        $ledgerIsCurrent = ($null -ne $recordedDryRun) -and (
+            -not $liveArtefact -or $entryStarted -isnot [datetime] -or
+            $liveArtefact.Timestamp -isnot [datetime] -or $entryStarted -ge $liveArtefact.Timestamp)
+
+        $isDryRun = if ($ledgerIsCurrent) {
             [bool]$recordedDryRun
         }
         else {
@@ -411,7 +426,12 @@ function Get-MigrationWorkspace {
             elseif ($exitCode -eq 3) { 'WorkRemains' }
             elseif ($isDryRun) { 'DryRun' }
             elseif ($summary.Failed -gt 0 -or $exitCode -eq 2) { 'PartlyFailed' }
-            elseif ($liveArtefact -or $exitCode -eq 0) { 'Done' }
+            # An artefact on its own is not enough when the newest ledger entry says the run it
+            # belongs to ended some other way: an abort (130) or a code the catalogue does not
+            # define, masked by an older live results file, would otherwise read as Done. Spec
+            # section 6 says Done needs exit code 0, and only a run with no ledger line at all
+            # ($null) may be judged by its file.
+            elseif (($liveArtefact -and ($null -eq $exitCode -or $exitCode -eq 0)) -or $exitCode -eq 0) { 'Done' }
             # A run was recorded, it left nothing behind and its exit code says nothing the
             # catalogue knows - an abort, or a child that died. It is certainly not done.
             elseif ($entries.Count -gt 0) { 'Failed' }

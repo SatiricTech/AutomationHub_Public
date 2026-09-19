@@ -36,7 +36,11 @@ function Invoke-MigrationStep {
 
         Every run appends one line to Workbench/Runs.jsonl, whatever the exit code and even
         when it was aborted, because "this was tried and killed" is exactly what the next
-        reader of the workspace needs to know.
+        reader of the workspace needs to know. That line's DryRun and Wave come from the driver
+        object, which took them from the arguments it emitted - the ledger describes the run
+        that happened rather than the run a front end thought it was asking for. A caller that
+        passes -DryRun or -Wave is asserting agreement, and a disagreement is refused before the
+        child starts.
 
     .PARAMETER Step
         The step instance from Get-MigrationStep.
@@ -71,11 +75,14 @@ function Invoke-MigrationStep {
         The soft gates the operator chose to override, recorded in the ledger.
 
     .PARAMETER Wave
-        The waves this run was limited to, recorded in the ledger.
+        The waves this run was limited to. Checked against the driver's own -Wave and refused
+        before the child starts if the two disagree; the ledger records the driver's.
 
     .PARAMETER DryRun
-        Records the run as a rehearsal. The driver already carries -DryRun; this is what makes
-        the ledger say so, which is what the DryRunFirst gate reads later.
+        Asserts that this is a rehearsal. The driver decides - it is the file that carries
+        -DryRun - and a caller that says otherwise is refused before the child starts, because
+        a ledger line recording a live run as a rehearsal is what the DryRunFirst gate reads
+        the next time somebody asks whether the step was practised.
 
     .EXAMPLE
         Invoke-MigrationStep -Step $step -Driver $driver -Workspace $ws -ExpectedTenantId $guid
@@ -154,6 +161,30 @@ function Invoke-MigrationStep {
     $driverPath = [string]$Driver.DriverPath
     if (-not (Test-Path -LiteralPath $driverPath -PathType Leaf)) {
         throw "The driver '$driverPath' is not on disk; generate it with New-MigrationStepDriver first."
+    }
+
+    # The ledger records the mode and the waves the driver will actually run with, not the ones
+    # the caller believes it asked for. A front end that resolved for a rehearsal and then told
+    # the runner 'live' - or the other way round - would leave one line in the only account of
+    # the run that outlives the workspace's files, and it would be the wrong one.
+    $driverDryRun = [bool](Get-MigrationProperty -InputObject $Driver -Name 'DryRun' -Default $false)
+    $driverWave = @(Get-MigrationProperty -InputObject $Driver -Name 'Wave' -Default @())
+
+    # A disagreement is a bug in the caller, and it is fatal before the child starts rather than
+    # a warning afterwards: by the time the run has happened the damage - a live writer recorded
+    # as a rehearsal, wave 3 recorded as wave 1 - is already in the tenant.
+    if ($PSBoundParameters.ContainsKey('DryRun') -and ([bool]$DryRun -ne $driverDryRun)) {
+        throw ("The driver runs this step as $(if ($driverDryRun) { 'a rehearsal' } else { 'a live run' }) " +
+            "and the caller asked for it to be recorded as $(if ($DryRun) { 'a rehearsal' } else { 'a live run' }). " +
+            'Resolve the arguments for the mode you are running.')
+    }
+    if ($PSBoundParameters.ContainsKey('Wave')) {
+        $callerKey = Get-MigrationWaveKey -Wave @($Wave)
+        if ($callerKey -ne (Get-MigrationWaveKey -Wave $driverWave)) {
+            throw ("The driver runs this step for wave(s) '$($driverWave -join ', ')' and the caller asked " +
+                "for '$(@($Wave | Where-Object { $_ }) -join ', ')' to be recorded. Resolve the arguments " +
+                'for the waves you are running.')
+        }
     }
 
     $runFolder = [string]$Driver.RunFolder
@@ -331,8 +362,8 @@ function Invoke-MigrationStep {
             Script         = [string]$Step.Script
             Side           = [string]$Step.Side
             TenantId       = [string]$ExpectedTenantId
-            DryRun         = [bool]$DryRun
-            Wave           = @($Wave | Where-Object { $_ })
+            DryRun         = $driverDryRun
+            Wave           = @($driverWave)
             ExitCode       = $exitCode
             Meaning        = $meaning
             Aborted        = $aborted
@@ -363,6 +394,7 @@ function Invoke-MigrationStep {
             Ended              = $ended
             StdoutPath         = $stdoutPath
             StderrPath         = $stderrPath
+            ExpectedTenantId   = [string]$ExpectedTenantId
             ConnectedTenantIds = $connected.ToArray()
             TenantVerified     = $tenantVerified
             Files              = @($produced.Files)
