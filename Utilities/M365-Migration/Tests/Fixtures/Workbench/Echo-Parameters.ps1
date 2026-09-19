@@ -19,10 +19,21 @@
     Justification = 'The parameters exist to be echoed through $PSBoundParameters, not to be used.')]
 param([string]$PlanPath, [string[]]$Wave, [switch]$DryRun, [bool]$ForceChangePassword = $true,
     [hashtable]$AliasDomainMap, [string]$Prefix, [string]$OutputPath, [int]$ExitWith = 0, [string]$TenantId,
-    [string]$Verbosity, [switch]$Confirm, [int]$SleepSeconds = 0)
+    [string]$Verbosity, [switch]$Confirm, [int]$SleepSeconds = 0,
+    [ValidateSet('Graph', 'Exchange', 'ExchangeCached')][string]$ConnectAs = 'Graph')
 
 $PSBoundParameters | ConvertTo-Json -Depth 4 -Compress
 if ($env:M365MIGRATION_TEST) { "M365MIGRATION_TEST=$env:M365MIGRATION_TEST" }
-if ($TenantId) { "Connected to Microsoft Graph - tenant $TenantId (Echo) as echo@contoso.com." }
+if ($TenantId) {
+    # The exact wording each connector logs, which is what Invoke-MigrationStep scrapes.
+    switch ($ConnectAs) {
+        'Exchange' {
+            'Connected to Exchange Online - organisation contoso.onmicrosoft.com ' +
+            "(tenant $TenantId) as echo@contoso.com."
+        }
+        'ExchangeCached' { "Reusing the cached Exchange Online session for tenant $TenantId as echo@contoso.com." }
+        default { "Connected to Microsoft Graph - tenant $TenantId (Echo) as echo@contoso.com." }
+    }
+}
 if ($SleepSeconds -gt 0) { Start-Sleep -Seconds $SleepSeconds }
 exit $ExitWith

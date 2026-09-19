@@ -167,21 +167,30 @@ Describe 'Invoke-MigrationStep' {
             $result.Meaning | Should -BeExactly 'Work remains'
         }
 
-        It 'marks every stderr line so the operator can see it in the same stream' {
+        It 'fails a run whose splat never reached the script, and marks the stderr lines' {
             # A parameter the script does not declare is what a resolver bug looks like from
-            # the child's side: the splat fails to bind and pwsh writes the binding error to
-            # stderr. Those lines must reach the same log pane as stdout, marked.
-            #
-            # The exit code is deliberately NOT asserted here: the driver ends with
-            # 'exit $LASTEXITCODE', and a call that never reached the script leaves that unset,
-            # so the child exits 0 - see the Task 8 report, which recommends seeding it.
+            # the child's side: the splat does not bind, so the script never runs. The driver's
+            # guard turns that into exit 1 - without it $LASTEXITCODE would be unset and the
+            # child would exit 0, and the workbench would record 'Completed' for a step that
+            # did nothing. The binding error must also reach the log pane, marked.
             $workspace = New-TestWorkspace -Name 'RunStderr'
             $captured = [System.Collections.Generic.List[string]]::new()
-            Invoke-TestEchoStep -Workspace $workspace -Captured $captured `
-                -Value @{ NotAParameter = 'x' } | Out-Null
+            $result = Invoke-TestEchoStep -Workspace $workspace -Captured $captured `
+                -Value @{ NotAParameter = 'x' }
 
+            $result.ExitCode | Should -Be 1
+            $result.Meaning | Should -BeExactly 'Failed'
             @($captured | Where-Object { $_ -like '  ! *' }).Count | Should -BeGreaterThan 0
             @($captured) -join "`n" | Should -Match 'NotAParameter'
+        }
+
+        It 'fails a run the script rejected before doing anything' {
+            # The other half of the same guard: the parameter exists but the value does not
+            # satisfy its ValidateSet, so again the script never starts.
+            $workspace = New-TestWorkspace -Name 'RunRejected'
+            $result = Invoke-TestEchoStep -Workspace $workspace -Value @{ ConnectAs = 'Nonsense' }
+            $result.ExitCode | Should -Be 1
+            $result.Meaning | Should -BeExactly 'Failed'
         }
 
         It 'sends an unknown exit code to the log rather than inventing a meaning' {
@@ -198,6 +207,26 @@ Describe 'Invoke-MigrationStep' {
             $workspace = New-TestWorkspace -Name 'TenantFound'
             $result = Invoke-TestEchoStep -Workspace $workspace -Value @{ TenantId = $script:SyntheticTenant }
             @($result.ConnectedTenantIds) | Should -Contain $script:SyntheticTenant
+        }
+
+        It 'collects the tenant GUID out of an Exchange Online connection line' {
+            # Exchange names the organisation as well as the tenant, so the GUID sits inside
+            # brackets rather than straight after the word 'tenant'.
+            $workspace = New-TestWorkspace -Name 'TenantExchange'
+            $result = Invoke-TestEchoStep -Workspace $workspace `
+                -Value @{ TenantId = $script:SyntheticTenant; ConnectAs = 'Exchange' } `
+                -Runner @{ ExpectedTenantId = $script:SyntheticTenant }
+            @($result.ConnectedTenantIds) | Should -Contain $script:SyntheticTenant
+            $result.TenantVerified | Should -BeTrue
+        }
+
+        It 'collects the tenant GUID out of a reused Exchange Online session line' {
+            $workspace = New-TestWorkspace -Name 'TenantExchangeCached'
+            $result = Invoke-TestEchoStep -Workspace $workspace `
+                -Value @{ TenantId = $script:SyntheticTenant; ConnectAs = 'ExchangeCached' } `
+                -Runner @{ ExpectedTenantId = $script:OtherTenant }
+            @($result.ConnectedTenantIds) | Should -Contain $script:SyntheticTenant
+            $result.TenantVerified | Should -BeFalse
         }
 
         It 'verifies the tenant when it is the one that was expected' {

@@ -128,7 +128,9 @@ function Initialize-MigrationRun {
     if ($BoundParameters -and $BoundParameters.Count -gt 0) {
         # Anything whose name reads like a secret is masked. The pattern is deliberately
         # broad: a false positive costs a masked log line, a false negative leaks a credential.
-        $secretPattern = 'password|passphrase|secret|credential|token|apikey|api-key|certificate|thumbprint|key$'
+        # It is shared with the settings validator and the driver writer so the three cannot
+        # drift apart (Get-MigrationSecretNamePattern).
+        $secretPattern = Get-MigrationSecretNamePattern
         foreach ($name in ($BoundParameters.Keys | Sort-Object)) {
             $value = if ($name -match $secretPattern) {
                 '***masked***'

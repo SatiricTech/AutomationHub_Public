@@ -518,6 +518,79 @@ Describe 'Connect-MigrationExchange' {
         }
     }
 
+    It 'names the tenant GUID on the success line so the workbench can verify it' {
+        # Invoke-MigrationStep scrapes the tenant out of the child's log to answer "which
+        # tenant did this step actually write to". The organisation alone cannot answer it,
+        # so the wording of this line is part of the contract, not cosmetics.
+        InModuleScope M365Migration {
+            $script:logged = [System.Collections.Generic.List[string]]::new()
+            Mock Initialize-MigrationModule { }
+            Mock Write-MigrationLog { $script:logged.Add($Message) }
+            Mock Connect-ExchangeOnline { }
+            Mock Disconnect-ExchangeOnline { }
+            $script:calls = 0
+            Mock Get-ConnectionInformation {
+                $script:calls++
+                if ($script:calls -le 1) { @() }
+                else {
+                    [pscustomobject]@{
+                        State = 'Connected'; Organization = 'contoso.onmicrosoft.com'; DelegatedOrganization = ''
+                        TenantId = '11111111-1111-1111-1111-111111111111'; UserPrincipalName = 'a@contoso.com'
+                    }
+                }
+            }
+
+            $null = Connect-MigrationExchange
+            @($script:logged) -join "`n" | Should -Match ([regex]::Escape(
+                    'Connected to Exchange Online - organisation contoso.onmicrosoft.com ' +
+                    '(tenant 11111111-1111-1111-1111-111111111111) as a@contoso.com.'))
+        }
+    }
+
+    It 'names the tenant GUID when it reuses a cached session too' {
+        InModuleScope M365Migration {
+            $script:logged = [System.Collections.Generic.List[string]]::new()
+            Mock Initialize-MigrationModule { }
+            Mock Write-MigrationLog { $script:logged.Add($Message) }
+            Mock Connect-ExchangeOnline { }
+            Mock Disconnect-ExchangeOnline { }
+            Mock Get-ConnectionInformation { [pscustomobject]@{
+                    State = 'Connected'; Organization = ''; DelegatedOrganization = 'contoso.onmicrosoft.com'
+                    TenantId = '11111111-1111-1111-1111-111111111111'; UserPrincipalName = 'a@contoso.com'
+                } }
+
+            $null = Connect-MigrationExchange -DelegatedOrganization 'contoso.onmicrosoft.com'
+            @($script:logged) -join "`n" | Should -Match (
+                'Reusing the cached Exchange Online session for tenant 11111111-1111-1111-1111-111111111111 ' +
+                'as a@contoso\.com\.')
+        }
+    }
+
+    It 'leaves the tenant out of the success line when the session reports none' {
+        InModuleScope M365Migration {
+            $script:logged = [System.Collections.Generic.List[string]]::new()
+            Mock Initialize-MigrationModule { }
+            Mock Write-MigrationLog { $script:logged.Add($Message) }
+            Mock Connect-ExchangeOnline { }
+            Mock Disconnect-ExchangeOnline { }
+            $script:calls = 0
+            Mock Get-ConnectionInformation {
+                $script:calls++
+                if ($script:calls -le 1) { @() }
+                else {
+                    [pscustomobject]@{
+                        State = 'Connected'; Organization = 'contoso.onmicrosoft.com'; DelegatedOrganization = ''
+                        TenantId = ''; UserPrincipalName = 'a@contoso.com'
+                    }
+                }
+            }
+
+            $null = Connect-MigrationExchange
+            @($script:logged) -join "`n" | Should -Match ([regex]::Escape(
+                    'Connected to Exchange Online - organisation contoso.onmicrosoft.com as a@contoso.com.'))
+        }
+    }
+
     It 'resolves a domain-form -TenantId before comparing' {
         InModuleScope M365Migration {
             Mock Initialize-MigrationModule { }

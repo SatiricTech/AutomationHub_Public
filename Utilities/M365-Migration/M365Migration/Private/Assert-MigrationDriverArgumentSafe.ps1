@@ -46,7 +46,7 @@ function Assert-MigrationDriverArgumentSafe {
         [object[]]$Argument
     )
 
-    $secretPattern = 'password|passphrase|secret|credential|token|apikey|api-key|certificate|thumbprint|key$'
+    $secretPattern = Get-MigrationSecretNamePattern
     $allowed = @('CertificateThumbprint')
 
     $offenders = [System.Collections.Generic.List[string]]::new()

@@ -105,7 +105,10 @@ function Connect-MigrationExchange {
             try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
         }
         else {
-            Write-MigrationLog -Message ("Reusing the existing Exchange Online session for tenant " +
+            # Wording is load-bearing: Invoke-MigrationStep reads the tenant GUID back out of
+            # the child's log to verify which tenant the step actually reached, so both this
+            # line and the success line below must name it in the shape the runner matches.
+            Write-MigrationLog -Message ("Reusing the cached Exchange Online session for tenant " +
                 "$existingTenantId as $existingUpn.") -Level SUCCESS
             return $existing
         }
@@ -152,7 +155,11 @@ function Connect-MigrationExchange {
         }
     }
 
+    # The organisation is what a technician recognises; the tenant GUID is what the workbench
+    # verifies against, so the line carries both whenever the session reported a GUID at all.
     $organizationText = if ($connectedOrganization) { $connectedOrganization } else { $connectedTenantId }
-    Write-MigrationLog -Message "Connected to Exchange Online - organisation $organizationText as $connectedUpn." -Level SUCCESS
+    $tenantText = if ($connectedTenantId) { " (tenant $connectedTenantId)" } else { '' }
+    Write-MigrationLog -Level SUCCESS -Message ("Connected to Exchange Online - organisation " +
+        "$organizationText$tenantText as $connectedUpn.")
     return $information
 }

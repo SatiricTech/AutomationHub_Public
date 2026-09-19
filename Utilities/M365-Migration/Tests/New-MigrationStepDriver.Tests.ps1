@@ -189,9 +189,19 @@ Describe 'New-MigrationStepDriver' {
             $script:Driver | Should -Not -Match 'TenantId'
         }
 
-        It 'splats into the script by full path and returns its exit code' {
-            $script:Driver | Should -Match ([regex]::Escape("& '$($script:EchoPath)' @parameters"))
-            $script:DriverLines[-1] | Should -BeExactly 'exit $LASTEXITCODE'
+        It 'splats into the script by full path and propagates its exit code' {
+            $script:Driver | Should -Match ([regex]::Escape("    & '$($script:EchoPath)' @parameters"))
+            $script:DriverLines[-1] | Should -BeExactly 'exit ([int]$LASTEXITCODE)'
+        }
+
+        It 'guards the call so a splat that never binds cannot exit 0' {
+            # An unset $LASTEXITCODE exits 0, which would have the workbench record 'Completed'
+            # for a step that never ran.
+            $script:Driver | Should -Match ([regex]::Escape('$ErrorActionPreference = ''Stop'''))
+            $script:DriverLines | Should -Contain 'try {'
+            $script:DriverLines | Should -Contain 'catch {'
+            $script:DriverLines | Should -Contain '    Write-Error $_'
+            $script:DriverLines | Should -Contain '    exit 1'
         }
     }
 

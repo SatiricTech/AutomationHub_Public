@@ -403,9 +403,23 @@ $parameters = @{
     DryRun   = $true
     Confirm  = $false
 }
-& '<toolkit path>/New-MigrationUsers.ps1' @parameters
-exit $LASTEXITCODE
+
+$ErrorActionPreference = 'Stop'
+try {
+    & '<toolkit path>/New-MigrationUsers.ps1' @parameters
+}
+catch {
+    Write-Error $_
+    exit 1
+}
+exit ([int]$LASTEXITCODE)
 ```
+
+The call is guarded because a splat that never binds — an unknown parameter, a value the
+script's `ValidateSet` rejects, a missing mandatory one — leaves `$LASTEXITCODE` unset, and an
+unset `$LASTEXITCODE` exits 0. A driver that exited 0 for a step that never ran would have the
+workbench record `Completed` and the folder scanner show the step as done. A script that exits
+with a code of its own still propagates it, so 2 and 3 keep their meaning.
 
 `Invoke-MigrationStep` runs `<same pwsh as the parent> -NoProfile -NonInteractive
 -ExecutionPolicy Bypass -File driver.ps1` with stdout/stderr redirected to the run folder,

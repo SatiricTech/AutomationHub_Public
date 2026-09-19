@@ -23,13 +23,25 @@ function New-MigrationStepDriver {
         business; re-stating it here would freeze today's value into a file that outlives the
         script. An argument with no value is left out for the same reason.
 
-        Nothing that reads like a secret is ever written. The driver stays in the workspace,
+        Failure. The driver does not end at the call: it sets $ErrorActionPreference to Stop,
+        wraps the splat in try/catch and exits 1 from the catch, then exits [int]$LASTEXITCODE.
+        A call that never reaches the script - an unknown parameter, a value its ValidateSet
+        rejects, a mandatory one missing - leaves $LASTEXITCODE unset, and an unset
+        $LASTEXITCODE exits 0. Without the guard the workbench would record 'Completed' for a
+        step that did nothing, and the folder scanner would then show it as done. A script that
+        exits with a code of its own still propagates it, so 2 and 3 keep their meaning.
+
+        Secrets. Nothing that reads like one is ever written. The driver stays in the workspace,
         which is synced and backed up like any other folder, so a credential in it outlives the
         run by years; the one secret the toolkit takes (the Viva Learning client secret) reaches
         the child through Invoke-MigrationStep -Environment instead, where it lives only as long
-        as the process. Assert-MigrationDriverArgumentSafe holds that line and explains exactly
-        which names it refuses and why -ForceChangePassword and -PasswordLength are not among
-        them.
+        as the process. The rule Assert-MigrationDriverArgumentSafe applies is the shared
+        secret-name pattern AND a value of a type that could hold a secret: a switch, a boolean
+        or a number is passed whatever it is called, which is what keeps -ForceChangePassword
+        and -PasswordLength - real parameters of real steps - out of the refusal. The one
+        name-based exception is -CertificateThumbprint, a locator for a certificate rather than
+        the certificate, accepted here exactly as the settings validator accepts it.
+        -ClientSecret, -ApiKey and anything else carrying a string still refuse.
 
     .PARAMETER Step
         The step instance from Get-MigrationStep.
@@ -128,9 +140,21 @@ function New-MigrationStepDriver {
         $lines.Add('}')
     }
 
+    # A call that never reaches the script - an unknown parameter, a value the script's
+    # ValidateSet rejects, a mandatory one missing - leaves $LASTEXITCODE untouched, and an
+    # unset $LASTEXITCODE exits 0. A workbench that reported that as 'Completed' would be
+    # telling an operator mid-migration that a step they must not skip had run. So the call is
+    # guarded, and silence exits 1.
     $lines.Add('')
-    $lines.Add(('& {0} @parameters' -f (ConvertTo-MigrationPowerShellLiteral -Value ([string]$Step.ScriptPath))))
-    $lines.Add('exit $LASTEXITCODE')
+    $lines.Add('$ErrorActionPreference = ''Stop''')
+    $lines.Add('try {')
+    $lines.Add(('    & {0} @parameters' -f (ConvertTo-MigrationPowerShellLiteral -Value ([string]$Step.ScriptPath))))
+    $lines.Add('}')
+    $lines.Add('catch {')
+    $lines.Add('    Write-Error $_')
+    $lines.Add('    exit 1')
+    $lines.Add('}')
+    $lines.Add('exit ([int]$LASTEXITCODE)')
 
     if ($PSCmdlet.ShouldProcess($driverPath, 'Write step driver')) {
         New-Item -ItemType Directory -Path $runFolder -Force -ErrorAction Stop | Out-Null

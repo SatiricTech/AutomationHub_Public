@@ -134,7 +134,7 @@ function Resolve-MigrationSettingsData {
     # which the unknown-key check above also flags, for a second, clearer reason) and one
     # buried inside the opaque Plan.AliasDomainMap, whose contents the unknown-key check
     # deliberately never inspects.
-    $secretPattern = 'password|passphrase|secret|credential|token|apikey|api-key|certificate|thumbprint|key$'
+    $secretPattern = Get-MigrationSecretNamePattern
     $knownPaths = [System.Collections.Generic.HashSet[string]]::new(
         [string[]]@($schema | ForEach-Object Key), [System.StringComparer]::Ordinal)
 
