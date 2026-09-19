@@ -147,8 +147,8 @@ function Connect-MigrationExchange {
         }
         catch {
             try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
-            throw ("$($_.Exception.Message) Sign in with an account in the expected tenant (check the " +
-                'account chooser) and re-run.')
+            throw ("$($_.Exception.Message) The wrong account was probably picked in the account chooser; " +
+                'sign in again with an account in the expected tenant.')
         }
     }
 
