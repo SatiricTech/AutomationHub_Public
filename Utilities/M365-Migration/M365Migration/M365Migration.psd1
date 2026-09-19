@@ -50,6 +50,7 @@
         'Resolve-MigrationPlanAddress'
         'Resolve-MigrationSkuMap'
         'Resolve-MigrationTeamsUser'
+        'Resolve-MigrationTenantId'
         'Save-MigrationPlan'
         'Select-MigrationPlanRows'
         'Split-MigrationList'
