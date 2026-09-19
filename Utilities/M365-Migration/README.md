@@ -675,6 +675,13 @@ Columns: what it does; the parameters beyond the common `-OutputPath -Prefix -Dr
 `Get-MigrationVivaLearningHistory` and `Import-MigrationVivaLearningHistory`, which have no
 `-LogPath` at all); what it reads; what it writes.
 
+### Workbench (front door)
+
+| Script | Purpose | Key parameters | In → Out |
+|---|---|---|---|
+| `Start-MigrationWorkbench.ps1` | Interactive workbench (console on any OS, WinForms on Windows) and non-interactive runner over every script below; reads `M365Migration.settings.json` in the workspace, scans what earlier steps produced, builds and runs the exact command with a live log and a run ledger | `-Workspace`, `-Console`, `-Step`, `-Wave`, `-DryRun`, `-Set`, `-Verbosity`, `-LogPath` | Workspace folder → `Workbench/Runs/<ts>_<Step>/driver.ps1`, `Workbench/Runs.jsonl`, plus whatever the chosen script writes |
+| `Start-MigrationWorkbench.cmd` | Windows launcher: locates `pwsh` 7, refuses Windows PowerShell 5.1, passes arguments through, never elevates | (pass-through) | — |
+
 ### Phase 1 — Discover (read-only)
 
 | Script | Purpose | Key parameters | In → Out |
