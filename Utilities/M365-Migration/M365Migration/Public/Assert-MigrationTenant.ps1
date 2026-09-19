@@ -25,6 +25,11 @@ function Assert-MigrationTenant {
         may not carry every property, and the module runs under
         Set-StrictMode -Version Latest.
 
+        A supplied connection that cannot report a TenantId at all is neither a match
+        nor a mismatch - there is nothing to compare - so it does not pass silently: it
+        is named in the returned Reason (for example 'Unverified: Exchange') and a
+        WARNING is written, and Matches can still be $true if nothing else disagreed.
+
     .PARAMETER ExpectedTenantId
         The tenant ID (GUID or domain) the run expects every connection to be signed in
         to. An empty string means no tenant was specified.
@@ -128,19 +133,35 @@ function Assert-MigrationTenant {
 
     $expectedTenantId = Resolve-MigrationTenantId -Tenant $ExpectedTenantId
 
+    # A connection that was supplied but returned no TenantId (a thin stub, or a
+    # property the caller's SDK did not populate) cannot be compared - it is not
+    # evidence the tenant is right, but it must not pass as though it agreed either,
+    # so it is named in Reason and warned about rather than silently ignored.
+    $unverified = [System.Collections.Generic.List[string]]::new()
     foreach ($key in $services.Keys) {
+        $service = $services[$key]
+        if (-not $service.Connection) { continue }
+
         $tenantId = $connected[$key]
-        if ($tenantId -and ($tenantId -ne $expectedTenantId)) {
-            $label = $services[$key].Label
-            throw ("${Purpose}: $label is connected to tenant $tenantId but $expectedTenantId was requested. " +
-                'Sign in with an account in the expected tenant and re-run.')
+        if (-not $tenantId) {
+            Write-MigrationLog -Message ("Could not read the tenant ID from the $key connection; the tenant " +
+                'guard cannot verify it.') -Level WARNING
+            $unverified.Add($key)
+            continue
+        }
+
+        if ($tenantId -ne $expectedTenantId) {
+            throw ("${Purpose}: $($service.Label) is connected to tenant $tenantId but $expectedTenantId was " +
+                'requested. Sign in with an account in the expected tenant and re-run.')
         }
     }
+
+    $reason = if ($unverified.Count -gt 0) { "Unverified: $($unverified -join ', ')" } else { '' }
 
     return [pscustomobject]@{
         Matches          = $true
         ExpectedTenantId = $expectedTenantId
         Connected        = $connected
-        Reason           = ''
+        Reason           = $reason
     }
 }

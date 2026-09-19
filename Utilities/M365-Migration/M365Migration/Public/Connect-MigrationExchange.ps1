@@ -136,11 +136,20 @@ function Connect-MigrationExchange {
     # A cached session can be dropped and reconnected only to land right back in the
     # wrong tenant if the interactive sign-in picks a different cached account (the
     # account chooser), so the freshly established session is checked too rather than
-    # trusting that a fresh Connect-ExchangeOnline call always honours -TenantId.
-    if ($expectedTenantId -and $connectedTenantId -and ($connectedTenantId -ne $expectedTenantId)) {
-        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
-        throw ("Exchange Online connected to tenant $connectedTenantId but $expectedTenantId was requested. " +
-            'Sign in with an account in the expected tenant (check the account chooser) and re-run.')
+    # trusting that a fresh Connect-ExchangeOnline call always honours -TenantId. The
+    # comparison itself lives in Assert-MigrationTenant, so every connector and script
+    # shares one implementation of "does this session match the tenant I was told to
+    # expect".
+    if ($expectedTenantId) {
+        try {
+            $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenantId -ExchangeConnection $information `
+                -Purpose 'Exchange Online sign-in'
+        }
+        catch {
+            try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
+            throw ("$($_.Exception.Message) Sign in with an account in the expected tenant (check the " +
+                'account chooser) and re-run.')
+        }
     }
 
     $organizationText = if ($connectedOrganization) { $connectedOrganization } else { $connectedTenantId }
