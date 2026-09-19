@@ -149,9 +149,26 @@ picked up cold. Section numbers below are sections of `Docs/Workbench-Design.md`
   different next actions. A seventh state, or a glyph modifier, would say which.
 - **A launch failure writes no ledger line.** `Invoke-MigrationStep` appends to the ledger in a
   `finally`, but a child that never starts — a missing or unreadable `pwsh`, a driver folder
-  that cannot be created — throws before there is a run to record. The step then looks as if it
-  was never attempted. The docstring says so; a ledger line with a synthetic exit code would say
-  it where the operator is looking.
+  that cannot be created, a `Start-Process` that throws before the `try` — is never recorded at
+  all. The step then looks as if it was never attempted. The docstring says so; a ledger line
+  with a synthetic exit code would say it where the operator is looking.
+- **A throwing `CancelIf` disables cancel for that run.** `Invoke-MigrationStepSeam` guards each
+  front-end scriptblock and turns it off after one throw, which is right for a writer or a pump
+  — a broken log pane must not take the run down — but the cancel seam is the only way to stop
+  a child, and losing it silently leaves the operator with a run they cannot end. A one-line
+  warning in the output, or a single retry, would at least say so.
+- **The three front ends still restate the run context.** The owned-parameter list, the
+  typed-confirmation rule, the runnable-workspace refusal and the tenant verdict are the
+  engine's now, but the expected-tenant lookup and the secret-from-environment block are still
+  written out in the console form, the window and the unattended path. A
+  `Get-MigrationStepRunPlan` returning `{ Resolved; Gates; ExpectedTenantId; SecretMapping;
+  CanRun }` would collapse three ~80-line blocks into one and make the next fix of this shape a
+  single-point change with engine tests.
+- **`Get-MigrationResultSummary` materialises whole rows.** It reads the results CSV with
+  `Import-Csv` and counts the `Status` column, so the `GeneratedPassword` column of a
+  provisioning run is in memory for the length of the call even though nothing reads, renders or
+  persists it. The spec's "reads only the `Status` column" is true in effect and the plan
+  prescribed this implementation; a streaming read would make it true in fact.
 - **The GUI has no password box, by design.** The Viva Learning app-only phase is the one step
   that needs a client secret, and the WinForms window asks for it the same way an unattended run
   does: `M365MIGRATION_CLIENT_SECRET` in the environment, or a certificate thumbprint in the
@@ -177,6 +194,12 @@ picked up cold. Section numbers below are sections of `Docs/Workbench-Design.md`
 
 ### Structure and tests
 
+- **Split the WinForms region out of `Start-MigrationWorkbench.ps1`.** Most of the entry script
+  is the `#region GUI` block, and §9 pins it there, so this is a spec change rather than a
+  refactor: a `Start-MigrationWorkbench.Gui.ps1` dot-sourced only after `Test-WorkbenchWindows`
+  would keep the entry script the "thin front end" §10 describes and make the Windows-only code
+  reviewable on its own. Recorded as a plan defect: "thin" was never achievable while the region
+  rule stood.
 - **The ledger sort is duplicated.** `Get-MigrationRunLedger` and the results renderer both sort
   entries by `Started` then line number, descending. One of them should call the other.
 - **`Get-MigrationStep -Id` builds all 17 script introspections before filtering.** Cached per

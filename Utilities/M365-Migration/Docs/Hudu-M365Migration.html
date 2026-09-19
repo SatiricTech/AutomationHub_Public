@@ -113,8 +113,8 @@ rules are worth knowing before the first run:</p>
 
 <div class="callout callout-warning">
   <div class="callout-title">The settings file never holds a secret</div>
-  <p>No key may match the module's secret-name pattern beyond the documented certificate
-  thumbprint, which is a locator rather than a secret, and a test enforces that on every
+  <p>No key may match the module's secret-name pattern beyond the documented locators, which
+  point at a secret rather than holding one, and a test enforces that on every
   write. The one step that needs a client secret — the Viva Learning app-only import — reads
   it from an environment variable and passes it to that single child process and nowhere else:
   never to the generated driver file, the settings file or the log. <strong>Set a certificate
@@ -184,14 +184,17 @@ recorded in the ledger as an override.</p>
   </thead>
   <tbody>
     <tr><td><code>0</code></td><td>The session closed normally, or the step succeeded</td></tr>
-    <tr><td><code>1</code></td><td>An unexpected error</td></tr>
+    <tr><td><code>1</code></td><td>An unexpected error, a child that reported no exit code at all, or a run whose tenant did not verify</td></tr>
     <tr><td><code>2</code></td><td>A refusal — no workspace, settings that will not load, an unknown step id, a parameter set short of a mandatory value, or a hard gate that was not acknowledged — or the step's own exit code 2</td></tr>
     <tr><td><code>130</code></td><td>The run was aborted</td></tr>
   </tbody>
 </table>
 
 <p>Any other code is the step's own, passed through unchanged, so a <code>3</code> from the
-domain-release script reaches the caller as <code>3</code>. Every run appends one JSON object
+domain-release script reaches the caller as <code>3</code>. The one exception is a tenant
+mismatch: a non-interactive run whose tenant did not verify exits <code>1</code> whatever the
+step returned, because a scheduler has only the exit code and a step that exited <code>0</code>
+against the wrong tenant must not read as a reason to run the next one. Every run appends one JSON object
 to <code>Workbench/Runs.jsonl</code> — when it started and ended, the step, the side, the
 tenant, whether it was a rehearsal, the waves, the exit code and its meaning, whether it was
 aborted, whether the tenant was verified, any gate overrides, the driver it ran and the files

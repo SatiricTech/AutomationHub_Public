@@ -230,10 +230,11 @@ still recomputing licences, since identity is the thing an operator hand-edits a
 are the thing a map is meant to own.
 
 **Not resolved by the workbench, and more likely to be hit because of it** (code): the planner
-step resolves `-ExistingPlanPath` from `Pinned.PlanPath` through the `ExistingPlan` resolver,
-so a re-plan run from the workbench carries the pinned plan by default rather than as a
-deliberate choice. That is the right behaviour for identity — pinning is what makes a re-plan
-safe — but it means the licence freeze described here is now the default path rather than an
+step resolves `-ExistingPlanPath` through the `ExistingPlan` resolver — the pinned plan, else
+the newest plan in the workspace — so a re-plan run from the workbench carries the last plan
+forward by default rather than as a deliberate choice. That is the right behaviour for identity
+— carrying the last plan forward is the safer default and pinning is what freezes it — but it
+means the licence freeze described here is now the default path rather than an
 opt-in one. The fix is still `-RecomputeLicenses`, on `EnhancementBacklog.md`. Open.
 
 ## 12. The seat pre-check counts users who already hold the licence

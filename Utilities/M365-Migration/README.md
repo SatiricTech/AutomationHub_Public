@@ -35,6 +35,11 @@ The console board takes a step number, or one of **A** (all tools), **P** (phase
 **D** to rehearse, **R** to run live, **C** to write the driver and print the command to paste,
 **B** to go back.
 
+The **All tools** view offers each script on its own, with none of the phase instance's fixed
+values — so an inventory started from there has no `-Prefix Source` and lands under `<Label>/`,
+where the resolvers that feed the planner and the comparison do not look. Start it from the
+phase instance whenever its result has to chain into a later step.
+
 ```powershell
 ./Start-MigrationWorkbench.ps1 -Workspace ~/Migration-Automations/Contoso -Step New-Users -DryRun
 ./Start-MigrationWorkbench.ps1 -Workspace ~/Migration-Automations/Contoso `
@@ -50,12 +55,15 @@ it is removed before the rest reach the script.
 | Code | Meaning |
 |---|---|
 | `0` | the session ran and was closed normally, or the step succeeded |
-| `1` | an unexpected error |
+| `1` | an unexpected error, a child that reported no exit code at all, or a run whose tenant did not verify |
 | `2` | a refusal — no workspace, a workspace folder that is not there, settings that will not load, an unknown step id, a parameter set still short of a mandatory value, or a hard gate that was not acknowledged — or the step's own exit code `2` |
 | `130` | the run was aborted |
 
 Any other code is the step's own, passed through unchanged: `3` from
-`Remove-MigrationDomainReferences` reaches the caller as `3`.
+`Remove-MigrationDomainReferences` reaches the caller as `3`. The one exception is a tenant
+mismatch: `-Step` exits `1` whatever the step returned, because an unattended caller has
+nothing but the exit code and a step that exited `0` against the wrong tenant must not read as
+a reason to run the next one. An aborted run still exits `130`.
 
 ### The workspace
 
@@ -168,7 +176,7 @@ rewrite mtimes. Reading a results file reads only its `Status` column, so the
 |---|---|---|
 | `[ ]` | `NotRun` | no artefact and no ledger entry |
 | `[~]` | `DryRun` | the newest run for the step was a rehearsal |
-| `[x]` | `Done` | newest live results have no `Failed` rows and exit code 0, or the inventory/plan/mapping artefact exists |
+| `[x]` | `Done` | newest live results have no `Failed` rows and exit code 0, or a live artefact (results, inventory, plan) exists and the newest ledger entry does not say the run ended some other way |
 | `[!]` | `PartlyFailed` | newest live results have `Failed` rows (exit 2) |
 | `[!]` | `Failed` | ledger exit code 1, or a recorded run that left nothing behind and carries a code the catalogue does not define |
 | `[?]` | `WorkRemains` | ledger exit code 3 — domain references remain |
@@ -192,7 +200,7 @@ same list, and the gates read the arguments that would actually be passed.
 | `TypedConfirmation` | every `Destructive` step, and every non-read step on the **source** tenant | Hard. The operator types the value exactly: the effective release domain (`Domains.Release`, else `Domains.Target`) for a source-side step, otherwise the word `REMOVE`, and `REMOVE` as the fallback where no domain is configured. A domain matches without case; `REMOVE` matches with case. Asked for on a rehearsal too — a rehearsal still signs in to the source tenant — and a gate naming nothing to type is refused rather than auto-accepted |
 | `Prerequisite` | steps with requirements | Soft. Lists what is not in hand. A requirement naming an artefact rather than a step is met by the artefact existing, whoever produced it — a plan supplied by hand counts |
 | `WaveRequired` | live runs of a `Write` or `Destructive` step whose chosen parameter set takes `-Wave` | Soft. A blank wave is legal and means the whole plan; the gate exists so that it is a decision rather than an omission |
-| `TenantMismatch` | any connecting step | Hard, and post-run: the `Connected to ... tenant <guid>` lines in the child's log are compared with the GUID the step should have reached, and a mismatch is flagged whatever the exit code was |
+| `TenantMismatch` | any connecting step | Hard, and post-run: the `Connected to ... tenant <guid>` lines in the child's log are compared with the GUID the step should have reached, and a mismatch is flagged whatever the exit code was. The board and the window shout it in red; a non-interactive run writes it to stderr and exits `1`. Where the child printed no tenant line at all the wording says so — that is a sign-in failure, not a wrong GUID |
 
 In a non-interactive run a hard gate is answered by `-Set @{ Acknowledge = '<what it asks
 for>' }` and nothing else: there is no console to type into, and a gate that cannot be typed at
@@ -986,7 +994,7 @@ which is what the Pester suite uses; it builds no window and runs nothing.)
 
 ```powershell
 pwsh -NoProfile -Command "Invoke-Pester -Path Utilities/M365-Migration/Tests -Output Detailed"
-pwsh -NoProfile -Command "Invoke-ScriptAnalyzer -Path Utilities/M365-Migration -Recurse -Severity Warning"
+pwsh -NoProfile -Command "Invoke-ScriptAnalyzer -Path Utilities/M365-Migration -Recurse -Severity Warning,Error"
 ```
 
 Pester 6. Pure functions (template engine, collision resolver, address validator, plan

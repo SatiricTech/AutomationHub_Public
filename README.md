@@ -110,7 +110,7 @@ Mirrors the top-level structure for cross-platform parity. Add Mac scripts in th
 | | `Remove-SysInternals.bat` | Unmount Sysinternals network drive |
 | | `Send-UserNotification.ps1` | Display a notification message to the user |
 | [`M365-Migration/`](Utilities/M365-Migration/) | `M365Migration/` | Shared module every migration script imports (connections, logging, plan I/O, naming engine, collision resolver) |
-| | `Start-MigrationWorkbench.ps1` | Front door for the toolkit: console menu on any OS (WinForms on Windows), settings file per migration folder, detected state per phase, live-log runs; `-Step` runs any script non-interactively |
+| | `Start-MigrationWorkbench.ps1` | Front door for the toolkit: console menu on any OS (WinForms on Windows), settings file per migration folder, detected state per phase, live-log runs; `-Step <instance id>` runs one catalogued step non-interactively |
 | | `Start-MigrationWorkbench.cmd` | Windows double-click launcher for the workbench (finds PowerShell 7, never elevates) |
 | | `Get-MigrationInventory.ps1` | Read-only tenant pull into nine CSVs + one workbook: Users, UserMailboxes, SharedMailboxes, MailboxPermissions, Groups, Contacts, Domains, Licenses, Summary |
 | | `Get-MigrationTeamsPhoneAssignments.ps1` | Export every user's Teams phone number, type and voice policies to a CSV (optionally the unassigned number inventory too) |

@@ -201,7 +201,9 @@ unaccounted for — each is bound, resolved, fixed, operator-entered, or listed 
 Named, pure functions over the workspace scan: `Plan` (pinned or newest plan),
 `Inventory:<Prefix>:<Tab>` (newest `<Prefix>_<Tab>_*.csv`), `Export:<Id>` (another step's
 export, e.g. the Teams `Get-` export for `Remove-`), `Settings:<key>` (a path
-stored in settings), `ExistingPlan` (pinned plan, for the planner re-run). A resolver returns
+stored in settings), `ExistingPlan` (the pinned plan, else the newest plan in the workspace —
+for the planner re-run; carrying the last plan forward is the safer default, and pinning is
+what freezes it). A resolver returns
 `{ Value; Source; Candidates }` so the UI can show where a value came from and offer the
 alternatives; `Value` is always `Candidates[0]`, and every path is absolute — a settings path
 stored relative is resolved against the workspace.
@@ -285,7 +287,7 @@ State per step instance:
 |---|---|
 | `NotRun` | no artefact and no ledger entry |
 | `DryRun` | newest artefact is a `-DryRun_` results file |
-| `Done` | newest live results has no `Failed` rows and exit code 0 (or an inventory/plan/mapping artefact exists) |
+| `Done` | newest live results has no `Failed` rows and exit code 0 — or a live artefact (results, inventory, plan) exists and the newest ledger entry does not say the run ended some other way |
 | `PartlyFailed` | newest live results has `Failed` rows (exit 2) |
 | `WorkRemains` | ledger exit code 3 (domain references remain) |
 | `Failed` | ledger exit code 1 |
@@ -303,10 +305,16 @@ no ledger entry stays `NotRun`.
 
 Whether a run was a rehearsal is the ledger's to say: when the newest entry for the step
 records `DryRun`, that wins over what the filenames imply; a line that did not record it
-leaves the question to the files.
+leaves the question to the files. It wins only while it is the *newer* account, though —
+its `Started` at or after the newest live artefact's timestamp. A live run made from the
+command line after a rehearsal leaves a newer artefact and no ledger line of its own, and a
+board that still read `DryRun` there would count the rehearsal's rows and offer the step again.
 
 A recorded run that left nothing behind and carries an exit code the catalogue does not
-define — an abort, a child that died — is `Failed`. It is certainly not `Done`.
+define — an abort, a child that died — is `Failed`. It is certainly not `Done`. Nor is a step
+whose newest ledger entry ended that way but which has an *older* live results file on disk:
+`Done` needs an exit code of 0, and only a run with no ledger entry at all may be judged by
+its file.
 
 `Stale` is judged afterwards, only for a step that reads the plan (`Requires` names `Plan`,
 or `Resolve` maps a parameter to the `Plan` resolver), against the plan's own filename
@@ -389,7 +397,7 @@ judge the run that would actually happen.
 | `DryRunFirst` | `Impact = Write` and `Destructive`, live runs only | Soft: satisfied by a dry-run ledger entry for that step whose waves match the ones requested (as sets: order and repeats do not count, and two blanks match), whose `Started` is after the plan's timestamp, that was not `Aborted` and whose `ExitCode` is 0 or 2 — an aborted or exit-1 rehearsal proved nothing, while exit 2 is a rehearsal doing its job. Where the ledger records no rehearsal of that step, a `-DryRun_` results file newer than the plan counts instead — a run made from the command line is still a run. With no plan in the workspace, any rehearsal counts. Override allowed, recorded in the ledger. |
 | `TypedConfirmation` | `Impact = Destructive`, and any `Side = Source` step whose `Impact` is not `Read` | Hard: the operator must type `RequiredInput` — the effective release domain (`Domains.Release`, else `Domains.Target`) for a source-side step, otherwise the word `REMOVE`, and `REMOVE` as the fallback where no domain is configured. A keypress/button is not accepted, so the gate is never returned satisfied. Asked for on a rehearsal too: a rehearsal still signs in to the source tenant. A domain is matched without case, because DNS has none and an operator who typed `NewCo.com` typed the domain; anything else — `REMOVE` — is matched with case, because shouting it is the point. A gate that names no `RequiredInput` at all is refused rather than auto-accepted: "nothing to type" must never become "anything is accepted". |
 | `Prerequisite` | steps with `Requires` | Soft: lists what is not in hand. A requirement naming an artefact kind is met by the artefact existing, whoever produced it. |
-| `TenantMismatch` | any connecting step | Hard, post-run: the "Connected to ... tenant <guid>" lines in the child's log are compared with the expected side's GUID; a mismatch is flagged regardless of exit code. Not produced by `Test-MigrationStepGate` — it cannot be known until the child has run, so `Invoke-MigrationStep` (7.3) appends it. |
+| `TenantMismatch` | any connecting step | Hard, post-run: the "Connected to ... tenant <guid>" lines in the child's log are compared with the expected side's GUID; a mismatch is flagged regardless of exit code. Not produced by `Test-MigrationStepGate` — it cannot be known until the child has run, so `Invoke-MigrationStep` (7.3) appends it. The console and the window shout it in red; the unattended path writes it to stderr **and exits 1 whatever the step returned** (§10), because a scheduler has nothing but the exit code. Where the child printed no tenant line at all, the wording says so — that is a sign-in failure, not a wrong GUID — and all three front ends take the sentence from `Format-MigrationTenantVerdict`. |
 | `WaveRequired` | plan consumers | Soft: a blank wave means the whole plan; confirmed explicitly for writers — live runs of a `Write` or `Destructive` step whose chosen parameter set takes `-Wave`. Satisfied once a wave is named. |
 
 ### 7.3 Driver and child process
@@ -500,7 +508,12 @@ Layout (TableLayoutPanel + Dock/Anchor, `SetHighDpiMode PerMonitorV2`, `AutoScal
 - Dialogs: Settings (same fields as the console form), typed-confirmation dialog, results
   summary.
 
-The window holds no logic: every button calls an engine function and renders the result.
+The window holds no logic: every button calls an engine function and renders the result. The
+form draws no row for a parameter the workbench owns (`Get-MigrationWorkbenchOwnedParameter`),
+refuses every run action against a workspace `Test-MigrationWorkspaceRunnable` rejects, judges a
+typed confirmation with `Test-MigrationTypedConfirmation` and reports the tenant with
+`Format-MigrationTenantVerdict` — the same four functions the console and the unattended path
+call, because a rule with two implementations is a rule that eventually has two meanings.
 A test dot-sources the script with `-NoGui` on macOS and asserts the GUI's step list equals
 `Get-MigrationStep`.
 
@@ -526,7 +539,16 @@ is not there, a `-Step` the catalogue does not hold — is made **before** `Init
 is called. That function creates its `-OutputPath` whether or not a line is ever written there,
 so a refusal made after it leaves a folder behind as the price of telling an operator they made
 a typo. These refusals go to the error stream and the host; there is no log to write them to, and
-that is the point.
+that is the point. Each is printed **once**, as a plain line on stderr, and once more to the run
+log where one exists — `Write-Error`'s position block around a one-sentence refusal is three
+quarters scaffolding in the one mode whose whole output a scheduler may be capturing.
+
+`-Step` exits with the step's exit code, **except a tenant mismatch, which exits 1** whatever
+the step returned: a run against the wrong tenant is the strongest post-run finding there is,
+and an unattended caller has only the code. An aborted run still exits 130 — "I stopped this"
+is the fact the caller needs first, and a killed child may simply never have reached the
+sign-in that would have printed a tenant line. A child that reported no exit code at all
+exits 1 rather than 0.
 
 `Start-MigrationWorkbench.cmd`: finds pwsh 7 (`%ProgramFiles%\PowerShell\7\pwsh.exe`, then
 PATH), refuses Windows PowerShell 5.1 with the install link, launches
@@ -700,6 +722,7 @@ under test on macOS, so a fault found on this list belongs in the window.
 |---|---|---|
 | 2026-09-18 | — | Document approved. Part A (§11) hardening of the 17 scripts and the module, shipped as module **1.2.0**. |
 | 2026-09-19 | module 1.2.0, workbench **1.0.0** | Part B built: the settings file, the step catalog, the folder scanner, argument resolution, the gates, the driver and runner, the ledger, the console board, the entry script, the `.cmd` launcher and the WinForms window. §15 "First Windows run" added, because the window is written where it cannot be executed. |
+| 2026-09-19 | module 1.2.0, workbench 1.0.0 | Post-review fix wave. The four rules the window's fix rounds established are now the engine's and all three front ends read them: `Get-MigrationWorkbenchOwnedParameter` (§7.1 — an `-Override` naming one is dropped with a warning), `Test-MigrationWorkspaceRunnable` (§8/§9/§10 — nothing runs against settings that will not load, re-checked after every rescan), `Test-MigrationTypedConfirmation` (§7.2) and `Format-MigrationTenantVerdict` (§7.2) are public, as is `ConvertFrom-MigrationMapText`. `Invoke-MigrationStep` takes the ledger's `DryRun`/`Wave` from the driver and refuses a caller that disagrees. A tenant mismatch exits 1 from the unattended path (§7.2/§10). §5.3 `ExistingPlan` wording and the §6 `Done` rule corrected to the code. |
 
 The module stays at **1.2.0** across both parts: §14 names one bump for the whole feature, and
 Part B adds exported functions to a manifest that had not shipped since the bump.
@@ -754,6 +777,36 @@ section named rather than being implemented against it.
   `$LASTEXITCODE` unset, and an unset `$LASTEXITCODE` exits 0 — which would have the workbench
   record `Completed` for a step that never ran. The guard exits 1 instead; a script that exits
   with a code of its own still propagates it.
+- **§7.1 — the workbench owns nine parameters, and the engine holds the list.**
+  `-DryRun`, `-Wave`, `-OutputPath`, `-TenantId`, `-LogPath`, `-Confirm`, `-WhatIf`, `-Verbose`
+  and `-Debug` are each decided by something the operator answered somewhere else — the mode,
+  the wave prompt, the workspace, the settings, the driver. An `-Override` naming one is dropped
+  with a warning that says which control sets it, rather than silently outranking it: that is
+  how a ledger comes to record the wave that was ticked while the driver runs the wave that was
+  typed. The window's own list is gone; all three front ends read
+  `Get-MigrationWorkbenchOwnedParameter`.
+- **§7.3/§7.4 — the ledger's `DryRun` and `Wave` come from the driver.** `New-MigrationStepDriver`
+  puts them on the driver object from the arguments it emits, and `Invoke-MigrationStep` writes
+  those to the ledger and refuses, before the child starts, a caller whose own `-DryRun`/`-Wave`
+  disagree. The ledger now describes the run that happened rather than the run a front end
+  thought it was asking for.
+- **§7.2/§10 — a tenant mismatch is fatal to an unattended run.** The spec's "exits with the
+  step's exit code" gains one exception: `TenantVerified = $false` exits 1 whatever the step
+  returned. A scheduler has nothing but the code, and a step that exited 0 against the wrong
+  tenant would otherwise read as a reason to run the next one.
+- **§8/§9/§10 — "while settings are invalid nothing can run" is one engine function.**
+  `Test-MigrationWorkspaceRunnable` replaces the window's own copy and is called by the console
+  board after every rescan, by the console step form before it resolves anything, and by the
+  unattended path in place of its bare `IsValid` check. Settings can stop validating *while* a
+  session is open, so asking once at the start was never enough.
+- **§5.3 — `ExistingPlan` is the pinned plan, else the newest.** The code was right and the
+  document was not: carrying the last plan forward is the safer default for a re-plan, and
+  pinning is what freezes it.
+- **§6 — `Done` needs an exit code of 0.** An older live results file no longer masks a newest
+  ledger entry that aborted or carries a code the catalogue does not define; and the ledger's
+  own `DryRun` outranks the filenames only while its `Started` is at or after the newest live
+  artefact's timestamp, so a live run made from the command line after a rehearsal is read as
+  the later run it is.
 - **§9 — the four renderers are exported, not private.** `Format-MigrationWorkbenchView`,
   `Format-MigrationStepGlyph`, `Format-MigrationStepLastRun` and
   `Get-MigrationScriptSynopsisText` stopped being the console's own business the moment a second
