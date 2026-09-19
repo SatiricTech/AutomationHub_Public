@@ -156,10 +156,10 @@ Describe 'Invoke-MigrationAction' {
     It 'throws when no run context exists instead of executing the action' {
         InModuleScope M365Migration {
             $script:MigrationRun = $null
-            $ran = $false
+            $script:ran = $false
             { Invoke-MigrationAction -Description 'x' -Action { $script:ran = $true } } |
                 Should -Throw '*outside a run*'
-            $ran | Should -BeFalse
+            $script:ran | Should -BeFalse
         }
     }
 }

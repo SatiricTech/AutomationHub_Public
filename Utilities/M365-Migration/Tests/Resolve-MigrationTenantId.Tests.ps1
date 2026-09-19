@@ -39,6 +39,22 @@ Describe 'Resolve-MigrationTenantId' {
         }
     }
 
+    It 'throws a named error when the issuer has no GUID segment' {
+        InModuleScope M365Migration {
+            Mock Invoke-RestMethod { [pscustomobject]@{ issuer = 'https://login.microsoftonline.com/common/v2.0' } }
+            { Resolve-MigrationTenantId -Tenant 'contoso.onmicrosoft.com' } |
+                Should -Throw '*could not be resolved*'
+        }
+    }
+
+    It 'throws a named error on a non-JSON response' {
+        InModuleScope M365Migration {
+            Mock Invoke-RestMethod { '<html>' }
+            { Resolve-MigrationTenantId -Tenant 'contoso.onmicrosoft.com' } |
+                Should -Throw '*could not be resolved*'
+        }
+    }
+
     It 'calls Invoke-RestMethod with a 15-second timeout' {
         InModuleScope M365Migration {
             $issuer = 'https://login.microsoftonline.com/a1b2c3d4-0000-0000-0000-000000000001/v2.0'

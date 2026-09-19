@@ -304,4 +304,11 @@ Describe 'Save-MigrationPlan' {
         { Save-MigrationPlan -Path $plan -Rows @() -Confirm:$false } | Should -Throw '*no rows were supplied*'
         (Get-Item $plan).Length | Should -BeGreaterThan 0
     }
+
+    It 'refuses a $null -Rows and leaves an existing plan untouched' {
+        $plan = Join-Path $TestDrive 'plan-null.csv'; 'a,b' | Set-Content $plan; 'x,y' | Add-Content $plan
+        $originalLength = (Get-Item $plan).Length
+        { Save-MigrationPlan -Path $plan -Rows $null -Confirm:$false } | Should -Throw
+        (Get-Item $plan).Length | Should -Be $originalLength
+    }
 }
