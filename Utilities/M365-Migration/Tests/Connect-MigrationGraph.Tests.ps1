@@ -317,4 +317,40 @@ Describe 'Connect-MigrationExchange' {
             { Connect-MigrationExchange } | Should -Throw -ExpectedMessage '*without establishing a session*'
         }
     }
+
+    It 'throws and disconnects when a fresh session lands in the wrong tenant' {
+        InModuleScope M365Migration {
+            Mock Initialize-MigrationModule { }
+            Mock Get-ConnectionInformation {
+                $script:calls++
+                if ($script:calls -le 1) { @() }
+                else {
+                    [pscustomobject]@{
+                        State = 'Connected'; TenantId = 'b0000000-0000-0000-0000-000000000002'
+                        UserPrincipalName = 'admin@wrong.com'; DelegatedOrganization = ''
+                    }
+                }
+            }
+            $script:calls = 0
+            Mock Connect-ExchangeOnline { }
+            Mock Disconnect-ExchangeOnline { }
+            { Connect-MigrationExchange -TenantId 'a0000000-0000-0000-0000-000000000001' } |
+                Should -Throw '*connected to tenant b0000000*'
+            Should -Invoke Disconnect-ExchangeOnline -Times 1
+        }
+    }
+
+    It 'resolves a domain-form -TenantId before comparing' {
+        InModuleScope M365Migration {
+            Mock Initialize-MigrationModule { }
+            Mock Resolve-MigrationTenantId { 'a0000000-0000-0000-0000-000000000001' }
+            Mock Get-ConnectionInformation { [pscustomobject]@{
+                State = 'Connected'; TenantId = 'a0000000-0000-0000-0000-000000000001'
+                UserPrincipalName = 'admin@contoso.com'; DelegatedOrganization = '' } }
+            Mock Connect-ExchangeOnline { }
+            (Connect-MigrationExchange -TenantId 'contoso.onmicrosoft.com').TenantId |
+                Should -Be 'a0000000-0000-0000-0000-000000000001'
+            Should -Invoke Connect-ExchangeOnline -Times 0   # cached session reused because it matches
+        }
+    }
 }

@@ -18,12 +18,13 @@ function Connect-MigrationExchange {
         'contoso.onmicrosoft.com'. Omit when signing in to your own tenant.
 
     .PARAMETER TenantId
-        The tenant ID (GUID) the caller expects to be connected to - typically the GUID
-        already returned by Connect-MigrationGraph in the same run. A cached session
-        whose TenantID does not match is dropped and reconnected. Exchange Online does
-        not expose the connected tenant's domain outside CBA/managed-identity
-        connections, so this check only works with the GUID form; pass a domain here and
-        it is ignored.
+        The tenant the caller expects to be connected to - a GUID (typically the one
+        already returned by Connect-MigrationGraph in the same run) or a domain, which
+        is resolved to its GUID via Resolve-MigrationTenantId before any comparison. A
+        cached session whose TenantID does not match is dropped and reconnected, and a
+        freshly established session is checked again after Connect-ExchangeOnline
+        returns: a mismatch there disconnects and throws, because a cutover run cannot
+        be allowed to silently proceed against the wrong tenant.
 
     .PARAMETER Reconnect
         Forces a fresh connection.
@@ -65,6 +66,11 @@ function Connect-MigrationExchange {
 
     Initialize-MigrationModule -Name 'ExchangeOnlineManagement'
 
+    # Resolved once so a domain is only looked up a single time and both the cached-
+    # session check below and the post-connect check further down compare against the
+    # same GUID.
+    $expectedTenantId = if ($TenantId) { Resolve-MigrationTenantId -Tenant $TenantId } else { '' }
+
     $existing = $null
     try {
         $existing = @(Get-ConnectionInformation -ErrorAction SilentlyContinue |
@@ -88,7 +94,7 @@ function Connect-MigrationExchange {
 
         $wrongOrganization = $DelegatedOrganization -and $existingDelegatedOrganization -and
             ($existingDelegatedOrganization -ne $DelegatedOrganization)
-        $wrongTenantId = $TenantId -and $existingTenantId -and ($existingTenantId -ne $TenantId)
+        $wrongTenantId = $expectedTenantId -and $existingTenantId -and ($existingTenantId -ne $expectedTenantId)
         $wrongTenant = $wrongOrganization -or $wrongTenantId
 
         if ($Reconnect -or $wrongTenant) {
@@ -126,6 +132,17 @@ function Connect-MigrationExchange {
     if (-not $connectedOrganization) { $connectedOrganization = Get-MigrationProperty -InputObject $information -Name 'Organization' -Default '' }
     $connectedUpn = Get-MigrationProperty -InputObject $information -Name 'UserPrincipalName' -Default ''
     $connectedTenantId = Get-MigrationProperty -InputObject $information -Name 'TenantId' -Default ''
+
+    # A cached session can be dropped and reconnected only to land right back in the
+    # wrong tenant if the interactive sign-in picks a different cached account (the
+    # account chooser), so the freshly established session is checked too rather than
+    # trusting that a fresh Connect-ExchangeOnline call always honours -TenantId.
+    if ($expectedTenantId -and $connectedTenantId -and ($connectedTenantId -ne $expectedTenantId)) {
+        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
+        throw ("Exchange Online connected to tenant $connectedTenantId but $expectedTenantId was requested. " +
+            'Sign in with an account in the expected tenant (check the account chooser) and re-run.')
+    }
+
     $organizationText = if ($connectedOrganization) { $connectedOrganization } else { $connectedTenantId }
     Write-MigrationLog -Message "Connected to Exchange Online - organisation $organizationText as $connectedUpn." -Level SUCCESS
     return $information
