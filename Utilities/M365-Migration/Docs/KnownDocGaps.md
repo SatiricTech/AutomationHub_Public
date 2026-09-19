@@ -10,13 +10,22 @@ Resolve these the next time the docs are revised. Where a fix belongs in code ra
 prose, that is called out.
 
 The 1.2.0 hardening pass closed **#2, #3, #4, #6, #7 and #9**; each carries a
-**Resolved in 1.2.0** line naming how, and its heading says so. **#1, #5, #8, #10, #11 and
-#12 are still open** — #11 and #12 are code changes now recorded in `EnhancementBacklog.md`,
-#10 is both, and the rest are prose still to be written.
+**Resolved in 1.2.0** line naming how, and its heading says so.
+
+The workbench (`Start-MigrationWorkbench.ps1`, 1.0.0) then closed **#1 and #5** for anyone
+running it, because both were gaps about where a value comes from and the workbench answers
+that from the workspace instead of from an example. Each carries a **Resolved by the
+workbench** line. It also moved **#8 and #10** from invisible to visible without deciding
+either, and left **#11** exactly where it was — see the note on it.
+
+**#8, #10, #11 and #12 are still open**: #11 and #12 are code changes recorded in
+`EnhancementBacklog.md`, #10 is both, and #8 is prose still to be written. #1 and #5 also stand
+for anyone working from the command line rather than through the workbench, since the README's
+own examples are unchanged.
 
 ---
 
-## 1. Example values are indistinguishable from values to substitute
+## 1. Example values are indistinguishable from values to substitute — resolved for workbench runs
 
 **What happens.** The runbook examples read `-TargetDomain newco.com`,
 `-InterimDomain newco.onmicrosoft.com` and `-Prefix Contoso`. An operator copied the block
@@ -26,6 +35,17 @@ them as placeholders.
 **Suggested fix.** Make substitutable values look substitutable, and add a short "before you
 run this, replace these" list to the top of the runbook naming every value that is
 environment-specific. Real-looking domains in examples are the trap.
+
+**Resolved by the workbench** (code): an operator running `Start-MigrationWorkbench.ps1` never
+copies an example. Every environment-specific value lives in that workspace's own
+`M365Migration.settings.json`; the settings form asks for each key by name with its one-line
+description beside it, and deliberately suggests nothing where a guess would be dangerous — a
+tenant GUID and a release domain are left blank rather than pre-filled, because Enter would
+otherwise accept them. The step form then shows each resolved value with where it came from
+(`Fixed`, `Operator`, `Settings`, `Resolved` or the script's own default), and the command
+preview shows the real command before anything runs. **Still open for command-line runs:** the
+README and the runbook examples still read `contoso.com`, `newco.com` and `-Prefix Contoso`,
+and the "before you run this, replace these" list has not been written.
 
 ## 2. Runbook examples use wildcards that only one parameter supports — resolved
 
@@ -81,7 +101,7 @@ header-only CSV handed to `New-MigrationRecipients` or `Set-MigrationMailboxPerm
 aborts with "contains no data rows" — the README's Runbook preamble says to drop the argument
 there.
 
-## 5. No rule for choosing the target domain
+## 5. No rule for choosing the target domain — resolved for workbench runs
 
 **What happens.** The docs explain what `-TargetDomain` is but not how to pick it. It is the
 domain users will sign in on **in the destination tenant**, which is frequently not the
@@ -91,6 +111,15 @@ may put every user's sign-in address on the parent domain regardless of origin.
 **Suggested fix.** Give the operator a rule: read the destination inventory's users file and
 use the domain its existing accounts actually sign in on. Say explicitly that the migrating
 company's own domain is often the wrong answer.
+
+**Resolved by the workbench** (code): the settings form applies that exact rule rather than
+describing it. `Domains.Target` is suggested from the workspace itself — the sign-in domain
+most of the destination tenant's existing users already have, read from the newest
+`Destination_Users_*.csv`, with `onmicrosoft.com` domains passed over because the vanity domain
+is the point of the key. Only the `UserPrincipalName` column is read. An operator who has run
+the destination inventory therefore sees the destination's own convention offered, not their
+client's domain. **Still open for command-line runs:** the README states what `-TargetDomain`
+is but still does not give the rule in prose.
 
 ## 6. No rule for deciding whether an interim domain is needed at all — resolved
 
@@ -146,6 +175,12 @@ department or company attribute naming the migrating organisation. Note that the
 script adopts an existing account rather than duplicating it, so the correct repair is to put
 the un-suffixed address back on the row and mark it as an operator override.
 
+**Surfaced, not resolved, by the workbench** (code): the board prints the plan's status counts
+every time the workspace is scanned, so `3 Collision` is on screen rather than in a console
+line that scrolled away an hour ago. Nothing else changed: the workbench cannot tell whether
+the holder of a taken address is a different person or the same person from an earlier wave,
+and the rule for deciding that is still unwritten. Open.
+
 ## 9. A runbook does not say which version of the toolkit it describes — resolved
 
 **What happens.** A published runbook described scripts that existed only on an unmerged
@@ -174,6 +209,13 @@ any `Skipped` row is a person whose mailbox and drive will not move. Consider ma
 exporter refuse to write a mapping file when any in-scope row is skipped unless a flag
 acknowledges it, since an incomplete mapping is worse than no mapping.
 
+**Surfaced, not resolved, by the workbench** (code): every run's Succeeded / Failed / Skipped
+counts are written into the run ledger (`Workbench/Runs.jsonl`) and rendered both in the run
+summary and in the results view, so the export's skipped count outlives the console it was
+printed to and is still readable weeks later. The mapping file itself still looks complete, and
+neither the reconciliation this gap asks for nor the acknowledgement switch exists — the switch
+is on `EnhancementBacklog.md`. Open.
+
 ## 11. Re-planning with an existing plan freezes licences too
 
 **What happens.** `-ExistingPlanPath` is documented as preserving a row's destination
@@ -186,6 +228,13 @@ even exist in the destination tenant.
 and warn that a SKU map change does not reach those rows. Consider preserving identity while
 still recomputing licences, since identity is the thing an operator hand-edits and licences
 are the thing a map is meant to own.
+
+**Not resolved by the workbench, and more likely to be hit because of it** (code): the planner
+step resolves `-ExistingPlanPath` from `Pinned.PlanPath` through the `ExistingPlan` resolver,
+so a re-plan run from the workbench carries the pinned plan by default rather than as a
+deliberate choice. That is the right behaviour for identity — pinning is what makes a re-plan
+safe — but it means the licence freeze described here is now the default path rather than an
+opt-in one. The fix is still `-RecomputeLicenses`, on `EnhancementBacklog.md`. Open.
 
 ## 12. The seat pre-check counts users who already hold the licence
 

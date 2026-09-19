@@ -5,6 +5,256 @@ built as a companion to **AvePoint Fly**. Fly moves the content. This toolkit do
 everything Fly hands back to the MSP: identity design, destination provisioning,
 licensing, mail recipients, delegation, domain release, cutover and verification.
 
+## Workbench
+
+`Start-MigrationWorkbench.ps1` is the front door on the seventeen scripts. Point it at a
+migration folder and it reads what is already there, keeps that migration's settings in one
+JSON file beside the outputs, shows the runbook with a detected state per step, builds the
+exact command line a step needs, runs it in a child `pwsh` with a live log, and records what
+ran.
+
+It never bypasses a script. Every option every script has today is still reachable, because
+all the workbench does is build the command an operator could have typed, and then type it.
+
+### Starting it
+
+| Mode | Command |
+|---|---|
+| Console workbench | `pwsh ./Start-MigrationWorkbench.ps1 [-Workspace <dir>]` — macOS, Linux and Windows |
+| WinForms workbench | Double-click `Start-MigrationWorkbench.cmd` on Windows (it finds pwsh 7, refuses Windows PowerShell 5.1 with the install link, and never elevates). `-Console` forces the console board on Windows instead |
+| Non-interactive | `./Start-MigrationWorkbench.ps1 -Workspace <dir> -Step <id> [-Wave <label[]>] [-DryRun] [-Set @{ ... }]` — runs one step, asks nothing, exits with the step's exit code |
+
+Omit `-Workspace` in console mode and the workbench offers a numbered pick list — the recent
+workspaces (kept in `~/.config/M365Migration/recent.json`, `%APPDATA%\M365Migration\recent.json`
+on Windows) and every folder under the default output root — plus **P** for a typed path and
+**N** to create a new workspace under that root. `-Workspace` is required with `-Step`, and a
+folder that is not there is a refusal rather than something the workbench creates behind you.
+
+The console board takes a step number, or one of **A** (all tools), **P** (phases), **S**
+(settings), **R** (results and logs), **Q** (quit). A step form takes **E** to edit a value,
+**D** to rehearse, **R** to run live, **C** to write the driver and print the command to paste,
+**B** to go back.
+
+```powershell
+./Start-MigrationWorkbench.ps1 -Workspace ~/Migration-Automations/Contoso -Step New-Users -DryRun
+./Start-MigrationWorkbench.ps1 -Workspace ~/Migration-Automations/Contoso `
+    -Step DomainReferences-Remediate -Set @{ Acknowledge = 'newco.com' }
+```
+
+`-Set` is a hashtable of the child script's own parameter names. Its one key that is not a
+script parameter is `Acknowledge`, which carries the typed confirmation a hard gate demands;
+it is removed before the rest reach the script.
+
+#### The workbench's own exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | the session ran and was closed normally, or the step succeeded |
+| `1` | an unexpected error |
+| `2` | a refusal — no workspace, a workspace folder that is not there, settings that will not load, an unknown step id, a parameter set still short of a mandatory value, or a hard gate that was not acknowledged — or the step's own exit code `2` |
+| `130` | the run was aborted |
+
+Any other code is the step's own, passed through unchanged: `3` from
+`Remove-MigrationDomainReferences` reaches the caller as `3`.
+
+### The workspace
+
+One migration per workspace folder, and that folder is `-OutputPath` for every step — files
+land exactly where the rest of this README says they land, so dropping to the command line
+mid-migration changes nothing. The "new workspace" flow creates `<default root>/<Label>/`; an
+existing folder that already holds `Source/`, `Destination/` and a label folder is a valid
+workspace as it stands.
+
+```
+<workspace>/                                  every step's -OutputPath
+  M365Migration.settings.json                 this migration's settings; git-ignored
+  Workbench/
+    Runs.jsonl                                one JSON line per run - the run ledger
+    Runs/<yyyyMMdd-HHmmss>_<StepId>/          driver.ps1, stdout.txt, stderr.txt
+    Start-MigrationWorkbench_<ts>.log         the workbench's own log
+  Source/        Source_<Tab>_<ts>.csv        -Prefix Source       (source inventory)
+  Destination/   Destination_<Tab>_<ts>.csv   -Prefix Destination  (destination inventory)
+  Post/          Post_<Tab>_<ts>.csv          -Prefix Post         (post-cutover inventory)
+  <Label>/       <Label>_IdentityPlan_<ts>.csv, <Label>_<Name>-Results_<ts>.csv, logs, reports
+```
+
+Input files you supply yourself — SKU map, exclusion rules, wave map — may live anywhere. Their
+settings keys take either a path relative to the workspace or an absolute one; a relative path
+is resolved against the workspace before it reaches a step, so the command line a step is given
+always names an absolute file.
+
+### The settings file
+
+`M365Migration.settings.json`, UTF-8 without a BOM, key order preserved on round-trip. The
+committed template is [`Templates/M365Migration.settings.example.json`](Templates/M365Migration.settings.example.json);
+the real filename is in `.gitignore`, so only the example ever enters this repository. Loading
+never throws — a missing file is a valid "no settings yet" state, and an unknown key or a wrong
+`SchemaVersion` comes back as an error naming what is valid. Saving is atomic and keeps one
+`.bak` of the previous version.
+
+| Key | What it is |
+|---|---|
+| `SchemaVersion` | Settings file format version. Always `1` today, and the one key the settings form never asks for |
+| `Label` | Names the migration; feeds the workspace folder and every output filename |
+| `Scenario` | `TenantToTenant` migrates between two tenants; `InPlaceRedesign` restructures one |
+| `Source.TenantId` | Source tenant GUID; every connector asserts it reached this tenant |
+| `Source.DisplayName` | Friendly name for the source tenant, shown in the workbench banner |
+| `Source.OnMicrosoftDomain` | Source tenant's `*.onmicrosoft.com` domain |
+| `Source.DelegatedOrganization` | Domain passed to `Connect-MigrationExchange -DelegatedOrganization` for GDAP sign-in |
+| `Destination.TenantId` | Destination tenant GUID; every connector asserts it reached this tenant |
+| `Destination.DisplayName` | Friendly name for the destination tenant, shown in the workbench banner |
+| `Destination.OnMicrosoftDomain` | Destination tenant's `*.onmicrosoft.com` domain |
+| `Destination.DelegatedOrganization` | Domain passed to `Connect-MigrationExchange -DelegatedOrganization` for GDAP sign-in |
+| `Domains.Target` | Vanity domain the identities land on in the destination; feeds `-TargetDomain` |
+| `Domains.Release` | Vanity domain to release from the **source** tenant; feeds `-Domain`. Blank = same as `Domains.Target`, i.e. the domain moves with the users |
+| `Domains.Smtp` | SMTP domain when it differs from `Domains.Target`; blank means "same as Target" |
+| `Domains.Interim` | Interim domain used before `Domains.Target` verifies; blank means not needed |
+| `Plan.UpnFormat` | UPN local-part format the identity planner builds, e.g. `First.Last` |
+| `Plan.SmtpFormat` | Primary SMTP local-part format; blank means "same as `UpnFormat`" |
+| `Plan.MailNicknameFormat` | MailNickname format; blank means "same as `UpnFormat`" |
+| `Plan.DefaultWave` | Wave assigned to a planned row when the operator does not choose one |
+| `Plan.DefaultUsageLocation` | Two-letter usage location assigned to provisioned users, e.g. `US` |
+| `Plan.SkuMapPath` | Path to the SKU map CSV, relative to the workspace or absolute |
+| `Plan.ExclusionRulesPath` | Path to the exclusion rules CSV, relative to the workspace or absolute |
+| `Plan.WaveMapPath` | Path to the wave map CSV, relative to the workspace or absolute |
+| `Plan.PreserveAliases` | Carries source proxy addresses forward as destination aliases |
+| `Plan.AliasDomainMap` | Old alias domain → new alias domain rewrites; keys are operator-supplied |
+| `Plan.IncludeDisabled` | Includes disabled source accounts in the plan |
+| `Plan.IncludeGuests` | Includes guest accounts in the plan |
+| `Plan.IncludeSynced` | Includes directory-synced accounts in the plan |
+| `Defaults.Verbosity` | Default `-Verbosity` passed to every step unless overridden |
+| `Defaults.IncludeCollisions` | Default `-IncludeCollisions` passed to steps that accept it |
+| `Defaults.UseInterim` | Default `-UseInterim` passed to steps that accept it |
+| `Defaults.Tool` | Third-party migration tool the plan and reports are shaped for |
+| `Defaults.PasswordLength` | Default generated-password length for newly provisioned accounts |
+| `Defaults.WordCount` | Default generated-passphrase word count for newly provisioned accounts |
+| `Pinned.PlanPath` | Pinned identity plan path; blank means "newest `<Label>_IdentityPlan_*.csv`" |
+| `VivaLearning.ClientId` | App registration (client) ID used for the Viva Learning app-only phase |
+| `VivaLearning.CertificateThumbprint` | Thumbprint of the sign-in certificate — a locator, not a secret |
+| `VivaLearning.LearningProviderId` | Registration ID of an existing Viva Learning provider, when reusing one |
+
+**Tenant IDs are stored as GUIDs.** The Exchange tenant assertion only works on a GUID, so the
+settings form resolves a domain you type into its GUID through the public, unauthenticated OIDC
+discovery document — no sign-in, one HTTPS call.
+
+**No secrets, ever.** No key may match the module's secret-name pattern
+(`password|passphrase|secret|credential|token|apikey|api-key|certificate|thumbprint|key$`)
+beyond the documented locators, and a test enforces that on the example file and on every
+write. The Viva Learning client secret is read from `M365MIGRATION_CLIENT_SECRET` in the
+environment and passed to that one child process's environment block — never to the driver
+file, the settings file or the log. Configure `VivaLearning.CertificateThumbprint` instead and
+no secret is needed at all.
+
+`Pinned.PlanPath` is what makes a re-plan safe: pin a plan and `-ExistingPlanPath` defaults to
+it, so a newer plan on disk does not silently become the one every step reads.
+
+### What the folder scan detects
+
+The workbench never asks where things are; it reads the folder. It loads the settings, works
+out the label folder, parses every filename that follows the output contract
+(`<Prefix>_<Name>[-<Suffix>]_<yyyyMMdd-HHmmss>.<ext>`), picks the identity plan and its waves
+and statuses, reads the run ledger, and derives one state per step instance — plus the step to
+do next, which is the lowest-ordered instance whose requirements are all met and which is not
+already done. Anything it cannot make sense of becomes a warning rather than an error: a
+missing folder, a broken settings file, a header-only CSV, a half-written ledger line. Files
+that do not match the contract are skipped in silence, because notes and exports live beside
+the artefacts quite legitimately.
+
+Newest always means **the timestamp in the filename**, never the file's mtime — sync clients
+rewrite mtimes. Reading a results file reads only its `Status` column, so the
+`GeneratedPassword` column a provisioning run writes is never read, rendered or recorded.
+
+| Glyph | State | Rule |
+|---|---|---|
+| `[ ]` | `NotRun` | no artefact and no ledger entry |
+| `[~]` | `DryRun` | the newest run for the step was a rehearsal |
+| `[x]` | `Done` | newest live results have no `Failed` rows and exit code 0, or the inventory/plan/mapping artefact exists |
+| `[!]` | `PartlyFailed` | newest live results have `Failed` rows (exit 2) |
+| `[!]` | `Failed` | ledger exit code 1, or a recorded run that left nothing behind and carries a code the catalogue does not define |
+| `[?]` | `WorkRemains` | ledger exit code 3 — domain references remain |
+| `[s]` | `Stale` | done, but the plan it consumed is older than the pinned plan |
+
+Where two rules could both apply they settle in the order `Failed`, `WorkRemains`, `DryRun`,
+`PartlyFailed`, `Done`: a ledger that says the run failed outranks the file it managed to write
+first, and a rehearsal newer than the last live run outranks it. Only a `-Results_` file, or
+the inventory or plan a non-results step writes, counts as live — a log or a report says what a
+step found, not that it finished.
+
+### Gates
+
+Every gate that applies is returned, satisfied ones included: the list is a checklist, and a
+gate already met is how an operator knows the rehearsal counted. Both front ends render the
+same list, and the gates read the arguments that would actually be passed.
+
+| Gate | Applies to | Behaviour |
+|---|---|---|
+| `DryRunFirst` | `Write` and `Destructive` steps, live runs only | Soft. Satisfied by a ledger rehearsal of this step for the same waves, started after the plan was written, not aborted, and exited 0 or 2 — an aborted or exit-1 rehearsal proved nothing, while "some rows failed" is a rehearsal doing its job. With no rehearsal on record a `-DryRun_` results file newer than the plan counts instead; with no plan in the workspace, any rehearsal counts |
+| `TypedConfirmation` | every `Destructive` step, and every non-read step on the **source** tenant | Hard. The operator types the value exactly: the effective release domain (`Domains.Release`, else `Domains.Target`) for a source-side step, otherwise the word `REMOVE`, and `REMOVE` as the fallback where no domain is configured. A domain matches without case; `REMOVE` matches with case. Asked for on a rehearsal too — a rehearsal still signs in to the source tenant — and a gate naming nothing to type is refused rather than auto-accepted |
+| `Prerequisite` | steps with requirements | Soft. Lists what is not in hand. A requirement naming an artefact rather than a step is met by the artefact existing, whoever produced it — a plan supplied by hand counts |
+| `WaveRequired` | live runs of a `Write` or `Destructive` step whose chosen parameter set takes `-Wave` | Soft. A blank wave is legal and means the whole plan; the gate exists so that it is a decision rather than an omission |
+| `TenantMismatch` | any connecting step | Hard, and post-run: the `Connected to ... tenant <guid>` lines in the child's log are compared with the GUID the step should have reached, and a mismatch is flagged whatever the exit code was |
+
+In a non-interactive run a hard gate is answered by `-Set @{ Acknowledge = '<what it asks
+for>' }` and nothing else: there is no console to type into, and a gate that cannot be typed at
+must not become a gate that is skipped. Soft gates are evaluated on live runs only; they warn,
+the run proceeds, and each is recorded in the ledger as an override.
+
+### Drivers and the ledger
+
+Each run writes `Workbench/Runs/<yyyyMMdd-HHmmss>_<StepId>/driver.ps1` — a splat of the
+arguments that were resolved, run as `pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass
+-File driver.ps1` with `stdout.txt` and `stderr.txt` beside it. A driver file rather than a
+command line because `pwsh -File` flattens arrays and hashtables to strings and a splat does
+not, and because the file is a reproducible record of exactly what ran. The call is wrapped so
+that a splat which never binds exits `1` rather than `0`; a script that exits with a code of
+its own still propagates it.
+
+Each value in that splat came from somewhere, and the step form names which: `Fixed` (what
+makes this instance that step), `Operator`, `Settings`, `Resolved` (a file found by scanning
+the workspace, with the alternatives kept as candidates), `Common` (a parameter the workbench
+owns and nothing else had answered) or the script's own `Default` — which is recorded so a form
+can show it and **deliberately not passed**, because re-stating a default would freeze today's
+value into a file that outlives the script. The workbench always sets
+`-OutputPath`, `-Prefix`, `-Verbosity`, `-DryRun` when asked for, `-Wave` when one is requested
+and the chosen parameter set can hold it, and `-Confirm:$false` for every script that declares
+`SupportsShouldProcess` — the child runs `-NonInteractive` and cannot answer a prompt.
+`-LogPath` is never passed: every script derives it from `-OutputPath`. `-Debug` and `-Verbose`
+are never passed either, because Graph request bodies would reach the console.
+
+Every run then appends one JSON object to `Workbench/Runs.jsonl`:
+
+```
+{ Started, Ended, StepId, Script, Side, TenantId, DryRun, Wave, ExitCode, Meaning, Aborted,
+  TenantVerified, GateOverrides, Driver, Files, Summary }
+```
+
+That file is the workbench's memory — the scanner reads it for state, the `DryRunFirst` gate
+reads it for rehearsals, and the results view lists it newest first. It never holds a parameter
+value matching the secret pattern. A line that will not parse costs its own line and nothing
+else.
+
+Step exit codes keep the toolkit's own vocabulary: `0` completed, `1` failed, `2` some rows
+failed, `3` work remains (domain release only), anything else means read the log. `2` and `3`
+are warnings rather than failures — the run did what it could and the remainder is named.
+
+### Step ids
+
+`-Step` takes a step **instance** id. Several instances can share one script: the inventory
+runs three times, readiness three times, domain release twice.
+
+| Phase | Step ids |
+|---|---|
+| Discover | `Inventory-Source`, `Inventory-Destination` |
+| Plan | `New-IdentityPlan`, `Export-MappingFile` |
+| Prepare | `Readiness-Pre`, `New-Users`, `Set-Licenses`, `New-Recipients`, `Readiness-Provisioned` |
+| Cutover | `DomainReferences-Report`, `DomainReferences-Remediate`, `Set-Identity`, `Set-Identity-InPlace`, `Set-MailboxPermissions`, `Reset-CutoverPasswords`, `TeamsPhone-Export`, `TeamsPhone-Remove`, `TeamsPhone-ListUnassigned`, `TeamsPhone-Assign`, `VivaLearning-Export`, `VivaLearning-Import`, `Readiness-Post`, `Inventory-Post`, `Compare-Plan` |
+
+`Get-MigrationStep | Select-Object Id, Phase, Order` lists them from the catalog itself.
+`Set-Identity` and `Set-Identity-InPlace` are the same script under the two scenarios, and the
+phase view only ever shows the one the workspace's `Scenario` selects.
+
+---
+
 ## What this is
 
 Seventeen phase scripts plus one shared module (`M365Migration/`). Every script imports
@@ -137,10 +387,12 @@ after sign-in; a missing scope throws by name rather than failing on the first c
 Utilities/M365-Migration/
   README.md
   M365Migration/            shared module (manifest + Public/ + Private/); imported by every script
-  Templates/                IdentityPlan.sample.csv, SkuMap.sample.csv,
-                            ExclusionRules.sample.csv, WaveMap.sample.csv
+  Templates/                IdentityPlan.sample.csv, SkuMap.sample.csv, ExclusionRules.sample.csv,
+                            WaveMap.sample.csv, M365Migration.settings.example.json
   Tests/                    Pester 6 suites, one per script and per pure function
-  Docs/                     source HTML for the published Hudu article, plus the two backlogs
+  Docs/                     Workbench-Design.md, source HTML for the Hudu article, the two backlogs
+  Start-MigrationWorkbench.ps1   the front door (console, WinForms and non-interactive)
+  Start-MigrationWorkbench.cmd   Windows double-click launcher for it
   *.ps1                     the 17 phase scripts
 ```
 
@@ -173,6 +425,8 @@ toolkit for real - friction rather than defects.
 | Exit codes | `0` completed · `1` fatal error · `2` some rows failed · `3` work remains. `2` also covers failed checks in `Test-MigrationReadiness` and any `Missing`/`Mismatch` row for `Compare-MigrationUserData` in plan mode (its CSV mode always exits 0). `3` is used by `Remove-MigrationDomainReferences` alone — references to the domain remain, or the scan did not finish — and a row failure outranks it, so that script exits `2` when both are true. |
 | Waves | Every writer takes `-Wave <label[]>` and processes only matching plan rows. Waves are labels, not numbers — `1`, `Pilot`, `Finance` all work. |
 | Passwords | Generated credentials go to the results CSV only, never to the log. Store that file the way you would store any other password list — and read "Credentials and the rescue copy" below. |
+| `M365Migration.settings.json` | The workbench's per-migration settings, written in the workspace root beside the output folders. Client data, so it is in `.gitignore` and only `Templates/M365Migration.settings.example.json` is committed. Holds no secret: tenant GUIDs, domains, naming formats, paths and defaults, and nothing matching the module's secret-name pattern. Nothing outside the workbench reads it — the 17 scripts still take everything as parameters. |
+| `Workbench/` | Created inside the workspace by `Start-MigrationWorkbench.ps1`: `Runs.jsonl` (the run ledger, one JSON object per run), `Runs/<ts>_<StepId>/` (that run's `driver.ps1`, `stdout.txt` and `stderr.txt`) and the workbench's own `Start-MigrationWorkbench_<ts>.log`. It lives only in a workspace, never in this repository. |
 
 ### Where output lands, and the paths in these examples
 
@@ -739,6 +993,23 @@ Pester 6. Pure functions (template engine, collision resolver, address validator
 reader/writer) are tested without mocks; anything touching Graph, Exchange or Teams is mocked
 inside `InModuleScope`. The analyzer run must come back clean.
 
+The workbench is tested the same way, with no display and no network. The suites are
+`MigrationSettings.Tests.ps1` (settings round-trip and refusals), `StepCatalog.Tests.ps1` (the
+drift guard over all 17 scripts — every binding, resolver and fixed value has to name a real
+parameter), `Get-MigrationScriptParameter.Tests.ps1` (the introspection the catalog overlays),
+`Get-MigrationWorkspace.Tests.ps1` (the folder scanner, against the synthetic workspace in
+`Tests/Fixtures/Workbench/`), `Resolve-MigrationStepArguments.Tests.ps1` (argument resolution
+and provenance), `Test-MigrationStepGate.Tests.ps1` (the gates),
+`New-MigrationStepDriver.Tests.ps1` (driver generation: it parses clean, carries no secret
+value, and arrays and hashtables survive), `Invoke-MigrationStep.Tests.ps1` (the child process
+and the ledger, driven against `Tests/Fixtures/Workbench/Echo-Parameters.ps1`, which dumps its
+bound parameters as JSON and exits with whatever code it is asked for),
+`Format-MigrationWorkbenchView.Tests.ps1` and `Show-MigrationWorkbench.Tests.ps1` (the console
+board and the whole flow, driven through the prompt seam),
+`Start-MigrationWorkbench.Tests.ps1` (the entry script, dot-sourced with `-NoGui`, including
+the parity assertion that the window and the engine list the same steps) and
+`Start-MigrationWorkbenchLauncher.Tests.ps1` (the `.cmd`, checked as text).
+
 `*.Main.Tests.ps1` files drive a script's whole `Main` region end to end against stub cmdlets
 — `Set-MigrationLicenses`, `Test-MigrationReadiness` and `Remove-MigrationDomainReferences`
 have one each — so exit codes and results files are asserted on the real control flow rather
@@ -806,3 +1077,4 @@ listed so a reviewer does not re-raise them as defects.
 | Domain removal blockers | The domain will not delete while any user UPN, proxy address, group, mailbox or contact still references it | `Remove-MigrationDomainReferences -ReportOnly` lists every one. Guest `#EXT#` UPNs embed the *resource* tenant's domain and are informational, not blockers. The initial `.onmicrosoft.com` domain can never be removed |
 | OneDrive not provisioned | `GET /users/{id}/drive` returns 404 and the mover has nowhere to write | Pre-provision with `Request-SPOPersonalSite -UserEmails <email>` (SharePoint Admin, user already licensed) |
 | `Get-MailboxPermission` on a large tenant | "data exceeded max permitted by session (500MB)" | The inventory uses the REST-based `Get-EXOMailboxPermission`; keep `-SkipMailboxPermissions` in reserve for very large estates |
+| `-TenantId contoso.onmicrosoft.com` fails with "could not be resolved to a tenant ID" | Since 1.2.0 the Graph and Teams connectors resolve a domain-form tenant to its GUID before anything is compared, exactly as the Exchange connector already did. That resolution is an unauthenticated `GET` to `login.microsoftonline.com`, so a host that can reach Microsoft 365 only through a proxy the SDKs use but plain REST does not will fail before it signs in | Pass the tenant GUID. It is compared as-is and makes no network call — which is also why the workbench stores tenant IDs as GUIDs |

@@ -673,3 +673,70 @@ below needs a tenant except where it says so.
 
 Anything that fails here is a finding against §9, not a change of design: the engine is already
 under test on macOS, so a fault found on this list belongs in the window.
+
+## 16. Change log
+
+| Date | Version | Change |
+|---|---|---|
+| 2026-09-18 | — | Document approved. Part A (§11) hardening of the 17 scripts and the module, shipped as module **1.2.0**. |
+| 2026-09-19 | module 1.2.0, workbench **1.0.0** | Part B built: the settings file, the step catalog, the folder scanner, argument resolution, the gates, the driver and runner, the ledger, the console board, the entry script, the `.cmd` launcher and the WinForms window. §15 "First Windows run" added, because the window is written where it cannot be executed. |
+
+The module stays at **1.2.0** across both parts: §14 names one bump for the whole feature, and
+Part B adds exported functions to a manifest that had not shipped since the bump.
+`Start-MigrationWorkbench.ps1` carries its own `$script:Version = '1.0.0'`, used in the banner,
+the driver header and the ledger.
+
+### Rulings that changed this document
+
+Each of these came out of building or reviewing the thing described, and each amended the
+section named rather than being implemented against it.
+
+- **§4 — `Domains.Release` is a new settings key.** The spec had one vanity domain doing two
+  jobs. `Domains.Target` is what the identities land on in the destination; the domain being
+  *released* from the source tenant is a different string whenever a migration lands on a brand
+  the destination already owns. `Domains.Release` blank therefore means "same as Target", the
+  fallback is a named rule in the argument resolver (a blank bound value is otherwise skipped),
+  and the effective release domain is what both the domain-release step's `-Domain` and the
+  source-side typed confirmation use.
+- **§7.1 — `-Confirm:$false` is passed to every script that declares
+  `SupportsShouldProcess`**, not only the High-impact ones. The child runs `-NonInteractive`
+  and cannot answer a prompt, so whether it would have prompted must not rest on a
+  `ConfirmImpact` sitting below whatever `$ConfirmPreference` that process happens to have. The
+  catalogue's `Confirm` flag now means only "this script is High impact", which is what the UI
+  warns on.
+- **§7.2 — `DryRunFirst` judges the rehearsal, not just its existence.** A rehearsal counts
+  only if it was not `Aborted` and exited 0 or 2: an aborted or exit-1 rehearsal proved
+  nothing, while "some rows failed" is a rehearsal doing its job.
+- **§7.2 — `WaveRequired` is restricted to live runs of a `Write` or `Destructive` step whose
+  chosen parameter set takes `-Wave`.** The gate exists so that "the whole plan" is a decision
+  rather than an omission, and only a step that changes something needs that decision.
+- **§7.2 — the typed confirmation is matched by kind.** A domain is matched without case,
+  because DNS has none and an operator who typed `NewCo.com` typed the domain; anything else —
+  `REMOVE` — is matched with case, because shouting it is the point. A gate that names no
+  `RequiredInput` at all is refused rather than auto-accepted: "nothing to type" must never
+  become "anything is accepted".
+- **§5.2 / catalog — `Readiness-Provisioned` is `Impact = 'Write'`.** It is the readiness stage
+  that writes `MailboxProvisioned` / `OneDriveProvisioned` back into the plan, so it earns the
+  rehearsal gate the other two stages do not.
+- **§5.2 / catalog — the source-side exports fix `Prefix = 'Source'`.** `TeamsPhone-Export` and
+  `VivaLearning-Export` pin their prefix the way the README runbook already does, so their
+  output lands in `Source/` and can never collide with the label folder's.
+- **§5.2 — `ResultIds`, instance `Bind` merging and the `Requires` vocabulary.** A script that
+  names its results by mode carries every token; an instance's `Bind` merges on the *target
+  parameter* rather than the settings key, so a destination-side instance replaces the entry's
+  source binding instead of leaving both standing; and `Requires` names either a step instance
+  or an artefact kind, so a plan supplied by hand satisfies `'Plan'`.
+- **§6 — only a live results file makes a step `Done`.** A log or a report says what a step
+  found, not that it finished, and the ledger entry's own `DryRun` field outranks whatever the
+  filenames imply. `StateSource`, `StateRun` and `StateDryRun` were added so that a front end
+  renders one run's stamp beside that same run's counts.
+- **§7.3 — the driver wraps the call in `try`/`catch`.** A splat that never binds leaves
+  `$LASTEXITCODE` unset, and an unset `$LASTEXITCODE` exits 0 — which would have the workbench
+  record `Completed` for a step that never ran. The guard exits 1 instead; a script that exits
+  with a code of its own still propagates it.
+- **§9 — the four renderers are exported, not private.** `Format-MigrationWorkbenchView`,
+  `Format-MigrationStepGlyph`, `Format-MigrationStepLastRun` and
+  `Get-MigrationScriptSynopsisText` stopped being the console's own business the moment a second
+  front end had to draw the same glyph and the same last-run line. The alternative is a window
+  that re-renders them by hand and eventually describes one workspace differently from the
+  board.
