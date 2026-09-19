@@ -107,10 +107,16 @@
     Written with assistance from Claude (Anthropic).
 
     Exit codes: 0 the session ran and was closed normally, or the step succeeded; 1 an
-    unexpected error; 2 a refusal - no workspace, a workspace folder that is not there, settings
-    that will not load, an unknown step id, a parameter set that is still short of a mandatory
-    value, or a hard gate that was not acknowledged - or the step's own exit code 2; 130 the run
-    was aborted. Any other code is the step's own, passed through unchanged.
+    unexpected error, a child that reported no exit code at all, or a run whose tenant did not
+    verify; 2 a refusal - no workspace, a workspace folder that is not there, settings that will
+    not load, an unknown step id, a parameter set that is still short of a mandatory value, or a
+    hard gate that was not acknowledged - or the step's own exit code 2; 130 the run was aborted.
+    Any other code is the step's own, passed through unchanged.
+
+    The one exception to "exits with the step's exit code": a run whose TenantVerified came back
+    false exits 1 whatever the step returned. A scheduler has only the exit code, and a step that
+    exited 0 against the wrong tenant must not read as a reason to run the next one. An aborted
+    run still exits 130, because "I stopped this" is the fact the caller needs first.
 
     No secret ever reaches the driver file or the settings file. A step that takes a
     -ClientSecret and has no certificate thumbprint configured reads the secret from
@@ -254,7 +260,9 @@ function Write-WorkbenchRefusal {
         non-interactive run.
 
         The same sentence goes to the run log when a run context exists, so the workspace's own
-        record of the session says why nothing happened.
+        record of the session says why nothing happened - and to stderr exactly once, as a plain
+        line, because a refusal printed twice (once as the log's [ERROR] line and again inside
+        Write-Error's position block) is three quarters scaffolding.
 
     .PARAMETER Message
         The sentence the operator reads.
@@ -277,7 +285,12 @@ function Write-WorkbenchRefusal {
     )
 
     if ($null -ne (Get-MigrationRunContext)) { Write-MigrationLog -Message $Message -Level ERROR }
-    Write-Error -Message $Message -ErrorAction Continue
+
+    # A plain line on stderr rather than Write-Error. The sentence has already gone to the log
+    # with an [ERROR] prefix, and Write-Error would print it a second time wrapped in a position
+    # block naming a line of this script - four lines of scaffolding around one sentence, in the
+    # one mode whose entire output a scheduler may be capturing and mailing to somebody.
+    [Console]::Error.WriteLine($Message)
 }
 
 function Select-WorkbenchMode {
@@ -757,18 +770,27 @@ function Invoke-WorkbenchNonInteractive {
         same driver writer and the same runner.
 
         In order, and every one of them a refusal that exits 2 rather than a run that guesses:
-        settings that will not load; a step id that is not in the catalogue; a parameter set
-        still short of a mandatory value; a hard gate whose RequiredInput was not supplied
-        through -Set @{ Acknowledge = ... }; and a step that needs a client secret with no
-        secret in the environment to give it.
+        settings that will not load (Test-MigrationWorkspaceRunnable, the refusal all three
+        front ends share); a step id that is not in the catalogue; a parameter set still short
+        of a mandatory value; a hard gate whose RequiredInput was not supplied through
+        -Set @{ Acknowledge = ... }; and a step that needs a client secret with no secret in the
+        environment to give it.
 
         Soft gates warn and the run goes ahead. That is the difference the severities exist to
         draw: a soft gate is advice an operator may have good reason to ignore, and recording
         each one as an override in the ledger is what lets the next reader see what was ignored.
+        The warnings are emitted after the hard gates have been judged, so a run that is about
+        to be refused does not first leave a scheduler's log describing what it waved through.
 
-        A hard gate is matched the way the interactive form matches it - a domain without case,
-        because DNS has none, and anything else with case, because shouting REMOVE is the point -
-        and a hard gate naming nothing to type is refused rather than treated as satisfied.
+        A hard gate is matched by the engine's own rule (Test-MigrationTypedConfirmation) - a
+        domain without case, because DNS has none, and anything else with case, because shouting
+        REMOVE is the point - and a hard gate naming nothing to type is refused rather than
+        treated as satisfied.
+
+        One thing is decided after the run: a tenant mismatch. It is written to stderr and the
+        log and it makes the exit code 1 whatever the step returned, because an unattended
+        caller has nothing but that code, and a step that exited 0 against the wrong tenant
+        would otherwise read as a reason to run the next one.
 
     .PARAMETER WorkspacePath
         The absolute workspace folder, already checked to exist.
@@ -837,11 +859,15 @@ function Invoke-WorkbenchNonInteractive {
 
     $workspace = Get-MigrationWorkspace -Path $WorkspacePath
 
-    # The scanner has already run the settings through Resolve-MigrationSettings; reading its
-    # result rather than loading the file a second time is what keeps the two from disagreeing.
-    if (-not $workspace.SettingsResult.IsValid) {
+    # The same refusal the console board and the window make, out of the same engine function,
+    # so all three agree on when a workspace may be run against at all. The scanner has already
+    # run the settings through Resolve-MigrationSettings; reading its result rather than loading
+    # the file a second time is what keeps the two from disagreeing.
+    $runnable = Test-MigrationWorkspaceRunnable -Workspace $workspace
+    if (-not $runnable.CanRun) {
         $detail = @(@($workspace.SettingsResult.Errors) | ForEach-Object { "  $_" }) -join [Environment]::NewLine
         Write-WorkbenchRefusal -Message (
+            [string]$runnable.Reason + [Environment]::NewLine +
             "The settings in '$($workspace.SettingsPath)' cannot be used:" +
             [Environment]::NewLine + $detail)
         return 2
@@ -883,20 +909,11 @@ function Invoke-WorkbenchNonInteractive {
 
     $gates = @(Test-MigrationStepGate -Step $step -Arguments $resolved -Workspace $workspace -Live:(-not $DryRun))
 
-    # Soft gates are judged on a live run only, which is the console's rule too: a rehearsal
-    # exists to be run before the prerequisites are met, so holding one to them would leave an
-    # unattended caller with nothing safe to do - and recording an override for a rehearsal would
-    # put a waiver in the ledger for a run that changed nothing.
-    $gateOverrides = [System.Collections.Generic.List[string]]::new()
-    if (-not $DryRun) {
-        foreach ($gate in @($gates | Where-Object { $_.Severity -eq 'Soft' -and -not $_.Satisfied })) {
-            Write-Warning "$($gate.Kind) gate not satisfied, continuing anyway: $($gate.Message)"
-            # The extra parentheses matter: a method call splits its arguments on commas, so
-            # without them the format operator would get only its first value.
-            $gateOverrides.Add(('{0}:{1}' -f $gate.Kind, $gate.Message))
-        }
-    }
-
+    # Hard gates are judged first, and the soft-gate warnings are held until after them. The
+    # console asks in the other order because there the typed confirmation is the last act
+    # before the run, which is where a deliberate act belongs; here nothing is asked, and
+    # warning about what was waved through on a run that is about to be refused anyway just
+    # leaves a scheduler's log describing a run that never happened.
     foreach ($gate in @($gates | Where-Object { $_.Severity -eq 'Hard' -and -not $_.Satisfied })) {
         $required = [string]$gate.RequiredInput
 
@@ -910,13 +927,27 @@ function Invoke-WorkbenchNonInteractive {
             return 2
         }
 
-        $accepted = if ($required -like '*.*') { $acknowledge -ieq $required } else { $acknowledge -ceq $required }
-        if ($accepted) { continue }
+        # The engine's rule, the same one the console form and the window's modal dialog apply.
+        if (Test-MigrationTypedConfirmation -Typed $acknowledge -Required $required) { continue }
 
         Write-WorkbenchRefusal -Message (
             "$($gate.Message) An unattended run answers it with " +
             "-Set @{ Acknowledge = '$required' }. The run was not started.")
         return 2
+    }
+
+    # Soft gates are judged on a live run only, which is the console's rule too: a rehearsal
+    # exists to be run before the prerequisites are met, so holding one to them would leave an
+    # unattended caller with nothing safe to do - and recording an override for a rehearsal would
+    # put a waiver in the ledger for a run that changed nothing.
+    $gateOverrides = [System.Collections.Generic.List[string]]::new()
+    if (-not $DryRun) {
+        foreach ($gate in @($gates | Where-Object { $_.Severity -eq 'Soft' -and -not $_.Satisfied })) {
+            Write-Warning "$($gate.Kind) gate not satisfied, continuing anyway: $($gate.Message)"
+            # The extra parentheses matter: a method call splits its arguments on commas, so
+            # without them the format operator would get only its first value.
+            $gateOverrides.Add(('{0}:{1}' -f $gate.Kind, $gate.Message))
+        }
     }
 
     # A secret never reaches the driver file or the settings file: it is set on the child
@@ -973,13 +1004,46 @@ function Invoke-WorkbenchNonInteractive {
     $environment = $null
 
     Write-Host ''
-    Write-Host ('Exit {0}: {1}' -f $result.ExitCode, $result.Meaning)
+    # Coloured by what the code means (Docs/Workbench-Design.md, section 7.3), the same mapping
+    # the console board uses: 0 green, 1 red, and 2, 3 and 130 amber - a run that did some of
+    # the work, left some behind, or was stopped is neither a success nor a failure.
+    $exitColour = switch ([string]$result.ExitCode) {
+        '0' { 'Green' }
+        '1' { 'Red' }
+        '2' { 'Yellow' }
+        '3' { 'Yellow' }
+        '130' { 'Yellow' }
+        default { '' }
+    }
+    $exitLine = 'Exit {0}: {1}' -f $result.ExitCode, $result.Meaning
+    if ($exitColour) { Write-Host $exitLine -ForegroundColor $exitColour } else { Write-Host $exitLine }
+
     foreach ($file in @($result.Files)) { Write-Host "  wrote $file" }
     Write-Host "  log  $($result.StdoutPath)"
 
+    # Spec section 7.2: a tenant mismatch is flagged regardless of the exit code, and the two
+    # interactive front ends shout it in red. An unattended caller has only the exit code and
+    # whatever it captured from stderr, so it gets both - and the exit code becomes 1 whatever
+    # the step returned, because a step that exited 0 against the wrong tenant is the worst
+    # outcome this toolkit can produce and 0 is the one answer that tells a scheduler to carry
+    # on to the next step.
+    $mismatch = ((Get-MigrationProperty -InputObject $result -Name 'TenantVerified' -Default $null) -eq $false)
+    if ($mismatch) {
+        Write-WorkbenchRefusal -Message ('TENANT MISMATCH — ' + (Format-MigrationTenantVerdict -Result $result))
+    }
+
     # 130 is the shell's own code for a process ended by an interrupt, and it is what a scheduler
-    # reading this run needs to tell 'the operator stopped it' from 'the step failed'.
+    # reading this run needs to tell 'the operator stopped it' from 'the step failed'. It is
+    # decided before the mismatch, because a run that was killed may simply never have reached
+    # the sign-in that would have printed a tenant line, and 'I stopped this' is the fact the
+    # caller needs first.
     if ($result.Aborted) { return 130 }
+
+    if ($mismatch) { return 1 }
+
+    # A child that reported no exit code at all is not a success: [int]$null is 0, and a
+    # scheduler reading 0 would go on to the next step of the migration.
+    if ($null -eq $result.ExitCode) { return 1 }
 
     $code = [int]$result.ExitCode
     # Complete-MigrationRun only accepts 0-255, and a child that returned something else has

@@ -24,6 +24,12 @@ function Show-MigrationWorkbench {
         a settings edit - because a board drawn from a stale scan is a board that tells an
         operator mid-migration that a step they just ran has not run.
 
+        Settings that stop validating mid-session - a hand edit, a sync client's conflict copy,
+        a .bak restored over the file - put the reason under the board and refuse every step
+        form (Test-MigrationWorkspaceRunnable) until they are fixed. The session carries on:
+        S is how they get fixed, and the runbook is how an operator works out which keys are
+        missing.
+
         Returns the last run's result, or $null where the session ran nothing, so a caller that
         drove one step non-interactively has the exit code to act on.
 
@@ -102,6 +108,17 @@ function Show-MigrationWorkbench {
     while ($true) {
         foreach ($line in @(Format-MigrationWorkbenchView -Workspace $workspace -View $view -Version $Version)) {
             Write-Host $line
+        }
+
+        # Drawn from the current scan, every time round, because the settings can stop
+        # validating while the board is open - a hand edit, a sync client's conflict copy, a
+        # .bak restored over the file. The session is not ended: S is how it gets fixed, and
+        # the runbook is how an operator works out which keys they are missing. The step form
+        # makes the same refusal, so nothing can be run from this state either.
+        $runnable = Test-MigrationWorkspaceRunnable -Workspace $workspace
+        if (-not $runnable.CanRun) {
+            Write-Host ''
+            Write-Host ('  ' + [string]$runnable.Reason) -ForegroundColor Yellow
         }
 
         $answer = ([string](Read-MigrationPrompt -Kind 'Text' -Message 'Choose a step, or a key')).Trim()

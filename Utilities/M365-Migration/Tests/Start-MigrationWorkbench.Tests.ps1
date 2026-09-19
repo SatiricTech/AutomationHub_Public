@@ -48,6 +48,7 @@ BeforeAll {
     $global:WorkbenchStepRuns = [System.Collections.Generic.List[object]]::new()
     $global:WorkbenchStepExitCode = 0
     $global:WorkbenchStepAborted = $false
+    $global:WorkbenchStepTenantVerified = $null
 
     function Invoke-MigrationStep {
         param(
@@ -82,7 +83,8 @@ BeforeAll {
             Files              = @()
             StdoutPath         = 'stdout.log'
             Summary            = $null
-            TenantVerified     = $null
+            ExpectedTenantId   = [string]$ExpectedTenantId
+            TenantVerified     = $global:WorkbenchStepTenantVerified
             ConnectedTenantIds = @()
         }
     }
@@ -134,12 +136,29 @@ BeforeAll {
         }
 
         $global:WorkbenchStepRuns = [System.Collections.Generic.List[object]]::new()
-        # Errors and warnings both: a soft gate the run warned past is a Write-Warning, and the
-        # 2>&1 alone would have left every one of those out of what the assertions can see.
-        $output = & $script:ScriptPath @Parameter 2>&1 3>&1 | Out-String
+
+        # A refusal is a plain line on the process's own stderr, not a PowerShell error record,
+        # so 2>&1 never sees it: the script writes it with [Console]::Error.WriteLine to keep
+        # Write-Error's four-line position block out of an unattended run's output. Redirecting
+        # Console.Error for the length of the call is the only way to read it back in-process,
+        # and it is restored in a finally so a failing invocation cannot swallow the suite's own
+        # error output for every test after it.
+        $captured = [System.IO.StringWriter]::new()
+        $previousError = [Console]::Error
+        [Console]::SetError($captured)
+        try {
+            # Errors and warnings both: a soft gate the run warned past is a Write-Warning, and
+            # the 2>&1 alone would have left every one of those out of what the assertions see.
+            $output = & $script:ScriptPath @Parameter 2>&1 3>&1 | Out-String
+        }
+        finally {
+            [Console]::SetError($previousError)
+        }
+
         return [pscustomobject]@{
             ExitCode = $LASTEXITCODE
-            Output   = $output
+            Output   = ($output + $captured.ToString())
+            Stderr   = $captured.ToString()
             Runs     = @($global:WorkbenchStepRuns)
         }
     }
@@ -198,7 +217,7 @@ AfterAll {
 
     Remove-Variable -Scope Global -ErrorAction SilentlyContinue -Name `
         WorkbenchStepRuns, WorkbenchStepExitCode, WorkbenchStepAborted, WorkbenchSuiteStart, `
-        WorkbenchStrayRoot, WorkbenchRootExisted, WorkbenchRootBefore
+        WorkbenchStrayRoot, WorkbenchRootExisted, WorkbenchRootBefore, WorkbenchStepTenantVerified
 }
 
 Describe 'Start-MigrationWorkbench helpers (dot-sourced with -NoGui)' {
@@ -512,6 +531,121 @@ Describe 'Start-MigrationWorkbench Main - a run the operator aborted' {
     }
 }
 
+Describe 'Start-MigrationWorkbench Main - a run whose tenant did not verify' {
+
+    <#
+        Spec section 7.2: a tenant mismatch is flagged regardless of the exit code. The console
+        and the window both shout it; the unattended path used to put it in the ledger and say
+        nothing, so a scheduler reading the exit code saw a success. It now says so on stderr
+        and exits 1 whatever the step returned.
+    #>
+
+    BeforeAll {
+        $global:WorkbenchStepTenantVerified = $false
+        $script:MismatchWorkspace = Copy-FixtureWorkspace -Name 'NonInteractiveMismatch'
+        $script:MismatchResult = Invoke-WorkbenchScript -Parameter @{
+            Workspace = $script:MismatchWorkspace
+            Step      = 'New-Users'
+            DryRun    = $true
+            Verbosity = 'Low'
+        }
+    }
+
+    AfterAll {
+        $global:WorkbenchStepTenantVerified = $null
+    }
+
+    It 'Exits 1 even though the step itself returned 0' {
+        $global:WorkbenchStepExitCode | Should -Be 0
+        $script:MismatchResult.ExitCode | Should -Be 1
+    }
+
+    It 'Says so on stderr, where an unattended caller can capture it' {
+        $script:MismatchResult.Stderr | Should -BeLike '*TENANT MISMATCH*'
+    }
+
+    It 'Names the expected tenant, because a run that printed no tenant line never signed in' {
+        $script:MismatchResult.Stderr | Should -BeLike '*No tenant line was found*'
+        $script:MismatchResult.Stderr | Should -BeLike '*00000000-0000-0000-0000-000000000000*'
+        $script:MismatchResult.Stderr | Should -Not -BeLike '*no tenant at all*'
+    }
+
+    It 'Ran the step: the flag is post-run, not a refusal' {
+        $script:MismatchResult.Runs | Should -HaveCount 1
+    }
+}
+
+Describe 'Start-MigrationWorkbench Main - a child that reported no exit code' {
+
+    BeforeAll {
+        $global:WorkbenchStepExitCode = $null
+        $script:NoCodeWorkspace = Copy-FixtureWorkspace -Name 'NonInteractiveNoExitCode'
+        $script:NoCodeResult = Invoke-WorkbenchScript -Parameter @{
+            Workspace = $script:NoCodeWorkspace
+            Step      = 'New-Users'
+            DryRun    = $true
+            Verbosity = 'Low'
+        }
+    }
+
+    AfterAll {
+        $global:WorkbenchStepExitCode = 0
+    }
+
+    It 'Exits 1 rather than letting [int]$null read as success' {
+        $script:NoCodeResult.ExitCode | Should -Be 1
+    }
+}
+
+Describe 'Start-MigrationWorkbench Main - a refusal is printed once' {
+
+    BeforeAll {
+        $script:OnceWorkspace = Copy-FixtureWorkspace -Name 'NonInteractiveRefusalOnce'
+        $script:OnceResult = Invoke-WorkbenchScript -Parameter @{
+            Workspace = $script:OnceWorkspace
+            Step      = 'Nope'
+            Verbosity = 'Low'
+        }
+    }
+
+    It 'Writes the sentence to stderr as a plain line, with no position block' {
+        $script:OnceResult.Stderr | Should -BeLike '*Nope*'
+        # Write-Error's block is what these two would come from.
+        $script:OnceResult.Stderr | Should -Not -BeLike '*Line |*'
+        $script:OnceResult.Stderr | Should -Not -BeLike '*~~~~*'
+    }
+
+    It 'Writes it exactly once' {
+        @(@($script:OnceResult.Stderr -split "`r?`n") |
+                Where-Object { $_ -like "*Step 'Nope' is not in the step catalogue*" }) | Should -HaveCount 1
+    }
+}
+
+Describe 'Start-MigrationWorkbench Main - a hard gate is judged before the soft ones warn' {
+
+    <#
+        A run that is about to be refused must not first tell a scheduler's log what it waved
+        through: the soft-gate warnings describe a run that never happened.
+    #>
+
+    BeforeAll {
+        $script:GateOrderWorkspace = Copy-FixtureWorkspace -Name 'NonInteractiveGateOrder'
+        $script:GateOrderResult = Invoke-WorkbenchScript -Parameter @{
+            Workspace = $script:GateOrderWorkspace
+            Step      = 'DomainReferences-Remediate'
+            Verbosity = 'Low'
+        }
+    }
+
+    It 'Exits 2 on the unanswered typed confirmation' {
+        $script:GateOrderResult.ExitCode | Should -Be 2
+    }
+
+    It 'Emits no soft-gate override warning for a run it refused' {
+        $script:GateOrderResult.Output | Should -Not -BeLike '*continuing anyway*'
+    }
+}
+
 Describe 'Start-MigrationWorkbench Main - a step id that is not in the catalogue' {
 
     BeforeAll {
@@ -739,6 +873,12 @@ Describe 'Start-MigrationWorkbench Main - settings that will not load' {
     It 'Exits 2 and says the settings cannot be used' {
         $script:BadSettingsResult.ExitCode | Should -Be 2
         $script:BadSettingsResult.Output | Should -BeLike '*settings*'
+    }
+
+    It 'Names the keys to fix, the same refusal the board and the window make' {
+        # Test-MigrationWorkspaceRunnable's reason, so all three front ends say the same thing.
+        $script:BadSettingsResult.Output | Should -BeLike '*not usable yet*'
+        $script:BadSettingsResult.Output | Should -BeLike '*(the settings file itself)*'
     }
 
     It 'Runs nothing' {
@@ -1326,9 +1466,17 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
                     Where-Object { & $isUi $_ } | ForEach-Object { $_.GetName().Name } | Sort-Object)
             @($before | Where-Object { $_ -like 'System.Windows.Forms*' }) | Should -HaveCount 0
 
-            $refusal = Start-MigrationWorkbenchGui -WorkspacePath '' 2>&1
+            # The refusal is a plain line on the process's own stderr (Write-WorkbenchRefusal),
+            # not a PowerShell error record, so 2>&1 never sees it: Console.Error is redirected
+            # for the length of the call and restored in the finally.
+            $captured = [System.IO.StringWriter]::new()
+            $previousError = [Console]::Error
+            [Console]::SetError($captured)
+            try { $refusal = Start-MigrationWorkbenchGui -WorkspacePath '' 2>&1 }
+            finally { [Console]::SetError($previousError) }
+
             @($refusal | Where-Object { $_ -is [int] }) | Should -Be @(2)
-            ($refusal | Out-String) | Should -BeLike '*Windows only*'
+            $captured.ToString() | Should -BeLike '*Windows only*'
 
             $after = @([AppDomain]::CurrentDomain.GetAssemblies() |
                     Where-Object { & $isUi $_ } | ForEach-Object { $_.GetName().Name } | Sort-Object)

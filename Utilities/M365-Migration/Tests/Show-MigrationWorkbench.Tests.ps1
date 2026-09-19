@@ -341,6 +341,60 @@ Describe 'Show-MigrationWorkbench' {
         }
     }
 
+    Context 'settings that stop validating while the board is open' {
+
+        <#
+            The board guarded validity only when it opened, and neither rescan re-checked it.
+            A settings file that becomes invalid mid-session - a hand edit, a sync client's
+            conflict copy, a .bak restored over it - would then let the step form run against
+            Settings = $null: no -TenantId, no expected tenant to verify against, no prefix, and
+            one Yes on a soft gate starting a live writer nobody can say which tenant it reached.
+        #>
+
+        BeforeAll {
+            $script:BrokenMidPath = Copy-FixtureWorkspace -Name 'BrokenMidSession'
+            $settingsPath = Join-Path $script:BrokenMidPath 'M365Migration.settings.json'
+
+            Reset-ConsoleCapture
+            # 6 = Provision users; the form's wave prompt blanks the Label on its way past, so
+            # the rescan after B sees a workspace nothing may be run against. The session is not
+            # ended - S is how it gets fixed - so the board is drawn again and the second 6 is
+            # refused by the step form itself.
+            $queue = [System.Collections.Generic.Queue[string]]::new([string[]]@('6', 'all', 'B', '6', 'Q'))
+            Set-MigrationPromptHandler -Handler {
+                param($Kind, $Message)
+                $global:MigrationPromptLog.Add("$Kind|$Message")
+                if ($queue.Count -eq 0) { throw "The scripted answers ran out at '$Message'." }
+                $answer = $queue.Dequeue()
+                if ($answer -eq 'all') {
+                    $document = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+                    $document.Label = ''
+                    $document | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $settingsPath
+                }
+                return $answer
+            }.GetNewClosure()
+
+            $script:BrokenMidResult = Show-MigrationWorkbench -Path $script:BrokenMidPath -Version '1.0.0'
+            $script:BrokenMidConsole = Get-ConsoleText
+        }
+
+        It 'refuses the step form and runs nothing' {
+            @($global:MigrationStepRuns).Count | Should -Be 0
+            $script:BrokenMidResult | Should -BeNullOrEmpty
+        }
+
+        It 'puts the reason and the key to fix under the board' {
+            $script:BrokenMidConsole | Should -BeLike '*not usable yet*'
+            $script:BrokenMidConsole | Should -BeLike '*Label*'
+        }
+
+        It 'keeps the session open, because S is how the operator fixes it' {
+            # The board was drawn again after the settings broke: the last answer was Q, and a
+            # session that had ended would have thrown on it instead.
+            $script:BrokenMidConsole | Should -BeLike '*M365 Migration Workbench 1.0.0*'
+        }
+    }
+
     Context 'the settings editor reached from the menu' {
 
         BeforeAll {
@@ -578,6 +632,44 @@ Describe 'Invoke-MigrationWorkbenchStep' {
 
         @($global:MigrationStepRuns)[0].Driver.DisplayLine | Should -BeLike '*-DefaultUsageLocation GB*'
         Get-ConsoleText | Should -BeLike '*DefaultUsageLocation*Operator*'
+    }
+
+    It 'refuses to edit a parameter the workbench owns, and names what really sets it' {
+        # -Override @{ Wave = ... } outranks the wave the run was told to use, and nothing on
+        # screen would say so: the ledger records the wave that was chosen at the prompt while
+        # the driver runs the wave that was typed. The engine drops it either way; E refuses so
+        # the operator is told which control decides.
+        Set-ScriptedAnswer -Answer @('all', 'E', 'Wave', 'B')
+        Invoke-TestStep -Id 'New-Users' -Path (Copy-FixtureWorkspace -Name 'OwnedParameter') | Out-Null
+
+        @($global:MigrationStepRuns).Count | Should -Be 0
+        Get-ConsoleText | Should -BeLike '*Wave is set through the Waves prompt, not here.*'
+    }
+
+    It 'refuses to edit a SecureString, and says where the secret really comes from' {
+        # A text prompt would echo the secret to the terminal and to any transcript, and store
+        # it in the hashtable the driver writer refuses. The run asks for it at the right
+        # moment, as a SecureString, and hands it to the child's environment block alone.
+        Set-ScriptedAnswer -Answer @('E', 'ClientSecret', 'B')
+        Invoke-TestStep -Id 'VivaLearning-Import' -Path (Copy-FixtureWorkspace -Name 'SecretEdit') | Out-Null
+
+        @($global:MigrationStepRuns).Count | Should -Be 0
+        Get-ConsoleText | Should -BeLike ('*ClientSecret is asked for at run time, or set ' +
+            '$env:M365MIGRATION_CLIENT_SECRET before running*')
+        Get-PromptText | Should -Not -BeLike '*Text|ClientSecret*'
+    }
+
+    It 'reads a typed map into the hashtable the script declares' {
+        # Stored as the typed string it would reach the child as a String where the script
+        # declares a Hashtable, and the run would die on a binding error long after the
+        # operator had typed it. One parser, shared with the settings form and the window.
+        Set-ScriptedAnswer -Answer @('E', 'AliasDomainMap', 'old.com=new.com;legacy.com=new.com', 'D', 'y')
+        Invoke-TestStep -Id 'New-IdentityPlan' -Path (Copy-FixtureWorkspace -Name 'MapEdit') | Out-Null
+
+        $driver = Get-Content -LiteralPath ([string]@($global:MigrationStepRuns)[0].Driver.DriverPath) -Raw
+        $driver | Should -Match "AliasDomainMap\s*=\s*@\{"
+        $driver | Should -Match "'old\.com'\s*=\s*'new\.com'"
+        $driver | Should -Match "'legacy\.com'\s*=\s*'new\.com'"
     }
 
     It 'backs out without running anything' {

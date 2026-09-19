@@ -18,7 +18,11 @@
           2. The arguments, each with the rung of the precedence ladder that decided it, and
              anything the chosen parameter set still needs. E re-asks one of them; the answer
              becomes an Operator override, which outranks everything but the instance's own
-             fixed values.
+             fixed values. Two kinds of parameter E will not ask for: one the workbench owns
+             (Get-MigrationWorkbenchOwnedParameter), because it is already decided by a control
+             the operator can see and a second answer would outrank the first silently; and a
+             SecureString, because typing one would echo the secret to the terminal and to any
+             transcript.
           3. The gates. A live run must clear them all: a soft gate is confirmed and the
              override is recorded in the ledger, a hard one is typed out in full. A rehearsal
              clears only the hard ones - a rehearsal exists to be run before the prerequisites
@@ -33,6 +37,12 @@
              that will actually start the child, and then one last confirmation.
           5. The outcome: what the exit code means, what was counted, what was written, and -
              loudly - whether the child reached the tenant it was supposed to.
+
+        The form refuses outright, before it resolves anything, on a workspace whose settings do
+        not validate (Test-MigrationWorkspaceRunnable). Validity is checked here and not only
+        when the board opened, because a settings file can stop validating while a session is
+        running and a form that went ahead would resolve without a -TenantId, verify against no
+        expected tenant, and write under whatever the workspace folder happens to be called.
 
         Nothing here is allowed to take the session down with it. Every engine call is inside
         one guard: a plan that will not parse, a driver that cannot be written, a workspace
@@ -89,8 +99,38 @@
         [string]$Version
     )
 
+    # Before anything is resolved, and asked here rather than only when the board opened: a
+    # settings file can stop validating while a session is running - a hand edit, a sync
+    # client's conflict copy, a .bak restored over it - and a form that went ahead anyway would
+    # resolve without a -TenantId, run with no expected tenant to verify against, and write into
+    # whatever the workspace folder happens to be called. S is how the operator fixes it.
+    $runnable = Test-MigrationWorkspaceRunnable -Workspace $Workspace
+    if (-not $runnable.CanRun) {
+        Write-Host ''
+        Write-Host ('  ' + [string]$runnable.Reason) -ForegroundColor Yellow
+        return $null
+    }
+
     $driverParameters = @{}
     if ($PSBoundParameters.ContainsKey('Version')) { $driverParameters['Version'] = $Version }
+
+    # The engine's list, not a copy of it: the window filters its generated form on the same
+    # one, and two lists is how a control comes to offer a value the resolver then drops.
+    $ownedParameters = @(Get-MigrationWorkbenchOwnedParameter)
+
+    # What actually decides each of them, so a refusal names the control rather than just
+    # saying no. Anything else owned is a common parameter the driver sets for every run.
+    $ownerOf = {
+        param([string]$Name)
+        switch ($Name) {
+            'Wave' { return 'set through the Waves prompt' }
+            'DryRun' { return 'chosen by Dry run vs Run' }
+            'OutputPath' { return 'the workspace this board is open on' }
+            'TenantId' { return 'from Settings' }
+            'LogPath' { return 'derived by the script from -OutputPath' }
+            default { return 'set by the workbench for every run' }
+        }
+    }
 
     # --- 1. the wave -------------------------------------------------------------------------
 
@@ -209,6 +249,31 @@
                 }
 
                 $parameter = $match[0]
+
+                # Two kinds of parameter are never edited here, for two different reasons.
+                #
+                # One the workbench owns is already decided somewhere the operator can see - the
+                # Waves prompt, D or R, the workspace, Settings - and an override would outrank
+                # that silently, which is how a ledger comes to record the wave that was ticked
+                # while the driver runs the wave that was typed. The engine drops it anyway; the
+                # point of refusing here is to say which control actually sets it.
+                $isCommon = [bool](Get-MigrationProperty -InputObject $parameter -Name 'Common' -Default $false)
+                if ($isCommon -or ([string]$parameter.Name) -in $ownedParameters) {
+                    Write-Host ("  $($parameter.Name) is $(& $ownerOf ([string]$parameter.Name)), not here.") `
+                        -ForegroundColor Yellow
+                    continue
+                }
+
+                # A SecureString has no text answer: typing one here would echo the secret to
+                # the terminal and to any transcript, and store it in a hashtable the driver
+                # writer refuses. The run asks for it at the right moment instead.
+                if ([string]$parameter.TypeName -eq 'SecureString') {
+                    Write-Host ("  $($parameter.Name) is asked for at run time, or set " +
+                        '$env:M365MIGRATION_CLIENT_SECRET before running — it is never typed here.') `
+                        -ForegroundColor Yellow
+                    continue
+                }
+
                 $edited = $true
                 if ($parameter.IsSwitch -or $parameter.IsBool) {
                     $overrides[$parameter.Name] = [bool](Read-MigrationPrompt -Kind 'Confirm' `
@@ -217,6 +282,16 @@
                 elseif (@($parameter.ValidValues).Count -gt 0) {
                     $overrides[$parameter.Name] = [string](Read-MigrationPrompt -Kind 'Choice' `
                             -Message $parameter.Name -Choices @($parameter.ValidValues))
+                }
+                elseif ([bool](Get-MigrationProperty -InputObject $parameter -Name 'IsHashtable' `
+                            -Default $false)) {
+                    # Read by the one parser the settings form and the window's two-column
+                    # editor use. Stored as the typed string it would reach the child as a
+                    # String where the script declares a Hashtable, and the run would die on a
+                    # binding error long after the operator had typed it.
+                    $entered = [string](Read-MigrationPrompt -Kind 'Text' `
+                            -Message ('{0} (old=new;old2=new2)' -f $parameter.Name))
+                    $overrides[$parameter.Name] = ConvertFrom-MigrationMapText -Text $entered
                 }
                 else {
                     $entered = [string](Read-MigrationPrompt -Kind 'Text' -Message $parameter.Name)
@@ -436,7 +511,21 @@
             $environment = $null
 
             Write-Host ''
-            Write-Host ('Exit {0}: {1}' -f $result.ExitCode, $result.Meaning)
+            # Coloured by what the code means (Docs/Workbench-Design.md, section 7.3): 0 green,
+            # 1 red, and 2, 3 and 130 amber - a run that did some of the work, left some behind,
+            # or was stopped is neither a success nor a failure, and an operator scanning a
+            # scrollback should not have to read the number to tell those three apart.
+            $exitColour = switch ([string]$result.ExitCode) {
+                '0' { 'Green' }
+                '1' { 'Red' }
+                '2' { 'Yellow' }
+                '3' { 'Yellow' }
+                '130' { 'Yellow' }
+                default { '' }
+            }
+            $exitLine = 'Exit {0}: {1}' -f $result.ExitCode, $result.Meaning
+            if ($exitColour) { Write-Host $exitLine -ForegroundColor $exitColour }
+            else { Write-Host $exitLine }
 
             $summary = Get-MigrationProperty -InputObject $result -Name 'Summary' -Default $null
             $counts = [System.Collections.Generic.List[string]]::new()
@@ -453,10 +542,11 @@
             if ($verified -eq $false) {
                 Write-Host ''
                 Write-Host '!! TENANT MISMATCH' -ForegroundColor Red
-                $connected = @($result.ConnectedTenantIds)
-                $text = if ($connected.Count -gt 0) { $connected -join ', ' } else { 'no tenant at all' }
-                Write-Host "   This run signed in to $text, which is not the tenant it was given." `
-                    -ForegroundColor Red
+                # One sentence, built by the engine, so the console, the window and the
+                # unattended path cannot describe the same outcome three different ways - and
+                # so that a run which printed no tenant line at all is reported as the sign-in
+                # failure it is rather than sending an operator after a GUID nobody saw.
+                Write-Host ('   ' + (Format-MigrationTenantVerdict -Result $result)) -ForegroundColor Red
             }
             elseif ($verified -eq $true) {
                 Write-Host '  tenant verified'
