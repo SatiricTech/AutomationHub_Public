@@ -22,7 +22,13 @@ function Connect-MigrationGraph {
         rehearse the same script with -DryRun afterwards.
 
     .PARAMETER TenantId
-        The tenant to sign in to. Recommended when the technician has access to several.
+        The tenant to sign in to - a GUID or a domain, which is resolved to its GUID via
+        Resolve-MigrationTenantId before anything is compared or passed on, exactly as
+        Connect-MigrationExchange resolves its own -TenantId. The Graph context reports a
+        GUID, so comparing a domain to it raw would judge a correct cached session "wrong
+        tenant" and re-sign-in on every script of a run. Recommended when the technician
+        has access to several tenants: a freshly established session is checked against it
+        too, and a mismatch disconnects and throws.
 
     .PARAMETER Reconnect
         Forces a fresh sign-in even when the cached session would qualify.
@@ -58,6 +64,11 @@ function Connect-MigrationGraph {
 
     Initialize-MigrationModule -Name 'Microsoft.Graph.Authentication'
 
+    # Resolved once so a domain is only looked up a single time, and so the cached-session
+    # check, the -TenantId handed to Connect-MgGraph and the post-connect check all compare
+    # against the same GUID - which is the only form Get-MgContext ever reports.
+    $expectedTenantId = if ($TenantId) { Resolve-MigrationTenantId -Tenant $TenantId } else { '' }
+
     # A ReadWrite scope covers every call its read-only sibling would have permitted, so it
     # is treated as satisfying that sibling when checking what a session already holds -
     # otherwise a -DryRun run right after (or before) a live run of the same script forces
@@ -78,7 +89,7 @@ function Connect-MigrationGraph {
     if ($existing) {
         $granted = @($existing.Scopes)
         $missing = @($Scopes | Where-Object { -not (& $scopeIsGranted $granted $_) })
-        $wrongTenant = $TenantId -and $existing.TenantId -and ($existing.TenantId -ne $TenantId)
+        $wrongTenant = $expectedTenantId -and $existing.TenantId -and ($existing.TenantId -ne $expectedTenantId)
 
         if ($Reconnect -or $missing.Count -gt 0 -or $wrongTenant) {
             $reason = if ($Reconnect) { '-Reconnect was requested' }
@@ -94,7 +105,7 @@ function Connect-MigrationGraph {
     }
 
     $connectParameters = @{ Scopes = $Scopes; NoWelcome = $true; ErrorAction = 'Stop' }
-    if ($TenantId) { $connectParameters['TenantId'] = $TenantId }
+    if ($expectedTenantId) { $connectParameters['TenantId'] = $expectedTenantId }
 
     try {
         Connect-MgGraph @connectParameters
@@ -106,6 +117,23 @@ function Connect-MigrationGraph {
     $context = Get-MgContext
     if (-not $context) {
         throw 'Connect-MgGraph returned without establishing a session. Re-run and complete the sign-in prompt.'
+    }
+
+    # The account chooser can put a fresh sign-in in any tenant the technician holds an
+    # account in, whatever -TenantId asked for, so the established session is checked before
+    # the scopes are: being in the wrong tenant is the worse finding and the clearer message.
+    # The comparison itself lives in Assert-MigrationTenant, so every connector and script
+    # shares one implementation of "does this session match the tenant I was told to expect".
+    if ($expectedTenantId) {
+        try {
+            $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenantId -GraphContext $context `
+                -Purpose 'Microsoft Graph sign-in'
+        }
+        catch {
+            try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { $null = $_ }
+            throw ("$($_.Exception.Message) The wrong account was probably picked in the account chooser; " +
+                'sign in again with an account in the expected tenant.')
+        }
     }
 
     $grantedScopes = @($context.Scopes)

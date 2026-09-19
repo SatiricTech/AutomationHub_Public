@@ -73,6 +73,36 @@ BeforeAll {
             }
         }
 
+        if (-not (Get-Command -Name 'Get-CsTenant' -ErrorAction SilentlyContinue)) {
+            function script:Get-CsTenant {
+                [CmdletBinding()]
+                param()
+                throw 'Unmocked SDK call: Get-CsTenant'
+            }
+        }
+
+        if (-not (Get-Command -Name 'Connect-MicrosoftTeams' -ErrorAction SilentlyContinue)) {
+            function script:Connect-MicrosoftTeams {
+                [CmdletBinding()]
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+                    Justification = 'Signature-only stub; the parameters exist to be bound, not read.')]
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
+                    Justification = 'The stub must carry the SDK cmdlet''s exact name for Mock to replace it.')]
+                param([string]$TenantId)
+                throw 'Unmocked SDK call: Connect-MicrosoftTeams'
+            }
+        }
+
+        if (-not (Get-Command -Name 'Disconnect-MicrosoftTeams' -ErrorAction SilentlyContinue)) {
+            function script:Disconnect-MicrosoftTeams {
+                [CmdletBinding()]
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
+                    Justification = 'The stub must carry the SDK cmdlet''s exact name for Mock to replace it.')]
+                param()
+                throw 'Unmocked SDK call: Disconnect-MicrosoftTeams'
+            }
+        }
+
         if (-not (Get-Command -Name 'Disconnect-ExchangeOnline' -ErrorAction SilentlyContinue)) {
             # SupportsShouldProcess so the module's own '-Confirm:$false' still binds against the stub.
             function script:Disconnect-ExchangeOnline {
@@ -192,12 +222,81 @@ Describe 'Connect-MigrationGraph' {
                 $script:contextCalls = 0
                 Mock Get-MgContext {
                     $script:contextCalls++
-                    $tenant = if ($script:contextCalls -eq 1) { 'tenant-other' } else { 'tenant-wanted' }
+                    $tenant = if ($script:contextCalls -eq 1) {
+                        'b0000000-0000-0000-0000-000000000002'
+                    }
+                    else { 'a0000000-0000-0000-0000-000000000001' }
                     return [pscustomobject]@{ Scopes = @('User.Read.All'); TenantId = $tenant; Account = 'a@contoso.com' }
                 }
 
-                $null = Connect-MigrationGraph -Scopes 'User.Read.All' -TenantId 'tenant-wanted'
+                $null = Connect-MigrationGraph -Scopes 'User.Read.All' -TenantId 'a0000000-0000-0000-0000-000000000001'
                 Should -Invoke Disconnect-MgGraph -Times 1 -Exactly
+            }
+        }
+
+        It 'Reuses a cached session whose GUID matches a domain-form -TenantId' {
+            InModuleScope M365Migration {
+                # The README's own examples pass a domain. Comparing that domain to the
+                # context's GUID judges a correct session "wrong tenant" and re-signs in on
+                # every script of the run, so the domain is resolved before it is compared.
+                Mock Initialize-MigrationModule { }
+                Mock Connect-MgGraph { }
+                Mock Disconnect-MgGraph { }
+                Mock Resolve-MigrationTenantId { 'a0000000-0000-0000-0000-000000000001' }
+                Mock Get-MgContext { [pscustomobject]@{
+                    Scopes   = @('User.Read.All')
+                    TenantId = 'a0000000-0000-0000-0000-000000000001'; Account = 'a@contoso.com' } }
+
+                $context = Connect-MigrationGraph -Scopes 'User.Read.All' -TenantId 'newco.onmicrosoft.com'
+                $context.TenantId | Should -BeExactly 'a0000000-0000-0000-0000-000000000001'
+                Should -Invoke Connect-MgGraph -Times 0 -Exactly
+                Should -Invoke Disconnect-MgGraph -Times 0 -Exactly
+            }
+        }
+
+        It 'Passes the resolved GUID to Connect-MgGraph rather than the domain it was given' {
+            InModuleScope M365Migration {
+                Mock Initialize-MigrationModule { }
+                Mock Disconnect-MgGraph { }
+                Mock Invoke-MgGraphRequest { throw 'Invoke-MgGraphRequest should not be reachable without a mock' }
+                Mock Resolve-MigrationTenantId { 'a0000000-0000-0000-0000-000000000001' }
+                Mock Connect-MgGraph { }
+                $script:contextCalls = 0
+                Mock Get-MgContext {
+                    $script:contextCalls++
+                    if ($script:contextCalls -eq 1) { return $null }
+                    return [pscustomobject]@{
+                        Scopes   = @('User.Read.All')
+                        TenantId = 'a0000000-0000-0000-0000-000000000001'; Account = 'a@contoso.com' }
+                }
+
+                $null = Connect-MigrationGraph -Scopes 'User.Read.All' -TenantId 'newco.onmicrosoft.com'
+                Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter {
+                    $TenantId -eq 'a0000000-0000-0000-0000-000000000001'
+                }
+            }
+        }
+
+        It 'Throws and disconnects when a fresh sign-in lands in the wrong tenant' {
+            InModuleScope M365Migration {
+                # The account chooser can put a fresh sign-in in any tenant the technician
+                # has an account in, so the session is checked again after connecting.
+                Mock Initialize-MigrationModule { }
+                Mock Connect-MgGraph { }
+                Mock Disconnect-MgGraph { }
+                Mock Invoke-MgGraphRequest { throw 'Invoke-MgGraphRequest should not be reachable without a mock' }
+                $script:contextCalls = 0
+                Mock Get-MgContext {
+                    $script:contextCalls++
+                    if ($script:contextCalls -eq 1) { return $null }
+                    return [pscustomobject]@{
+                        Scopes   = @('User.Read.All')
+                        TenantId = 'b0000000-0000-0000-0000-000000000002'; Account = 'admin@wrong.com' }
+                }
+
+                { Connect-MigrationGraph -Scopes 'User.Read.All' -TenantId 'a0000000-0000-0000-0000-000000000001' } |
+                    Should -Throw '*connected to tenant b0000000*'
+                Should -Invoke Disconnect-MgGraph -Times 1
             }
         }
 
@@ -430,6 +529,87 @@ Describe 'Connect-MigrationExchange' {
             (Connect-MigrationExchange -TenantId 'contoso.onmicrosoft.com').TenantId |
                 Should -Be 'a0000000-0000-0000-0000-000000000001'
             Should -Invoke Connect-ExchangeOnline -Times 0   # cached session reused because it matches
+        }
+    }
+}
+
+Describe 'Connect-MigrationTeams' {
+
+    It 'Reuses a cached session whose GUID matches a domain-form -TenantId' {
+        InModuleScope M365Migration {
+            # Same trap as the Graph connector: Get-CsTenant reports a GUID, the README's
+            # examples pass a domain, and comparing the two directly throws away a perfectly
+            # good session and re-signs in - the slowest sign-in of the three.
+            Mock Initialize-MigrationModule { }
+            Mock Connect-MicrosoftTeams { }
+            Mock Disconnect-MicrosoftTeams { }
+            Mock Resolve-MigrationTenantId { 'a0000000-0000-0000-0000-000000000001' }
+            Mock Get-CsTenant { [pscustomobject]@{
+                TenantId = 'a0000000-0000-0000-0000-000000000001'; DisplayName = 'Contoso' } }
+
+            $tenant = Connect-MigrationTeams -TenantId 'newco.onmicrosoft.com'
+            $tenant.TenantId | Should -BeExactly 'a0000000-0000-0000-0000-000000000001'
+            Should -Invoke Connect-MicrosoftTeams -Times 0 -Exactly
+            Should -Invoke Disconnect-MicrosoftTeams -Times 0 -Exactly
+        }
+    }
+
+    It 'Passes the resolved GUID to Connect-MicrosoftTeams rather than the domain it was given' {
+        InModuleScope M365Migration {
+            Mock Initialize-MigrationModule { }
+            Mock Disconnect-MicrosoftTeams { }
+            Mock Resolve-MigrationTenantId { 'a0000000-0000-0000-0000-000000000001' }
+            Mock Connect-MicrosoftTeams { }
+            $script:tenantCalls = 0
+            Mock Get-CsTenant {
+                $script:tenantCalls++
+                if ($script:tenantCalls -eq 1) { throw 'no session' }
+                [pscustomobject]@{ TenantId = 'a0000000-0000-0000-0000-000000000001'; DisplayName = 'Contoso' }
+            }
+
+            $null = Connect-MigrationTeams -TenantId 'newco.onmicrosoft.com'
+            Should -Invoke Connect-MicrosoftTeams -Times 1 -Exactly -ParameterFilter {
+                $TenantId -eq 'a0000000-0000-0000-0000-000000000001'
+            }
+        }
+    }
+
+    It 'Throws and disconnects when a fresh sign-in lands in the wrong tenant' {
+        InModuleScope M365Migration {
+            Mock Initialize-MigrationModule { }
+            Mock Connect-MicrosoftTeams { }
+            Mock Disconnect-MicrosoftTeams { }
+            $script:tenantCalls = 0
+            Mock Get-CsTenant {
+                $script:tenantCalls++
+                if ($script:tenantCalls -eq 1) { throw 'no session' }
+                [pscustomobject]@{ TenantId = 'b0000000-0000-0000-0000-000000000002'; DisplayName = 'Fabrikam' }
+            }
+
+            { Connect-MigrationTeams -TenantId 'a0000000-0000-0000-0000-000000000001' } |
+                Should -Throw '*connected to tenant b0000000*'
+            Should -Invoke Disconnect-MicrosoftTeams -Times 1
+        }
+    }
+
+    It 'Drops a cached session that targets a different tenant' {
+        InModuleScope M365Migration {
+            Mock Initialize-MigrationModule { }
+            Mock Connect-MicrosoftTeams { }
+            Mock Disconnect-MicrosoftTeams { }
+            $script:tenantCalls = 0
+            Mock Get-CsTenant {
+                $script:tenantCalls++
+                $id = if ($script:tenantCalls -eq 1) {
+                    'b0000000-0000-0000-0000-000000000002'
+                }
+                else { 'a0000000-0000-0000-0000-000000000001' }
+                [pscustomobject]@{ TenantId = $id; DisplayName = 'Contoso' }
+            }
+
+            $null = Connect-MigrationTeams -TenantId 'a0000000-0000-0000-0000-000000000001'
+            Should -Invoke Disconnect-MicrosoftTeams -Times 1 -Exactly
+            Should -Invoke Connect-MicrosoftTeams -Times 1 -Exactly
         }
     }
 }
