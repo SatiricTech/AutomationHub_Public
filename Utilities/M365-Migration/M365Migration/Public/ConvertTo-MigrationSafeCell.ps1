@@ -21,17 +21,21 @@ function ConvertTo-MigrationSafeCell {
         Only a string is inspected. Numbers, booleans, dates and $null already have no
         formula reading in a spreadsheet and pass through unchanged.
 
-        A string that is a pure signed number - optional leading + or -, digits, an optional
-        decimal part, and an optional trailing ';ext=<digits>' extension, nothing else - is
-        left alone even though it starts with + or -. A spreadsheet reads a bare number as a
-        number, never as a formula or a DDE payload, and this toolkit round-trips E.164
-        phone numbers in both plain (Format-MigrationE164: '+<digits>', no spaces or
-        separators) and extension-qualified (Split-MigrationTeamsLineUri:
-        '+<digits>;ext=<digits>') form out of one script's CSV and into another's
-        -PhoneNumber parameter: quoting them here would corrupt that round trip for no
-        security benefit. Anything with so much as a space, a non-digit extension, or any
-        other character after the sign - '+1 555 123', '+1555;ext=abc',
-        "-1+cmd|' /C calc'!A0" - is not a bare number and is still prefixed.
+        A string that is phone-shaped - an optional leading + or -, then nothing but digits,
+        spaces, parentheses, dots and hyphens, with an optional trailing ';ext=<digits>'
+        extension - is left alone even though it may start with + or -. None of those
+        characters can turn the cell into a formula or a DDE payload, and this shape is
+        exactly what a directory stores in MobilePhone, BusinessPhone and FaxNumber:
+        '+15551234567' (Format-MigrationE164), '+15551110000;ext=524'
+        (Split-MigrationTeamsLineUri) and the formatted forms a tenant actually holds,
+        '+1 (425) 555-0100' among them. Those values are chain inputs, not just report
+        cells - Get-MigrationInventory's Users tab becomes New-MigrationIdentityPlan's plan,
+        which New-MigrationUsers POSTs to Graph - so a quote prefix would be provisioned
+        into the destination tenant. A bare '-', the placeholder a source tenant writes for
+        "no value", matches the same shape and is exempt for the same reason.
+
+        Anything with a letter or another symbol after the sign - '+1555;ext=abc',
+        "-1+cmd|' /C calc'!A0", '=1+1' - is not phone-shaped and is still prefixed.
 
     .PARAMETER Value
         The cell value to check, of any type.
@@ -47,10 +51,10 @@ function ConvertTo-MigrationSafeCell {
         Returns 'John Smith' unchanged; it does not start with a formula-triggering character.
 
     .EXAMPLE
-        ConvertTo-MigrationSafeCell -Value '+15551234567'
+        ConvertTo-MigrationSafeCell -Value '+1 (425) 555-0100'
 
-        Returns '+15551234567' unchanged - a pure signed number, including an E.164 phone
-        number, is never a formula.
+        Returns '+1 (425) 555-0100' unchanged - a phone-shaped value, E.164 or formatted,
+        is never a formula, and it has to reach the destination tenant verbatim.
 
     .EXAMPLE
         ConvertTo-MigrationSafeCell -Value '+15551110000;ext=524'
@@ -61,6 +65,8 @@ function ConvertTo-MigrationSafeCell {
     .NOTES
         Author: AutomationHub
         Written with assistance from Claude (Anthropic).
+        ConvertFrom-MigrationSafeCell is the inverse, applied wherever the toolkit reads
+        one of its own CSVs back in.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -71,10 +77,11 @@ function ConvertTo-MigrationSafeCell {
 
     if ($Value -isnot [string]) { return $Value }
 
-    # A bare signed number - an E.164 phone number among them, with or without a
+    # A phone-shaped value - digits, spaces, parentheses, dots and hyphens, with an optional
     # ';ext=<digits>' extension - can never be read as a formula or a DDE payload, so it is
-    # exempt from the leader check below even though it may start with + or -.
-    if ($Value -match '^[+-]?\d+(\.\d+)?(;ext=\d+)?$') { return $Value }
+    # exempt from the leader check below even though it may start with + or -. The bare '-'
+    # placeholder matches this shape as well, which is intended: it is data, not a formula.
+    if ($Value -match '^[+-]?[\d\s().\-]*(;ext=\d+)?$') { return $Value }
 
     # Formula-triggering leaders recognised by Excel/Calc/Sheets, plus the two whitespace
     # characters some readers also treat as a formula lead-in.

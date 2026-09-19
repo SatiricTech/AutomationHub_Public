@@ -410,7 +410,18 @@ try {
 
     Initialize-MigrationModule -Name 'Microsoft.Graph.Authentication'
 
-    $csvRows = @(Import-Csv -LiteralPath $CsvPath)
+    # Get-MigrationVivaLearningHistory exports through Export-MigrationReport, which defuses
+    # a formula-looking cell with a leading apostrophe so a spreadsheet shows it instead of
+    # evaluating it. This file is a chain input, so that apostrophe comes back off here -
+    # the same inverse Import-MigrationCsv applies, reached directly because this script
+    # resolves its own columns (see Resolve-ColumnName) rather than using the shared reader.
+    $csvRows = @(Import-Csv -LiteralPath $CsvPath | ForEach-Object {
+            $restored = [ordered]@{}
+            foreach ($property in $_.PSObject.Properties) {
+                $restored[$property.Name] = ConvertFrom-MigrationSafeCell -Value $property.Value
+            }
+            [pscustomobject]$restored
+        })
     if ($csvRows.Count -eq 0) { throw "CSV '$CsvPath' contains no rows." }
 
     $headers = @($csvRows[0].PSObject.Properties.Name)

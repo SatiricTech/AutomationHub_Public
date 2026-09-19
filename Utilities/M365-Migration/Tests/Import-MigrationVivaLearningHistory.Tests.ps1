@@ -749,3 +749,45 @@ Describe 'Import-MigrationVivaLearningHistory - the tenant guard runs once over 
             Should -Be @($script:tenantId, $script:tenantId)
     }
 }
+
+Describe 'Import-MigrationVivaLearningHistory - a history CSV the exporter defused' {
+
+    BeforeAll {
+        # Get-MigrationVivaLearningHistory writes its export through Export-MigrationReport,
+        # which prefixes a formula-looking cell with an apostrophe so Excel shows it rather
+        # than evaluating it. This script reads that same file back as a chain input, so the
+        # apostrophe has to come off again before the title reaches Graph.
+        $script:defusedWorkspace = New-VivaWorkspace -Label 'Defused'
+        Reset-VivaCallLog
+        $global:vivaProviders = @()
+        $global:vivaExistingActivityIds = @()
+
+        $historyPath = Join-Path $script:defusedWorkspace 'VivaLearningHistory.csv'
+        @(Import-Csv -LiteralPath $historyPath) |
+            ForEach-Object {
+                if ($_.CourseTitle -eq 'Security Awareness 101') { $_.CourseTitle = "'=Security Awareness 101" }
+                $_
+            } |
+            Export-Csv -LiteralPath $historyPath -NoTypeInformation -Encoding utf8
+
+        & $script:scriptPath -CsvPath $historyPath `
+            -TenantId $script:tenantId -ClientId $script:clientId -ClientSecret $script:clientSecret `
+            -PlanPath (Join-Path $script:defusedWorkspace 'IdentityPlan.csv') `
+            -OutputPath $script:defusedWorkspace -Verbosity Low -DryRun
+
+        $file = @(Get-ChildItem -LiteralPath $script:defusedWorkspace -Filter 'Import-VivaLearningHistory-DryRun_*.csv')
+        $script:defusedRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+    }
+
+    AfterAll {
+        if ($script:defusedWorkspace -and (Test-Path -LiteralPath $script:defusedWorkspace)) {
+            Remove-Item -LiteralPath $script:defusedWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Strips the exporter''s apostrophe before the title is used' {
+        $row = @($script:defusedRows |
+                Where-Object { $_.Identity -eq 'john.smith@newco.com' -and $_.ActivityType -eq 'Assignment' })[0]
+        $row.Detail | Should -Match "Would create Assignment '=Security Awareness 101' for john.smith@newco.com"
+    }
+}

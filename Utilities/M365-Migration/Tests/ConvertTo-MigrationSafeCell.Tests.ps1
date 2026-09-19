@@ -28,25 +28,30 @@ Describe 'ConvertTo-MigrationSafeCell' {
         ConvertTo-MigrationSafeCell -Value $true | Should -BeTrue
     }
 
-    It 'leaves a pure signed number alone, even though it starts with + or -' -ForEach @(
+    It 'leaves a phone-shaped value alone, even though it starts with + or -' -ForEach @(
         '+15551234567', '-42', '+3.14', '-3.14', '15551234567'
         # The extension-qualified line URI shape Split-MigrationTeamsLineUri produces.
         '+15551110000;ext=524'
+        # The shapes a tenant actually stores in MobilePhone/BusinessPhone/FaxNumber. These
+        # reach a destination tenant verbatim through the inventory -> plan -> New-Users
+        # chain, so a quote prefix here would be written to the user's profile.
+        '+1 (425) 555-0100', '(425) 555-0100', '425-555-0100', '+1.425.555.0100'
+        '+1 425 555 0100', '+1 (425) 555-0100;ext=524'
+        # The hyphen placeholder a source tenant uses for "no value".
+        '-'
     ) {
         ConvertTo-MigrationSafeCell -Value $_ | Should -Be $_
     }
 
-    It 'still prefixes a value that starts with + or - but is not a pure number' -ForEach @(
-        # A space breaks the pure-number match: this toolkit always stores E.164 numbers
-        # without spaces (Format-MigrationE164), so a spaced-out number reaching this
-        # function is not the phone-number case the numeric carve-out exists for.
-        '+1 555 123'
+    It 'still prefixes a value that starts with + or - but is not phone-shaped' -ForEach @(
         # A non-digit extension is not the ';ext=<digits>' shape the carve-out allows.
         '+1555;ext=abc'
         # A non-digit payload after the sign is exactly the injection shape the sanitiser
         # exists to defuse.
         "-1+cmd|' /C calc'!A0"
+        "-cmd|' /C calc'!A0"
         '=1+1'
+        '@SUM(A1)'
     ) {
         ConvertTo-MigrationSafeCell -Value $_ | Should -Be ("'" + $_)
     }
@@ -86,6 +91,72 @@ Describe 'ConvertTo-MigrationSafeCell' {
 
         $written.PhoneNumber | Should -Be '+15551234567'
         $written.DisplayName | Should -Be "'=x"
+    }
+}
+
+Describe 'ConvertFrom-MigrationSafeCell' {
+
+    It 'strips the apostrophe the sanitiser added' -ForEach @(
+        '=SUM(A1)', '+cmd', '-cmd', '@SUM', "`tx", "`rx", "=HYPERLINK(""x"")"
+    ) {
+        ConvertFrom-MigrationSafeCell -Value (ConvertTo-MigrationSafeCell -Value $_) | Should -BeExactly $_
+    }
+
+    It 'leaves an apostrophe that is part of the data alone' -ForEach @(
+        # A surname is the common case, and it is why the inverse checks the SECOND
+        # character rather than just the leading apostrophe.
+        "'Brien", "O'Brien", "'", "''", "'1", "' "
+    ) {
+        ConvertFrom-MigrationSafeCell -Value $_ | Should -BeExactly $_
+    }
+
+    It 'leaves a value the sanitiser never touched alone' -ForEach @(
+        'John Smith', '+1 (425) 555-0100', '-', '+15551234567'
+    ) {
+        ConvertFrom-MigrationSafeCell -Value $_ | Should -BeExactly $_
+    }
+
+    It 'passes a non-string through unchanged' {
+        ConvertFrom-MigrationSafeCell -Value 5 | Should -Be 5
+        ConvertFrom-MigrationSafeCell -Value $null | Should -BeNullOrEmpty
+        ConvertFrom-MigrationSafeCell -Value $true | Should -BeTrue
+    }
+}
+
+Describe 'Export-MigrationReport round-trips through Import-MigrationCsv' {
+
+    BeforeAll {
+        $null = Initialize-MigrationRun -ScriptName 'Get-Inventory' -OutputPath $script:workspace -Prefix 'RoundTrip'
+
+        # Exactly what an inventory Users tab carries into New-MigrationIdentityPlan: a
+        # formatted phone number, a hyphen placeholder, a value that really is a formula,
+        # and a surname that legitimately begins with an apostrophe.
+        $script:roundTripRow = [pscustomobject]@{
+            UserPrincipalName = 'a@contoso.com'
+            MobilePhone       = '+1 (425) 555-0100'
+            Department        = '-'
+            Office            = '=SUM(A1)'
+            LastName          = "'Brien"
+        }
+
+        $script:roundTripPath = Export-MigrationReport -Rows @($script:roundTripRow) -Name 'RoundTrip'
+        $script:roundTripRead = @(Import-MigrationCsv -Path $script:roundTripPath)[0]
+    }
+
+    It 'gives back <Column> exactly as it went in' -ForEach @(
+        @{ Column = 'MobilePhone' }, @{ Column = 'Department' }
+        @{ Column = 'Office' },      @{ Column = 'LastName' }
+    ) {
+        $script:roundTripRead.$Column | Should -BeExactly $script:roundTripRow.$Column
+    }
+
+    It 'still writes the formula cell to disk defused' {
+        $onDisk = @(Import-Csv -LiteralPath $script:roundTripPath)[0]
+        $onDisk.Office | Should -BeExactly "'=SUM(A1)"
+        # The phone, the placeholder and the surname are readable in Excel as they stand.
+        $onDisk.MobilePhone | Should -BeExactly '+1 (425) 555-0100'
+        $onDisk.Department | Should -BeExactly '-'
+        $onDisk.LastName | Should -BeExactly "'Brien"
     }
 }
 

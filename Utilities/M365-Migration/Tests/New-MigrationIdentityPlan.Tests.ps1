@@ -791,4 +791,53 @@ Describe 'New-MigrationIdentityPlan' {
             $row.BusinessPhone | Should -BeExactly ''
         }
     }
+
+    Context 'A users inventory written by Export-MigrationReport' {
+
+        BeforeAll {
+            # The real chain: Get-MigrationInventory writes its Users tab through
+            # Export-MigrationReport, which defuses formula-looking cells, and the planner
+            # reads that same file. Anything the exporter changed on the way out has to be
+            # changed back on the way in, because these columns are copied verbatim into the
+            # plan and from there into the destination tenant by New-MigrationUsers.
+            $script:ChainInventory = Join-Path $TestDrive 'chain-inventory'
+            $null = Initialize-MigrationRun -ScriptName 'Get-Inventory' -OutputPath $script:ChainInventory
+
+            $script:ChainUsersCsv = Export-MigrationReport -Name 'Users' -Rows @(
+                [pscustomobject]@{
+                    UserPrincipalName = 'chain.user@contoso.com'
+                    DisplayName       = 'Chain User'
+                    FirstName         = 'Chain'
+                    LastName          = 'User'
+                    Department        = '-'
+                    MobilePhone       = '+1 (425) 555-0100'
+                    BusinessPhone     = '(425) 555-0199'
+                    JobTitle          = '=Analyst'
+                    UsageLocation     = 'IE'
+                }
+            )
+        }
+
+        It 'Carries a formatted phone number into the plan unchanged' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'chain-plan') `
+                -Parameter @{ UsersCsv = $script:ChainUsersCsv }
+            $row = Get-PlanRow -Result $result -Identity 'chain.user@contoso.com'
+            $row.MobilePhone | Should -BeExactly '+1 (425) 555-0100'
+            $row.BusinessPhone | Should -BeExactly '(425) 555-0199'
+        }
+
+        It 'Carries a hyphen placeholder into the plan as a hyphen' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'chain-plan-2') `
+                -Parameter @{ UsersCsv = $script:ChainUsersCsv }
+            $row = Get-PlanRow -Result $result -Identity 'chain.user@contoso.com'
+            $row.Department | Should -BeExactly '-'
+        }
+
+        It 'Undoes the exporter''s apostrophe on a value that really did start with =' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'chain-plan-3') `
+                -Parameter @{ UsersCsv = $script:ChainUsersCsv }
+            $row = Get-PlanRow -Result $result -Identity 'chain.user@contoso.com'
+            $row.JobTitle | Should -BeExactly '=Analyst'
+        }
+    }
 }

@@ -16,6 +16,7 @@
         'Connect-MigrationGraph'
         'Connect-MigrationTeams'
         'ConvertFrom-MigrationOutputPath'
+        'ConvertFrom-MigrationSafeCell'
         'ConvertTo-MigrationLocalPart'
         'ConvertTo-MigrationODataString'
         'ConvertTo-MigrationSafeCell'
