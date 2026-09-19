@@ -74,11 +74,14 @@ BeforeAll {
 
         $files = @(Get-ChildItem -Path $OutputPath -Filter 'IdentityPlan_*.csv' -Recurse -ErrorAction SilentlyContinue)
         $rows = if ($files.Count -gt 0) { @(Import-Csv -LiteralPath $files[0].FullName -Encoding utf8) } else { @() }
+        $logs = @(Get-ChildItem -Path $OutputPath -Filter '*.log' -Recurse -ErrorAction SilentlyContinue)
+        $log = if ($logs.Count -gt 0) { Get-Content -LiteralPath $logs[0].FullName -Raw -Encoding utf8 } else { '' }
 
         [pscustomobject]@{
             ExitCode = $exitCode
             Path     = if ($files.Count -gt 0) { $files[0].FullName } else { '' }
             Rows     = $rows
+            Log      = $log
         }
     }
 
@@ -356,6 +359,161 @@ Describe 'New-MigrationIdentityPlan' {
         It 'Leaves matching addresses as Planned' {
             $matched = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'nodiverge')
             (Get-PlanRow -Result $matched -Identity 'rdubois@contoso.com').PlanStatus | Should -BeExactly 'Planned'
+        }
+    }
+
+    Context 'An optional inventory with a header and no rows' {
+
+        <#
+            A tenant with no shared mailboxes still produces the SharedMailboxes tab, header and
+            all. Refusing that file would stop the plan over an inventory that is simply empty.
+        #>
+
+        BeforeAll {
+            $script:EmptySharedCsv = Join-Path $TestDrive 'empty-shared.csv'
+            Set-Content -LiteralPath $script:EmptySharedCsv -Encoding utf8 `
+                -Value 'PrimarySmtpAddress,DisplayName,RecipientTypeDetails'
+
+            $parameters = @{} + $script:FullParameters
+            $parameters['SharedMailboxesCsv'] = $script:EmptySharedCsv
+            $script:EmptyShared = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'emptyshared') `
+                -Parameter $parameters
+        }
+
+        It 'Still plans everything else' {
+            $script:EmptyShared.ExitCode | Should -Be 0
+            (Get-PlanRow -Result $script:EmptyShared -Identity 'jsmith@contoso.com').TargetUserPrincipalName |
+                Should -BeExactly 'john.smith@newco.com'
+        }
+
+        It 'Warns that the file had a header and no rows' {
+            $script:EmptyShared.Log | Should -Match ([regex]::Escape(
+                    "[WARNING] -SharedMailboxesCsv '$script:EmptySharedCsv' has a header but no rows; " +
+                    'nothing was taken from it.'))
+        }
+
+        It 'Takes nothing from it' {
+            @($script:EmptyShared.Rows | Where-Object { $_.ObjectType -eq 'Shared' }) | Should -HaveCount 0
+        }
+
+        It 'Tolerates a header-only file in every optional input at once, and names each one' {
+            # The whole point of the rule: a small tenant can legitimately have nothing in any of
+            # these tabs, and the planner's job is still to plan the users.
+            $headerOnly = [ordered]@{
+                UserMailboxesCsv      = 'UserPrincipalName,PrimarySmtpAddress,EmailAddresses'
+                SharedMailboxesCsv    = 'PrimarySmtpAddress,DisplayName,RecipientTypeDetails'
+                GroupsCsv             = 'DisplayName,PrimarySmtpAddress,GroupType'
+                ContactsCsv           = 'DisplayName,ExternalEmailAddress'
+                SkuMapPath            = 'SourceSkuPartNumber,TargetSkuPartNumber'
+                ExclusionRulesPath    = 'Pattern,MatchOn,Reason,MatchType'
+                WaveMapPath           = 'UserPrincipalName,Wave'
+                ReservedAddressesPath = 'UserPrincipalName,PrimarySmtpAddress'
+            }
+
+            $parameters = @{}
+            foreach ($name in $headerOnly.Keys) {
+                $path = Join-Path $TestDrive "headeronly-$name.csv"
+                Set-Content -LiteralPath $path -Encoding utf8 -Value $headerOnly[$name]
+                $parameters[$name] = $path
+            }
+
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'headeronly') -Parameter $parameters
+
+            $result.ExitCode | Should -Be 0
+            (Get-PlanRow -Result $result -Identity 'jsmith@contoso.com').TargetUserPrincipalName |
+                Should -BeExactly 'john.smith@newco.com'
+            foreach ($name in $headerOnly.Keys) {
+                $result.Log | Should -Match ([regex]::Escape(
+                        "-$name '$($parameters[$name])' has a header but no rows; nothing was taken from it."))
+            }
+        }
+
+        It 'Still fails the run when the required users CSV is the empty one' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'emptyusers') -Parameter @{
+                UsersCsv = $script:EmptySharedCsv
+            }
+            $result.ExitCode | Should -Be 1
+            $result.Log | Should -BeLike '*contains no data rows*'
+        }
+    }
+
+    Context 'A mail domain of its own' {
+
+        BeforeAll {
+            $parameters = @{} + $script:FullParameters
+            $parameters['SmtpDomain'] = 'mail.newco.com'
+            $script:MailDomain = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain') `
+                -Parameter $parameters
+        }
+
+        It 'Signs users in on the target domain and mails them in the SMTP domain' {
+            $row = Get-PlanRow -Result $script:MailDomain -Identity 'jsmith@contoso.com'
+            $row.TargetUserPrincipalName | Should -BeExactly 'john.smith@newco.com'
+            $row.TargetPrimarySmtp | Should -BeExactly 'john.smith@mail.newco.com'
+            $row.PlanStatus | Should -BeExactly 'UpnSmtpDiverge'
+        }
+
+        It 'Keeps the interim mail address equal to the target one even with an interim domain' {
+            # The interim domain stands in for a vanity domain the source still holds. A separate
+            # mail domain is not that domain, so there is nothing for it to stand in for.
+            $row = Get-PlanRow -Result $script:MailDomain -Identity 'jsmith@contoso.com'
+            $row.InterimUserPrincipalName | Should -BeExactly 'john.smith@newco.onmicrosoft.com'
+            $row.InterimPrimarySmtp | Should -BeExactly $row.TargetPrimarySmtp
+        }
+
+        It 'Moves recipients that have no UPN too, and leaves them Planned' {
+            $row = Get-PlanRow -Result $script:MailDomain -Identity 'accounts@contoso.com'
+            $row.TargetPrimarySmtp | Should -BeExactly 'accounts@mail.newco.com'
+            $row.TargetUserPrincipalName | Should -BeExactly ''
+            $row.PlanStatus | Should -BeExactly 'Planned'
+        }
+
+        It 'Normalises a leading @ and upper case the way -TargetDomain does' {
+            $parameters = @{} + $script:FullParameters
+            $parameters['SmtpDomain'] = '@Mail.NewCo.COM'
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-normalise') -Parameter $parameters
+            (Get-PlanRow -Result $result -Identity 'jsmith@contoso.com').TargetPrimarySmtp |
+                Should -BeExactly 'john.smith@mail.newco.com'
+        }
+
+        It 'Changes nothing when it names the target domain itself' {
+            $parameters = @{} + $script:FullParameters
+            $parameters['SmtpDomain'] = 'newco.com'
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-same') -Parameter $parameters
+            $row = Get-PlanRow -Result $result -Identity 'jsmith@contoso.com'
+            $row.TargetPrimarySmtp | Should -BeExactly 'john.smith@newco.com'
+            $row.InterimPrimarySmtp | Should -BeExactly 'john.smith@newco.onmicrosoft.com'
+            $row.PlanStatus | Should -BeExactly 'Planned'
+        }
+    }
+
+    Context 'The shipped templates' {
+
+        It 'Plans with the sample exclusion rules and wave map as shipped' {
+            $templates = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Templates')).ProviderPath
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'templates') -Parameter @{
+                ExclusionRulesPath = (Join-Path $templates 'ExclusionRules.sample.csv')
+                WaveMapPath        = (Join-Path $templates 'WaveMap.sample.csv')
+            }
+
+            $result.ExitCode | Should -Be 0
+            (Get-PlanRow -Result $result -Identity 'break-glass-admin@contoso.com').PlanStatus |
+                Should -BeExactly 'Excluded'
+        }
+
+        It 'Offers MatchType in the exclusion rules sample and uses it at least once' {
+            $sample = Join-Path $PSScriptRoot '..' 'Templates' 'ExclusionRules.sample.csv'
+            $rules = @(Import-Csv -LiteralPath $sample)
+            @($rules[0].PSObject.Properties.Name) | Should -Contain 'MatchType'
+            @($rules | Where-Object { $_.MatchType -eq 'Regex' }).Count | Should -BeGreaterThan 0
+            @($rules | Where-Object { $_.MatchType -notin @('Wildcard', 'Regex') }).Count | Should -Be 0
+        }
+
+        It 'Ships a wave map sample with the columns the planner requires' {
+            $sample = Join-Path $PSScriptRoot '..' 'Templates' 'WaveMap.sample.csv'
+            $waves = @(Import-Csv -LiteralPath $sample)
+            @($waves[0].PSObject.Properties.Name) | Should -Be @('UserPrincipalName', 'Wave')
+            $waves.Count | Should -Be 3
         }
     }
 

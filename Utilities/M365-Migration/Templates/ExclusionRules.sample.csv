@@ -1,7 +1,7 @@
-Pattern,MatchOn,Reason
-break-glass*,UserPrincipalName,Emergency access account - must never be migrated or have its password reset
-*.breakglass@*,UserPrincipalName,Emergency access account held outside the normal naming scheme
-svc-*,UserPrincipalName,Service account - re-created in the destination tenant with its own credential
-*service account*,DisplayName,Service account identified by its display name rather than its address
-DiscoverySearchMailbox*,DisplayName,System discovery mailbox - created by Exchange Online in the destination tenant
-SystemMailbox*,UserPrincipalName,Exchange system mailbox - not a real recipient
+Pattern,MatchOn,Reason,MatchType
+break-glass*,UserPrincipalName,Emergency access account - must never be migrated or have its password reset,Wildcard
+^.+\.breakglass@.+$,UserPrincipalName,Emergency access account held outside the normal naming scheme,Regex
+svc-*,UserPrincipalName,Service account - re-created in the destination tenant with its own credential,Wildcard
+*service account*,DisplayName,Service account identified by its display name rather than its address,Wildcard
+DiscoverySearchMailbox*,DisplayName,System discovery mailbox - created by Exchange Online in the destination tenant,Wildcard
+SystemMailbox*,UserPrincipalName,Exchange system mailbox - not a real recipient,Wildcard
