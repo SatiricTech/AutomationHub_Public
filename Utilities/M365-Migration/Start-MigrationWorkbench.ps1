@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+﻿#Requires -Version 7.4
 
 <#
 .SYNOPSIS
@@ -27,8 +27,10 @@
     The workbench's own log lands in <workspace>/Workbench/ beside the run ledger, so a
     technician reading a workspace afterwards finds the front end's account of the session next
     to the runs it started. With no workspace known yet - a console session that has not picked
-    one, or a refusal before the pick - it lands in Workbench/ under the default output root,
-    which keeps loose log files out of the folder the migration folders themselves live in.
+    one - it lands in Workbench/ under the default output root, which keeps loose log files out
+    of the folder the migration folders themselves live in. A refusal that can be read off the
+    arguments (no -Workspace, a folder that is not there, a step id the catalogue does not hold)
+    is made before the log is opened at all, so it creates nothing anywhere.
 
     A non-interactive run answers a hard gate through -Set @{ Acknowledge = '<what it asks for>' }
     and nothing else: there is no console to type into, and a gate that cannot be typed at must
@@ -66,7 +68,8 @@
     always receives every line, and a child step's verbosity comes from the workspace settings.
 
 .PARAMETER LogPath
-    Overrides this script's own log file path.
+    Overrides this script's own log file path. The folder that file is in becomes the run's
+    output folder too, so a redirected log leaves nothing behind under the default output root.
 
 .PARAMETER NoGui
     Load the helper functions and stop: no mode is chosen, no UI is built and nothing is run.
@@ -185,6 +188,19 @@ $script:WorkbenchGuiPaneLimit = 2000
 # inferred rule because 'every wave ticked' and 'no wave ticked' produce the same command, and
 # neither the WaveRequired gate nor the ledger could then tell the two screens apart.
 $script:WorkbenchGuiAllWavesLabel = '(all waves)'
+
+# The parameters a dedicated control owns: -Wave is the Waves checked list, -DryRun is the pair
+# of Dry run / Run buttons, and -OutputPath is the workspace box at the top of the window. The
+# generated step form must never draw a second control for any of them - two controls for one
+# parameter is how a ledger comes to record the ticked wave while the driver runs the typed one.
+# One list, read by the form's filter and by the override converter, so the two cannot drift.
+$script:GuiOwnedParameters = @('Wave', 'DryRun', 'OutputPath')
+
+# What a [SecureString] parameter's row says instead of offering a box. The window collects no
+# secret at all: a password box is one more place a client secret can be shoulder-read or land
+# in a screenshot, and the child process reads it from this environment variable instead.
+$script:WorkbenchGuiSecretRowText =
+    'Set $env:{0} before Run — the window never takes a secret.' -f $script:WorkbenchSecretVariable
 
 # The window's state bag, and the two scriptblocks Invoke-MigrationStep is handed as its
 # -OutputWriter and -Pump. $null until a window exists.
@@ -677,6 +693,58 @@ function Select-WorkbenchWorkspace {
     }
 }
 
+function Get-WorkbenchStepProblem {
+    <#
+    .SYNOPSIS
+        Says why a named step cannot be run, or returns '' when the catalogue knows it.
+
+    .DESCRIPTION
+        The unattended path refuses an unknown step id anyway, and so it should - but by then a
+        run context exists, and a run context is a folder on disk. Every refusal this script can
+        make from its arguments alone has to be makeable before Initialize-MigrationRun is
+        called, or the price of telling an operator they mistyped a step name is a log folder
+        left behind under the default output root (Docs/Workbench-Design.md, section 10).
+
+        Get-MigrationStep throws on an unknown id and the sentence it throws already names the id
+        and lists every step the catalogue holds, which is exactly the refusal to print. The
+        catalogue is cached, so asking twice - here and again in the run itself - costs nothing.
+
+    .PARAMETER StepId
+        The step instance id the operator named, or empty when they named none.
+
+    .EXAMPLE
+        Get-WorkbenchStepProblem -StepId 'New-Users'
+
+        Returns '': the catalogue knows that step.
+
+    .EXAMPLE
+        Get-WorkbenchStepProblem -StepId 'Nope'
+
+        Returns the catalogue's own sentence, naming 'Nope' and listing the ids it does know.
+
+    .NOTES
+        Author: AutomationHub
+        Written with assistance from Claude (Anthropic).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$StepId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($StepId)) { return '' }
+
+    try {
+        $null = Get-MigrationStep -Id $StepId
+        return ''
+    }
+    catch {
+        return [string]$_.Exception.Message
+    }
+}
+
 function Invoke-WorkbenchNonInteractive {
     <#
     .SYNOPSIS
@@ -941,7 +1009,14 @@ function ConvertTo-WorkbenchGuiControlKind {
         function of the parameter, which is what lets it be tested on a machine with no WinForms
         (Docs/Workbench-Design.md, section 9).
 
-        The order the tests are applied in matters twice:
+        A [SecureString] parameter is a kind of its own, and the one kind that is not a control:
+        'Secret' is drawn as a line of text telling the operator to set the environment variable
+        the child process reads. It is decided first, because a secret must never fall through to
+        the text box at the bottom of this function - that is how a client secret ends up typed
+        into a window, shoulder-read, screenshot, and (if the form ever sent it) written into a
+        driver file.
+
+        The order the remaining tests are applied in matters twice:
 
           * a folder parameter is recognised before a file one, because -OutputPath ends in
             'Path' and would otherwise be offered as a file the operator has to pick; and
@@ -965,6 +1040,11 @@ function ConvertTo-WorkbenchGuiControlKind {
 
         Returns 'CheckedListBox' for a [string[]] parameter with a ValidateSet.
 
+    .EXAMPLE
+        ConvertTo-WorkbenchGuiControlKind -Parameter $clientSecret
+
+        Returns 'Secret' for a [SecureString] parameter: a line of text, never a box.
+
     .NOTES
         Author: AutomationHub
         Written with assistance from Claude (Anthropic).
@@ -976,6 +1056,9 @@ function ConvertTo-WorkbenchGuiControlKind {
         [ValidateNotNull()]
         [pscustomobject]$Parameter
     )
+
+    $typeName = [string](Get-MigrationProperty -InputObject $Parameter -Name 'TypeName' -Default '')
+    if ($typeName -in @('SecureString', 'System.Security.SecureString')) { return 'Secret' }
 
     $name = [string](Get-MigrationProperty -InputObject $Parameter -Name 'Name' -Default '')
     $isSwitch = [bool](Get-MigrationProperty -InputObject $Parameter -Name 'IsSwitch' -Default $false)
@@ -997,6 +1080,139 @@ function ConvertTo-WorkbenchGuiControlKind {
     if ($name -match '(Path|Csv|File)$') { return 'FilePicker' }
 
     return 'TextBox'
+}
+
+function Test-WorkbenchGuiFormParameter {
+    <#
+    .SYNOPSIS
+        Decides whether the generated step form draws a row for one script parameter.
+
+    .DESCRIPTION
+        Two parameters never get a row, and for two different reasons
+        (Docs/Workbench-Design.md, section 9).
+
+        A Common parameter - -OutputPath, -Prefix, -LogPath, -Verbosity, -DryRun - is set by the
+        workbench itself for every step, so a row for it would be a box whose value the resolver
+        replaces.
+
+        A parameter a dedicated control already owns ($script:GuiOwnedParameters) is worse than
+        redundant: the window would be showing two controls for one value, and -Override wins
+        over the dedicated argument silently. That is exactly how a run comes to be recorded in
+        the ledger as the wave the operator ticked while the driver runs the wave they typed.
+
+        A pure function of the parameter, so the rule the form applies is the rule the test
+        asserts - there is no window on the machine this is written on.
+
+    .PARAMETER Parameter
+        One parameter object from a step's Parameters collection.
+
+    .EXAMPLE
+        Test-WorkbenchGuiFormParameter -Parameter $wave
+
+        Returns $false: the Waves checked list owns -Wave.
+
+    .EXAMPLE
+        Test-WorkbenchGuiFormParameter -Parameter $planPath
+
+        Returns $true: -PlanPath is the operator's to fill in.
+
+    .NOTES
+        Author: AutomationHub
+        Written with assistance from Claude (Anthropic).
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        [pscustomobject]$Parameter
+    )
+
+    if ([bool](Get-MigrationProperty -InputObject $Parameter -Name 'Common' -Default $false)) { return $false }
+
+    $name = [string](Get-MigrationProperty -InputObject $Parameter -Name 'Name' -Default '')
+    # -in on strings is case-insensitive, which is what a parameter name is compared by.
+    return ($name -notin $script:GuiOwnedParameters)
+}
+
+function Test-WorkbenchGuiCanRun {
+    <#
+    .SYNOPSIS
+        Decides whether this workspace is in a state anything may be run against, and says why not.
+
+    .DESCRIPTION
+        The window is allowed to open a workspace whose settings do not validate - that is how an
+        operator fixes them through the Settings dialog, and it is the one thing the window can do
+        that the console cannot (Docs/Workbench-Design.md, sections 8 and 9). What it must not do
+        is run a step against one.
+
+        With no valid settings there is no tenant GUID to assert against, so Invoke-MigrationStep
+        is handed no -ExpectedTenantId and TenantVerified comes back $null; there is no label, so
+        the prefix and the output folder fall back to the shared Common folder; and a soft gate
+        answered Yes would start a live writer against a tenant nobody checked. The console
+        (Show-MigrationWorkbench) and the unattended path (Invoke-WorkbenchNonInteractive, exit 2)
+        both refuse outright, and this is the window's version of the same refusal.
+
+        The keys are named because they are what the operator has to fix: every settings error
+        carries the dotted schema key it is about, and the Settings dialog puts its message beside
+        that field.
+
+        A pure function of the scan, so the refusal can be tested on a machine with no WinForms.
+
+    .PARAMETER Workspace
+        The scan from Get-MigrationWorkspace, or $null when no workspace is open yet.
+
+    .EXAMPLE
+        (Test-WorkbenchGuiCanRun -Workspace $ws).CanRun
+
+        Returns $true for a workspace whose settings validate.
+
+    .EXAMPLE
+        (Test-WorkbenchGuiCanRun -Workspace $ws).Reason
+
+        Returns "The settings for this workspace are not usable yet: Label. Nothing can be run
+        until they are fixed - open Settings." for a workspace whose Label was blanked.
+
+    .NOTES
+        Author: AutomationHub
+        Written with assistance from Claude (Anthropic).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        $Workspace
+    )
+
+    if ($null -eq $Workspace) {
+        return [pscustomobject]@{
+            CanRun = $false
+            Keys   = @()
+            Reason = 'Open a workspace first: a step runs against one migration folder.'
+        }
+    }
+
+    $result = Get-MigrationProperty -InputObject $Workspace -Name 'SettingsResult' -Default $null
+    if ([bool](Get-MigrationProperty -InputObject $result -Name 'IsValid' -Default $false)) {
+        return [pscustomobject]@{ CanRun = $true; Keys = @(); Reason = '' }
+    }
+
+    # The key is the field the operator edits; a file-level problem (no file at all, or one that
+    # is not JSON) carries no key, and naming the file itself is the only useful thing to say.
+    $keys = [System.Collections.Generic.List[string]]::new()
+    foreach ($problem in @(Get-MigrationProperty -InputObject $result -Name 'Errors' -Default @())) {
+        $key = [string](Get-MigrationProperty -InputObject $problem -Name 'Key' -Default '')
+        if (-not $key) { $key = '(the settings file itself)' }
+        if (-not $keys.Contains($key)) { $keys.Add($key) }
+    }
+    if ($keys.Count -eq 0) { $keys.Add('(the settings file itself)') }
+
+    return [pscustomobject]@{
+        CanRun = $false
+        Keys   = @($keys)
+        Reason = ('The settings for this workspace are not usable yet: {0}. Nothing can be run ' -f
+            (@($keys) -join ', ')) + 'until they are fixed - open Settings.'
+    }
 }
 
 function Get-WorkbenchGuiStepList {
@@ -1179,6 +1395,13 @@ function ConvertTo-WorkbenchGuiOverride {
         forcing an empty string onto the command line. A switch is the exception: a cleared tick
         is $false, which is a value.
 
+        Two parameters can never produce one, whatever they were handed. A [SecureString] has no
+        control to read - its row is a line of text - and a secret must never reach an -Override
+        hashtable, because that is what New-MigrationStepDriver writes into a file. And a
+        parameter a dedicated control owns ($script:GuiOwnedParameters) would arrive here only
+        through a form that should not have drawn it; returning $null is the second lock on the
+        bug where -Override @{ Wave = ... } silently outranks the wave the run was told to use.
+
     .PARAMETER Parameter
         The parameter object the control was generated from.
 
@@ -1187,9 +1410,9 @@ function ConvertTo-WorkbenchGuiOverride {
         line for a checked list.
 
     .EXAMPLE
-        ConvertTo-WorkbenchGuiOverride -Parameter $wave -Text "1`n2"
+        ConvertTo-WorkbenchGuiOverride -Parameter $scope -Text "Users`nGroups"
 
-        Returns @('1', '2') for a [string[]] parameter.
+        Returns @('Users', 'Groups') for a [string[]] parameter.
 
     .EXAMPLE
         ConvertTo-WorkbenchGuiOverride -Parameter $aliasMap -Text 'old.com=new.com'
@@ -1213,6 +1436,11 @@ function ConvertTo-WorkbenchGuiOverride {
     )
 
     $value = if ($null -eq $Text) { '' } else { $Text }
+
+    # Both refusals are decided before anything is read, so no path through this function can
+    # return a secret or a value for a parameter the window sets from a control of its own.
+    if ((ConvertTo-WorkbenchGuiControlKind -Parameter $Parameter) -eq 'Secret') { return $null }
+    if (-not (Test-WorkbenchGuiFormParameter -Parameter $Parameter)) { return $null }
 
     $isSwitch = [bool](Get-MigrationProperty -InputObject $Parameter -Name 'IsSwitch' -Default $false)
     $isBool = [bool](Get-MigrationProperty -InputObject $Parameter -Name 'IsBool' -Default $false)
@@ -1355,6 +1583,11 @@ function Write-WorkbenchGuiPane {
         $kept = @(@($box.Lines) | Select-Object -Last $keep)
         $box.Lines = [string[]](@("--- the oldest lines were trimmed; the run folder has all of them ---") + $kept)
         $script:Gui.PaneLines = $kept.Count + 1
+
+        # TextBox.Lines joins its array with a newline and leaves none on the end, so the next
+        # AppendText would run onto the last kept line and the pane would silently lose a line
+        # break at every trim. One explicit terminator here is what keeps it line-per-line.
+        if ($box.TextLength -gt 0) { $box.AppendText("`r`n") }
     }
 
     $box.SelectionStart = $box.TextLength
@@ -1391,6 +1624,50 @@ function Set-WorkbenchGuiStatus {
 
     if ($null -eq $script:Gui) { return }
     $script:Gui.StatusItem.Text = [string]$Text
+}
+
+function Update-WorkbenchGuiRunState {
+    <#
+    .SYNOPSIS
+        Says in the strip, and in the pane, whether anything can be run against this workspace.
+
+    .DESCRIPTION
+        Called after every scan - opening a workspace, refreshing one, and the refresh a saved
+        settings document triggers - so the one sentence that decides whether the buttons will do
+        anything is written from one place and is never stale. That is what makes the refusal
+        lift by itself the moment the Settings dialog saves a document that validates: the save
+        rescans, the rescan calls this, and the strip goes back to Ready.
+
+        The pane gets the line as well as the strip. The strip holds one sentence and is
+        overwritten by the next thing that happens; the pane is the session's record, and an
+        operator who came back to the window after lunch should be able to scroll up and find out
+        why Run did nothing.
+
+    .EXAMPLE
+        Update-WorkbenchGuiRunState
+
+        Writes 'Ready', or names the settings keys that have to be fixed before anything runs.
+
+    .NOTES
+        Author: AutomationHub
+        Written with assistance from Claude (Anthropic).
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Updates the local window only; nothing on the system changes, so -WhatIf would mislead.')]
+    [CmdletBinding()]
+    [OutputType([void])]
+    param()
+
+    if ($null -eq $script:Gui) { return }
+
+    $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
+    if ($canRun.CanRun) {
+        Set-WorkbenchGuiStatus -Text 'Ready'
+        return
+    }
+
+    Set-WorkbenchGuiStatus -Text ([string]$canRun.Reason)
+    if ($null -ne $script:Gui.Workspace) { Write-WorkbenchGuiPane -Line ('  ! ' + [string]$canRun.Reason) }
 }
 
 function Set-WorkbenchGuiBusy {
@@ -1711,15 +1988,23 @@ function Show-WorkbenchGuiStepForm {
 
     .DESCRIPTION
         The form is generated, never hand-written (Docs/Workbench-Design.md, section 9). One row
-        per parameter the operator could fill in - the five options every script shares are set
-        by the workbench itself and never appear - with the control
-        ConvertTo-WorkbenchGuiControlKind chose, the value
+        per parameter the operator could fill in - Test-WorkbenchGuiFormParameter decides which
+        those are, so the five options every script shares and the three a dedicated control owns
+        never appear - with the control ConvertTo-WorkbenchGuiControlKind chose, the value
         Resolve-MigrationStepArguments already decided, and the rung of the precedence ladder
         that decided it beside the value.
 
         The values are resolved for a rehearsal, because a rehearsal is the safe reading of a
         step and because the buttons re-resolve for the mode they are: the form is a picture of
         what would run, and the run action never trusts it.
+
+        On a workspace whose settings do not validate (Test-WorkbenchGuiCanRun) nothing is
+        resolved at all. The resolver would answer from a settings document that does not exist:
+        no tenant to assert against, no label, and a picture of a run that must not be started
+        anyway. The rows are drawn empty and the strip says which keys have to be fixed first.
+
+        A [SecureString] parameter gets a line of text rather than a control. There is no box to
+        type a client secret into anywhere in this window, by design.
 
         A row the instance fixes is drawn disabled. Those values are what make the instance that
         step rather than another one, they outrank an operator override in the resolver, and a
@@ -1776,14 +2061,19 @@ function Show-WorkbenchGuiStepForm {
         $Step.Side, $Step.Impact)
 
     # Resolved once, for a rehearsal: the form shows what a safe run would pass, and both
-    # buttons resolve again for the mode they actually are.
+    # buttons resolve again for the mode they actually are. Nothing is resolved while the
+    # settings are unusable - the run actions refuse then, and a form full of values resolved
+    # from a document that did not load would be a picture of a run nobody can start.
+    $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
     $resolved = $null
-    try {
-        $resolved = Resolve-MigrationStepArguments -Step $Step -Workspace $script:Gui.Workspace `
-            -Override @{} -Wave @() -DryRun
-    }
-    catch {
-        Write-WorkbenchGuiPane -Line "  ! This step's arguments could not be resolved: $($_.Exception.Message)"
+    if ($canRun.CanRun) {
+        try {
+            $resolved = Resolve-MigrationStepArguments -Step $Step -Workspace $script:Gui.Workspace `
+                -Override @{} -Wave @() -DryRun
+        }
+        catch {
+            Write-WorkbenchGuiPane -Line "  ! This step's arguments could not be resolved: $($_.Exception.Message)"
+        }
     }
 
     $valueByName = @{}
@@ -1809,7 +2099,7 @@ function Show-WorkbenchGuiStepForm {
 
         $row = 0
         foreach ($parameter in @($Step.Parameters)) {
-            if ([bool](Get-MigrationProperty -InputObject $parameter -Name 'Common' -Default $false)) { continue }
+            if (-not (Test-WorkbenchGuiFormParameter -Parameter $parameter)) { continue }
 
             $name = [string]$parameter.Name
             $kind = ConvertTo-WorkbenchGuiControlKind -Parameter $parameter
@@ -1843,7 +2133,9 @@ function Show-WorkbenchGuiStepForm {
 
             # A fixed value is what makes this instance this step; the resolver outranks any
             # override with it, so an editable control here would be a promise nothing keeps.
-            if ($source -eq 'Fixed') { $hostControl.Enabled = $false }
+            # A Secret row is a sentence rather than a control, and it is disabled for the same
+            # reason: there is nothing in it to edit and nothing in it to read back.
+            if ($source -eq 'Fixed' -or $kind -eq 'Secret') { $hostControl.Enabled = $false }
 
             $helpText = [string](Get-MigrationProperty -InputObject $parameter -Name 'Help' -Default '')
             if ($helpText) { $script:Gui.ToolTip.SetToolTip($entry.Control, $helpText) }
@@ -1884,6 +2176,13 @@ function Show-WorkbenchGuiStepForm {
     finally {
         $panel.ResumeLayout()
         $script:Gui.Suppress = $false
+    }
+
+    if (-not $canRun.CanRun) {
+        # The strip is where the operator looks before pressing a button, so it - not a dialog
+        # they would have to dismiss on every selection - is where the refusal belongs.
+        Set-WorkbenchGuiStatus -Text ([string]$canRun.Reason)
+        return
     }
 
     Set-WorkbenchGuiStatus -Text ('Ready - {0}' -f $Step.Id)
@@ -1948,6 +2247,22 @@ function New-WorkbenchGuiParameterControl {
     }
 
     switch ($Row.Kind) {
+        'Secret' {
+            # A Label, not a disabled TextBox and certainly not a PasswordChar box: there is no
+            # control here to type into, to paste into, or to read a value back out of. The
+            # secret reaches the child process through its environment block and nowhere else
+            # (Docs/Workbench-Design.md, sections 7.3 and 9), and a window that collected one
+            # would be one more place it could be shoulder-read or screenshot.
+            $text = New-Object System.Windows.Forms.Label
+            $text.Text = [string]$script:WorkbenchGuiSecretRowText
+            $text.AutoSize = $true
+            $text.Anchor = 'Left'
+            $text.ForeColor = [System.Drawing.Color]::DimGray
+            $text.Margin = New-Object System.Windows.Forms.Padding(3, 6, 3, 3)
+            $Row.Control = $text
+            return $text
+        }
+
         'CheckBox' {
             $box = New-Object System.Windows.Forms.CheckBox
             $box.AutoSize = $true
@@ -2267,141 +2582,153 @@ function Show-WorkbenchGuiSettingsDialog {
     }
 
     $dialog = New-Object System.Windows.Forms.Form
-    $dialog.Text = "Settings - $($workspace.Path)"
-    $dialog.StartPosition = 'CenterParent'
-    $dialog.ClientSize = New-Object System.Drawing.Size(900, 640)
-    $dialog.MinimumSize = New-Object System.Drawing.Size(760, 480)
-    $dialog.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-    $dialog.AutoScaleMode = 'Dpi'
 
-    $grid = New-Object System.Windows.Forms.TableLayoutPanel
-    $grid.Dock = 'Fill'
-    $grid.ColumnCount = 4
-    $grid.AutoScroll = $true
-    $grid.GrowStyle = 'AddRows'
-    $null = $grid.ColumnStyles.Add(
-        (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
-    $null = $grid.ColumnStyles.Add(
-        (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
-    $null = $grid.ColumnStyles.Add(
-        (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
-    $null = $grid.ColumnStyles.Add(
-        (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    # Everything the dialog is made of is built inside the try. Building a control can fail for
+    # reasons that have nothing to do with this workspace - a font that is not installed, a
+    # value the schema describes but this document holds in another shape - and this dialog is
+    # the only way an operator fixes a settings file that will not validate. It must arrive as a
+    # message, never as an error that closes the window behind it.
+    try {
+        $dialog.Text = "Settings - $($workspace.Path)"
+        $dialog.StartPosition = 'CenterParent'
+        $dialog.ClientSize = New-Object System.Drawing.Size(900, 640)
+        $dialog.MinimumSize = New-Object System.Drawing.Size(760, 480)
+        $dialog.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+        $dialog.AutoScaleMode = 'Dpi'
 
-    $rows = [System.Collections.Generic.List[object]]::new()
-    $index = 0
-    foreach ($entry in $schema) {
-        $key = [string]$entry.Key
-        $current = Get-WorkbenchGuiSettingsValue -Document $workspace.Settings -Key $key
+        $grid = New-Object System.Windows.Forms.TableLayoutPanel
+        $grid.Dock = 'Fill'
+        $grid.ColumnCount = 4
+        $grid.AutoScroll = $true
+        $grid.GrowStyle = 'AddRows'
+        $null = $grid.ColumnStyles.Add(
+            (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        $null = $grid.ColumnStyles.Add(
+            (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        $null = $grid.ColumnStyles.Add(
+            (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+        $null = $grid.ColumnStyles.Add(
+            (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 
-        $label = New-Object System.Windows.Forms.Label
-        $label.Text = $key
-        $label.AutoSize = $true
-        $label.Anchor = 'Left'
-        $label.Margin = New-Object System.Windows.Forms.Padding(3, 7, 8, 3)
+        $rows = [System.Collections.Generic.List[object]]::new()
+        $index = 0
+        foreach ($entry in $schema) {
+            $key = [string]$entry.Key
+            $current = Get-WorkbenchGuiSettingsValue -Document $workspace.Settings -Key $key
 
-        $control = $null
-        switch ([string]$entry.Type) {
-            'Choice' {
-                $control = New-Object System.Windows.Forms.ComboBox
-                $control.DropDownStyle = 'DropDownList'
-                $control.Width = 320
-                foreach ($choice in @($entry.Choices)) { $null = $control.Items.Add([string]$choice) }
-                $chosen = [string]$current
-                if (-not $chosen) { $chosen = [string]$entry.Default }
-                if ($control.Items.Contains($chosen)) { $control.SelectedItem = $chosen }
-            }
-            'Bool' {
-                $control = New-Object System.Windows.Forms.CheckBox
-                $control.AutoSize = $true
-                $control.Checked = [bool]$current
-            }
-            'Map' {
-                $control = New-Object System.Windows.Forms.TextBox
-                $control.Multiline = $true
-                $control.ScrollBars = 'Vertical'
-                $control.Width = 320
-                $control.Height = 60
-                if ($current -is [System.Collections.IDictionary]) {
-                    $control.Text = ((@($current.Keys) |
-                            ForEach-Object { '{0}={1}' -f $_, $current[$_] }) -join "`r`n")
+            $label = New-Object System.Windows.Forms.Label
+            $label.Text = $key
+            $label.AutoSize = $true
+            $label.Anchor = 'Left'
+            $label.Margin = New-Object System.Windows.Forms.Padding(3, 7, 8, 3)
+
+            $control = $null
+            switch ([string]$entry.Type) {
+                'Choice' {
+                    $control = New-Object System.Windows.Forms.ComboBox
+                    $control.DropDownStyle = 'DropDownList'
+                    $control.Width = 320
+                    foreach ($choice in @($entry.Choices)) { $null = $control.Items.Add([string]$choice) }
+                    $chosen = [string]$current
+                    if (-not $chosen) { $chosen = [string]$entry.Default }
+                    if ($control.Items.Contains($chosen)) { $control.SelectedItem = $chosen }
+                }
+                'Bool' {
+                    $control = New-Object System.Windows.Forms.CheckBox
+                    $control.AutoSize = $true
+                    $control.Checked = [bool]$current
+                }
+                'Map' {
+                    $control = New-Object System.Windows.Forms.TextBox
+                    $control.Multiline = $true
+                    $control.ScrollBars = 'Vertical'
+                    $control.Width = 320
+                    $control.Height = 60
+                    if ($current -is [System.Collections.IDictionary]) {
+                        $control.Text = ((@($current.Keys) |
+                                ForEach-Object { '{0}={1}' -f $_, $current[$_] }) -join "`r`n")
+                    }
+                }
+                default {
+                    $control = New-Object System.Windows.Forms.TextBox
+                    $control.Width = 320
+                    $control.Text = [string]$current
                 }
             }
-            default {
-                $control = New-Object System.Windows.Forms.TextBox
-                $control.Width = 320
-                $control.Text = [string]$current
+
+            $extra = New-Object System.Windows.Forms.Label
+            $extra.Text = ''
+            $extra.AutoSize = $true
+            if ($key -like '*.TenantId') {
+                $extra = New-Object System.Windows.Forms.Button
+                $extra.Text = 'Resolve'
+                $extra.Width = 80
+                $extra.Tag = $control
+                $extra.Add_Click({ Invoke-WorkbenchGuiResolveTenantAction -Control $args[0] })
             }
+
+            $message = New-Object System.Windows.Forms.Label
+            $message.Text = [string]$entry.Description
+            $message.AutoSize = $true
+            $message.MaximumSize = New-Object System.Drawing.Size(420, 0)
+            $message.ForeColor = [System.Drawing.Color]::DimGray
+            $message.Margin = New-Object System.Windows.Forms.Padding(8, 7, 3, 3)
+
+            $grid.Controls.Add($label, 0, $index)
+            $grid.Controls.Add($control, 1, $index)
+            $grid.Controls.Add($extra, 2, $index)
+            $grid.Controls.Add($message, 3, $index)
+
+            $rows.Add(@{
+                    Key          = $key
+                    Type         = [string]$entry.Type
+                    Control      = $control
+                    MessageLabel = $message
+                    Description  = [string]$entry.Description
+                })
+            $index++
         }
 
-        $extra = New-Object System.Windows.Forms.Label
-        $extra.Text = ''
-        $extra.AutoSize = $true
-        if ($key -like '*.TenantId') {
-            $extra = New-Object System.Windows.Forms.Button
-            $extra.Text = 'Resolve'
-            $extra.Width = 80
-            $extra.Tag = $control
-            $extra.Add_Click({ Invoke-WorkbenchGuiResolveTenantAction -Control $args[0] })
+        $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
+        $buttons.Dock = 'Bottom'
+        $buttons.FlowDirection = 'RightToLeft'
+        $buttons.AutoSize = $true
+        $buttons.Padding = New-Object System.Windows.Forms.Padding(6)
+
+        $cancel = New-Object System.Windows.Forms.Button
+        $cancel.Text = 'Cancel'
+        $cancel.Width = 100
+        $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+        $save = New-Object System.Windows.Forms.Button
+        $save.Text = 'Save'
+        $save.Width = 100
+        $save.Add_Click({ Invoke-WorkbenchGuiSettingsSaveAction })
+
+        $buttons.Controls.Add($cancel)
+        $buttons.Controls.Add($save)
+
+        $dialog.Controls.Add($grid)
+        $dialog.Controls.Add($buttons)
+        $dialog.CancelButton = $cancel
+
+        # Save reads the rows and the dialog out of the state bag, so it is a named function like
+        # every other handler rather than a closure over this function's locals.
+        $script:Gui.SettingsForm = @{
+            Dialog   = $dialog
+            Rows     = @($rows)
+            Writer   = ${function:Set-WorkbenchGuiSettingsValue}
+            SavePath = [string]$workspace.SettingsPath
         }
 
-        $message = New-Object System.Windows.Forms.Label
-        $message.Text = [string]$entry.Description
-        $message.AutoSize = $true
-        $message.MaximumSize = New-Object System.Drawing.Size(420, 0)
-        $message.ForeColor = [System.Drawing.Color]::DimGray
-        $message.Margin = New-Object System.Windows.Forms.Padding(8, 7, 3, 3)
-
-        $grid.Controls.Add($label, 0, $index)
-        $grid.Controls.Add($control, 1, $index)
-        $grid.Controls.Add($extra, 2, $index)
-        $grid.Controls.Add($message, 3, $index)
-
-        $rows.Add(@{
-                Key          = $key
-                Type         = [string]$entry.Type
-                Control      = $control
-                MessageLabel = $message
-                Description  = [string]$entry.Description
-            })
-        $index++
-    }
-
-    $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
-    $buttons.Dock = 'Bottom'
-    $buttons.FlowDirection = 'RightToLeft'
-    $buttons.AutoSize = $true
-    $buttons.Padding = New-Object System.Windows.Forms.Padding(6)
-
-    $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = 'Cancel'
-    $cancel.Width = 100
-    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-
-    $save = New-Object System.Windows.Forms.Button
-    $save.Text = 'Save'
-    $save.Width = 100
-    $save.Add_Click({ Invoke-WorkbenchGuiSettingsSaveAction })
-
-    $buttons.Controls.Add($cancel)
-    $buttons.Controls.Add($save)
-
-    $dialog.Controls.Add($grid)
-    $dialog.Controls.Add($buttons)
-    $dialog.CancelButton = $cancel
-
-    # Save reads the rows and the dialog out of the state bag, so it is a named function like
-    # every other handler rather than a closure over this function's locals.
-    $script:Gui.SettingsForm = @{
-        Dialog   = $dialog
-        Rows     = @($rows)
-        Writer   = ${function:Set-WorkbenchGuiSettingsValue}
-        SavePath = [string]$workspace.SettingsPath
-    }
-
-    try {
         $result = $dialog.ShowDialog($script:Gui.Form)
         return ($result -eq [System.Windows.Forms.DialogResult]::OK)
+    }
+    catch {
+        Show-WorkbenchGuiMessage -Message ("The settings dialog could not be built: " +
+            "$($_.Exception.Message)`r`n`r`nThe file can still be edited by hand: " +
+            [string]$workspace.SettingsPath) -Icon 'Error'
+        return $false
     }
     finally {
         $script:Gui.SettingsForm = $null
@@ -2644,6 +2971,13 @@ function Invoke-WorkbenchGuiPickPathAction {
     .SYNOPSIS
         Opens a file or folder picker for a path parameter and writes the choice into its box.
 
+    .DESCRIPTION
+        A common dialog is a shell call, and a shell call fails for reasons that have nothing to
+        do with this window - a path the shell cannot expand, a namespace extension that throws.
+        Every handler in this region has to survive that with a message rather than by taking the
+        window down, and the dialog is disposed in a finally because it is an unmanaged handle
+        whether it returned OK, Cancel or an exception.
+
     .PARAMETER Control
         The '...' button; its Tag is the row.
 
@@ -2671,28 +3005,37 @@ function Invoke-WorkbenchGuiPickPathAction {
 
     $start = [string]$script:Gui.WorkspacePath
     $chosen = ''
+    $picker = $null
 
-    if ([string]$row.Kind -eq 'FolderPicker') {
-        $picker = New-Object System.Windows.Forms.FolderBrowserDialog
-        $picker.Description = "Folder for -$($row.Name)"
-        if ($start) { $picker.SelectedPath = $start }
-        if ($picker.ShowDialog($script:Gui.Form) -eq [System.Windows.Forms.DialogResult]::OK) {
-            $chosen = $picker.SelectedPath
+    try {
+        if ([string]$row.Kind -eq 'FolderPicker') {
+            $picker = New-Object System.Windows.Forms.FolderBrowserDialog
+            $picker.Description = "Folder for -$($row.Name)"
+            if ($start) { $picker.SelectedPath = $start }
+            if ($picker.ShowDialog($script:Gui.Form) -eq [System.Windows.Forms.DialogResult]::OK) {
+                $chosen = $picker.SelectedPath
+            }
         }
-        $picker.Dispose()
+        else {
+            $picker = New-Object System.Windows.Forms.OpenFileDialog
+            $picker.Title = "File for -$($row.Name)"
+            $picker.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+            # An array parameter takes several files, which is exactly what the picker offers.
+            $picker.Multiselect = [bool](Get-MigrationProperty -InputObject $row.Parameter -Name 'IsArray' `
+                    -Default $false)
+            if ($start) { $picker.InitialDirectory = $start }
+            if ($picker.ShowDialog($script:Gui.Form) -eq [System.Windows.Forms.DialogResult]::OK) {
+                $chosen = (@($picker.FileNames) -join "`r`n")
+            }
+        }
     }
-    else {
-        $picker = New-Object System.Windows.Forms.OpenFileDialog
-        $picker.Title = "File for -$($row.Name)"
-        $picker.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
-        # An array parameter takes several files, which is exactly what the picker offers.
-        $picker.Multiselect = [bool](Get-MigrationProperty -InputObject $row.Parameter -Name 'IsArray' `
-                -Default $false)
-        if ($start) { $picker.InitialDirectory = $start }
-        if ($picker.ShowDialog($script:Gui.Form) -eq [System.Windows.Forms.DialogResult]::OK) {
-            $chosen = (@($picker.FileNames) -join "`r`n")
-        }
-        $picker.Dispose()
+    catch {
+        Show-WorkbenchGuiMessage -Message ("That picker could not be opened: $($_.Exception.Message)" +
+            "`r`n`r`nType the path into the box instead.") -Icon 'Warning'
+        return
+    }
+    finally {
+        if ($null -ne $picker) { $picker.Dispose() }
     }
 
     if (-not $chosen) { return }
@@ -2792,7 +3135,14 @@ function Invoke-WorkbenchGuiOpenWorkspaceAction {
         One scan, one redraw. The scan is Get-MigrationWorkspace and nothing else, so the window
         shows exactly what the console would show for the same folder; a workspace whose
         settings will not load is still opened, with the problems written into the pane and the
-        Settings dialog offered, because the operator has to be able to fix them from here.
+        Settings dialog offered, because the operator has to be able to fix them from here - and
+        fixing them through that dialog is the one thing this window can do that the console
+        cannot.
+
+        Opened, but not runnable: Update-WorkbenchGuiRunState puts the keys that have to be fixed
+        in the status strip and in the pane, and every run action refuses until they are. The
+        tree is still drawn, because a runbook an operator can read is how they work out which
+        settings they are missing.
 
     .PARAMETER Path
         The workspace folder.
@@ -2842,14 +3192,14 @@ function Invoke-WorkbenchGuiOpenWorkspaceAction {
             Write-WorkbenchGuiPane -Line "  ! $warning"
         }
 
-        if (-not $script:Gui.Workspace.SettingsResult.IsValid) {
+        $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
+        if (-not $canRun.CanRun) {
             foreach ($problem in @($script:Gui.Workspace.SettingsResult.Errors)) {
                 Write-WorkbenchGuiPane -Line "  ! $problem"
             }
-            Show-WorkbenchGuiMessage -Message ('This workspace has no usable settings yet. Fill them in ' +
-                'through Settings before running anything: without a label the scanner cannot attribute a ' +
-                'single file to a step, and without the tenant GUIDs no run can assert where it wrote.') `
-                -Title 'Settings' -Icon 'Warning'
+            Show-WorkbenchGuiMessage -Message ([string]$canRun.Reason + "`r`n`r`n" +
+                'Without a label the scanner cannot attribute a single file to a step, and without the ' +
+                'tenant GUIDs no run can assert where it wrote.') -Title 'Settings' -Icon 'Warning'
         }
 
         if ($null -ne (Get-MigrationRunContext)) {
@@ -2862,7 +3212,7 @@ function Invoke-WorkbenchGuiOpenWorkspaceAction {
     }
     finally {
         Set-WorkbenchGuiBusy -Busy $false
-        Set-WorkbenchGuiStatus -Text 'Ready'
+        Update-WorkbenchGuiRunState
     }
 }
 
@@ -2870,6 +3220,11 @@ function Invoke-WorkbenchGuiBrowseAction {
     <#
     .SYNOPSIS
         Asks for a workspace folder and opens it.
+
+    .DESCRIPTION
+        Everything is inside the try, the picker included. Working out where to start it reads
+        the default output root and touches the disk, and a handler that threw before it reached
+        its own try would take the window down over a path lookup.
 
     .EXAMPLE
         Invoke-WorkbenchGuiBrowseAction
@@ -2886,18 +3241,23 @@ function Invoke-WorkbenchGuiBrowseAction {
 
     if ($null -eq $script:Gui) { return }
 
-    $picker = New-Object System.Windows.Forms.FolderBrowserDialog
-    $picker.Description = 'Pick the migration folder'
-    $start = [string]$script:Gui.WorkspacePath
-    if (-not $start) { $start = Get-MigrationDefaultOutputRoot }
-    if ($start -and (Test-Path -LiteralPath $start -PathType Container)) { $picker.SelectedPath = $start }
-
+    $picker = $null
     try {
+        $picker = New-Object System.Windows.Forms.FolderBrowserDialog
+        $picker.Description = 'Pick the migration folder'
+        $start = [string]$script:Gui.WorkspacePath
+        if (-not $start) { $start = Get-MigrationDefaultOutputRoot }
+        if ($start -and (Test-Path -LiteralPath $start -PathType Container)) { $picker.SelectedPath = $start }
+
         if ($picker.ShowDialog($script:Gui.Form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
         Invoke-WorkbenchGuiOpenWorkspaceAction -Path $picker.SelectedPath
     }
+    catch {
+        Show-WorkbenchGuiMessage -Message "The folder picker could not be opened: $($_.Exception.Message)" `
+            -Icon 'Error'
+    }
     finally {
-        $picker.Dispose()
+        if ($null -ne $picker) { $picker.Dispose() }
     }
 }
 
@@ -2932,7 +3292,9 @@ function Invoke-WorkbenchGuiRefreshAction {
     }
     finally {
         Set-WorkbenchGuiBusy -Busy $false
-        Set-WorkbenchGuiStatus -Text 'Ready'
+        # The rescan is also what a saved settings document triggers, so this is where a refusal
+        # that has just been fixed stops being shown.
+        Update-WorkbenchGuiRunState
     }
 }
 
@@ -2940,6 +3302,12 @@ function Invoke-WorkbenchGuiSettingsAction {
     <#
     .SYNOPSIS
         Opens the settings dialog and rescans when it saved.
+
+    .DESCRIPTION
+        The dialog is the way out of a workspace whose settings do not validate, so a failure to
+        build or show it has to arrive as a message rather than as an unhandled error: an
+        operator whose only route to fixing the file is this menu item must not be left with a
+        window that closed itself instead.
 
     .EXAMPLE
         Invoke-WorkbenchGuiSettingsAction
@@ -2959,10 +3327,19 @@ function Invoke-WorkbenchGuiSettingsAction {
         return
     }
 
-    if (Show-WorkbenchGuiSettingsDialog) {
-        # Every state on the board is derived from the settings - the label decides which files
-        # belong to which step - so a saved document means a stale board.
-        Invoke-WorkbenchGuiRefreshAction
+    try {
+        if (Show-WorkbenchGuiSettingsDialog) {
+            # Every state on the board is derived from the settings - the label decides which
+            # files belong to which step - so a saved document means a stale board. The rescan
+            # is also what lifts the run refusal when the document now validates.
+            Invoke-WorkbenchGuiRefreshAction
+        }
+    }
+    catch {
+        Show-WorkbenchGuiMessage -Message ("The settings dialog could not be opened: " +
+            "$($_.Exception.Message)`r`n`r`nThe file can still be edited by hand: " +
+            [string](Get-MigrationProperty -InputObject $script:Gui.Workspace -Name 'SettingsPath' `
+                    -Default '')) -Icon 'Error'
     }
 }
 
@@ -3024,9 +3401,16 @@ function Invoke-WorkbenchGuiCopyAction {
         eventually print one the file does not match.
 
         The preview's command is copied when there is one - after a run, that is the command
-        that ran. With an empty preview a rehearsal's driver is written, because a rehearsal is
-        the safe reading of a step; pressing Run writes the live one into the preview before it
-        starts, and copying then gives the live command.
+        that ran, because the run action leaves its own driver in the preview. With an empty
+        preview a rehearsal's driver is written, because a rehearsal is the safe reading of a
+        step; pressing Run writes the live one into the preview before it starts, and copying
+        then gives the live command.
+
+        A workspace whose settings do not validate is refused here as it is on the run buttons.
+        Writing a driver would mean resolving arguments against a settings document that did not
+        load, and a command line on the clipboard is a command line somebody pastes into a
+        console - so the one thing worse than running it from here would be handing it over to
+        be run somewhere else.
 
     .EXAMPLE
         Invoke-WorkbenchGuiCopyAction
@@ -3044,6 +3428,12 @@ function Invoke-WorkbenchGuiCopyAction {
     if ($null -eq $script:Gui) { return }
     if ($null -eq $script:Gui.Step) {
         Show-WorkbenchGuiMessage -Message 'Pick a step first.' -Icon 'Warning'
+        return
+    }
+
+    $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
+    if (-not $canRun.CanRun) {
+        Show-WorkbenchGuiMessage -Message ([string]$canRun.Reason) -Title 'Settings' -Icon 'Warning'
         return
     }
 
@@ -3221,7 +3611,9 @@ function Invoke-WorkbenchGuiStepAction {
 
         The re-entrancy guard is the first thing checked: DoEvents keeps the window alive during
         a run, which also means it keeps the buttons capable of raising events, and a second run
-        started on top of the first would share this function's state with it.
+        started on top of the first would share this function's state with it. Then the settings:
+        a workspace whose settings did not load is refused before the resolver is called at all,
+        the same refusal the console and the unattended path make (Test-WorkbenchGuiCanRun).
 
     .PARAMETER Live
         $true to run the step for real, $false to rehearse it.
@@ -3253,6 +3645,16 @@ function Invoke-WorkbenchGuiStepAction {
         return
     }
 
+    # Before the resolver, before the gates, before a driver exists. A run resolved against
+    # settings that did not load is handed no -TenantId, so the expected tenant is never set and
+    # TenantVerified comes back $null; the prefix and the output folder fall back to Common; and
+    # one Yes on a soft gate would start a live writer nobody can say which tenant it reached.
+    $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
+    if (-not $canRun.CanRun) {
+        Show-WorkbenchGuiMessage -Message ([string]$canRun.Reason) -Title 'Settings' -Icon 'Warning'
+        return
+    }
+
     $step = $script:Gui.Step
     $workspace = $script:Gui.Workspace
     $mode = if ($Live) { 'run' } else { 'rehearsal' }
@@ -3264,6 +3666,11 @@ function Invoke-WorkbenchGuiStepAction {
         Write-WorkbenchGuiPane -Line ('--- {0} {1} ({2}) ---' -f $mode, $step.Id, (Get-Date -Format 's'))
 
         # --- 1. the arguments, for the mode the button is ---------------------------------
+        # Read once. The resolver, the gates and Invoke-MigrationStep below are all handed this
+        # same variable, never a second call to Get-WorkbenchGuiWave: the ledger records the
+        # waves the runner was given, and a list read twice is a ledger that can disagree with
+        # the driver about which wave ran. The step form draws no -Wave control of its own
+        # (Test-WorkbenchGuiFormParameter), so an -Override cannot outrank it either.
         $wave = @(Get-WorkbenchGuiWave)
         $resolved = Resolve-MigrationStepArguments -Step $step -Workspace $workspace `
             -Override (Get-WorkbenchGuiOverride) -Wave $wave -DryRun:(-not $Live)
@@ -3347,10 +3754,11 @@ function Invoke-WorkbenchGuiStepAction {
         Write-WorkbenchGuiPane -Line ([string]$driver.DisplayLine)
         Write-WorkbenchGuiPane -Line ([string]$driver.CommandLine)
 
-        # From here the folder belongs to the run, not to the preview slot: clearing the slot
-        # without going through Set-WorkbenchGuiPreview is what keeps the command that ran on
-        # screen while making sure nothing later deletes its folder.
-        $script:Gui.Preview = $null
+        # The driver that is about to run stays in the preview slot, so what is on screen - and
+        # what Copy command copies - is the command that ran, which is what Copy's own
+        # description promises. Its folder is safe there: Set-WorkbenchGuiPreview only removes
+        # the driver it replaces when that folder holds no stdout.txt, and Invoke-MigrationStep
+        # writes stdout.txt the moment it starts the child.
         $script:Gui.LastRunFolder = [string]$driver.RunFolder
 
         # The one place Cancel is armed: from here there is a child to cancel, and the finally's
@@ -3401,9 +3809,13 @@ function Invoke-WorkbenchGuiStepAction {
             -Icon 'Error'
     }
     finally {
+        # Busy is released first and Running cleared after it. Set-WorkbenchGuiBusy re-enables
+        # the buttons and then pumps the message queue, so a click queued during the run is
+        # dispatched inside that DoEvents - and it has to meet the re-entrancy guard still
+        # closed, or the window starts a second run out of the first one's finally block.
+        Set-WorkbenchGuiBusy -Busy $false
         $script:Gui.Running = $false
         $script:Gui.CancelRequested = $false
-        Set-WorkbenchGuiBusy -Busy $false
         Set-WorkbenchGuiStatus -Text 'Ready'
     }
 }
@@ -3929,22 +4341,44 @@ if (-not $NoGui -and $MyInvocation.InvocationName -ne '.') {
         $resolution = Resolve-WorkbenchWorkspacePath -Workspace $Workspace -Mode $mode
         $workspacePath = $resolution.Path
 
+        # Every refusal that can be read off the arguments alone is made here, before there is a
+        # run context - and therefore before any folder exists. Initialize-MigrationRun creates
+        # its -OutputPath whether or not a line is ever written there, so a refusal raised after
+        # it leaves a folder behind under the operator's default output root as the price of
+        # telling them they mistyped a path or a step id. There is no log to write these to yet,
+        # which is why they go to the error stream and to the host and nowhere else.
+        $refusal = [string]$resolution.Problem
+        if (-not $refusal -and $mode -eq 'NonInteractive') {
+            $refusal = Get-WorkbenchStepProblem -StepId $Step
+        }
+        if ($refusal) {
+            Write-WorkbenchRefusal -Message $refusal
+            exit 2
+        }
+
         # The workbench's own log belongs beside the ledger it is about to append to. With no
-        # workspace known - a refusal, or a console session that has not picked one yet - the
-        # default output root is the only place left that is certainly writable, and the log
-        # goes in a Workbench subfolder of it rather than in the root: the root is where an
-        # operator's migration folders live, and a front end that drops loose log files among
-        # them makes its own folder list harder to read every time it refuses.
-        $logRoot = Join-Path -ChildPath 'Workbench' -Path $(
-            if ($workspacePath) { $workspacePath } else { Get-MigrationDefaultOutputRoot })
+        # workspace known - a console session that has not picked one yet - the default output
+        # root is the only place left that is certainly writable, and the log goes in a Workbench
+        # subfolder of it rather than in the root: the root is where an operator's migration
+        # folders live, and a front end that drops loose log files among them makes its own
+        # folder list harder to read every time it writes one.
+        #
+        # A caller who named -LogPath gets that file's own folder as the output path. The log
+        # path alone would not do it: Initialize-MigrationRun creates -OutputPath either way, so
+        # redirecting the log without this would still leave a folder under the default root -
+        # which is exactly what a test run, or a run against a workspace that is not there, must
+        # not do.
+        $logRoot = if ($LogPath) {
+            [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath(
+                    [System.IO.Path]::Combine((Get-Location -PSProvider FileSystem).ProviderPath, $LogPath)))
+        }
+        else {
+            Join-Path -ChildPath 'Workbench' -Path $(
+                if ($workspacePath) { $workspacePath } else { Get-MigrationDefaultOutputRoot })
+        }
 
         $null = Initialize-MigrationRun -ScriptName 'Start-MigrationWorkbench' -OutputPath $logRoot `
             -Prefix '' -LogPath $LogPath -Verbosity $Verbosity -BoundParameters $PSBoundParameters
-
-        if ($resolution.Problem) {
-            Write-WorkbenchRefusal -Message $resolution.Problem
-            exit (Complete-MigrationRun -ExitCode 2)
-        }
 
         Write-MigrationLog -Message "Workbench mode: $mode" -Level INFO
 

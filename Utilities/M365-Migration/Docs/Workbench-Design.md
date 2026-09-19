@@ -516,7 +516,17 @@ describes one workspace differently from the board.
 `Start-MigrationWorkbench.ps1` parameters: `-Workspace`, `-Console`, `-Step`, `-Wave`,
 `-DryRun`, `-Set` (hashtable of parameter overrides for non-interactive runs), `-Verbosity`,
 `-LogPath`, `-NoGui` (load-only guard). Its own log goes to `<workspace>/Workbench/` when a
-workspace is known, else the default root.
+workspace is known, else to `<root>/Workbench/` — a subfolder of the default output root, never
+the root itself, which is where an operator's migration folders live. `-LogPath` names the file
+and its folder becomes the run's output folder, so a redirected log leaves nothing behind under
+the default root either.
+
+Every refusal the arguments alone decide — no `-Workspace` with `-Step`, a workspace folder that
+is not there, a `-Step` the catalogue does not hold — is made **before** `Initialize-MigrationRun`
+is called. That function creates its `-OutputPath` whether or not a line is ever written there,
+so a refusal made after it leaves a folder behind as the price of telling an operator they made
+a typo. These refusals go to the error stream and the host; there is no log to write them to, and
+that is the point.
 
 `Start-MigrationWorkbench.cmd`: finds pwsh 7 (`%ProgramFiles%\PowerShell\7\pwsh.exe`, then
 PATH), refuses Windows PowerShell 5.1 with the install link, launches
@@ -633,42 +643,52 @@ below needs a tenant except where it says so.
    needs the internet, nothing else does). Clear `Label`, press Save: the dialog stays open and
    the message beside `Label` turns red. Put it back, Save: the dialog closes, the pane says
    where the file went, and `M365Migration.settings.json.bak` is beside it.
-5. **A step form.** Select **New-Users**. The banner turns blue and names the destination
+5. **A workspace that cannot run yet.** Blank `Label` in `M365Migration.settings.json` by hand
+   and reopen the folder. The tree still draws, the status strip and the pane name `Label`, and
+   **Dry run**, **Run** and **Copy command** each refuse with a box naming that key and pointing
+   at Settings — no gate list, no driver, no run folder. Fix `Label` through the dialog: the
+   save rescans and the strip goes back to `Ready` with no further click.
+6. **A step form.** Select **New-Users**. The banner turns blue and names the destination
    tenant. Each row shows a value and its provenance (`Settings`, `Resolved`, `Fixed`,
    `Operator`); a `Fixed` row is greyed out. Hover a row — the script's own `.PARAMETER` text is
-   the tooltip. `-PlanPath` has a `...` button that opens a file dialog.
-6. **Waves.** `(all waves)` is unticked for New-Users (a writer) and the plan's waves are listed
+   the tooltip. `-PlanPath` has a `...` button that opens a file dialog. There is no `Wave` row:
+   the Waves checked list owns that parameter and the form draws no second control for it.
+7. **The Viva step form.** Select **VivaLearning-Import**. The `ClientSecret` row is a greyed
+   line of text reading `Set $env:M365MIGRATION_CLIENT_SECRET before Run — the window never
+   takes a secret.` — no text box, no password box, nothing to click and nothing to paste into.
+   Tab through the form and confirm the focus skips it.
+8. **Waves.** `(all waves)` is unticked for New-Users (a writer) and the plan's waves are listed
    under it. Tick wave 1.
-7. **Copy command.** Press it: the preview box fills with the two lines, the clipboard holds the
+9. **Copy command.** Press it: the preview box fills with the two lines, the clipboard holds the
    `pwsh ... -File "...driver.ps1"` line, and the status strip says so. Paste it into Notepad and
    check it names the driver, not a script.
-8. **Dry run.** Press it. The gate list appears in the pane, the preview shows the driver that
-   is about to run, output streams into the pane while the window stays responsive (drag it
-   around mid-run), Cancel is the only enabled button, and the summary dialog names the exit
-   code, the counts, the files and the tenant line. The tree redraws with the rehearsal's glyph.
-9. **Cancel.** Start a dry run of a long step (an inventory) and press **Cancel**. The pane says
-   it is cancelling, the run ends, the summary says `Aborted by the operator`, and
-   `Workbench/Runs.jsonl` records `"Aborted": true`.
-10. **The soft gate.** Select a writer that has not been rehearsed and press **Run**. A Yes/No
+10. **Dry run.** Press it. The gate list appears in the pane, the preview shows the driver that
+    is about to run, output streams into the pane while the window stays responsive (drag it
+    around mid-run), Cancel is the only enabled button, and the summary dialog names the exit
+    code, the counts, the files and the tenant line. The tree redraws with the rehearsal's glyph.
+11. **Cancel.** Start a dry run of a long step (an inventory) and press **Cancel**. The pane says
+    it is cancelling, the run ends, the summary says `Aborted by the operator`, and
+    `Workbench/Runs.jsonl` records `"Aborted": true`.
+12. **The soft gate.** Select a writer that has not been rehearsed and press **Run**. A Yes/No
     box names the `DryRunFirst` gate. Answer No — nothing runs. Answer Yes on a second attempt
     and the ledger line for that run carries the override in `GateOverrides`.
-11. **The typed confirmation.** Select **DomainReferences-Remediate** and press **Dry run**. The
+13. **The typed confirmation.** Select **DomainReferences-Remediate** and press **Dry run**. The
     modal dialog appears; **Continue** stays disabled until the box holds the release domain
     exactly (case-insensitively — try `NEWCO.COM`). Cancel it and nothing runs.
-12. **Tenant mismatch.** Point `Destination.TenantId` at a GUID that is not the tenant the run
+14. **Tenant mismatch.** Point `Destination.TenantId` at a GUID that is not the tenant the run
     will reach and run a connecting step. A red `TENANT MISMATCH` box must appear *before* the
     summary, whatever the exit code was.
-13. **Open folder.** After a run, it opens that run's folder — `driver.ps1`, `stdout.txt`,
+15. **Open folder.** After a run, it opens that run's folder — `driver.ps1`, `stdout.txt`,
     `stderr.txt`. Before any run, it opens the workspace.
-14. **Results & logs.** The menu item writes the console's own results view into the pane,
+16. **Results & logs.** The menu item writes the console's own results view into the pane,
     newest first, with each run's folder under it.
-15. **The pane cap.** Run an inventory with `Verbosity` High. Past 2000 lines the pane trims its
+17. **The pane cap.** Run an inventory with `Verbosity` High. Past 2000 lines the pane trims its
     oldest half and says so; the complete output is still in `stdout.txt`.
-16. **DPI.** Set the display to 150% and reopen the window (`PerMonitorV2` applies at start).
+18. **DPI.** Set the display to 150% and reopen the window (`PerMonitorV2` applies at start).
     Nothing is clipped, the tree text stays readable, and the form scrolls rather than truncating.
-17. **Closing mid-run.** Start a run and try to close the window: it refuses and points at
+19. **Closing mid-run.** Start a run and try to close the window: it refuses and points at
     Cancel.
-18. **The workbench log.** `<workspace>/Workbench/` holds this session's own `.log` beside
+20. **The workbench log.** `<workspace>/Workbench/` holds this session's own `.log` beside
     `Runs.jsonl`.
 
 Anything that fails here is a finding against §9, not a change of design: the engine is already

@@ -100,6 +100,19 @@ BeforeAll {
     # was already there.
     $global:WorkbenchSuiteStart = Get-Date
 
+    # The litter guard's baseline: whether the operator's own default output root exists at all,
+    # and everything in it, recursively. Recorded as a whole listing rather than as a pattern
+    # because the front end's log lands in a Workbench subfolder of that root - a guard that
+    # looked only for Start-MigrationWorkbench_*.log files directly in the root watched a folder
+    # appear beside a technician's real migrations and said nothing.
+    $global:WorkbenchStrayRoot = Get-MigrationDefaultOutputRoot
+    $global:WorkbenchRootExisted = Test-Path -LiteralPath $global:WorkbenchStrayRoot -PathType Container
+    $global:WorkbenchRootBefore = @()
+    if ($global:WorkbenchRootExisted) {
+        $global:WorkbenchRootBefore = @(Get-ChildItem -LiteralPath $global:WorkbenchStrayRoot -Recurse -Force `
+                -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.FullName })
+    }
+
     # One non-interactive run, with the shadow's log cleared first and everything the operator
     # would have seen - host output and errors alike - captured as text.
     #
@@ -133,26 +146,59 @@ BeforeAll {
 }
 
 AfterAll {
-    # Nothing this suite ran may have written a workbench log into the operator's own default
-    # output root. Checked by age rather than by emptying the folder, because that folder is a
-    # technician's real migrations and this suite has no business deleting anything it did not
-    # create. Anything it did create is cleaned up before the failure is raised, so a run that
-    # trips this does not leave the litter behind as well.
-    $strayRoot = Get-MigrationDefaultOutputRoot
-    if (Test-Path -LiteralPath $strayRoot -PathType Container) {
-        $stray = @(Get-ChildItem -LiteralPath $strayRoot -Filter 'Start-MigrationWorkbench_*.log' `
-                -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTime -ge $global:WorkbenchSuiteStart })
-        foreach ($file in $stray) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
-        if ($stray.Count -gt 0) {
-            throw ("This suite wrote $($stray.Count) workbench log(s) into '$strayRoot': " +
-                (@($stray | ForEach-Object { $_.Name }) -join ', ') +
-                '. Every invocation needs a -Workspace on disk or a -LogPath under TestDrive.')
+    # Nothing this suite ran may have added anything at all to the operator's own default output
+    # root - not a log file, not a Workbench folder, and not the root itself where it did not
+    # exist. The whole listing is compared with the one BeforeAll recorded, because the two ways
+    # this front end has littered that folder both hid from a narrower check: a log file the root
+    # never saw (it goes in a subfolder), and the subfolder itself, created by
+    # Initialize-MigrationRun before the refusal that meant nothing was ever written to it.
+    $root = [string]$global:WorkbenchStrayRoot
+    $rootExistsNow = Test-Path -LiteralPath $root -PathType Container
+    $after = @()
+    if ($rootExistsNow) {
+        $after = @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { [string]$_.FullName })
+    }
+
+    $before = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]@($global:WorkbenchRootBefore), [System.StringComparer]::OrdinalIgnoreCase)
+    $added = @(@($after) | Where-Object { -not $before.Contains($_) } | Sort-Object)
+
+    # Cleaned up before the failure is raised, so a run that trips this does not leave the litter
+    # behind as well - and then only what this front end could have written. That folder holds a
+    # technician's real migrations, and this suite has no business deleting anything else, so
+    # anything unexpected is reported and left exactly where it is.
+    if (-not $global:WorkbenchRootExisted -and $rootExistsNow) {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        $mine = @($added | Where-Object {
+                $_ -like (Join-Path $root 'Workbench*') -or
+                (Split-Path -Leaf $_) -like 'Start-MigrationWorkbench_*.log'
+            })
+        # Deepest first, so a folder is emptied before it is removed.
+        foreach ($path in @($mine | Sort-Object -Property Length -Descending)) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
+    $problems = [System.Collections.Generic.List[string]]::new()
+    if (-not $global:WorkbenchRootExisted -and $rootExistsNow) {
+        $problems.Add("it did not exist before this suite ran, and it does now")
+    }
+    if (@($added).Count -gt 0) {
+        $problems.Add("it gained " + (@($added) -join ', '))
+    }
+    if ($problems.Count -gt 0) {
+        throw ("This suite wrote into the operator's own output root '$root': " +
+            ($problems -join '; ') + '. Every invocation needs a -Workspace on disk or a -LogPath ' +
+            'under TestDrive, and a refusal the arguments alone decide must be made before ' +
+            'Initialize-MigrationRun creates the run folder.')
+    }
+
     Remove-Variable -Scope Global -ErrorAction SilentlyContinue -Name `
-        WorkbenchStepRuns, WorkbenchStepExitCode, WorkbenchStepAborted, WorkbenchSuiteStart
+        WorkbenchStepRuns, WorkbenchStepExitCode, WorkbenchStepAborted, WorkbenchSuiteStart, `
+        WorkbenchStrayRoot, WorkbenchRootExisted, WorkbenchRootBefore
 }
 
 Describe 'Start-MigrationWorkbench helpers (dot-sourced with -NoGui)' {
@@ -586,18 +632,73 @@ Describe 'Start-MigrationWorkbench Main - a step named with no workspace' {
 
 Describe 'Start-MigrationWorkbench Main - a workspace folder that is not there' {
 
+    <#
+        The litter this covers: the run context was opened before the refusal was raised, and
+        Initialize-MigrationRun creates its -OutputPath whether or not anything is written there.
+        A run that refused in its first second therefore left a Workbench folder behind under the
+        operator's default output root - and, because -LogPath named a file and not a folder,
+        it left it there even when the caller had redirected the log somewhere else entirely.
+    #>
+
     BeforeAll {
+        $script:MissingLogPath = Join-Path $TestDrive 'missing-workspace.log'
         $script:MissingResult = Invoke-WorkbenchScript -Parameter @{
             Workspace = (Join-Path $TestDrive 'NotAWorkspaceAtAll')
             Step      = 'New-Users'
             Verbosity = 'Low'
-            LogPath   = (Join-Path $TestDrive 'missing-workspace.log')
+            LogPath   = $script:MissingLogPath
         }
     }
 
     It 'Exits 2 and names the folder' {
         $script:MissingResult.ExitCode | Should -Be 2
         $script:MissingResult.Output | Should -BeLike '*NotAWorkspaceAtAll*'
+    }
+
+    It 'Opens no run at all: the refusal reaches the operator, not a log file' {
+        Test-Path -LiteralPath $script:MissingLogPath | Should -BeFalse
+    }
+
+    It 'Creates nothing under the default output root' {
+        # The suite-wide guard in AfterAll is the net; this is the one invocation that used to
+        # fall through it, asserted where a reader will look for it.
+        $root = Get-MigrationDefaultOutputRoot
+        $workbenchFolder = Join-Path $root 'Workbench'
+        if (Test-Path -LiteralPath $workbenchFolder -PathType Container) {
+            @(Get-ChildItem -LiteralPath $workbenchFolder -Recurse -Force |
+                    Where-Object { $_.LastWriteTime -ge $global:WorkbenchSuiteStart }) |
+                Should -HaveCount 0
+        }
+        else {
+            Test-Path -LiteralPath $workbenchFolder | Should -BeFalse
+        }
+    }
+}
+
+Describe 'Start-MigrationWorkbench Main - a step id that is refused before the run is opened' {
+
+    BeforeAll {
+        # A workspace that does exist, so the only thing wrong is the step id. The refusal is
+        # still made before Initialize-MigrationRun, which is why no Workbench folder appears
+        # inside the workspace either.
+        $script:EarlyRefusalWorkspace = Copy-FixtureWorkspace -Name 'UnknownStepNoLog'
+        $script:EarlyRefusalResult = Invoke-WorkbenchScript -Parameter @{
+            Workspace = $script:EarlyRefusalWorkspace
+            Step      = 'NoSuchStepAtAll'
+            Verbosity = 'Low'
+        }
+    }
+
+    It 'Exits 2 and names the id' {
+        $script:EarlyRefusalResult.ExitCode | Should -Be 2
+        $script:EarlyRefusalResult.Output | Should -BeLike '*NoSuchStepAtAll*'
+    }
+
+    It 'Wrote no workbench log into the workspace' {
+        # The fixture ships a Workbench folder (it holds Runs.jsonl), so what is asserted is that
+        # this invocation added no log file to it.
+        @(Get-ChildItem -LiteralPath (Join-Path $script:EarlyRefusalWorkspace 'Workbench') `
+                -Filter '*.log' -File -ErrorAction SilentlyContinue) | Should -HaveCount 0
     }
 }
 
@@ -920,11 +1021,74 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
 
         It 'Maps every non-common parameter of all 17 scripts to a control it knows' {
             $kinds = @('CheckBox', 'ComboBox', 'CheckedListBox', 'FilePicker', 'FolderPicker',
-                'MapEditor', 'TextBox')
+                'MapEditor', 'Secret', 'TextBox')
             foreach ($entry in @(Get-MigrationStep)) {
                 foreach ($parameter in @($entry.Parameters | Where-Object { -not $_.Common })) {
                     ConvertTo-WorkbenchGuiControlKind -Parameter $parameter | Should -BeIn $kinds
                 }
+            }
+        }
+
+        It 'Offers no control at all for a [SecureString]' {
+            ConvertTo-WorkbenchGuiControlKind -Parameter (
+                New-GuiParameterStub -Name 'ClientSecret' -TypeName 'SecureString') |
+                Should -BeExactly 'Secret'
+        }
+
+        It 'Reads the real VivaLearning-Import -ClientSecret as a secret, not as a text box' {
+            # The regression: [SecureString] had no case of its own, so -ClientSecret fell through
+            # to the bottom of the function and the form drew a clear-text box for it.
+            $secret = @(@((Get-MigrationStep -Id 'VivaLearning-Import').Parameters) |
+                    Where-Object { $_.Name -eq 'ClientSecret' })
+            $secret | Should -HaveCount 1
+            $secret[0].Common | Should -BeFalse -Because 'the form would otherwise skip it for another reason'
+            ConvertTo-WorkbenchGuiControlKind -Parameter $secret[0] | Should -BeExactly 'Secret'
+        }
+
+        It 'Tells the operator where the secret comes from, in those words' {
+            # The row's whole content, asserted verbatim: it is the only instruction an operator
+            # gets, and the window has nowhere else to say it.
+            $script:WorkbenchGuiSecretRowText | Should -BeExactly (
+                'Set $env:M365MIGRATION_CLIENT_SECRET before Run ' + [char]0x2014 +
+                ' the window never takes a secret.')
+        }
+    }
+
+    Context 'Test-WorkbenchGuiFormParameter' {
+
+        <#
+            The regression this covers: -Wave is not a Common parameter, so the generated form
+            drew a second control for it beside the Waves checked list of section 9. The two
+            disagreed silently - -Override @{ Wave = '3' } outranks -Wave @('1') in the resolver
+            - so the ledger recorded the ticked wave while the driver ran the typed one, and the
+            DryRunFirst evidence for the next live run was evidence of a different run.
+        #>
+
+        It 'Draws no row for a parameter a dedicated control already owns' {
+            foreach ($name in @('Wave', 'DryRun', 'OutputPath')) {
+                Test-WorkbenchGuiFormParameter -Parameter (New-GuiParameterStub -Name $name) |
+                    Should -BeFalse -Because "the window has its own control for -$name"
+            }
+        }
+
+        It 'Draws a row for a parameter that is the operator''s to fill in' {
+            Test-WorkbenchGuiFormParameter -Parameter (New-GuiParameterStub -Name 'PlanPath') | Should -BeTrue
+        }
+
+        It 'Draws no row for the options the workbench sets for every step' {
+            $common = New-GuiParameterStub -Name 'Prefix'
+            $common.Common = $true
+            Test-WorkbenchGuiFormParameter -Parameter $common | Should -BeFalse
+        }
+
+        It 'Leaves -Wave out of the form of every step that takes one' {
+            # Read off the catalogue rather than off a stub: -Wave really is Common = $false, which
+            # is what put it on the form in the first place.
+            foreach ($entry in @(Get-MigrationStep)) {
+                $drawn = @(@($entry.Parameters) |
+                        Where-Object { Test-WorkbenchGuiFormParameter -Parameter $_ } |
+                        ForEach-Object { [string]$_.Name })
+                $drawn | Should -Not -Contain 'Wave' -Because 'the Waves checked list owns it'
             }
         }
     }
@@ -1001,9 +1165,28 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
         }
 
         It 'Splits a list on lines and on commas, dropping the blanks' {
-            $list = New-GuiParameterStub -Name 'Wave' -TypeName 'String[]' -IsArray $true
+            $list = New-GuiParameterStub -Name 'Scope' -TypeName 'String[]' -IsArray $true
             @(ConvertTo-WorkbenchGuiOverride -Parameter $list -Text "1`n2") | Should -Be @('1', '2')
             @(ConvertTo-WorkbenchGuiOverride -Parameter $list -Text '1, 2 ,') | Should -Be @('1', '2')
+        }
+
+        It 'Never returns a value for a parameter a dedicated control owns' {
+            # The second lock on the disagreeing-wave bug: even a row that somehow reached the
+            # form cannot become -Override @{ Wave = ... } and outrank the wave the run was given.
+            $wave = New-GuiParameterStub -Name 'Wave' -TypeName 'String[]' -IsArray $true
+            ConvertTo-WorkbenchGuiOverride -Parameter $wave -Text "1`n2" | Should -BeNullOrEmpty
+            ConvertTo-WorkbenchGuiOverride -Parameter (New-GuiParameterStub -Name 'OutputPath') `
+                -Text '/somewhere/else' | Should -BeNullOrEmpty
+        }
+
+        It 'Never returns a secret, whatever it was handed' {
+            # A secret in an -Override hashtable is a secret in the driver file
+            # New-MigrationStepDriver writes from it.
+            $secret = New-GuiParameterStub -Name 'ClientSecret' -TypeName 'SecureString'
+            ConvertTo-WorkbenchGuiOverride -Parameter $secret -Text 'not-a-real-secret' |
+                Should -BeNullOrEmpty
+            ConvertTo-WorkbenchGuiOverride -Parameter $secret -Text $script:WorkbenchGuiSecretRowText |
+                Should -BeNullOrEmpty
         }
 
         It 'Reads one old=new rewrite per line into a map' {
@@ -1059,6 +1242,65 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
         }
     }
 
+    Context 'Test-WorkbenchGuiCanRun' {
+
+        <#
+            The window may open a workspace whose settings do not validate - that is how an
+            operator fixes them through the Settings dialog, and it is the one thing the window
+            can do that the console cannot. What it must not do is run a step against one: with
+            no settings there is no tenant GUID to assert against (TenantVerified comes back
+            $null), no label (the prefix and the output folder fall back to Common), and one Yes
+            on a soft gate would start a live writer nobody can say which tenant it reached. The
+            console refuses outright and the unattended path exits 2; this is the window's
+            version of the same refusal, and it is a pure function so it can be tested here.
+        #>
+
+        BeforeAll {
+            $script:BrokenWorkspacePath = Join-Path $TestDrive 'GuiSettingsRefusal'
+            Copy-Item -LiteralPath $script:FixtureRoot -Destination $script:BrokenWorkspacePath -Recurse -Force
+
+            # Label blanked and nothing else: the smallest edit that makes a settings document
+            # fail validation, and the one whose consequences the operator sees least.
+            $settingsPath = Join-Path $script:BrokenWorkspacePath 'M365Migration.settings.json'
+            $document = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+            $document.Label = ''
+            $document | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $settingsPath
+            $script:BrokenWorkspace = Get-MigrationWorkspace -Path $script:BrokenWorkspacePath
+        }
+
+        It 'Lets a workspace whose settings validate run' {
+            $verdict = Test-WorkbenchGuiCanRun -Workspace $script:GuiWorkspace
+            $verdict.CanRun | Should -BeTrue
+            $verdict.Reason | Should -BeExactly ''
+        }
+
+        It 'Refuses a workspace whose Label was blanked, and names Label' {
+            $script:BrokenWorkspace.SettingsResult.IsValid | Should -BeFalse
+            $verdict = Test-WorkbenchGuiCanRun -Workspace $script:BrokenWorkspace
+            $verdict.CanRun | Should -BeFalse
+            $verdict.Keys | Should -Contain 'Label'
+            $verdict.Reason | Should -BeLike '*Label*'
+        }
+
+        It 'Points the operator at the Settings dialog, which is the way out' {
+            (Test-WorkbenchGuiCanRun -Workspace $script:BrokenWorkspace).Reason |
+                Should -BeLike '*Settings*'
+        }
+
+        It 'Refuses before a workspace is open at all' {
+            $verdict = Test-WorkbenchGuiCanRun -Workspace $null
+            $verdict.CanRun | Should -BeFalse
+            $verdict.Reason | Should -BeLike '*workspace*'
+        }
+
+        It 'Still lists the runbook for a workspace it refuses to run' {
+            # The tree is drawn either way: a runbook an operator can read is how they work out
+            # which settings they are missing.
+            @((Get-WorkbenchGuiStepList -Workspace $script:BrokenWorkspace).Steps.Id) |
+                Should -Not -BeNullOrEmpty
+        }
+    }
+
     Context 'The refusals the window returns to Main' {
 
         <#
@@ -1069,10 +1311,30 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
         #>
 
         It 'Returns 2 off Windows, having loaded no WinForms assembly' -Skip:([bool]$IsWindows) {
+            # The assemblies loaded into this AppDomain, before and after. Get-Module was the
+            # wrong instrument entirely: WinForms is a .NET assembly, never a PowerShell module,
+            # so that assertion passed whether or not Add-Type had ever run.
+            #
+            # Compared as sets rather than asserted empty, because a few System.Drawing.* pieces
+            # are already in a .NET 8 process on macOS before this suite starts. What must not
+            # happen is one appearing across the refusal - and System.Windows.Forms must not be
+            # there at all, before or after: there is no such assembly to load on this platform,
+            # and Add-Type would have ended the session rather than returned 2.
+            $isUi = { $args[0].GetName().Name -like 'System.Windows.Forms*' -or
+                $args[0].GetName().Name -like 'System.Drawing*' }
+            $before = @([AppDomain]::CurrentDomain.GetAssemblies() |
+                    Where-Object { & $isUi $_ } | ForEach-Object { $_.GetName().Name } | Sort-Object)
+            @($before | Where-Object { $_ -like 'System.Windows.Forms*' }) | Should -HaveCount 0
+
             $refusal = Start-MigrationWorkbenchGui -WorkspacePath '' 2>&1
             @($refusal | Where-Object { $_ -is [int] }) | Should -Be @(2)
             ($refusal | Out-String) | Should -BeLike '*Windows only*'
-            @(Get-Module -Name 'System.Windows.Forms') | Should -HaveCount 0
+
+            $after = @([AppDomain]::CurrentDomain.GetAssemblies() |
+                    Where-Object { & $isUi $_ } | ForEach-Object { $_.GetName().Name } | Sort-Object)
+            @($after | Where-Object { $_ -notin $before }) |
+                Should -HaveCount 0 -Because 'the refusal must come before Add-Type, not after it'
+            @($after | Where-Object { $_ -like 'System.Windows.Forms*' }) | Should -HaveCount 0
         }
 
         It 'Is the exit code Main uses, not a value Main throws away' {
@@ -1157,6 +1419,29 @@ Describe 'Start-MigrationWorkbench - WinForms is never loaded before the platfor
 
         $platform[0].Extent.StartOffset |
             Should -BeLessThan $addType[0].Extent.StartOffset -Because 'the refusal comes first'
+    }
+
+    It 'Checks the apartment state before it loads WinForms' {
+        # The other half of the ordering rule. WinForms needs a single-threaded apartment, and
+        # the relaunch that gets one re-runs this script from the start - so loading the
+        # assembly first would load it into the very process that is about to be replaced, in
+        # the apartment it cannot be used from.
+        $builder = @($script:WorkbenchAst.FindAll({
+                    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $args[0].Name -eq 'Start-MigrationWorkbenchGui'
+                }, $true))
+        $builder | Should -HaveCount 1
+
+        $apartment = @($builder[0].FindAll({
+                    $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                    [string]$args[0].Member.Value -eq 'GetApartmentState'
+                }, $true))
+        $addType = @(Get-WorkbenchCommandAst -Ast $builder[0] -Name 'Add-Type')
+        $apartment | Should -Not -BeNullOrEmpty -Because 'the window has to know its apartment'
+        $addType | Should -Not -BeNullOrEmpty
+
+        $apartment[0].Extent.StartOffset |
+            Should -BeLessThan $addType[0].Extent.StartOffset -Because 'the STA check comes first'
     }
 
     It 'Builds no window and loads no assembly at load time: the GUI region is functions only' {
