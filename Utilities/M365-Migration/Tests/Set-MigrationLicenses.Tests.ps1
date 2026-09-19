@@ -595,10 +595,12 @@ Describe 'The -RemoveUnplanned acknowledgement' {
             $exitCode = $LASTEXITCODE
 
             $log = @(Get-ChildItem -LiteralPath $runPath -Filter '*.log')
+            $csv = @(Get-ChildItem -LiteralPath $runPath -Filter '*.csv')
             [pscustomobject]@{
                 ExitCode    = $exitCode
                 Log         = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
-                ResultFiles = @(Get-ChildItem -LiteralPath $runPath -Filter '*.csv').Count
+                ResultFiles = $csv.Count
+                ResultPath  = if ($csv.Count -eq 1) { $csv[0].FullName } else { $null }
             }
         }
     }
@@ -634,6 +636,16 @@ Describe 'The -RemoveUnplanned acknowledgement' {
         $result.Log | Should -Not -BeLike '*Re-run with -AcknowledgeLicenseRemoval*'
         $result.Log | Should -BeLike '*0 of 1 plan row(s) are eligible for licensing*'
         $result.ResultFiles | Should -Be 1
+    }
+
+    It 'Names the results file so it parses back to Set-Licenses' {
+        $result = Invoke-LicenseScript -Arguments @{
+            RemoveUnplanned = $true; AcknowledgeLicenseRemoval = $true; DryRun = $true
+        }
+
+        $parsed = ConvertFrom-MigrationOutputPath -Path $result.ResultPath
+        $parsed.Name | Should -BeExactly 'Set-Licenses'
+        $parsed.Suffix | Should -BeExactly 'DryRun'
     }
 
     It 'Leaves a run without -RemoveUnplanned alone' {

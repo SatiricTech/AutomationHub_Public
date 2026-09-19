@@ -134,28 +134,10 @@ $run = Initialize-MigrationRun -ScriptName 'Get-MigrationTeamsPhoneAssignments' 
 
 try {
     $isDryRun = [bool]$run.DryRun
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $assignmentsCsv = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}TeamsPhoneAssignments_$timestamp.csv"
-    $unassignedCsv = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}TeamsPhoneNumbers-Unassigned_$timestamp.csv"
-
-    # These two CSVs are read back by the Set-/Remove- scripts, so they are written here
-    # rather than through Export-MigrationReport: a dry run must not leave a stale export
-    # behind for the next script in the chain to pick up.
-    $writeCsv = {
-        param([object[]]$Rows, [string]$Path, [string]$Label)
-        if ($isDryRun) {
-            Write-MigrationLog -Message "[DRYRUN] Would write $($Rows.Count) $Label row(s) to $Path" -Level WARNING
-            return
-        }
-        try {
-            $Rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding utf8 -ErrorAction Stop
-        }
-        catch {
-            throw "Could not write the $Label CSV '$Path': $($_.Exception.Message)"
-        }
-        Write-MigrationLog -Message "$Label CSV ($($Rows.Count) row(s)): $Path" -Level SUCCESS
-    }
+    # Both CSVs are read back by the Set-/Remove- scripts, so they share one timestamp - the
+    # set reads as one export - and -SuppressInDryRun is what keeps a dry run from leaving a
+    # stale file behind for the next script in the chain to pick up.
+    $runTimestamp = Get-Date
 
     $tenant = Connect-MigrationTeams -TenantId $TenantId
 
@@ -381,28 +363,26 @@ try {
     if ($exportRows.Count -eq 0) {
         Write-MigrationLog -Message 'No users matched - nothing to export.' -Level WARNING
     }
-    else {
-        & $writeCsv $exportRows.ToArray() $assignmentsCsv 'Assignments'
-    }
+    $null = Export-MigrationReport -Rows $exportRows.ToArray() -Name 'TeamsPhoneAssignments' `
+        -Timestamp $runTimestamp -SuppressInDryRun
 
     if ($IncludeUnassignedNumbers) {
         $unassigned = @($allNumbers | Where-Object { [string]$_.PstnAssignmentStatus -eq 'Unassigned' })
         Write-MigrationLog -Message "Unassigned numbers in inventory: $($unassigned.Count)" -Level INFO
 
-        if ($unassigned.Count -gt 0) {
-            $unassignedReport = @($unassigned | ForEach-Object {
-                    [pscustomobject][ordered]@{
-                        PhoneNumber        = $_.TelephoneNumber
-                        PhoneNumberType    = [string]$_.NumberType
-                        AssignmentCategory = [string]$_.AssignmentCategory
-                        Capability         = ($_.Capability -join ';')
-                        IsoCountryCode     = $_.IsoCountryCode
-                        LocationId         = [string]$_.LocationId
-                        ActivationState    = [string]$_.ActivationState
-                    }
-                })
-            & $writeCsv $unassignedReport $unassignedCsv 'Unassigned numbers'
-        }
+        $unassignedReport = @($unassigned | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    PhoneNumber        = $_.TelephoneNumber
+                    PhoneNumberType    = [string]$_.NumberType
+                    AssignmentCategory = [string]$_.AssignmentCategory
+                    Capability         = ($_.Capability -join ';')
+                    IsoCountryCode     = $_.IsoCountryCode
+                    LocationId         = [string]$_.LocationId
+                    ActivationState    = [string]$_.ActivationState
+                }
+            })
+        $null = Export-MigrationReport -Rows $unassignedReport -Name 'TeamsPhoneNumbers' -Suffix 'Unassigned' `
+            -Timestamp $runTimestamp -SuppressInDryRun
     }
 
     $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Get-TeamsPhoneAssignments'

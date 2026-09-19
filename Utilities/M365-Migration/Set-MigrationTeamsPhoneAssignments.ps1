@@ -259,25 +259,14 @@ try {
         if ($unassigned.Count -eq 0) {
             Write-MigrationLog -Message 'No unassigned numbers found in the tenant inventory.' -Level WARNING
         }
-        elseif ($isDryRun) {
-            Write-MigrationLog -Message "[DRYRUN] Would write $($unassigned.Count) unassigned number(s) to the unassigned-numbers CSV." -Level WARNING
-        }
-        else {
-            # Same file name Get-MigrationTeamsPhoneAssignments.ps1 -IncludeUnassignedNumbers
-            # writes, so the two scripts' output is interchangeable.
-            $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-            $unassignedCsv = Join-Path -Path $run.OutputDirectory `
-                -ChildPath ("${leader}TeamsPhoneNumbers-Unassigned_" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.csv')
-            try {
-                $unassignedReport | Export-Csv -LiteralPath $unassignedCsv -NoTypeInformation -Encoding utf8 -ErrorAction Stop
-            }
-            catch {
-                throw "Could not write the unassigned-numbers CSV '$unassignedCsv': $($_.Exception.Message)"
-            }
-            Write-MigrationLog -Message "Unassigned numbers CSV: $unassignedCsv" -Level SUCCESS
-        }
 
-        $null = Export-MigrationResult -Rows $listResults.ToArray() -Name 'Set-TeamsPhoneNumbers-Unassigned'
+        # Same file name Get-MigrationTeamsPhoneAssignments.ps1 -IncludeUnassignedNumbers
+        # writes, so the two scripts' output is interchangeable. -SuppressInDryRun matches the
+        # old writer, which never touched disk under -DryRun.
+        $null = Export-MigrationReport -Rows $unassignedReport.ToArray() -Name 'TeamsPhoneNumbers' `
+            -Suffix 'Unassigned' -SuppressInDryRun
+
+        $null = Export-MigrationResult -Rows $listResults.ToArray() -Name 'Set-TeamsPhoneAssignments'
 
         # The finally block below still runs on exit, so Complete-MigrationRun is called
         # exactly once and the exit code survives.

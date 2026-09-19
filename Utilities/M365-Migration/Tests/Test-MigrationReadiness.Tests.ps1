@@ -588,3 +588,35 @@ Describe 'The tenant guard is wired into the Main region' {
         $script:mainText | Should -Match 'No -TenantId was given; this run acts on tenant \$expectedTenant'
     }
 }
+
+Describe 'The results file name' {
+
+    <#
+        Structural, like the tenant-guard block above: proves the Main region calls
+        Export-MigrationResult with the normalised token 'Test-Readiness' (script name minus
+        'Migration'), then proves that token round-trips through the shared filename contract.
+    #>
+
+    BeforeAll {
+        $script:mainScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Test-MigrationReadiness.ps1')).Path
+        $script:mainAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:mainScriptPath, [ref]$null, [ref]$null)
+
+        $script:resultCalls = @($script:mainAst.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+                    $args[0].GetCommandName() -eq 'Export-MigrationResult' }, $true) |
+            ForEach-Object { $_.Extent.Text })
+    }
+
+    It 'Calls Export-MigrationResult with the normalised -Name' {
+        $script:resultCalls.Count | Should -Be 1
+        $script:resultCalls[0] | Should -Match "-Name 'Test-Readiness'"
+    }
+
+    It 'Parses the produced results file name back to Test-Readiness' {
+        $path = Get-MigrationOutputPath -Name 'Test-Readiness' -Suffix 'Results' -Directory $TestDrive
+        $parsed = ConvertFrom-MigrationOutputPath -Path $path
+        $parsed.Name | Should -BeExactly 'Test-Readiness'
+        $parsed.Suffix | Should -BeExactly 'Results'
+    }
+}

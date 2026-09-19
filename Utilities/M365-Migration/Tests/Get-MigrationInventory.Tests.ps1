@@ -655,3 +655,51 @@ Describe 'The tenant guard is wired into the Main region' {
         $script:mainText | Should -Match 'No -TenantId was given; this run acts on tenant \$expectedTenant'
     }
 }
+
+Describe 'The tab writer' {
+
+    <#
+        Structural, like the tenant-guard block above: the script is tenant-bound so there is no
+        offline harness to run the nine-tab write for real. This proves the local writers
+        (Export-InventoryTab, Get-InventoryTabColumn) are gone, that every tab is written through
+        Export-MigrationReport sharing one run timestamp, and that the resulting name parses back
+        with ConvertFrom-MigrationOutputPath.
+    #>
+
+    # Built here, at Describe scope rather than inside BeforeAll, because -ForEach needs it during
+    # Pester's discovery pass; a BeforeAll only runs later, during Run.
+    $inventoryTabNames = @(
+        'Users', 'UserMailboxes', 'SharedMailboxes', 'MailboxPermissions',
+        'Groups', 'Contacts', 'Domains', 'Licenses', 'Summary'
+    )
+
+    It 'No longer defines the retired local writers' {
+        $names = @($ast.FindAll($predicate, $true) | ForEach-Object { $_.Name })
+        $names | Should -Not -Contain 'Export-InventoryTab'
+        $names | Should -Not -Contain 'Get-InventoryTabColumn'
+    }
+
+    It 'Writes every tab through Export-MigrationReport, suppressed in a dry run' {
+        $calls = @($ast.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+                    $args[0].GetCommandName() -eq 'Export-MigrationReport' }, $true) |
+            ForEach-Object { $_.Extent.Text })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-Name \$tab\b'
+        $calls[0] | Should -Match '-Timestamp \$runTimestamp'
+        $calls[0] | Should -Match '-SuppressInDryRun'
+    }
+
+    It 'Computes one shared $runTimestamp for the whole run' {
+        $mainText = Get-Content -LiteralPath $inventoryScript -Raw
+        @([regex]::Matches($mainText, '\$runTimestamp\s*=\s*Get-Date\b')).Count | Should -Be 1
+    }
+
+    It 'Names <_>''s tab file so it parses back with ConvertFrom-MigrationOutputPath' -ForEach $inventoryTabNames {
+        $path = Get-MigrationOutputPath -Name $_ -Directory $TestDrive -Prefix 'Contoso'
+        $parsed = ConvertFrom-MigrationOutputPath -Path $path
+        $parsed.Name | Should -BeExactly $_
+        $parsed.Suffix | Should -BeExactly ''
+        $parsed.Prefix | Should -BeExactly 'Contoso'
+    }
+}

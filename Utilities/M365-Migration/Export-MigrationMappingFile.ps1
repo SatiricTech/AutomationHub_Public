@@ -267,7 +267,7 @@ try {
     if ($mappings.Count -eq 0) {
         # Every selected row was Skipped. The results file is the whole point in that case - it
         # names why each row was left out - so it is written before the run is failed.
-        $null = Export-MigrationResult -Rows $results.ToArray() -Name 'MappingFile'
+        $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Export-MappingFile'
         throw ("None of the $($planRows.Count) selected plan row(s) could be mapped - see the results file. " +
             'Resolve the NeedsReview and Invalid rows, pass -IncludeCollisions to map Collision rows, ' +
             'or widen -Wave / -ObjectType.')
@@ -303,7 +303,7 @@ try {
     # The results file is the operator's check that nothing was left behind, so it is written
     # as soon as the deliverable is settled: whatever the workbook step does next cannot take
     # the report with it.
-    $null = Export-MigrationResult -Rows $results.ToArray() -Name 'MappingFile'
+    $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Export-MappingFile'
 
     if ($format.FileType -eq 'Xlsx') {
         if ($SkipExcel) {

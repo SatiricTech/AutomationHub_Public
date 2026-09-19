@@ -735,121 +735,6 @@ function Write-InventoryProgress {
     Write-Progress -Activity "Inventory: $Tab" -Status "$Current of $Total $Status" -PercentComplete $percent
 }
 
-function Export-InventoryTab {
-    <#
-        Writes one tab to CSV and, when enabled, to a worksheet in the shared workbook. Not
-        Export-MigrationReport: all nine files and the workbook share one timestamp so the set
-        reads as one inventory, and a report writer has nowhere to put the worksheet.
-
-        An empty tab is written as a header-only CSV carrying the tab's real columns (-Column),
-        so New-MigrationIdentityPlan's required-column check still passes when the file is handed
-        to it; the worksheet gets a single informational row instead because Export-Excel cannot
-        write a sheet from an empty pipeline. A WARNING names the empty tab. When no column list
-        is known the CSV falls back to the same informational row. The write goes through
-        Invoke-MigrationAction, which is what makes -DryRun log the planned file list and write
-        nothing.
-    #>
-    [CmdletBinding()]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
-        Justification = 'ExcelPath and IncludeExcel are consumed inside the Invoke-MigrationAction scriptblock, which the analyzer does not follow. The scriptblock is what makes the write DryRun-aware.')]
-    param(
-        [AllowNull()][AllowEmptyCollection()][object[]]$Row,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CsvPath,
-        [AllowNull()][AllowEmptyString()][string]$ExcelPath,
-        [AllowNull()][AllowEmptyCollection()][string[]]$Column,
-        [switch]$IncludeExcel
-    )
-
-    $data = @($Row)
-    $count = $data.Count
-    $headerOnly = $null
-    if ($count -eq 0) {
-        $placeholder = @([pscustomobject]@{ Info = "No $Name records found." })
-        $columns = @($Column | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if ($columns.Count -gt 0) {
-            $headerOnly = ($columns | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }) -join ','
-        }
-        else {
-            $data = $placeholder
-        }
-        Write-MigrationLog -Level WARNING -Message ("The $Name tab is empty. Do not pass " +
-            "$CsvPath to New-MigrationIdentityPlan - Import-MigrationCsv rejects a CSV with no data rows.")
-    }
-
-    # Sanitised once, here, so the CSV and (when included) the workbook sheet for this tab
-    # are built from the same rows and neither can carry a formula-looking cell into a
-    # spreadsheet. $placeholder is sanitised too - it is what the workbook sheet uses when
-    # the tab is empty and $data has been replaced by $headerOnly-driven raw text instead.
-    $data = @($data | ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ })
-    if ($count -eq 0) {
-        $placeholder = @($placeholder | ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ })
-    }
-
-    Invoke-MigrationAction -Description "Write the $Name tab ($count row(s)) to $CsvPath" -Action {
-        if ($null -ne $headerOnly) {
-            Set-Content -LiteralPath $CsvPath -Value $headerOnly -Encoding UTF8
-        }
-        else {
-            $data | Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding UTF8
-        }
-        if ($IncludeExcel -and -not [string]::IsNullOrWhiteSpace($ExcelPath)) {
-            $sheet = if ($count -eq 0) { $placeholder } else { $data }
-            $sheet | Export-Excel -Path $ExcelPath -WorksheetName $Name -AutoSize -FreezeTopRow -BoldTopRow -AutoFilter
-        }
-    }
-}
-
-function Get-InventoryTabColumn {
-    <#
-        The column names of one tab, taken from the same row-shaping code that fills it, so an
-        empty tab's header never drifts from a populated one. Groups, Domains and Licenses are
-        shaped inline in the main block and are listed here by name.
-    #>
-    [CmdletBinding()]
-    [OutputType([string[]])]
-    param(
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
-        [switch]$IncludeAuthMethodColumn,
-        [switch]$IncludeOneDriveColumn
-    )
-
-    $blank = [pscustomobject]@{}
-    $row = switch ($Name) {
-        'Users' {
-            ConvertTo-InventoryUserRow -User $blank -IncludeAuthMethodColumn:$IncludeAuthMethodColumn `
-                -IncludeOneDriveColumn:$IncludeOneDriveColumn
-        }
-        'UserMailboxes' { ConvertTo-InventoryMailboxRow -Mailbox $blank }
-        'SharedMailboxes' { ConvertTo-InventoryMailboxRow -Mailbox $blank }
-        'MailboxPermissions' { ConvertTo-InventoryPermissionRow -Trustee '' -Permission '' -IsInherited $false }
-        'Contacts' { ConvertTo-InventoryContactRow -MailContact $blank }
-        default { $null }
-    }
-    if ($row) { return @($row.PSObject.Properties.Name) }
-
-    switch ($Name) {
-        'Groups' {
-            return @(
-                'ObjectId', 'DisplayName', 'PrimarySmtpAddress', 'GroupType', 'Alias', 'EmailAddresses',
-                'LegacyExchangeDN', 'ManagedBy', 'Members', 'MemberCount', 'Owners', 'HiddenFromAddressLists',
-                'RequireSenderAuthenticationEnabled', 'AcceptMessagesOnlyFrom', 'ModerationEnabled', 'ModeratedBy',
-                'ReportToManagerEnabled', 'GrantSendOnBehalfTo', 'MemberJoinRestriction', 'MemberDepartRestriction',
-                'RecipientFilter', 'IsSynced', 'Visibility', 'TeamEnabled'
-            )
-        }
-        'Domains' {
-            return @('DomainName', 'IsDefault', 'IsInitial', 'IsVerified', 'AuthenticationType', 'SupportedServices')
-        }
-        'Licenses' {
-            return @('SkuPartNumber', 'FriendlyName', 'SkuId', 'Enabled', 'Consumed', 'Available', 'ServicePlansDisabledCommon')
-        }
-        'Summary' { return @('Item', 'Value') }
-    }
-
-    return @()
-}
-
 function ConvertTo-InventoryFolderTrustee {
     <#
         The trustee of a Get-EXOMailboxFolderPermission entry as a plain string. The REST cmdlet
@@ -1258,13 +1143,12 @@ try {
         Write-MigrationLog -Message "Domain filter: $(Join-MigrationList -Values $domains)" -Level INFO
     }
 
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    # One shared stamp for every tab's CSV (written through Export-MigrationReport) and the
+    # workbook, so the whole set reads as one inventory.
+    $runTimestamp = Get-Date
+    $timestamp = $runTimestamp.ToString('yyyyMMdd-HHmmss')
     $filePrefix = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
     $excelPath = Join-Path -Path $run.OutputDirectory -ChildPath "${filePrefix}Migration-Inventory_$timestamp.xlsx"
-    $csvPaths = [ordered]@{}
-    foreach ($tab in $inventoryTabs) {
-        $csvPaths[$tab] = Join-Path -Path $run.OutputDirectory -ChildPath "${filePrefix}${tab}_$timestamp.csv"
-    }
 
     # ImportExcel is a convenience, not a dependency: an inventory that produced only CSVs is
     # still a complete inventory, so a failed install warns rather than aborting the run.
@@ -1839,11 +1723,25 @@ try {
         Summary            = @($summaryRows)
     }
 
+    $csvPaths = [ordered]@{}
     foreach ($tab in $inventoryTabs) {
-        $columns = @(Get-InventoryTabColumn -Name $tab -IncludeAuthMethodColumn:$IncludeAuthMethods `
-                -IncludeOneDriveColumn:$IncludeOneDrive)
-        Export-InventoryTab -Row $tabData[$tab] -Name $tab -CsvPath $csvPaths[$tab] -Column $columns `
-            -ExcelPath $excelPath -IncludeExcel:$useExcel
+        $rows = @($tabData[$tab])
+        $csvPaths[$tab] = Export-MigrationReport -Rows $rows -Name $tab -Timestamp $runTimestamp -SuppressInDryRun
+
+        if ($useExcel) {
+            # Export-Excel cannot write a sheet from an empty pipeline, so an empty tab gets the
+            # same single informational row the CSV gets from Export-MigrationReport. The write
+            # goes through Invoke-MigrationAction, which is what makes -DryRun log the planned
+            # file and write nothing.
+            $placeholder = @([pscustomobject]@{ Info = "No $tab records found." })
+            $sheetRows = if ($rows.Count -eq 0) { $placeholder } else { $rows }
+            $sheetRows = @($sheetRows | ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ })
+            $description = "Write the $tab worksheet ($($rows.Count) row(s)) to $excelPath"
+            Invoke-MigrationAction -Description $description -Action {
+                $sheetRows | Export-Excel -Path $excelPath -WorksheetName $tab -AutoSize `
+                    -FreezeTopRow -BoldTopRow -AutoFilter
+            }
+        }
     }
 
     Write-MigrationLog -Message '--- Inventory summary ---' -Level SUCCESS

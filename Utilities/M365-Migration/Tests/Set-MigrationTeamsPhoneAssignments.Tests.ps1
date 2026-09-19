@@ -81,11 +81,30 @@ BeforeAll {
 
     function Get-MigrationPhoneNumberInventory {
         param([hashtable]$Filter, [int]$PageSize)
+        # Carries every property the -ListUnassigned report reads (AssignmentCategory, Capability,
+        # IsoCountryCode, ActivationState), matching the real Get-CsPhoneNumberAssignment shape, so
+        # the -ListUnassigned tests below exercise the same fields a live tenant would return.
         return @(
-            [pscustomobject]@{ TelephoneNumber = '+15551110000'; AssignedPstnTargetId = 'obj-aa'; NumberType = 'CallingPlan'; LocationId = 'loc-aa' }
-            [pscustomobject]@{ TelephoneNumber = '+15551110000;ext=524'; AssignedPstnTargetId = 'obj-mary'; NumberType = 'CallingPlan'; LocationId = 'loc-good' }
-            [pscustomobject]@{ TelephoneNumber = '+15553330000'; AssignedPstnTargetId = 'obj-owner'; NumberType = 'CallingPlan'; LocationId = '' }
-            [pscustomobject]@{ TelephoneNumber = '+15552220000'; AssignedPstnTargetId = ''; NumberType = 'DirectRouting'; LocationId = '' }
+            [pscustomobject]@{
+                TelephoneNumber = '+15551110000'; AssignedPstnTargetId = 'obj-aa'; NumberType = 'CallingPlan'
+                LocationId = 'loc-aa'; AssignmentCategory = 'Primary'; Capability = @('UserAssignment')
+                IsoCountryCode = 'US'; ActivationState = 'Activated'
+            }
+            [pscustomobject]@{
+                TelephoneNumber = '+15551110000;ext=524'; AssignedPstnTargetId = 'obj-mary'; NumberType = 'CallingPlan'
+                LocationId = 'loc-good'; AssignmentCategory = 'Primary'; Capability = @('UserAssignment')
+                IsoCountryCode = 'US'; ActivationState = 'Activated'
+            }
+            [pscustomobject]@{
+                TelephoneNumber = '+15553330000'; AssignedPstnTargetId = 'obj-owner'; NumberType = 'CallingPlan'
+                LocationId = ''; AssignmentCategory = 'Primary'; Capability = @('UserAssignment')
+                IsoCountryCode = 'US'; ActivationState = 'Activated'
+            }
+            [pscustomobject]@{
+                TelephoneNumber = '+15552220000'; AssignedPstnTargetId = ''; NumberType = 'DirectRouting'
+                LocationId = ''; AssignmentCategory = ''; Capability = @('UserAssignment')
+                IsoCountryCode = 'US'; ActivationState = 'Activated'
+            }
         )
     }
 
@@ -135,7 +154,9 @@ BeforeAll {
         $log = @(Get-ChildItem -LiteralPath $workspace -Filter '*.log')
         return [pscustomobject]@{
             ExitCode         = $exitCode
+            Workspace        = $workspace
             ResultFile       = if ($csv.Count -eq 1) { $csv[0].Name } else { $null }
+            ResultPath       = if ($csv.Count -eq 1) { $csv[0].FullName } else { $null }
             Rows             = if ($csv.Count -eq 1) { @(Import-Csv -LiteralPath $csv[0].FullName) } else { @() }
             Log              = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
             SetPhoneCalls    = @($global:setPhoneCalls)
@@ -285,6 +306,60 @@ Describe 'A single unresolvable -LocationId fails the row instead of being silen
     It 'Fails the row and never resolves to a Planned assignment' {
         $script:badLocationUser.Rows[0].Status | Should -BeExactly 'Failed'
         $script:badLocationUser.Rows[0].Detail | Should -Match "LocationId 'loc-bad' does not exist"
+    }
+}
+
+Describe '-ListUnassigned' {
+
+    <#
+        The stub Get-MigrationPhoneNumberInventory (BeforeAll, above) ignores -Filter and always
+        returns its four fixture numbers, so a real run here reports all four as unassigned - the
+        point of these tests is the writer retirement (Export-MigrationReport replacing the local
+        CSV write), not the tenant-side filtering.
+    #>
+
+    BeforeAll {
+        $script:listRun = Invoke-ScriptUnderTest -Arguments @{ ListUnassigned = $true }
+        $script:unassignedFile = @(Get-ChildItem -LiteralPath $script:listRun.Workspace `
+                -Filter 'TeamsPhoneNumbers-Unassigned_*.csv')
+        $script:unassignedRows = if ($script:unassignedFile.Count -eq 1) {
+            @(Import-Csv -LiteralPath $script:unassignedFile[0].FullName)
+        } else { @() }
+    }
+
+    It 'Exits 0, writes the results file with the normal token, and never assigns anything' {
+        $script:listRun.ExitCode | Should -Be 0
+        $script:listRun.ResultFile | Should -Not -BeNullOrEmpty
+        $script:listRun.Rows.Count | Should -Be 4
+        $script:listRun.SetPhoneCalls.Count | Should -Be 0
+        $script:listRun.GrantPolicyCalls.Count | Should -Be 0
+    }
+
+    It 'Writes the unassigned-numbers report, the same file name Get-MigrationTeamsPhoneAssignments writes' {
+        $script:unassignedFile.Count | Should -Be 1
+        $script:unassignedRows.Count | Should -Be 4
+        $script:unassignedRows.PhoneNumber | Should -Contain '+15552220000'
+    }
+
+    It 'Names both files so they parse back with ConvertFrom-MigrationOutputPath' {
+        $results = ConvertFrom-MigrationOutputPath -Path $script:listRun.ResultPath
+        $results.Name | Should -BeExactly 'Set-TeamsPhoneAssignments'
+        $results.Suffix | Should -BeExactly 'Results'
+
+        $report = ConvertFrom-MigrationOutputPath -Path $script:unassignedFile[0].FullName
+        $report.Name | Should -BeExactly 'TeamsPhoneNumbers-Unassigned'
+        $report.Suffix | Should -BeExactly ''
+    }
+
+    It 'Writes neither file under -DryRun' {
+        $dryRun = Invoke-ScriptUnderTest -Arguments @{ ListUnassigned = $true; DryRun = $true }
+        $dryRun.ExitCode | Should -Be 0
+        $dryReportFiles = @(Get-ChildItem -LiteralPath $dryRun.Workspace -Filter 'TeamsPhoneNumbers-Unassigned_*.csv')
+        $dryReportFiles.Count | Should -Be 0
+
+        $dryResults = ConvertFrom-MigrationOutputPath -Path $dryRun.ResultPath
+        $dryResults.Name | Should -BeExactly 'Set-TeamsPhoneAssignments'
+        $dryResults.Suffix | Should -BeExactly 'DryRun'
     }
 }
 

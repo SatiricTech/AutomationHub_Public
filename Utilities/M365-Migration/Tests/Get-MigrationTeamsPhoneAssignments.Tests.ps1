@@ -164,16 +164,24 @@ Describe 'Get-MigrationTeamsPhoneAssignments - real run' {
         & $script:scriptPath -OutputPath $script:workspace -Verbosity Low -IncludeUnassignedNumbers
         $script:exitCode = $LASTEXITCODE
 
-        $exportFile = Get-TeamsPhoneTestFile -Workspace $script:workspace -Pattern 'TeamsPhoneAssignments_*.csv'
-        $script:exportHeaders = if ($exportFile) { @((Get-Content -LiteralPath $exportFile -TotalCount 1) -replace '"', '' -split ',') } else { @() }
-        $script:export = if ($exportFile) { @(Import-Csv -LiteralPath $exportFile) } else { @() }
+        $script:exportFile = Get-TeamsPhoneTestFile -Workspace $script:workspace -Pattern 'TeamsPhoneAssignments_*.csv'
+        $script:exportHeaders = if ($script:exportFile) {
+            @((Get-Content -LiteralPath $script:exportFile -TotalCount 1) -replace '"', '' -split ',')
+        } else { @() }
+        $script:export = if ($script:exportFile) { @(Import-Csv -LiteralPath $script:exportFile) } else { @() }
 
-        $resultsFile = Get-TeamsPhoneTestFile -Workspace $script:workspace -Pattern 'Get-TeamsPhoneAssignments-Results_*.csv'
-        $script:resultHeaders = if ($resultsFile) { @((Get-Content -LiteralPath $resultsFile -TotalCount 1) -replace '"', '' -split ',') } else { @() }
-        $script:results = if ($resultsFile) { @(Import-Csv -LiteralPath $resultsFile) } else { @() }
+        $script:resultsFile = Get-TeamsPhoneTestFile -Workspace $script:workspace `
+            -Pattern 'Get-TeamsPhoneAssignments-Results_*.csv'
+        $script:resultHeaders = if ($script:resultsFile) {
+            @((Get-Content -LiteralPath $script:resultsFile -TotalCount 1) -replace '"', '' -split ',')
+        } else { @() }
+        $script:results = if ($script:resultsFile) { @(Import-Csv -LiteralPath $script:resultsFile) } else { @() }
 
-        $unassignedFile = Get-TeamsPhoneTestFile -Workspace $script:workspace -Pattern 'TeamsPhoneNumbers-Unassigned_*.csv'
-        $script:unassigned = if ($unassignedFile) { @(Import-Csv -LiteralPath $unassignedFile) } else { @() }
+        $script:unassignedFile = Get-TeamsPhoneTestFile -Workspace $script:workspace `
+            -Pattern 'TeamsPhoneNumbers-Unassigned_*.csv'
+        $script:unassigned = if ($script:unassignedFile) {
+            @(Import-Csv -LiteralPath $script:unassignedFile)
+        } else { @() }
 
         $logFile = Get-TeamsPhoneTestFile -Workspace $script:workspace -Pattern 'Get-MigrationTeamsPhoneAssignments_*.log'
         $script:log = if ($logFile) { Get-Content -LiteralPath $logFile -Raw } else { '' }
@@ -192,6 +200,22 @@ Describe 'Get-MigrationTeamsPhoneAssignments - real run' {
         $script:results.Count | Should -BeGreaterThan 0
     }
 
+    It 'Writes report and results file names that parse back to their expected Name and Suffix' {
+        $assignments = ConvertFrom-MigrationOutputPath -Path $script:exportFile
+        $assignments.Name | Should -BeExactly 'TeamsPhoneAssignments'
+        $assignments.Suffix | Should -BeExactly ''
+
+        $results = ConvertFrom-MigrationOutputPath -Path $script:resultsFile
+        $results.Name | Should -BeExactly 'Get-TeamsPhoneAssignments'
+        $results.Suffix | Should -BeExactly 'Results'
+
+        # 'Unassigned' is a report -Suffix, not one of ConvertFrom-MigrationOutputPath's two mode
+        # suffixes (Results/DryRun), so it parses back whole into Name with an empty Suffix.
+        $unassigned = ConvertFrom-MigrationOutputPath -Path $script:unassignedFile
+        $unassigned.Name | Should -BeExactly 'TeamsPhoneNumbers-Unassigned'
+        $unassigned.Suffix | Should -BeExactly ''
+    }
+
     It 'Keeps the round-trip columns first and appends AccountType and AdditionalNumbers' {
         $script:exportHeaders | Should -Be @(
             'UserPrincipalName', 'DisplayName', 'PhoneNumber', 'Extension', 'PhoneNumberType',
@@ -203,7 +227,8 @@ Describe 'Get-MigrationTeamsPhoneAssignments - real run' {
 
     It 'Names the tenant it read at SUCCESS before writing anything' {
         $script:log | Should -Match '\[SUCCESS\] Reading tenant 11111111-1111-1111-1111-111111111111 \(Contoso\)'
-        $script:log.IndexOf('Reading tenant') | Should -BeLessThan $script:log.IndexOf('Assignments CSV')
+        $script:log.IndexOf('Reading tenant') |
+            Should -BeLessThan $script:log.IndexOf('TeamsPhoneAssignments report written')
     }
 
     Context 'A user holding a Primary and a Private line' {
@@ -216,7 +241,10 @@ Describe 'Get-MigrationTeamsPhoneAssignments - real run' {
         }
 
         It 'Lists the other line in AdditionalNumbers as number:category' {
-            $script:byUpn['alice@contoso.com'].AdditionalNumbers | Should -BeExactly '+15550100002:Private'
+            # Export-MigrationReport sanitises every cell, and 'category' after the colon means
+            # this is not the bare-number shape the sanitiser exempts, so a leading apostrophe is
+            # added - the same defusing Excel itself performs on a formula-looking value.
+            $script:byUpn['alice@contoso.com'].AdditionalNumbers | Should -BeExactly "'+15550100002:Private"
         }
 
         It 'Still exports exactly one row for the user' {
@@ -316,8 +344,11 @@ Describe 'Get-MigrationTeamsPhoneAssignments - dry run' {
         & $script:scriptPath -OutputPath $script:dryWorkspace -Verbosity Low -IncludeUnassignedNumbers -DryRun
         $script:dryExitCode = $LASTEXITCODE
 
-        $resultsFile = Get-TeamsPhoneTestFile -Workspace $script:dryWorkspace -Pattern 'Get-TeamsPhoneAssignments-DryRun_*.csv'
-        $script:dryResults = if ($resultsFile) { @(Import-Csv -LiteralPath $resultsFile) } else { @() }
+        $script:dryResultsFile = Get-TeamsPhoneTestFile -Workspace $script:dryWorkspace `
+            -Pattern 'Get-TeamsPhoneAssignments-DryRun_*.csv'
+        $script:dryResults = if ($script:dryResultsFile) {
+            @(Import-Csv -LiteralPath $script:dryResultsFile)
+        } else { @() }
     }
 
     AfterAll {
@@ -332,6 +363,12 @@ Describe 'Get-MigrationTeamsPhoneAssignments - dry run' {
         $script:dryExitCode | Should -Be 0
         $script:dryResults.Count | Should -Be 6
         @($script:dryResults | Where-Object Status -ne 'Planned').Count | Should -Be 0
+    }
+
+    It 'Names the DryRun results file so it parses back to Get-TeamsPhoneAssignments' {
+        $parsed = ConvertFrom-MigrationOutputPath -Path $script:dryResultsFile
+        $parsed.Name | Should -BeExactly 'Get-TeamsPhoneAssignments'
+        $parsed.Suffix | Should -BeExactly 'DryRun'
     }
 }
 

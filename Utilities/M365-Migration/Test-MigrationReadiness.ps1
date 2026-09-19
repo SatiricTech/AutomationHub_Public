@@ -75,7 +75,7 @@
 .EXAMPLE
     .\Test-MigrationReadiness.ps1 -PlanPath .\IdentityPlan.csv -Prefix Fabrikam
 
-    Runs the Pre stage over the whole plan and writes Fabrikam_Test-MigrationReadiness-Results_<ts>.csv.
+    Runs the Pre stage over the whole plan and writes Fabrikam_Test-Readiness-Results_<ts>.csv.
 
 .EXAMPLE
     .\Test-MigrationReadiness.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -Stage Provisioned -SourceMailboxesCsv .\Mailboxes.csv
@@ -1218,7 +1218,7 @@ catch {
 Write-CheckTable -Result $results.ToArray()
 
 if ($results.Count -gt 0) {
-    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Test-MigrationReadiness' }
+    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Test-Readiness' }
     catch {
         Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
         $exitCode = 1

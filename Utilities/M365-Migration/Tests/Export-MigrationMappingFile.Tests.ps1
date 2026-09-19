@@ -64,7 +64,8 @@ BeforeAll {
 
         $mappingFiles = @(Get-ChildItem -Path $OutputPath -Filter 'Fly_User_Mapping_*.csv' -Recurse -ErrorAction SilentlyContinue)
         $workbooks = @(Get-ChildItem -Path $OutputPath -Filter 'Fly_User_Mapping_*.xlsx' -Recurse -ErrorAction SilentlyContinue)
-        $resultFiles = @(Get-ChildItem -Path $OutputPath -Filter 'MappingFile-*.csv' -Recurse -ErrorAction SilentlyContinue)
+        $resultFiles = @(Get-ChildItem -Path $OutputPath -Filter 'Export-MappingFile-*.csv' -Recurse `
+                -ErrorAction SilentlyContinue)
 
         [pscustomobject]@{
             ExitCode     = $exitCode
@@ -97,6 +98,12 @@ Describe 'Export-MigrationMappingFile' {
 
         It 'Maps every signed-off plan row that has both a source and a target address' {
             $script:Default.Mappings.Count | Should -Be 9
+        }
+
+        It 'Writes a results file whose name parses back to Export-MappingFile' {
+            $parsed = ConvertFrom-MigrationOutputPath -Path $script:Default.ResultPath
+            $parsed.Name | Should -BeExactly 'Export-MappingFile'
+            $parsed.Suffix | Should -BeExactly 'Results'
         }
 
         It 'Maps a user onto the target address the plan chose' {
@@ -252,7 +259,7 @@ Describe 'Export-MigrationMappingFile' {
 
             $result.ExitCode | Should -Be 0
             $result.MappingPath | Should -BeExactly ''
-            $result.ResultPath | Should -BeLike '*MappingFile-DryRun_*'
+            $result.ResultPath | Should -BeLike '*Export-MappingFile-DryRun_*'
             @($result.Results | Where-Object { $_.Status -eq 'Planned' }).Count | Should -Be 9
         }
     }
@@ -265,7 +272,7 @@ Describe 'Export-MigrationMappingFile' {
             $result.ExitCode | Should -Be 0
             $result.MappingPath | Should -BeExactly ''
             $result.WorkbookPath | Should -BeExactly ''
-            $result.ResultPath | Should -BeLike '*MappingFile-Results_*'
+            $result.ResultPath | Should -BeLike '*Export-MappingFile-Results_*'
             @($result.Results | Where-Object { $_.Status -eq 'Succeeded' }).Count | Should -Be 0
             @($result.Results | Where-Object { $_.Status -eq 'Planned' }).Count | Should -Be 0
 

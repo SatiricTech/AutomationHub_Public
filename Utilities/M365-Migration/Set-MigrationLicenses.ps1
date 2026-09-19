@@ -91,7 +91,7 @@
     .\Set-MigrationLicenses.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -DryRun -Prefix Fabrikam
 
     Reads wave 1, resolves every licence change, prints the seat table and writes
-    Fabrikam_Set-MigrationLicenses-DryRun_<timestamp>.csv without touching the tenant.
+    Fabrikam_Set-Licenses-DryRun_<timestamp>.csv without touching the tenant.
 
 .EXAMPLE
     .\Set-MigrationLicenses.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -DefaultUsageLocation US -Confirm:$false
@@ -922,7 +922,7 @@ catch {
 #region Cleanup
 
 if ($results.Count -gt 0) {
-    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Set-MigrationLicenses' }
+    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Set-Licenses' }
     catch {
         Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
         $exitCode = 1

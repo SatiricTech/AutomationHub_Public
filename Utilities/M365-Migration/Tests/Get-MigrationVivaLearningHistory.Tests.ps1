@@ -582,13 +582,24 @@ Describe 'Script structure' {
         $script:AllCommandNames | Should -Not -Contain 'Disconnect-MgGraph'
     }
 
-    It 'Writes the export only through Invoke-MigrationAction' {
+    It 'Writes the history CSV through Export-MigrationReport, DryRun-safe' {
+        $reportCalls = @($script:Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Export-MigrationReport'
+                }, $true))
+        $reportCalls.Count | Should -Be 1
+        $reportCalls[0].Extent.Text | Should -Match "-Name 'VivaLearningHistory'"
+        $reportCalls[0].Extent.Text | Should -Match '-SuppressInDryRun'
+    }
+
+    It 'Writes the raw JSON backup only through Invoke-MigrationAction' {
         $writers = @($script:Ast.FindAll({
                     param($node)
                     $node -is [System.Management.Automation.Language.CommandAst] -and
                     $node.GetCommandName() -in @('Export-Csv', 'Set-Content')
                 }, $true))
-        $writers.Count | Should -Be 2
+        $writers.Count | Should -Be 1
         foreach ($writer in $writers) {
             $wrapped = $false
             $parent = $writer.Parent
@@ -601,6 +612,23 @@ Describe 'Script structure' {
             }
             $wrapped | Should -BeTrue -Because "$($writer.GetCommandName()) at line $($writer.Extent.StartLineNumber) must be wrapped"
         }
+    }
+
+    It 'Names the CSV report and the JSON backup so both parse back to VivaLearningHistory, sharing a stamp' {
+        $stamp = Get-Date
+        $csvPath = Get-MigrationOutputPath -Name 'VivaLearningHistory' -Directory $TestDrive -Timestamp $stamp
+        $jsonPath = Get-MigrationOutputPath -Name 'VivaLearningHistory' -Extension 'json' `
+            -Directory $TestDrive -Timestamp $stamp
+
+        $csv = ConvertFrom-MigrationOutputPath -Path $csvPath
+        $csv.Name | Should -BeExactly 'VivaLearningHistory'
+        $csv.Extension | Should -BeExactly 'csv'
+
+        $json = ConvertFrom-MigrationOutputPath -Path $jsonPath
+        $json.Name | Should -BeExactly 'VivaLearningHistory'
+        $json.Extension | Should -BeExactly 'json'
+
+        $csv.Timestamp | Should -Be $json.Timestamp
     }
 }
 

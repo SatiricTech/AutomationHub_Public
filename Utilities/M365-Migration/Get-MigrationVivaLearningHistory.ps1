@@ -612,16 +612,17 @@ function Read-LearningHistory {
 
 $exitCode = 0
 
-$run = Initialize-MigrationRun -ScriptName 'Get-MigrationVivaLearningHistory' -OutputPath $OutputPath `
+$null = Initialize-MigrationRun -ScriptName 'Get-MigrationVivaLearningHistory' -OutputPath $OutputPath `
     -Prefix $Prefix -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
 
 $results = [System.Collections.Generic.List[object]]::new()
 
 try {
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $historyCsv = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}VivaLearningHistory_$timestamp.csv"
-    $historyJson = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}VivaLearningHistory_$timestamp.json"
+    # One shared stamp for the CSV (written through Export-MigrationReport) and the JSON
+    # fidelity backup (written here directly), so the pair reads as one export.
+    $runTimestamp = Get-Date
+    $historyCsv = Get-MigrationOutputPath -Name 'VivaLearningHistory' -Timestamp $runTimestamp
+    $historyJson = Get-MigrationOutputPath -Name 'VivaLearningHistory' -Extension 'json' -Timestamp $runTimestamp
 
     if ($DryRun) {
         # This script only reads, so the DryRun stops before the sign-in: there is
@@ -733,8 +734,10 @@ try {
             Write-MigrationLog -Message 'No learner history found - nothing to export.' -Level WARNING
         }
         else {
-            Invoke-MigrationAction -Description "Write $($history.Rows.Count) activity row(s) to $historyCsv" -Action {
-                $history.Rows | Export-Csv -LiteralPath $historyCsv -NoTypeInformation -Encoding utf8
+            $null = Export-MigrationReport -Rows $history.Rows -Name 'VivaLearningHistory' -Timestamp $runTimestamp `
+                -SuppressInDryRun
+
+            Invoke-MigrationAction -Description "Write the raw JSON backup to $historyJson" -Action {
                 # -InputObject keeps the JSON an array even when exactly one user has history.
                 ConvertTo-Json -InputObject @($history.RawByUser) -Depth 10 | Set-Content -LiteralPath $historyJson -Encoding utf8
             }
