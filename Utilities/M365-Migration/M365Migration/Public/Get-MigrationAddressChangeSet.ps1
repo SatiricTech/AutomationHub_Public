@@ -6,21 +6,29 @@ function Get-MigrationAddressChangeSet {
 
     .DESCRIPTION
         Pure function - no tenant calls, which is what makes the riskiest decision in the
-        toolkit testable offline. It returns three ordered buckets because the order
-        matters to Exchange:
+        toolkit testable offline. Promoting an address the object already carries and adding
+        one it does not are different Exchange calls, so the result describes both:
 
-          RemoveBeforeAdd  A lowercase 'smtp:' entry that already holds the address we are
-                           about to promote. Exchange rejects an add of an address the
-                           object already carries, so the alias is released first and
-                           re-added immediately as the uppercase primary.
-          Add              'SMTP:' primary, then 'smtp:' aliases, then 'X500:' entries.
-          RemoveAfterAdd   The demoted old primary, only with -RemoveOldPrimary, and never
-                           when it is a protected address. It cannot be removed before the
-                           add because an object may not be left without a primary.
+          PromoteInPlace   True when the wanted primary is already on the object as a
+                           lowercase 'smtp:' alias.
+          ReplaceWith      The object's whole address list for that case - every entry
+                           unchanged except the wanted address recased to 'SMTP:' and the old
+                           primary recased to 'smtp:' (dropped with -RemoveOldPrimary unless
+                           it is protected). Written in one Set-Mailbox -EmailAddresses call,
+                           which replaces every proxy address at once, so the address is never
+                           absent from the object. Empty in every other case.
+          Add              'SMTP:' primary - add case only, because the promote case carries
+                           it in ReplaceWith - then 'smtp:' aliases, then 'X500:' entries.
+          RemoveAfterAdd   The demoted old primary, only with -RemoveOldPrimary, never when it
+                           is a protected address, and never in the promote case, where the
+                           demotion is part of ReplaceWith. It cannot be removed before the add
+                           because an object may not be left without a primary.
+          RemoveBeforeAdd  Always empty. Kept on the output object for compatibility with
+                           callers written against the older release-then-re-add shape.
 
         Nothing else is ever removed. Aliases present on the object but absent from the
         plan are left alone, and Test-MigrationProtectedAddress keeps the tenant routing
-        address, SIP, SPO and X500 entries out of both removal lists in every case.
+        address, SIP, SPO and X500 entries out of the removal list in every case.
 
         Address values are compared case-insensitively - SMTP addresses are not
         case-sensitive in practice and a plan typed in mixed case must not produce a
@@ -55,6 +63,13 @@ function Get-MigrationAddressChangeSet {
 
         Returns Add = @('SMTP:john.smith@newco.com') and no removals - the old primary is
         demoted to an alias by Exchange and the routing address is protected.
+
+    .EXAMPLE
+        Get-MigrationAddressChangeSet -CurrentAddress @('SMTP:jsmith@contoso.com', 'smtp:john.smith@newco.com') `
+            -TargetPrimarySmtp 'john.smith@newco.com' -Apply PrimarySmtp
+
+        The object already carries the target as an alias, so PromoteInPlace is true and
+        ReplaceWith is @('smtp:jsmith@contoso.com', 'SMTP:john.smith@newco.com') - one call.
 
     .EXAMPLE
         Get-MigrationAddressChangeSet -CurrentAddress $mailbox.EmailAddresses `
@@ -102,10 +117,17 @@ function Get-MigrationAddressChangeSet {
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
         ForEach-Object { Split-MigrationProxyAddress -Entry $_ })
 
-    $currentPrimaryEntry = @($entries | Where-Object { $_.IsPrimary }) | Select-Object -First 1
+    # Indexes rather than object references: the replacement list below has to rebuild the
+    # object's addresses in their original order, recasing exactly two of them.
+    $currentPrimaryIndex = -1
+    for ($position = 0; $position -lt $entries.Count; $position++) {
+        if ($entries[$position].IsPrimary) { $currentPrimaryIndex = $position; break }
+    }
+    $currentPrimaryEntry = if ($currentPrimaryIndex -ge 0) { $entries[$currentPrimaryIndex] } else { $null }
     $currentPrimary = if ($currentPrimaryEntry) { $currentPrimaryEntry.Address } else { '' }
 
     $removeBefore = [System.Collections.Generic.List[string]]::new()
+    $replaceWith = [System.Collections.Generic.List[string]]::new()
     $add = [System.Collections.Generic.List[string]]::new()
     $removeAfter = [System.Collections.Generic.List[string]]::new()
     $aliasAdded = [System.Collections.Generic.List[string]]::new()
@@ -113,6 +135,7 @@ function Get-MigrationAddressChangeSet {
 
     $newPrimary = ''
     $primaryDetail = ''
+    $promoteInPlace = $false
 
     if ($applied -contains 'PrimarySmtp') {
         $wanted = ([string]$TargetPrimarySmtp).Trim() -replace '^(?i)smtp:', ''
@@ -123,27 +146,50 @@ function Get-MigrationAddressChangeSet {
             $primaryDetail = "Primary SMTP is already $currentPrimary."
         }
         else {
-            $held = @($entries | Where-Object { $_.Kind -eq 'Smtp' -and -not $_.IsPrimary -and $_.Address -ieq $wanted }) |
-                Select-Object -First 1
-            if ($held) {
-                # Exchange will not add an address the object already carries, so the alias
-                # form is released in a separate call and immediately re-added below as the
-                # uppercase primary. The address itself is never absent from the object.
-                $removeBefore.Add("smtp:$($held.Address)")
+            $heldIndex = -1
+            for ($position = 0; $position -lt $entries.Count; $position++) {
+                $entry = $entries[$position]
+                if ($entry.Kind -eq 'Smtp' -and -not $entry.IsPrimary -and $entry.Address -ieq $wanted) {
+                    $heldIndex = $position
+                    break
+                }
             }
 
-            $add.Add("SMTP:$wanted")
             $newPrimary = $wanted
             $primaryDetail = "Primary SMTP set to $wanted."
 
+            $dropOldPrimary = $false
             if ($RemoveOldPrimary -and $currentPrimaryEntry) {
                 if (Test-MigrationProtectedAddress -AddressEntry $currentPrimaryEntry) {
                     $primaryDetail += " Kept $currentPrimary - protected address."
                 }
                 else {
-                    $removeAfter.Add("smtp:$currentPrimary")
+                    $dropOldPrimary = $true
                     $primaryDetail += " Removed the demoted $currentPrimary."
                 }
+            }
+
+            if ($heldIndex -ge 0) {
+                # Exchange will not add an address the object already carries, and releasing the
+                # alias in its own call would leave the mailbox with no vanity address at all if
+                # the re-add then failed. So the whole list is rewritten in a single
+                # Set-Mailbox -EmailAddresses call, which replaces every proxy address at once:
+                # the address is never absent from the object, not even for an instant.
+                $promoteInPlace = $true
+                for ($position = 0; $position -lt $entries.Count; $position++) {
+                    if ($position -eq $heldIndex) { $replaceWith.Add("SMTP:$wanted"); continue }
+                    if ($position -eq $currentPrimaryIndex) {
+                        if (-not $dropOldPrimary) { $replaceWith.Add("smtp:$currentPrimary") }
+                        continue
+                    }
+                    # Everything else is carried over byte for byte: Exchange compares addresses
+                    # case-insensitively, but the operator reads this list back.
+                    $replaceWith.Add($entries[$position].Entry)
+                }
+            }
+            else {
+                $add.Add("SMTP:$wanted")
+                if ($dropOldPrimary) { $removeAfter.Add("smtp:$currentPrimary") }
             }
         }
     }
@@ -180,6 +226,8 @@ function Get-MigrationAddressChangeSet {
         NewPrimary      = $newPrimary
         PrimaryChanged  = [bool]$newPrimary
         PrimaryDetail   = $primaryDetail
+        PromoteInPlace  = $promoteInPlace
+        ReplaceWith     = $replaceWith.ToArray()
         RemoveBeforeAdd = $removeBefore.ToArray()
         Add             = $add.ToArray()
         RemoveAfterAdd  = $removeAfter.ToArray()

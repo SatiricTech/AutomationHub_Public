@@ -333,6 +333,153 @@ Describe 'A declined confirmation is a Skip, not a Plan' {
     }
 }
 
+Describe 'Promoting an alias to primary never leaves the address absent' {
+
+    <#
+        Same shadowing technique as the block above, with one difference: this run is live rather
+        than a rehearsal, because the behaviour under test is which Set-Mailbox calls reach
+        Exchange. The mailbox already carries the target address as a lowercase alias - the case
+        that used to be applied as a Remove followed by an Add, which leaves the mailbox with no
+        vanity address at all if the Add fails.
+    #>
+
+    BeforeAll {
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{
+                TenantId = '00000000-0000-0000-0000-0000000000ba'
+                Account  = 'tech@newco.onmicrosoft.com'
+            }
+        }
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = $TenantId; UserPrincipalName = 'tech@newco.onmicrosoft.com' }
+        }
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            # -Apply PrimarySmtp writes through Exchange alone, so Graph must stay read-only here.
+            if ($Method -ne 'GET') { throw "The run reached a $Method call on $Uri." }
+            return [pscustomobject]@{
+                id                    = 'bbbbbbbb-0000-0000-0000-000000000001'
+                userPrincipalName     = 'old@c.com'
+                mail                  = 'old@c.com'
+                mailNickname          = 'old'
+                displayName           = 'Pat Promote'
+                onPremisesSyncEnabled = $false
+                proxyAddresses        = @('SMTP:old@c.com', 'smtp:new@n.com')
+            }
+        }
+        # The mailbox already holds the target address, as a lowercase alias.
+        function Get-EXOMailbox {
+            param($Identity, $Properties, $ErrorAction)
+            return [pscustomobject]@{
+                PrimarySmtpAddress = 'old@c.com'
+                EmailAddresses     = @('SMTP:old@c.com', 'smtp:new@n.com')
+                Alias              = 'old'
+            }
+        }
+
+        $script:PromoteRoot = Join-Path ([System.IO.Path]::GetTempPath()) "SetIdentity-Promote-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:PromoteRoot -ItemType Directory -Force
+
+        # Built here rather than shipped as a fixture so the one row the promotion needs sits next
+        # to the mailbox it describes.
+        $planRow = New-MigrationPlanRow
+        $planRow.ObjectType = 'User'
+        $planRow.Wave = '1'
+        $planRow.PlanStatus = 'Planned'
+        $planRow.TargetObjectId = 'bbbbbbbb-0000-0000-0000-000000000001'
+        $planRow.SourceUserPrincipalName = 'old@c.com'
+        $planRow.TargetPrimarySmtp = 'new@n.com'
+
+        $script:PromotePlanPath = Join-Path -Path $script:PromoteRoot -ChildPath 'PromotePlan.csv'
+        $planRow | Export-Csv -LiteralPath $script:PromotePlanPath -NoTypeInformation
+
+        # The same mailbox, targeted at an address it does not hold: the add case, which still
+        # runs as an Add followed by a separate Remove of the demoted primary.
+        $addRow = New-MigrationPlanRow
+        $addRow.ObjectType = 'User'
+        $addRow.Wave = '1'
+        $addRow.PlanStatus = 'Planned'
+        $addRow.TargetObjectId = 'bbbbbbbb-0000-0000-0000-000000000001'
+        $addRow.SourceUserPrincipalName = 'old@c.com'
+        $addRow.TargetPrimarySmtp = 'spare@n.com'
+
+        $script:AddPlanPath = Join-Path -Path $script:PromoteRoot -ChildPath 'AddPlan.csv'
+        $addRow | Export-Csv -LiteralPath $script:AddPlanPath -NoTypeInformation
+    }
+
+    AfterAll {
+        if ($script:PromoteRoot -and (Test-Path -LiteralPath $script:PromoteRoot)) {
+            Remove-Item -LiteralPath $script:PromoteRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Writes the whole address list in a single call, with no Remove before it' {
+        Mock Set-Mailbox { }
+        $workspace = Join-Path -Path $script:PromoteRoot -ChildPath 'promoted'
+        $null = New-Item -Path $workspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:PromotePlanPath -Apply 'PrimarySmtp' `
+            -OutputPath $workspace -Verbosity Low -Confirm:$false
+
+        # -ccontains, not -contains: the uppercase prefix is what makes the address primary, so a
+        # case-insensitive match would pass on the alias form the mailbox already had.
+        Should -Invoke Set-Mailbox -Times 1 -Exactly -ParameterFilter {
+            @($EmailAddresses) -ccontains 'SMTP:new@n.com' -and @($EmailAddresses) -ccontains 'smtp:old@c.com'
+        }
+        Should -Invoke Set-Mailbox -Times 1 -Exactly
+        # The old two-call promotion released the alias first with @{ Remove = ... }.
+        Should -Invoke Set-Mailbox -Times 0 -Exactly -ParameterFilter {
+            $EmailAddresses -is [hashtable] -and $EmailAddresses.ContainsKey('Remove')
+        }
+    }
+
+    It 'Reports the row Failed and names the step when the replacement call is refused' {
+        Mock Set-Mailbox { throw 'Exchange refused the address list.' }
+        $workspace = Join-Path -Path $script:PromoteRoot -ChildPath 'refused'
+        $null = New-Item -Path $workspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:PromotePlanPath -Apply 'PrimarySmtp' `
+            -OutputPath $workspace -Verbosity Low -Confirm:$false
+
+        $file = @(Get-ChildItem -LiteralPath $workspace -Filter 'Set-Identity-Results_*.csv')
+        $file.Count | Should -Be 1
+        $rows = @(Import-Csv -LiteralPath $file[0].FullName)
+        $primary = @($rows | Where-Object { $_.Action -eq 'PrimarySmtp' })
+        $primary.Count | Should -Be 1
+        $primary[0].Status | Should -BeExactly 'Failed'
+        $primary[0].Detail | Should -Match 'Completed: none\. Failed at: replace'
+        $primary[0].Detail | Should -Match 'Exchange refused the address list\.'
+    }
+
+    It 'Names the step and what already landed when the add case fails halfway' {
+        Mock Set-Mailbox {
+            if ($EmailAddresses -is [hashtable] -and $EmailAddresses.ContainsKey('Remove')) {
+                throw 'Exchange refused the removal.'
+            }
+        }
+        $workspace = Join-Path -Path $script:PromoteRoot -ChildPath 'halfway'
+        $null = New-Item -Path $workspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:AddPlanPath -Apply 'PrimarySmtp' -RemoveOldPrimaryAlias `
+            -OutputPath $workspace -Verbosity Low -Confirm:$false
+
+        $file = @(Get-ChildItem -LiteralPath $workspace -Filter 'Set-Identity-Results_*.csv')
+        $file.Count | Should -Be 1
+        $primary = @(@(Import-Csv -LiteralPath $file[0].FullName) | Where-Object { $_.Action -eq 'PrimarySmtp' })
+        $primary.Count | Should -Be 1
+        $primary[0].Status | Should -BeExactly 'Failed'
+        # The new primary is on the mailbox and the old one is still there too, which is the
+        # state the operator has to be told about.
+        $primary[0].Detail | Should -Match 'Completed: add\. Failed at: remove demoted old@c\.com'
+    }
+}
+
 Describe 'The tenant guard runs once over both connections' {
 
     <#

@@ -79,14 +79,22 @@ Describe 'Get-MigrationAddressChangeSet' {
         }
 
         It 'Keeps the routing address on the object when it is being promoted to primary' {
-            # The only case where a protected entry appears in a removal list: the alias form
-            # is released so the same address can be re-added as the uppercase primary. The
-            # address itself is never absent from the object.
+            # Promoting an address the object already carries removes nothing at all: the whole
+            # address list is rewritten in one call, with the alias recased to the uppercase
+            # primary prefix, so the address is never absent from the object.
             $changeSet = Get-MigrationAddressChangeSet -CurrentAddress $script:currentAddresses `
                 -TargetPrimarySmtp 'jsmith@contoso.mail.onmicrosoft.com' -Apply PrimarySmtp
-            @($changeSet.RemoveBeforeAdd) | Should -Be @('smtp:jsmith@contoso.mail.onmicrosoft.com')
-            @($changeSet.Add) | Should -Be @('SMTP:jsmith@contoso.mail.onmicrosoft.com')
-            @($changeSet.RemoveAfterAdd) | Should -HaveCount 0
+            $changeSet.PromoteInPlace | Should -BeTrue
+            (Get-AllRemoval -ChangeSet $changeSet) | Should -HaveCount 0
+            @($changeSet.Add) | Should -HaveCount 0
+            @($changeSet.ReplaceWith) | Should -BeExactly @(
+                'smtp:jsmith@contoso.com'
+                'smtp:j.smith@contoso.com'
+                'SMTP:jsmith@contoso.mail.onmicrosoft.com'
+                'SIP:jsmith@contoso.com'
+                'SPO:SPO_1111@SPO_2222'
+                'X500:/o=ExchangeLabs/ou=Exchange Administrative Group/cn=Recipients/cn=old'
+            )
         }
     }
 
@@ -129,6 +137,92 @@ Describe 'Get-MigrationAddressChangeSet' {
                 -TargetPrimarySmtp '' -Apply PrimarySmtp
             $changeSet.PrimaryChanged | Should -BeFalse
             $changeSet.PrimaryDetail | Should -BeLike '*no TargetPrimarySmtp*'
+        }
+    }
+
+    Context 'Promoting an address the object already carries' {
+
+        BeforeAll {
+            # The mailbox already holds the vanity address as a lowercase alias - the case that
+            # used to be applied as a Remove followed by an Add, leaving the address absent from
+            # the mailbox if the Add failed.
+            $script:heldAddresses = @('SMTP:old@c.com', 'smtp:new@n.com', 'X500:/o=x')
+        }
+
+        It 'Rewrites the whole list in one call rather than releasing the alias first' {
+            $changeSet = Get-MigrationAddressChangeSet -CurrentAddress $script:heldAddresses `
+                -TargetPrimarySmtp 'new@n.com' -Apply PrimarySmtp
+            $changeSet.PromoteInPlace | Should -BeTrue
+            $changeSet.PrimaryChanged | Should -BeTrue
+            @($changeSet.RemoveBeforeAdd) | Should -HaveCount 0
+            @($changeSet.Add) | Should -HaveCount 0
+            @($changeSet.RemoveAfterAdd) | Should -HaveCount 0
+            @($changeSet.ReplaceWith) | Should -BeExactly @('smtp:old@c.com', 'SMTP:new@n.com', 'X500:/o=x')
+        }
+
+        It 'Drops the demoted old primary from the replacement list with -RemoveOldPrimary' {
+            $changeSet = Get-MigrationAddressChangeSet -CurrentAddress $script:heldAddresses `
+                -TargetPrimarySmtp 'new@n.com' -Apply PrimarySmtp -RemoveOldPrimary
+            @($changeSet.ReplaceWith) | Should -BeExactly @('SMTP:new@n.com', 'X500:/o=x')
+            @($changeSet.RemoveAfterAdd) | Should -HaveCount 0
+            $changeSet.PrimaryDetail | Should -BeLike '*Removed the demoted old@c.com*'
+        }
+
+        It 'Keeps a protected old primary in the replacement list even with -RemoveOldPrimary' {
+            $changeSet = Get-MigrationAddressChangeSet `
+                -CurrentAddress @('SMTP:jsmith@contoso.mail.onmicrosoft.com', 'smtp:new@n.com') `
+                -TargetPrimarySmtp 'new@n.com' -Apply PrimarySmtp -RemoveOldPrimary
+            @($changeSet.ReplaceWith) | Should -BeExactly @(
+                'smtp:jsmith@contoso.mail.onmicrosoft.com'
+                'SMTP:new@n.com'
+            )
+            $changeSet.PrimaryDetail | Should -BeLike '*protected address*'
+        }
+
+        It 'Leaves every entry it does not touch exactly as it found it' {
+            # Exchange compares addresses case-insensitively, but the operator reads this list
+            # back, so only the two SMTP entries the promotion touches are recased.
+            $changeSet = Get-MigrationAddressChangeSet `
+                -CurrentAddress @('SMTP:Old@C.com', 'smtp:New@N.com', 'SIP:Old@C.com', 'X500:/o=X/cn=ABC') `
+                -TargetPrimarySmtp 'new@n.com' -Apply PrimarySmtp
+            @($changeSet.ReplaceWith) | Should -BeExactly @(
+                'smtp:Old@C.com'
+                'SMTP:new@n.com'
+                'SIP:Old@C.com'
+                'X500:/o=X/cn=ABC'
+            )
+        }
+
+        It 'Adds the primary the old way when the object does not already carry it' {
+            $changeSet = Get-MigrationAddressChangeSet -CurrentAddress @('SMTP:old@c.com', 'X500:/o=x') `
+                -TargetPrimarySmtp 'new@n.com' -Apply PrimarySmtp
+            $changeSet.PromoteInPlace | Should -BeFalse
+            @($changeSet.Add) | Should -BeExactly @('SMTP:new@n.com')
+            @($changeSet.ReplaceWith) | Should -HaveCount 0
+        }
+
+        It 'Promotes in place and still reports the aliases and X500 entries to add' {
+            $changeSet = Get-MigrationAddressChangeSet -CurrentAddress $script:heldAddresses `
+                -TargetPrimarySmtp 'new@n.com' -TargetAlias @('spare@n.com') -TargetX500 @('/o=y')
+            $changeSet.PromoteInPlace | Should -BeTrue
+            @($changeSet.ReplaceWith) | Should -BeExactly @('smtp:old@c.com', 'SMTP:new@n.com', 'X500:/o=x')
+            # The primary is carried by ReplaceWith, so only the later buckets remain in Add.
+            @($changeSet.Add) | Should -BeExactly @('smtp:spare@n.com', 'X500:/o=y')
+        }
+
+        It 'Reports PromoteInPlace false when PrimarySmtp is not applied' {
+            $changeSet = Get-MigrationAddressChangeSet -CurrentAddress $script:heldAddresses `
+                -TargetPrimarySmtp 'new@n.com' -TargetAlias @('spare@n.com') -Apply Aliases
+            $changeSet.PromoteInPlace | Should -BeFalse
+            @($changeSet.ReplaceWith) | Should -HaveCount 0
+        }
+
+        It 'Never emits RemoveBeforeAdd, whatever the change set' {
+            # Kept on the output object for compatibility with callers written against the older
+            # two-call shape; it is always empty now.
+            $changeSet = Get-MigrationAddressChangeSet -CurrentAddress $script:currentAddresses `
+                -TargetPrimarySmtp 'j.smith@contoso.com' -TargetAlias @('spare@newco.com') -RemoveOldPrimary
+            @($changeSet.RemoveBeforeAdd) | Should -HaveCount 0
         }
     }
 
@@ -227,8 +321,9 @@ Describe 'Get-MigrationAddressChangeSet' {
             $changeSet = Get-MigrationAddressChangeSet `
                 -CurrentAddress @('SMTP:jsmith@contoso.com', 'smtp:John.Smith@NewCo.com') `
                 -TargetPrimarySmtp 'john.smith@newco.com' -Apply PrimarySmtp
-            @($changeSet.RemoveBeforeAdd) | Should -Be @('smtp:John.Smith@NewCo.com')
-            @($changeSet.Add) | Should -Be @('SMTP:john.smith@newco.com')
+            $changeSet.PromoteInPlace | Should -BeTrue
+            # The promoted entry is written with the plan's casing, exactly as the add case does.
+            @($changeSet.ReplaceWith) | Should -BeExactly @('smtp:jsmith@contoso.com', 'SMTP:john.smith@newco.com')
         }
     }
 

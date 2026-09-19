@@ -12,15 +12,18 @@
       Upn           PATCH /users/{id} { userPrincipalName } via Microsoft Graph.
       PrimarySmtp   Set-Mailbox -EmailAddresses @{ Add = 'SMTP:<target>' } - the uppercase prefix is
                     what makes the address primary, and Exchange demotes the previous primary to a
-                    lowercase 'smtp:' alias by itself.
+                    lowercase 'smtp:' alias by itself. When the mailbox already carries the target
+                    as an alias it is promoted in place instead: one Set-Mailbox -EmailAddresses
+                    call rewrites the whole address list, so the address is never absent from the
+                    mailbox even for an instant.
       Aliases       Adds every TargetAliases entry that is not already on the object.
       X500          Adds X500:<LegacyExchangeDN> (or each SourceX500 entry) so mail sent to the old
                     address and cached Outlook entries still resolve after the move.
       MailNickname  Set-Mailbox -Alias.
       GalVisibility Set-Mailbox -HiddenFromAddressListsEnabled (True, or False with -Unhide).
 
-    Address handling is deliberately additive. The script computes an add/remove set from the
-    object's current EmailAddresses and never removes the tenant routing (MOERA) address, a SIP
+    Address handling is deliberately additive. The script computes the change from the object's
+    current EmailAddresses and never removes the tenant routing (MOERA) address, a SIP
     address, or any existing X500 address - removing any of those breaks Teams sign-in, mail
     routing, or reply-ability from cached address entries. The only address it will ever remove is
     the previous primary, and only when you ask for it with -RemoveOldPrimaryAlias.
@@ -398,6 +401,45 @@ function Set-MailboxAddress {
     }
 }
 
+function Set-MailboxAddressList {
+    <#
+    .SYNOPSIS
+        Replaces the whole EmailAddresses collection with a single Set-Mailbox call.
+
+    .DESCRIPTION
+        Exchange's documented "replace all existing proxy addresses with the values you specify"
+        form. It is the only way to promote an address the object already carries without first
+        releasing it: one call, so the address is never absent from the mailbox - where a Remove
+        followed by an Add leaves it absent if the Add fails.
+
+        The caller must hand over the object's complete address list. Anything left out of it is
+        removed from the mailbox, which is why Get-MigrationAddressChangeSet builds that list
+        rather than each call site.
+
+    .EXAMPLE
+        Set-MailboxAddressList -Identity 'john.smith@newco.com' `
+            -Address @('smtp:jsmith@contoso.com', 'SMTP:john.smith@newco.com')
+
+        Promotes the alias john.smith@newco.com to primary and demotes the old primary, in one call.
+    #>
+    [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'The caller gates the row with ShouldProcess and Invoke-MigrationAction honours -DryRun.')]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Identity,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Address
+    )
+
+    # An empty list would strip every address off the mailbox, so it can only be a caller bug.
+    if (@($Address).Count -eq 0) { return }
+
+    $description = "Replace addresses on ${Identity}: $(@($Address) -join ', ')"
+
+    Invoke-MigrationAction -Description $description -Action {
+        Set-Mailbox -Identity $Identity -EmailAddresses $Address -ErrorAction Stop
+    }
+}
+
 function Set-MailboxAttribute {
     <#
     .SYNOPSIS
@@ -696,14 +738,41 @@ try {
                                     break
                                 }
 
-                                if ($changeSet.RemoveBeforeAdd.Count -gt 0) {
-                                    Set-MailboxAddress -Identity $objectId -Address $changeSet.RemoveBeforeAdd -Operation Remove
+                                # Which calls have actually landed. A promotion that fails halfway
+                                # leaves the mailbox in a state the operator has to know about, and
+                                # the exception alone never says how far the row got.
+                                $completed = [System.Collections.Generic.List[string]]::new()
+                                $step = ''
+                                try {
+                                    if ($changeSet.PromoteInPlace) {
+                                        # The mailbox already carries the address as an alias:
+                                        # rewrite the whole list in one call rather than releasing
+                                        # it and adding it back, which would leave the mailbox
+                                        # without the address if the second call failed.
+                                        $step = 'replace'
+                                        Set-MailboxAddressList -Identity $objectId -Address $changeSet.ReplaceWith
+                                        $completed.Add($step)
+                                    }
+                                    else {
+                                        $step = 'add'
+                                        Set-MailboxAddress -Identity $objectId `
+                                            -Address @("SMTP:$($changeSet.NewPrimary)") -Operation Add
+                                        $completed.Add($step)
+
+                                        if ($changeSet.RemoveAfterAdd.Count -gt 0) {
+                                            $step = "remove demoted $($changeSet.CurrentPrimary)"
+                                            Set-MailboxAddress -Identity $objectId `
+                                                -Address $changeSet.RemoveAfterAdd -Operation Remove
+                                            $completed.Add($step)
+                                        }
+                                    }
+                                    $detail = $changeSet.PrimaryDetail
                                 }
-                                Set-MailboxAddress -Identity $objectId -Address @("SMTP:$($changeSet.NewPrimary)") -Operation Add
-                                if ($changeSet.RemoveAfterAdd.Count -gt 0) {
-                                    Set-MailboxAddress -Identity $objectId -Address $changeSet.RemoveAfterAdd -Operation Remove
+                                catch {
+                                    $status = 'Failed'
+                                    $done = if ($completed.Count -gt 0) { $completed -join '; ' } else { 'none' }
+                                    $detail = "Completed: $done. Failed at: $step - $($_.Exception.Message)"
                                 }
-                                $detail = $changeSet.PrimaryDetail
                             }
 
                             'Aliases' {
