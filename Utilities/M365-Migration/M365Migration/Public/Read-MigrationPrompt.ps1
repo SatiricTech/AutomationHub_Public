@@ -57,8 +57,10 @@ function Read-MigrationPrompt {
 
     .NOTES
         Author: AutomationHub
-        Private module helper - not exported.
         Written with assistance from Claude (Anthropic).
+        Exported so the entry script's workspace picker prompts through the same seam the
+        console does, which keeps the repo-wide "no Read-Host" guard meaningful and lets
+        tests script every prompt with Set-MigrationPromptHandler.
     #>
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',

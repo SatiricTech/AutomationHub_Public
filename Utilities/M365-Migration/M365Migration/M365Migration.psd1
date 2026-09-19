@@ -54,6 +54,7 @@
         'New-MigrationRandomPassword'
         'New-MigrationSettings'
         'New-MigrationStepDriver'
+        'Read-MigrationPrompt'
         'Resolve-MigrationCollision'
         'Resolve-MigrationPlanAddress'
         'Resolve-MigrationSettings'

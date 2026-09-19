@@ -190,7 +190,7 @@ Describe 'No interactive prompts' {
         # The exclusion above is only safe while the seam really is where the prompts live: a
         # Read-MigrationPrompt.ps1 that had stopped prompting would mean they had moved
         # somewhere the scan no longer covers.
-        $seamPath = Join-Path $PSScriptRoot '..' 'M365Migration' 'Private' 'Read-MigrationPrompt.ps1'
+        $seamPath = Join-Path $PSScriptRoot '..' 'M365Migration' 'Public' 'Read-MigrationPrompt.ps1'
         $survey = Get-InteractivePromptSurvey -Path $seamPath
         $survey.ReadHostCalls | Should -Not -BeNullOrEmpty
         $survey.HostUiPrompts | Should -Not -BeNullOrEmpty
