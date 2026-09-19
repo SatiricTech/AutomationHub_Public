@@ -51,6 +51,7 @@
         'New-MigrationPlanRow'
         'New-MigrationRandomPassword'
         'New-MigrationSettings'
+        'New-MigrationStepDriver'
         'Resolve-MigrationCollision'
         'Resolve-MigrationPlanAddress'
         'Resolve-MigrationSettings'
