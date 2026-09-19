@@ -178,6 +178,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4+ and the bundled M365Migration module. Entirely offline - no
                   Graph scope or Exchange Online role is needed, so GDAP does not apply.
     Exit codes  : 0 success (rows needing review are the operator's to-do, not a failure),

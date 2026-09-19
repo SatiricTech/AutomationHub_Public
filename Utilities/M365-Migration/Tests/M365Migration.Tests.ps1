@@ -189,3 +189,39 @@ function Get-Sample {
         (Get-InteractivePromptSurvey -Path $sample).ReadHostCalls | Should -Not -BeNullOrEmpty
     }
 }
+
+Describe 'Script versions' {
+
+    <#
+        Every top-level script's .NOTES block must carry a 'Version:' line. Get-Help -Full on a
+        script path (verified interactively - it works for a .ps1 with proper comment-based help,
+        unlike a bare AST walk, which would have to reimplement the parser's own tag recognition)
+        surfaces that block as .alertSet.alert[].Text. The 'Version' label is aligned to whatever
+        column that file's own 'Author:' line uses, so the colon may or may not be preceded by
+        spaces - the regex tolerates either.
+
+        Built here, at Describe scope rather than inside BeforeAll, because -ForEach needs it
+        during Pester's discovery pass; a BeforeAll only runs later, during Run.
+    #>
+
+    $toolkitRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $topLevelScripts = @(Get-ChildItem -LiteralPath $toolkitRoot -Filter '*.ps1' -File | ForEach-Object {
+            @{ Path = $_.FullName; Name = $_.Name }
+        })
+
+    It 'Stamps <Name> with a Version line in .NOTES' -ForEach $topLevelScripts {
+        $help = Get-Help -Name $Path -Full -ErrorAction Stop
+        $notesText = ($help.alertSet.alert.Text -join "`n")
+        $notesText | Should -Match 'Version\s*:\s+\d+\.\d+\.\d+' -Because "$Name needs a Version: line in .NOTES"
+    }
+
+    $nonStandardExitCodeScripts = @(
+        'Remove-MigrationDomainReferences.ps1', 'Compare-MigrationUserData.ps1', 'Test-MigrationReadiness.ps1'
+    ) | ForEach-Object { @{ Name = $_; Path = (Join-Path $toolkitRoot $_) } }
+
+    It 'Documents non-standard exit codes for <Name>' -ForEach $nonStandardExitCodeScripts {
+        $help = Get-Help -Name $Path -Full -ErrorAction Stop
+        $notesText = ($help.alertSet.alert.Text -join "`n")
+        $notesText | Should -Match 'Exit codes\s*:' -Because "$Name has non-standard exit codes to document"
+    }
+}

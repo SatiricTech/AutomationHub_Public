@@ -90,6 +90,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4+ and the bundled M365Migration module. ImportExcel 7.1.0 or
                   later is needed only for the workbook. No tenant connection is made and no
                   Graph scope or Exchange Online role is required, so GDAP does not apply.

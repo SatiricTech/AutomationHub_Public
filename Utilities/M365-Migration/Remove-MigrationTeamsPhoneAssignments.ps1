@@ -109,6 +109,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
                   the MicrosoftTeams module version 5.7.0 or later (installed on demand when
                   absent). Older module versions report a failed removal by returning a

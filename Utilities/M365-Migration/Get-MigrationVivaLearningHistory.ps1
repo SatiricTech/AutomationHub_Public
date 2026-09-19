@@ -24,8 +24,8 @@
     API quirks this script works around (documented behaviour as of Aug 2026):
       - Listing course activities supports DELEGATED sign-in only; app-only
         (client credential) tokens are rejected. The delegated scopes are
-        LearningAssignedCourse.Read and LearningSelfInitiatedCourse.Read. The
-        .All variants that Microsoft's list page mentions exist only as
+        LearningAssignedCourse.Read and LearningSelfInitiatedCourse.Read. Their
+        All-suffixed variants that Microsoft's list page mentions exist only as
         application permissions (the permissions reference carries their
         identifiers), so requesting them at a delegated sign-in fails at Entra
         before the consent prompt - this script never asks for them.
@@ -113,6 +113,7 @@
 
 .NOTES
     Author       : AutomationHub
+    Version      : 1.2.0
     Requires     : PowerShell 7.4, the M365Migration module beside this script,
                    Microsoft.Graph.Authentication (installed on demand)
     Graph scopes : Delegated - LearningAssignedCourse.Read,

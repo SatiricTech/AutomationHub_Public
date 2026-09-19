@@ -90,6 +90,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
                   the MicrosoftTeams module (installed on demand).
     Permissions : Teams Administrator, or Teams Communications Administrator / Global Reader

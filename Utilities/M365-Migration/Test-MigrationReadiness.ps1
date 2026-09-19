@@ -96,6 +96,7 @@
 
 .NOTES
     Author: AutomationHub
+    Version: 1.2.0
     Written with assistance from Claude (Anthropic).
 
     Required Microsoft Graph scopes:

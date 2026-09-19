@@ -127,6 +127,7 @@
 
 .NOTES
     Author       : AutomationHub
+    Version      : 1.2.0
     Requires     : PowerShell 7.4, ExchangeOnlineManagement
     EXO roles    : Exchange Administrator, or a role group holding the Mail Recipients role.
                    Add-MailboxPermission, Add-RecipientPermission, Set-Mailbox

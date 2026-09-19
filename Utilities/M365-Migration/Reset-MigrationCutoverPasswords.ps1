@@ -109,6 +109,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
                   Microsoft.Graph.Authentication (installed on demand by Connect-MigrationGraph).
                   All Graph reads and writes go through raw REST calls via

@@ -168,6 +168,7 @@
 
 .NOTES
     Author       : AutomationHub
+    Version      : 1.2.0
     Requires     : PowerShell 7.4, the M365Migration module beside this script,
                    Microsoft.Graph.Authentication (installed on demand)
     Graph scopes : Delegated (interactive, only when registering/reusing a

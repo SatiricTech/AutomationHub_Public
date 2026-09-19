@@ -136,6 +136,7 @@
 
 .NOTES
     Author       : AutomationHub
+    Version      : 1.2.0
     Requires     : PowerShell 7.4, Microsoft.Graph.Authentication, ExchangeOnlineManagement
     Graph scopes : User.ReadWrite.All, Directory.ReadWrite.All
     EXO roles    : Exchange Administrator (or a role group holding the Mail Recipients and
