@@ -22,11 +22,19 @@
       MailNickname  Set-Mailbox -Alias.
       GalVisibility Set-Mailbox -HiddenFromAddressListsEnabled (True, or False with -Unhide).
 
-    Address handling is deliberately additive. The script computes the change from the object's
-    current EmailAddresses and never removes the tenant routing (MOERA) address, a SIP
-    address, or any existing X500 address - removing any of those breaks Teams sign-in, mail
-    routing, or reply-ability from cached address entries. The only address it will ever remove is
-    the previous primary, and only when you ask for it with -RemoveOldPrimaryAlias.
+    Address handling is deliberately conservative. Every change is computed from the object's
+    current EmailAddresses and applied one of two ways: promoting an address the mailbox already
+    carries rewrites the whole address list in a single call - the only way to promote it without
+    the address being absent in between - while everything else is an additive Add. Either way the
+    tenant routing (MOERA) address, SIP addresses and existing X500 addresses are carried through
+    untouched; removing any of those breaks Teams sign-in, mail routing, or reply-ability from
+    cached address entries. The only address the script will ever drop is the previous primary, and
+    only when you ask for it with -RemoveOldPrimaryAlias.
+
+    One consequence of the promotion rewriting the whole list: it is computed from the mailbox as
+    read at the start of the row, so an address added to that mailbox by someone else between the
+    read and the write is overwritten. Cutover runs own their mailboxes for the evening, which is
+    why that trade is worth making against leaving the vanity address absent.
 
     Because it can match on the source UPN (-MatchOn Source), the same script performs the in-place
     UPN/address redesign inside a single tenant: build a plan whose Source* columns describe today
@@ -207,6 +215,11 @@ $requiredGraphScopes = @('User.ReadWrite.All', 'Directory.ReadWrite.All')
 
 # Canonical execution order. Whatever order -Apply arrives in, the UPN moves first (it is the
 # cheapest to reverse), addresses next, cosmetics last.
+#
+# PrimarySmtp MUST stay ahead of Aliases and X500. When the target address is already on the
+# mailbox, PrimarySmtp promotes it by writing the whole address list as read at the top of the
+# row - so any alias or X500 added before it would be silently erased by that write, with the
+# results file still reporting both as Succeeded.
 $actionOrder = @('Upn', 'PrimarySmtp', 'Aliases', 'X500', 'MailNickname', 'GalVisibility')
 
 # Operations that need an Exchange Online session.
@@ -414,7 +427,8 @@ function Set-MailboxAddressList {
 
         The caller must hand over the object's complete address list. Anything left out of it is
         removed from the mailbox, which is why Get-MigrationAddressChangeSet builds that list
-        rather than each call site.
+        rather than each call site, and why an empty list throws rather than being ignored: it
+        would leave the mailbox with no addresses at all.
 
     .EXAMPLE
         Set-MailboxAddressList -Identity 'john.smith@newco.com' `
@@ -430,8 +444,12 @@ function Set-MailboxAddressList {
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Address
     )
 
-    # An empty list would strip every address off the mailbox, so it can only be a caller bug.
-    if (@($Address).Count -eq 0) { return }
+    # An empty list would strip every address off the mailbox, so it can only be a caller bug -
+    # and a silent return would hand the row a Succeeded it never earned.
+    if (@($Address).Count -eq 0) {
+        throw 'Set-MailboxAddressList was given an empty address list; a replace-all write with ' +
+            'no entries would strip every address.'
+    }
 
     $description = "Replace addresses on ${Identity}: $(@($Address) -join ', ')"
 

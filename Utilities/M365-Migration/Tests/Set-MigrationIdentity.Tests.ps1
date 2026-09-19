@@ -219,11 +219,18 @@ Describe 'DryRun makes no changes' {
 
         Set-MailboxAddress -Identity 'john.smith@newco.com' -Address @('SMTP:john.smith@newco.com') -Operation Add
         Set-MailboxAddress -Identity 'john.smith@newco.com' -Address @('smtp:jsmith@contoso.com') -Operation Remove
+        # The promote path writes through a different helper, and a replace-all write is the one
+        # call in the toolkit that could strip a mailbox bare, so DryRun has to cover it too.
+        Set-MailboxAddressList -Identity 'john.smith@newco.com' `
+            -Address @('smtp:jsmith@contoso.com', 'SMTP:john.smith@newco.com')
         Set-MailboxAttribute -Identity 'john.smith@newco.com' -Name 'Alias' -Value 'john.smith' -Description 'Set alias'
         Set-MailboxAttribute -Identity 'john.smith@newco.com' -Name 'HiddenFromAddressListsEnabled' -Value $true `
             -Description 'Hide from the GAL'
 
         Should -Invoke Set-Mailbox -Times 0 -Exactly
+        Should -Invoke Set-Mailbox -Times 0 -Exactly -ParameterFilter {
+            @($EmailAddresses) -ccontains 'SMTP:john.smith@newco.com'
+        }
     }
 
     It 'Does nothing at all for an empty address list' {
@@ -244,6 +251,30 @@ Describe 'DryRun makes no changes' {
             -Address @('X500:/o=First Organization/cn=jsmith') -Operation Add
 
         Should -Invoke Set-Mailbox -Times 1 -Exactly
+    }
+
+    It 'Sends the replacement list as the bare collection that replaces every proxy address' {
+        Mock Set-Mailbox { } -ParameterFilter {
+            # A bare collection, not an Add/Remove hashtable: that is what makes the write a
+            # replace-all, and so atomic.
+            $EmailAddresses -isnot [hashtable] -and
+            @($EmailAddresses) -ccontains 'SMTP:john.smith@newco.com' -and
+            @($EmailAddresses) -ccontains 'smtp:jsmith@contoso.com'
+        }
+        Initialize-TestRun
+        Set-MailboxAddressList -Identity 'john.smith@newco.com' `
+            -Address @('smtp:jsmith@contoso.com', 'SMTP:john.smith@newco.com')
+
+        Should -Invoke Set-Mailbox -Times 1 -Exactly
+    }
+
+    It 'Refuses an empty replacement list rather than stripping the mailbox bare' {
+        Mock Set-Mailbox { }
+        Initialize-TestRun
+
+        { Set-MailboxAddressList -Identity 'john.smith@newco.com' -Address @() } |
+            Should -Throw -ExpectedMessage '*would strip every address*'
+        Should -Invoke Set-Mailbox -Times 0 -Exactly
     }
 
     It 'Produces Planned result rows for the operations a DryRun would perform' {
@@ -365,20 +396,20 @@ Describe 'Promoting an alias to primary never leaves the address absent' {
             if ($Method -ne 'GET') { throw "The run reached a $Method call on $Uri." }
             return [pscustomobject]@{
                 id                    = 'bbbbbbbb-0000-0000-0000-000000000001'
-                userPrincipalName     = 'old@c.com'
-                mail                  = 'old@c.com'
+                userPrincipalName     = 'old@contoso.com'
+                mail                  = 'old@contoso.com'
                 mailNickname          = 'old'
                 displayName           = 'Pat Promote'
                 onPremisesSyncEnabled = $false
-                proxyAddresses        = @('SMTP:old@c.com', 'smtp:new@n.com')
+                proxyAddresses        = @('SMTP:old@contoso.com', 'smtp:new@newco.com')
             }
         }
         # The mailbox already holds the target address, as a lowercase alias.
         function Get-EXOMailbox {
             param($Identity, $Properties, $ErrorAction)
             return [pscustomobject]@{
-                PrimarySmtpAddress = 'old@c.com'
-                EmailAddresses     = @('SMTP:old@c.com', 'smtp:new@n.com')
+                PrimarySmtpAddress = 'old@contoso.com'
+                EmailAddresses     = @('SMTP:old@contoso.com', 'smtp:new@newco.com')
                 Alias              = 'old'
             }
         }
@@ -393,8 +424,8 @@ Describe 'Promoting an alias to primary never leaves the address absent' {
         $planRow.Wave = '1'
         $planRow.PlanStatus = 'Planned'
         $planRow.TargetObjectId = 'bbbbbbbb-0000-0000-0000-000000000001'
-        $planRow.SourceUserPrincipalName = 'old@c.com'
-        $planRow.TargetPrimarySmtp = 'new@n.com'
+        $planRow.SourceUserPrincipalName = 'old@contoso.com'
+        $planRow.TargetPrimarySmtp = 'new@newco.com'
 
         $script:PromotePlanPath = Join-Path -Path $script:PromoteRoot -ChildPath 'PromotePlan.csv'
         $planRow | Export-Csv -LiteralPath $script:PromotePlanPath -NoTypeInformation
@@ -406,8 +437,8 @@ Describe 'Promoting an alias to primary never leaves the address absent' {
         $addRow.Wave = '1'
         $addRow.PlanStatus = 'Planned'
         $addRow.TargetObjectId = 'bbbbbbbb-0000-0000-0000-000000000001'
-        $addRow.SourceUserPrincipalName = 'old@c.com'
-        $addRow.TargetPrimarySmtp = 'spare@n.com'
+        $addRow.SourceUserPrincipalName = 'old@contoso.com'
+        $addRow.TargetPrimarySmtp = 'spare@newco.com'
 
         $script:AddPlanPath = Join-Path -Path $script:PromoteRoot -ChildPath 'AddPlan.csv'
         $addRow | Export-Csv -LiteralPath $script:AddPlanPath -NoTypeInformation
@@ -430,7 +461,7 @@ Describe 'Promoting an alias to primary never leaves the address absent' {
         # -ccontains, not -contains: the uppercase prefix is what makes the address primary, so a
         # case-insensitive match would pass on the alias form the mailbox already had.
         Should -Invoke Set-Mailbox -Times 1 -Exactly -ParameterFilter {
-            @($EmailAddresses) -ccontains 'SMTP:new@n.com' -and @($EmailAddresses) -ccontains 'smtp:old@c.com'
+            @($EmailAddresses) -ccontains 'SMTP:new@newco.com' -and @($EmailAddresses) -ccontains 'smtp:old@contoso.com'
         }
         Should -Invoke Set-Mailbox -Times 1 -Exactly
         # The old two-call promotion released the alias first with @{ Remove = ... }.
@@ -476,7 +507,7 @@ Describe 'Promoting an alias to primary never leaves the address absent' {
         $primary[0].Status | Should -BeExactly 'Failed'
         # The new primary is on the mailbox and the old one is still there too, which is the
         # state the operator has to be told about.
-        $primary[0].Detail | Should -Match 'Completed: add\. Failed at: remove demoted old@c\.com'
+        $primary[0].Detail | Should -Match 'Completed: add\. Failed at: remove demoted old@contoso\.com'
     }
 }
 
