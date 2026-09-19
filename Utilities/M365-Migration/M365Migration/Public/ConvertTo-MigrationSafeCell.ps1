@@ -21,6 +21,16 @@ function ConvertTo-MigrationSafeCell {
         Only a string is inspected. Numbers, booleans, dates and $null already have no
         formula reading in a spreadsheet and pass through unchanged.
 
+        A string that is a pure signed number - optional leading + or -, digits, an optional
+        decimal part, nothing else - is left alone even though it starts with + or -. A
+        spreadsheet reads a bare number as a number, never as a formula or a DDE payload, and
+        this toolkit round-trips E.164 phone numbers (Format-MigrationE164 always produces
+        '+<digits>', no spaces or separators) out of one script's CSV and into another's
+        -PhoneNumber parameter: quoting them here would corrupt that round trip for no
+        security benefit. Anything with so much as a space or a non-digit character after the
+        sign - '+1 555 123', "-1+cmd|' /C calc'!A0" - is not a bare number and is still
+        prefixed.
+
     .PARAMETER Value
         The cell value to check, of any type.
 
@@ -34,6 +44,12 @@ function ConvertTo-MigrationSafeCell {
 
         Returns 'John Smith' unchanged; it does not start with a formula-triggering character.
 
+    .EXAMPLE
+        ConvertTo-MigrationSafeCell -Value '+15551234567'
+
+        Returns '+15551234567' unchanged - a pure signed number, including an E.164 phone
+        number, is never a formula.
+
     .NOTES
         Author: AutomationHub
         Written with assistance from Claude (Anthropic).
@@ -46,6 +62,11 @@ function ConvertTo-MigrationSafeCell {
     )
 
     if ($Value -isnot [string]) { return $Value }
+
+    # A bare signed number - an E.164 phone number among them - can never be read as a
+    # formula or a DDE payload, so it is exempt from the leader check below even though it
+    # may start with + or -.
+    if ($Value -match '^[+-]?\d+(\.\d+)?$') { return $Value }
 
     # Formula-triggering leaders recognised by Excel/Calc/Sheets, plus the two whitespace
     # characters some readers also treat as a formula lead-in.
