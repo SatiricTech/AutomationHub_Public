@@ -1225,8 +1225,12 @@ try {
     # workbook, so the whole set reads as one inventory.
     $runTimestamp = Get-Date
     $timestamp = $runTimestamp.ToString('yyyyMMdd-HHmmss')
-    $filePrefix = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $excelPath = Join-Path -Path $run.OutputDirectory -ChildPath "${filePrefix}Migration-Inventory_$timestamp.xlsx"
+
+    # Named through Get-MigrationOutputPath, the single owner of the filename contract.
+    # 'Migration-Inventory' is the whole Name rather than a name plus a suffix: the parser
+    # splits on the last hyphen only when what follows it is a mode suffix ('Results' or
+    # 'DryRun'), so a hyphenated name like this one comes back whole.
+    $excelPath = Get-MigrationOutputPath -Name 'Migration-Inventory' -Extension 'xlsx' -Timestamp $runTimestamp
 
     # ImportExcel is a convenience, not a dependency: an inventory that produced only CSVs is
     # still a complete inventory, so a failed install warns rather than aborting the run.

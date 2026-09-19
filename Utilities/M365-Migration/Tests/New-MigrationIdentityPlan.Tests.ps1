@@ -792,6 +792,28 @@ Describe 'New-MigrationIdentityPlan' {
         }
     }
 
+    Context 'The plan filename is on the output contract' {
+
+        It 'Parses back through ConvertFrom-MigrationOutputPath as Name IdentityPlan' {
+            # The plan is named through Get-MigrationOutputPath, the single owner of the
+            # <Prefix>_<Name>_<timestamp>.<ext> contract. This pins the shape so a future
+            # change to either side has to keep the file readable by the parser.
+            $outputPath = Join-Path $TestDrive 'named-plan'
+            # Invoke-PlanRun's own file search only matches the unprefixed name, so the
+            # prefixed one is located here.
+            $null = Invoke-PlanRun -OutputPath $outputPath -Parameter @{ Prefix = 'Contoso' }
+            $file = @(Get-ChildItem -Path $outputPath -Filter '*IdentityPlan_*.csv' -Recurse)
+            $file.Count | Should -Be 1
+            $parsed = ConvertFrom-MigrationOutputPath -Path $file[0].FullName
+
+            $parsed | Should -Not -BeNullOrEmpty
+            $parsed.Prefix | Should -BeExactly 'Contoso'
+            $parsed.Name | Should -BeExactly 'IdentityPlan'
+            $parsed.Suffix | Should -BeExactly ''
+            $parsed.Extension | Should -BeExactly 'csv'
+        }
+    }
+
     Context 'A users inventory written by Export-MigrationReport' {
 
         BeforeAll {

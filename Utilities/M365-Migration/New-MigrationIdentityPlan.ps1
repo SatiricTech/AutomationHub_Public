@@ -710,7 +710,9 @@ function Get-PlanTargetLicense {
 $exitCode = 0
 
 try {
-    $run = Initialize-MigrationRun -ScriptName 'New-MigrationIdentityPlan' -OutputPath $OutputPath `
+    # Discarded on purpose: the run context is read back through Get-MigrationOutputPath and
+    # Write-MigrationLog when they need it, so nothing here has to hold on to it.
+    $null = Initialize-MigrationRun -ScriptName 'New-MigrationIdentityPlan' -OutputPath $OutputPath `
         -Prefix $Prefix -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity `
         -BoundParameters $PSBoundParameters
 
@@ -1344,8 +1346,10 @@ try {
         }
     }
 
-    $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $planPath = Join-Path -Path $run.OutputDirectory -ChildPath ("${leader}IdentityPlan_{0}.csv" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    # Get-MigrationOutputPath owns the <Prefix>_<Name>_<timestamp>.<ext> contract, so the
+    # plan is named through it rather than assembled here: the run context already supplies
+    # the directory and the prefix, and this filename has always matched the contract.
+    $planPath = Get-MigrationOutputPath -Name 'IdentityPlan'
 
     if ($PSCmdlet.ShouldProcess($planPath, "Write $($planRows.Count) identity plan row(s)")) {
         Invoke-MigrationAction -Description "Write the identity plan to $planPath" -Action {

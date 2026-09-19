@@ -656,6 +656,20 @@ Describe 'The tenant guard is wired into the Main region' {
     It 'Still says out loud that an unpinned run was not verified' {
         $script:mainText | Should -Match 'No -TenantId was given; this run acts on tenant \$expectedTenant'
     }
+
+    It 'Names the workbook through Get-MigrationOutputPath rather than assembling it inline' {
+        # Structural for the same reason as the rest of this block. The point is that the
+        # filename contract has one owner: 'Migration-Inventory' is the whole Name (the
+        # parser keeps a hyphenated name whole unless what follows the hyphen is a mode
+        # suffix), and the prefix and directory come from the run context.
+        $calls = @($script:commandText |
+                Where-Object { $_ -like 'Get-MigrationOutputPath*' -and $_ -like "*Migration-Inventory*" })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match "-Name 'Migration-Inventory'"
+        $calls[0] | Should -Match "-Extension 'xlsx'"
+        $calls[0] | Should -Match '-Timestamp \$runTimestamp'
+        $script:mainText | Should -Not -Match 'Migration-Inventory_\$timestamp'
+    }
 }
 
 Describe 'The tab writer' {
