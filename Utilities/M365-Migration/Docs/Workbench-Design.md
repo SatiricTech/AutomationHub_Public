@@ -210,13 +210,26 @@ alternatives.
 `Get-MigrationWorkspace -Path` returns:
 
 ```
-Path, Settings (or $null), Label,
-Plan     = { Path; Pinned; RowCount; Waves = @{ '1' = 90; '2' = 52 }; Statuses = @{ Planned = 134; Collision = 3; ... }; LastWrite }
-Steps    = one entry per step instance:
-           { Id; State; LastRun; LastDryRun; Files; Summary = @{ Succeeded; Failed; Skipped; Planned }; ExitCode; TenantVerified }
-Folders  = the prefix folders found
-Warnings = header-only CSVs, unparseable filenames, a plan newer than the pinned one, ...
+Path           the workspace folder, resolved
+SettingsPath   <workspace>/M365Migration.settings.json
+SettingsResult the whole Resolve-MigrationSettings result { Path; Exists; IsValid; Errors; Settings }
+Settings       the settings document, or $null when it is missing or invalid
+Label          from settings, else inferred (below), else ''
+Scenario       from settings, else 'TenantToTenant' - it selects which step instances are scanned
+Folders        [ordered] Source, Destination, Post, Label -> full path or $null
+Artefacts      every parsed file: { Path; Folder; Prefix; Name; Suffix; Timestamp; Extension }
+Plan           { Path; Pinned; Timestamp; RowCount; Waves = [ordered] @{ '1' = 90; '2' = 52 };
+                 Statuses = [ordered] @{ Planned = 134; Collision = 3; ... }; DivergentRows } or $null
+Steps          one entry per step instance:
+               { Id; State; LastRun; LastDryRun; Files; Summary = @{ Succeeded; Failed; Skipped; Planned };
+                 ExitCode; TenantVerified }
+Ledger         the run-ledger entries (7.4), in the order they were appended
+NextStepId     the step to do next, or $null
+Warnings       header-only CSVs, an unreadable plan, a plan newer than the pinned one, a damaged
+               ledger line, an ambiguous label, an unsatisfiable Requires, ...
 ```
+
+`Plan.Timestamp`, like every other "when", is the moment in the filename.
 
 Filenames are parsed by `ConvertFrom-MigrationOutputPath` (new, the single owner of the
 `<Prefix>_<Name>[-<Suffix>]_<yyyyMMdd-HHmmss>.<ext>` contract; `Get-MigrationOutputPath`
@@ -229,10 +242,18 @@ result tokens, in the folder that instance writes to (its fixed `-Prefix`, else 
 an inventory by `Prefix` equal to the instance's fixed `-Prefix` and the name `Users`; the
 plan by the name `IdentityPlan` in the label folder; a report by a name the instance's
 `Produces` lists as `Report:<name>`, taken whole (`DomainBlockers-Recheck` is one name).
+A script that names its results by mode carries both tokens as `ResultIds`, and the scanner
+matches on all of them: a CSV-mode comparison run from the command line still belongs to the
+comparison step that only ever writes the plan-mode token itself.
+
 Where two instances of one script could claim the same file (the three readiness stages, the
 domain-release report and remediation) the catalogue's attribution rule decides: the file
 belongs to the instance whose ledger entry recorded it, matched on the entry's `Files` list
-or on its `Started`..`Ended` window, and otherwise to the lowest-ordered instance.
+or on its `Started`..`Ended` window, and otherwise to the lowest-ordered instance. `Files`
+entries are matched on the leaf name, so a ledger written with relative or absolute paths
+reads the same, and a file *no* naming rule claims but a ledger entry names — a log, a report
+a future script adds — belongs to that entry's step. `Started` is floored to the whole second
+before the window comparison, because filename stamps carry nothing finer.
 
 Without a settings file the label is inferred: exactly one prefix folder that is not
 `Source`/`Destination`/`Post` and holds at least one parseable artefact is the label folder;
@@ -253,15 +274,32 @@ State per step instance:
 
 Where two rules could both apply, they are settled in this order: `Failed`, `WorkRemains`,
 `DryRun`, `PartlyFailed`, `Done` — a ledger that says the run failed outranks the file it
-managed to write before it did, and a dry run newer than the last live run outranks that run.
+managed to write before it did, and a rehearsal newer than the last live run outranks it.
+
+What counts as "live" is narrow, and deliberately so: a `-Results_` file, or the inventory or
+plan a non-results step writes. A log or a report never makes a step `Done` — a domain-release
+report says what the step found, not that it finished, and a log written in the same second as
+a rehearsal would otherwise read as a live run. A step with only logs or reports on disk and
+no ledger entry stays `NotRun`.
+
+Whether a run was a rehearsal is the ledger's to say: when the newest entry for the step
+records `DryRun`, that wins over what the filenames imply; a line that did not record it
+leaves the question to the files.
+
+A recorded run that left nothing behind and carries an exit code the catalogue does not
+define — an abort, a child that died — is `Failed`. It is certainly not `Done`.
+
 `Stale` is judged afterwards, only for a step that reads the plan (`Requires` names `Plan`,
-or `Resolve` maps a parameter to the `Plan` resolver), and against the plan's own filename
-timestamp.
+or `Resolve` maps a parameter to the `Plan` resolver), against the plan's own filename
+timestamp, and dated by the step's newest artefact — or, when the run left no file behind, by
+its ledger entry's `Started`.
 
 "Next step" is the lowest-ordered instance whose `Requires` are all `Done` and whose own
 state is not `Done`. A `Requires` entry that names an artefact kind rather than a step
 instance (see 5.2) is satisfied when that artefact exists in the workspace, whether or not
-the step that would have produced it has run here.
+the step that would have produced it has run here. A `Requires` entry that is neither — not a
+step in the scanned scenario, not a kind in the `Produces` vocabulary — can never be met, so
+it blocks its step and is reported in `Warnings` naming both.
 
 Reading a results CSV for the summary reads only the `Status` column; the `GeneratedPassword`
 column is never read, rendered or persisted by the workbench.

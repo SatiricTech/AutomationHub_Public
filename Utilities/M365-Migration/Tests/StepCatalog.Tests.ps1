@@ -534,7 +534,35 @@ Describe 'Get-MigrationStep' {
         $step = Get-MigrationStep -Id 'New-Users'
         $step.Script | Should -BeExactly 'New-MigrationUsers'
         $step.ResultId | Should -BeExactly 'New-Users'
+        @($step.ResultIds) | Should -Be @('New-Users')
         @($step.Fixed.Keys) | Should -BeNullOrEmpty
+    }
+
+    <#
+        A script that names its results by mode writes two tokens, and the folder scanner has
+        to look for both: an instance that produces only one of them still has to own a file
+        the other mode wrote, or a CSV-mode comparison run from the command line would look
+        like a step that never ran. ResultId stays the token this view writes; ResultIds is
+        every token the script can write.
+    #>
+    It 'exposes every result token of a script that names its results by mode' {
+        $bare = Get-MigrationStep -Script 'Compare-MigrationUserData'
+        $bare.ResultId | Should -BeExactly 'Compare-UserData'
+        @($bare.ResultIds) | Should -Be @('Compare-UserData', 'Compare-UserData-Plan')
+
+        $instance = Get-MigrationStep -Id 'Compare-Plan'
+        $instance.ResultId | Should -BeExactly 'Compare-UserData-Plan'
+        @($instance.ResultIds) | Should -Be @('Compare-UserData', 'Compare-UserData-Plan')
+    }
+
+    It 'gives every step a ResultIds list that contains its own ResultId' {
+        foreach ($step in Get-MigrationStep) {
+            if (-not $step.ResultId) {
+                @($step.ResultIds) | Should -BeNullOrEmpty -Because "$($step.Id) names no results"
+                continue
+            }
+            @($step.ResultIds) | Should -Contain $step.ResultId -Because "$($step.Id) writes that token"
+        }
     }
 
     It 'returns the bare script entry, with no fixed values, for the all-tools view' {

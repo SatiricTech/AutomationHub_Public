@@ -60,7 +60,10 @@ function Get-MigrationRunLedgerEntry {
     }
 
     # Every field section 7.4 defines, with the default an absent one takes. The three list
-    # fields default to an empty array so a caller can pipe them without a null check.
+    # fields default to an empty array so a caller can pipe them without a null check. DryRun
+    # and TenantVerified default to $null rather than $false because the scanner acts on them:
+    # "this run was a rehearsal" and "we never recorded whether it was" are different answers,
+    # and only the first may override what the files on disk say.
     $template = [ordered]@{
         Started        = $null
         Ended          = $null
@@ -68,7 +71,7 @@ function Get-MigrationRunLedgerEntry {
         Script         = ''
         Side           = ''
         TenantId       = ''
-        DryRun         = $false
+        DryRun         = $null
         Wave           = @()
         ExitCode       = $null
         Meaning        = ''

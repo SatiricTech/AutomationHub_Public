@@ -231,7 +231,7 @@ Describe 'Get-MigrationWorkspace and the pinned plan' {
         ($workspace.Warnings -join ' ') | Should -Match '20250101-000000'
     }
 
-    It 'calls a plan consumer Stale when its last run predates the pinned plan' {
+    It 'calls a plan consumer Stale when its last run predates the workspace plan' {
         $workspacePath = Copy-FixtureWorkspace -Name 'stale'
         New-PlanFile -Path (Join-Path $workspacePath 'Contoso' 'Contoso_IdentityPlan_20260919-080000.csv') -Rows @(
             @{ ObjectType = 'User'; Wave = '1'; SourceUserPrincipalName = 'ada.lovelace@contoso.com'
@@ -243,6 +243,25 @@ Describe 'Get-MigrationWorkspace and the pinned plan' {
         (Get-WorkspaceStep -Workspace $workspace -Id 'Readiness-Pre').State | Should -BeExactly 'Stale'
         # The source inventory reads no plan, so a newer plan cannot make it stale.
         (Get-WorkspaceStep -Workspace $workspace -Id 'Inventory-Source').State | Should -BeExactly 'Done'
+    }
+
+    It 'calls a step Stale when the plan has moved on since the only run the ledger records' {
+        $workspacePath = Join-Path $TestDrive 'stale-from-ledger'
+        $null = New-Item -Path (Join-Path $workspacePath 'Workbench') -ItemType Directory -Force
+        Copy-Item -LiteralPath (Join-Path $script:FixtureRoot 'M365Migration.settings.json') `
+            -Destination $workspacePath
+        New-PlanFile -Path (Join-Path $workspacePath 'Contoso' 'Contoso_IdentityPlan_20260919-080000.csv') -Rows @(
+            @{ ObjectType = 'User'; Wave = '1'; SourceUserPrincipalName = 'ada.lovelace@contoso.com'
+                TargetUserPrincipalName = 'ada.lovelace@newco.com'; PlanStatus = 'Planned'
+            })
+        Add-Content -LiteralPath (Join-Path $workspacePath 'Workbench' 'Runs.jsonl') -Encoding utf8 -Value (
+            '{"Started":"2026-09-18T10:20:00","Ended":"2026-09-18T10:20:44","StepId":"Readiness-Pre",' +
+            '"DryRun":false,"ExitCode":0,"Meaning":"Completed","TenantVerified":true,"Files":[]}')
+
+        # The run left no file behind, so the ledger's own start time is what the plan is
+        # compared against.
+        (Get-WorkspaceStep -Workspace (Get-MigrationWorkspace -Path $workspacePath) -Id 'Readiness-Pre').State |
+            Should -BeExactly 'Stale'
     }
 
     It 'warns and reports no plan when the plan file fails the schema' {
@@ -328,6 +347,26 @@ Describe 'Get-MigrationWorkspace on a messy folder' {
         ($workspace.Warnings -join ' ') | Should -Match 'Contoso_New-Recipients-Results_20260918-120000\.csv'
     }
 
+    It 'warns by name about a requirement that is neither a step nor an artefact kind' {
+        InModuleScope M365Migration -Parameters @{ Root = $TestDrive } {
+            param($Root)
+            Mock Get-MigrationStep {
+                [pscustomobject]@{
+                    Id = 'Imaginary-Step'; Order = 1; ResultId = 'Imaginary'; Fixed = @{}; Resolve = @{}
+                    Produces = @('Results', 'Log'); Requires = @('SomethingElse')
+                }
+            }
+
+            $workspacePath = Join-Path $Root 'bad-requirement'
+            $null = New-Item -Path $workspacePath -ItemType Directory -Force
+            $workspace = Get-MigrationWorkspace -Path $workspacePath
+
+            ($workspace.Warnings -join ' ') | Should -Match 'Imaginary-Step'
+            ($workspace.Warnings -join ' ') | Should -Match 'SomethingElse'
+            $workspace.NextStepId | Should -BeNullOrEmpty
+        }
+    }
+
     It 'warns about a malformed ledger line and still reads the good ones' {
         $workspacePath = Copy-FixtureWorkspace -Name 'bad-ledger'
         $ledgerPath = Join-Path $workspacePath 'Workbench' 'Runs.jsonl'
@@ -401,9 +440,62 @@ Describe 'Get-MigrationWorkspace state rules driven by the ledger' {
                 'Contoso_DomainBlockers-Recheck_20260918-150000.csv')
 
         $workspace = Get-MigrationWorkspace -Path $workspacePath
-        $files = @((Get-WorkspaceStep -Workspace $workspace -Id 'DomainReferences-Report').Files |
-                ForEach-Object { Split-Path -Path $_.Path -Leaf })
-        $files | Should -Contain 'Contoso_DomainBlockers-Recheck_20260918-150000.csv'
+        $step = Get-WorkspaceStep -Workspace $workspace -Id 'DomainReferences-Report'
+        @($step.Files | ForEach-Object { Split-Path -Path $_.Path -Leaf }) |
+            Should -Contain 'Contoso_DomainBlockers-Recheck_20260918-150000.csv'
+        # A report says what the step found, never that it finished: only a live results file
+        # (or the inventory or plan a non-results step writes) can do that.
+        $step.State | Should -BeExactly 'NotRun'
+    }
+
+    It 'attributes both result tokens of a script that names its results by mode' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'both-tokens'
+        New-ResultFile -Status @('Succeeded') -Path (Join-Path $workspacePath 'Contoso' `
+                'Contoso_Compare-UserData-Results_20260919-090000.csv')
+
+        $step = Get-WorkspaceStep -Workspace (Get-MigrationWorkspace -Path $workspacePath) -Id 'Compare-Plan'
+        @($step.Files | ForEach-Object { Split-Path -Path $_.Path -Leaf }) |
+            Should -Contain 'Contoso_Compare-UserData-Results_20260919-090000.csv'
+    }
+}
+
+Describe 'Get-MigrationWorkspace tells a rehearsal from a live run' {
+
+    It 'stays a rehearsal when a log the ledger attributes shares the second of the dry run' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'same-second-log'
+        $log = 'Contoso_New-MigrationUsers_20260918-103100.log'
+        'rehearsal log' | Set-Content -LiteralPath (Join-Path $workspacePath 'Contoso' $log) -Encoding utf8
+        Add-Content -LiteralPath (Join-Path $workspacePath 'Workbench' 'Runs.jsonl') -Encoding utf8 -Value (
+            '{"Started":"2026-09-18T10:31:00","Ended":"2026-09-18T10:31:20","StepId":"New-Users",' +
+            '"ExitCode":0,"Meaning":"Completed","TenantVerified":true,"Files":["' + $log + '"]}')
+
+        $workspace = Get-MigrationWorkspace -Path $workspacePath
+        (Get-WorkspaceStep -Workspace $workspace -Id 'New-Users').State | Should -BeExactly 'DryRun'
+        $workspace.NextStepId | Should -BeExactly 'New-Users'
+    }
+
+    It 'believes a ledger entry that says the run was a rehearsal' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'ledger-says-dryrun'
+        $log = 'Contoso_New-MigrationRecipients_20260918-120000.log'
+        'rehearsal log' | Set-Content -LiteralPath (Join-Path $workspacePath 'Contoso' $log) -Encoding utf8
+        Add-Content -LiteralPath (Join-Path $workspacePath 'Workbench' 'Runs.jsonl') -Encoding utf8 -Value (
+            '{"Started":"2026-09-18T12:00:00","Ended":"2026-09-18T12:00:30","StepId":"New-Recipients",' +
+            '"DryRun":true,"ExitCode":0,"Meaning":"Completed","TenantVerified":true,"Files":["' + $log + '"]}')
+
+        (Get-WorkspaceStep -Workspace (Get-MigrationWorkspace -Path $workspacePath) -Id 'New-Recipients').State |
+            Should -BeExactly 'DryRun'
+    }
+
+    It 'calls provisioning Done once a live run follows the rehearsal' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'live-after-dryrun'
+        New-ResultFile -Status @('Succeeded', 'Succeeded') -Path (Join-Path $workspacePath 'Contoso' `
+                'Contoso_New-Users-Results_20260918-104500.csv')
+
+        $workspace = Get-MigrationWorkspace -Path $workspacePath
+        $step = Get-WorkspaceStep -Workspace $workspace -Id 'New-Users'
+        $step.State | Should -BeExactly 'Done'
+        $step.Summary.Succeeded | Should -Be 2
+        $workspace.NextStepId | Should -BeExactly 'Set-Licenses'
     }
 }
 
@@ -505,6 +597,52 @@ Describe 'Private workspace helpers' {
             @($ledger.Entries).Count | Should -Be 2
             @($ledger.Warnings) | Should -BeNullOrEmpty
             $ledger.Entries[1].ExitCode | Should -Be 2
+        }
+    }
+
+    It 'Select-MigrationNewestEntry takes the latest start, then the latest line' {
+        InModuleScope M365Migration {
+            $entries = @(
+                [pscustomobject]@{ StepId = 'A'; Started = [datetime]'2026-09-18T10:00:00'; LineNumber = 1 }
+                [pscustomobject]@{ StepId = 'B'; Started = [datetime]'2026-09-18T12:00:00'; LineNumber = 2 }
+                [pscustomobject]@{ StepId = 'C'; Started = [datetime]'2026-09-18T12:00:00'; LineNumber = 3 }
+                [pscustomobject]@{ StepId = 'D'; Started = $null; LineNumber = 4 }
+            )
+            (Select-MigrationNewestEntry -Entry $entries).StepId | Should -BeExactly 'C'
+        }
+    }
+
+    It 'Test-MigrationRunWindow floors a sub-second start to the whole second the filename carries' {
+        InModuleScope M365Migration {
+            $entry = [pscustomobject]@{
+                Started = [datetime]'2026-09-18T13:00:00.500'
+                Ended   = [datetime]'2026-09-18T13:00:30'
+            }
+            Test-MigrationRunWindow -Entry $entry -Timestamp ([datetime]'2026-09-18T13:00:00') | Should -BeTrue
+            Test-MigrationRunWindow -Entry $entry -Timestamp ([datetime]'2026-09-18T13:00:31') | Should -BeFalse
+
+            # An entry that never recorded an end can only own a file stamped at its own second.
+            $open = [pscustomobject]@{ Started = [datetime]'2026-09-18T13:00:00.500'; Ended = $null }
+            Test-MigrationRunWindow -Entry $open -Timestamp ([datetime]'2026-09-18T13:00:00') | Should -BeTrue
+            Test-MigrationRunWindow -Entry $open -Timestamp ([datetime]'2026-09-18T13:00:01') | Should -BeFalse
+
+            $unstarted = [pscustomobject]@{ Started = $null; Ended = $null }
+            Test-MigrationRunWindow -Entry $unstarted -Timestamp ([datetime]'2026-09-18T13:00:00') |
+                Should -BeFalse
+        }
+    }
+
+    It 'Get-MigrationRunLedgerEntry leaves DryRun unknown when the line does not say' {
+        InModuleScope M365Migration -Parameters @{ Path = (Join-Path $script:FixtureRoot 'Workbench' 'Runs.jsonl') } {
+            param($Path)
+            $ledger = Get-MigrationRunLedgerEntry -Path $Path
+            $ledger.Entries[0].DryRun | Should -BeFalse -Because 'the fixture ledger states it'
+        }
+
+        InModuleScope M365Migration -Parameters @{ Path = (Join-Path $TestDrive 'silent-ledger.jsonl') } {
+            param($Path)
+            '{"StepId":"New-Users","ExitCode":0}' | Set-Content -LiteralPath $Path -Encoding utf8
+            (Get-MigrationRunLedgerEntry -Path $Path).Entries[0].DryRun | Should -BeNullOrEmpty
         }
     }
 

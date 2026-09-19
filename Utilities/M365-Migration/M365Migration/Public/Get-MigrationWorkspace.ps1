@@ -70,29 +70,6 @@ function Get-MigrationWorkspace {
         [string]$Path
     )
 
-    # The newest of a set of ledger entries: by start time, and by position in the file when
-    # two runs share one (or when a line carries no readable Started).
-    function Select-MigrationNewestEntry {
-        param([object[]]$Entry)
-
-        return @($Entry | Sort-Object -Property @{
-                Expression = { if ($null -ne $_.Started) { $_.Started } else { [datetime]::MinValue } }
-                Descending = $true
-            }, @{ Expression = 'LineNumber'; Descending = $true }) | Select-Object -First 1
-    }
-
-    # Did this run produce a file stamped at this moment? Filename stamps are whole seconds,
-    # so a run that started at .500 would otherwise appear to start after the file it wrote
-    # in that same second.
-    function Test-MigrationRunWindow {
-        param($Entry, [datetime]$Timestamp)
-
-        if ($null -eq $Entry.Started) { return $false }
-        $from = $Entry.Started.AddTicks( - ($Entry.Started.Ticks % [timespan]::TicksPerSecond))
-        $to = if ($null -ne $Entry.Ended) { $Entry.Ended } else { $from }
-        return ($Timestamp -ge $from -and $Timestamp -le $to)
-    }
-
     $warnings = [System.Collections.Generic.List[string]]::new()
 
     $workspacePath = $Path
@@ -357,18 +334,46 @@ function Get-MigrationWorkspace {
     foreach ($step in $steps) {
         $files = @()
         if ($claims.ContainsKey($step.Id)) {
-            $files = @($claims[$step.Id] | Sort-Object -Property Timestamp -Descending)
+            # Path is the tie-break: two artefacts of one step can share a second, and the
+            # answer to "which is newest" has to be the same on every scan.
+            $files = @($claims[$step.Id] | Sort-Object -Property Timestamp, Path -Descending)
         }
 
         $entries = @()
         if ($entriesByStep.ContainsKey($step.Id)) { $entries = @($entriesByStep[$step.Id]) }
         $newestEntry = if ($entries.Count -gt 0) { Select-MigrationNewestEntry -Entry $entries } else { $null }
 
+        # LastRun is for display - the newest thing this step left behind, log or report
+        # included. What decides Done is narrower: only a live results file, or the inventory
+        # or plan a non-results step writes, is evidence that the step actually completed. A
+        # log stamped at the same second as a rehearsal must never read as a live run.
+        $producesInventory = $step.Produces -contains 'Inventory'
+        $producesPlan = $step.Produces -contains 'Plan'
         $lastRun = @($files | Where-Object { $_.Suffix -ne 'DryRun' }) | Select-Object -First 1
         $lastDryRun = @($files | Where-Object { $_.Suffix -eq 'DryRun' }) | Select-Object -First 1
-        $summarySource = @($files |
-                Where-Object { $_.Suffix -in @('Results', 'DryRun') -and $_.Extension -eq 'csv' }) |
-            Select-Object -First 1
+        $liveResults = @($files | Where-Object { $_.Suffix -eq 'Results' }) | Select-Object -First 1
+        $liveArtefact = @($files | Where-Object {
+                $_.Suffix -eq 'Results' -or
+                ($producesInventory -and $_.Suffix -eq '' -and $_.Name -eq 'Users') -or
+                ($producesPlan -and $_.Suffix -eq '' -and $_.Name -eq 'IdentityPlan')
+            }) | Select-Object -First 1
+
+        # The ledger knows whether a run was a rehearsal; the filenames only imply it. A line
+        # that did not record DryRun leaves the field $null, and then the files decide.
+        $recordedDryRun = if ($newestEntry) {
+            Get-MigrationProperty -InputObject $newestEntry -Name 'DryRun' -Default $null
+        }
+        else { $null }
+        $isDryRun = if ($null -ne $recordedDryRun) {
+            [bool]$recordedDryRun
+        }
+        else {
+            [bool]$lastDryRun -and (-not $liveArtefact -or $lastDryRun.Timestamp -gt $liveArtefact.Timestamp)
+        }
+
+        $summarySource = if ($isDryRun -and $lastDryRun) { $lastDryRun }
+        elseif ($liveResults) { $liveResults }
+        else { $lastDryRun }
 
         $summary = [pscustomobject]@{ Succeeded = 0; Failed = 0; Skipped = 0; Planned = 0 }
         if ($summarySource) {
@@ -395,22 +400,28 @@ function Get-MigrationWorkspace {
 
         $state = 'NotRun'
         if ($files.Count -gt 0 -or $entries.Count -gt 0) {
-            $newestIsDryRun = $lastDryRun -and (-not $lastRun -or $lastDryRun.Timestamp -gt $lastRun.Timestamp)
             $state = if ($exitCode -eq 1) { 'Failed' }
             elseif ($exitCode -eq 3) { 'WorkRemains' }
-            elseif ($newestIsDryRun) { 'DryRun' }
+            elseif ($isDryRun) { 'DryRun' }
             elseif ($summary.Failed -gt 0 -or $exitCode -eq 2) { 'PartlyFailed' }
-            elseif ($files.Count -gt 0 -or $exitCode -eq 0) { 'Done' }
+            elseif ($liveArtefact -or $exitCode -eq 0) { 'Done' }
             # A run was recorded, it left nothing behind and its exit code says nothing the
             # catalogue knows - an abort, or a child that died. It is certainly not done.
-            else { 'Failed' }
+            elseif ($entries.Count -gt 0) { 'Failed' }
+            # Only logs or reports on disk and no record of a run: something wrote here, but
+            # nothing says this step completed, so it is still waiting to be done.
+            else { 'NotRun' }
         }
 
         # Only a step that reads the plan can be stale against it: it was run against a
-        # document that has since been replaced.
+        # document that has since been replaced. A run that left no file behind is dated by
+        # the ledger instead, which is the only record there is of when it happened.
         $readsPlan = ($step.Requires -contains 'Plan') -or (@($step.Resolve.Values) -contains 'Plan')
-        if ($state -eq 'Done' -and $readsPlan -and $plan -and $lastRun -and
-            $null -ne $plan.Timestamp -and $lastRun.Timestamp -lt $plan.Timestamp) {
+        $ranAt = if ($lastRun) { $lastRun.Timestamp }
+        elseif ($newestEntry) { Get-MigrationProperty -InputObject $newestEntry -Name 'Started' -Default $null }
+        else { $null }
+        if ($state -eq 'Done' -and $readsPlan -and $plan -and $ranAt -is [datetime] -and
+            $plan.Timestamp -is [datetime] -and $ranAt -lt $plan.Timestamp) {
             $state = 'Stale'
         }
 
@@ -449,6 +460,22 @@ function Get-MigrationWorkspace {
         }
     }
 
+    # A requirement that is neither a step in this scenario nor a kind the Produces vocabulary
+    # defines can never be satisfied, so the step it belongs to would sit un-offered forever
+    # with nothing to show for it. That is a catalogue mistake, and it is worth saying so.
+    $knownKinds = @('Results', 'Inventory', 'Plan', 'Mapping', 'Log')
+    foreach ($step in $steps) {
+        foreach ($requirement in @($step.Requires)) {
+            $name = [string]$requirement
+            if ($stateById.Contains($name) -or $knownKinds -contains $name -or
+                $declaredReports -contains $name) {
+                continue
+            }
+            $warnings.Add("Step '$($step.Id)' requires '$name', which is neither a step in this " +
+                'workspace nor an artefact kind the scanner knows.')
+        }
+    }
+
     $nextStepId = $null
     foreach ($step in $steps) {
         if ($stateById[$step.Id] -eq 'Done') { continue }
@@ -481,7 +508,7 @@ function Get-MigrationWorkspace {
         Label          = $label
         Scenario       = $scenario
         Folders        = $folders
-        Artefacts      = @($artefacts | Sort-Object -Property Folder, Timestamp, Name)
+        Artefacts      = @($artefacts | Sort-Object -Property Folder, Timestamp, Path)
         Plan           = $plan
         Steps          = @($stepStates)
         Ledger         = $ledger

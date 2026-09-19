@@ -90,6 +90,17 @@ function New-MigrationStepObject {
         $fixed = Merge-MigrationStepMap -Base $entryFixed -Override $instanceFixed
     }
 
+    # A script that names its results by mode declares both tokens on its entry and the token
+    # this view writes as ResultId. Both are published: the folder scanner has to recognise a
+    # file either mode wrote, while the driver only ever writes this view's own token. Where
+    # only one of the two keys is declared, the other is derived from it, so every step comes
+    # back with a ResultIds list that contains its ResultId.
+    $resultId = Get-MigrationCatalogValue -Entry $Entry -Instance $Instance -Key 'ResultId' -Default $null
+    $resultIds = @(Get-MigrationCatalogValue -Entry $Entry -Instance $Instance -Key 'ResultIds' -Default @())
+    if ($resultIds.Count -eq 0 -and $resultId) { $resultIds = @($resultId) }
+    if (-not $resultId -and $resultIds.Count -gt 0) { $resultId = $resultIds[0] }
+    if ($resultId -and $resultIds -notcontains $resultId) { $resultIds = @($resultIds) + @($resultId) }
+
     $entryBind = Get-MigrationCatalogValue -Entry $Entry -Instance $null -Key 'Bind' -Default @{}
     $entryResolve = Get-MigrationCatalogValue -Entry $Entry -Instance $null -Key 'Resolve' -Default @{}
     $exitCodes = Get-MigrationCatalogValue -Entry $Entry -Instance $Instance -Key 'ExitCodes' `
@@ -108,7 +119,8 @@ function New-MigrationStepObject {
         Connects      = @(Get-MigrationCatalogValue -Entry $Entry -Instance $Instance -Key 'Connects' -Default @())
         Impact        = [string](Get-MigrationCatalogValue -Entry $Entry -Instance $Instance -Key 'Impact' `
                 -Default 'Read')
-        ResultId      = Get-MigrationCatalogValue -Entry $Entry -Instance $Instance -Key 'ResultId' -Default $null
+        ResultId      = $resultId
+        ResultIds     = @($resultIds)
         Confirm       = [bool](Get-MigrationCatalogValue -Entry $Entry -Instance $Instance -Key 'Confirm' `
                 -Default $false)
         Fixed         = $fixed
