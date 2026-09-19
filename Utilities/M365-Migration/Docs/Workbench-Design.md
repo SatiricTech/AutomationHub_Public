@@ -170,6 +170,17 @@ Keyed by script basename. Every key below is optional except `Phase`, `Side`, `T
 }
 ```
 
+Two details the example does not show. A script that names its results by mode carries
+`ResultIds` as well as `ResultId` — `Compare-MigrationUserData` writes `Compare-UserData` in
+CSV mode and `Compare-UserData-Plan` in plan mode — and the drift guard compares that list
+with the `-Name` literals the script really passes to `Export-MigrationResult`. An instance
+may override any key of its script's entry, `Bind` included; `Bind` merges on the target
+parameter rather than the settings key, so the inventory's destination-side instances replace
+the entry's `Source.TenantId` → `-TenantId` binding instead of leaving both standing.
+`Requires` names either a step instance (which must be `Done`) or an artefact kind from the
+`Produces` vocabulary (which must exist), so a plan supplied by hand satisfies `'Plan'`
+without the planner having run in this workspace.
+
 The drift-guard test (`Tests/StepCatalog.Tests.ps1`) asserts, for every script: an overlay
 entry exists; every `Bind` target, `Resolve` key and `Fixed` key names a real parameter;
 every `Bind` source is a key in the settings schema; every `ValidateSet` value used in
