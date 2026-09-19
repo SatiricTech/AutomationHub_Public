@@ -66,6 +66,7 @@
         'Split-MigrationTeamsLineUri'
         'Test-MigrationAddress'
         'Test-MigrationPlanRowActionable'
+        'Test-MigrationStepGate'
         'Test-MigrationProtectedAddress'
         'Write-MigrationLog'
     )

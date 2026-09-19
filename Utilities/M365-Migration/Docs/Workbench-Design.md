@@ -352,15 +352,20 @@ cannot bind at all.
 
 ### 7.2 Gates — `Test-MigrationStepGate`
 
-Returned as data; both front ends render them the same way.
+`Test-MigrationStepGate -Step -Arguments <the 7.1 result> -Workspace [-Live]` returns the
+gates as data — `{ Kind; Severity; Satisfied; Message; RequiredInput }` — and both front ends
+render them the same way. Every gate that applies comes back, satisfied ones included: the
+list is a checklist, and a gate the operator has already met is how they know the rehearsal
+counted. The waves and the parameter set are read off the resolved arguments, so the gates
+judge the run that would actually happen.
 
 | Gate | Applies to | Behaviour |
 |---|---|---|
-| `DryRunFirst` | `Impact = Write` and `Destructive` | Soft: a live run is offered only after a `-DryRun_` results file newer than the pinned plan exists for that step and wave. Override allowed, recorded in the ledger. |
-| `TypedConfirmation` | `Impact = Destructive`, and any `Side = Source` writer | Hard: the operator must type the source vanity domain (domain release, Teams number removal) or the word the gate names. A keypress/button is not accepted. |
-| `Prerequisite` | steps with `Requires` | Soft: lists what is not `Done`. |
-| `TenantMismatch` | any connecting step | Hard, post-run: the "Connected to ... tenant <guid>" lines in the child's log are compared with the expected side's GUID; a mismatch is flagged regardless of exit code. |
-| `WaveRequired` | plan consumers | Soft: a blank wave means the whole plan; confirmed explicitly for writers. |
+| `DryRunFirst` | `Impact = Write` and `Destructive`, live runs only | Soft: satisfied by a dry-run ledger entry for that step whose waves match the ones requested (as sets: order and repeats do not count, and two blanks match) and whose `Started` is after the plan's timestamp. Where the ledger records no rehearsal of that step, a `-DryRun_` results file newer than the plan counts instead — a run made from the command line is still a run. With no plan in the workspace, any rehearsal counts. Override allowed, recorded in the ledger. |
+| `TypedConfirmation` | `Impact = Destructive`, and any `Side = Source` step whose `Impact` is not `Read` | Hard: the operator must type `RequiredInput` — the source vanity domain (`Domains.Target`) for a source-side step, otherwise the word `REMOVE`, and `REMOVE` as the fallback where no domain is configured. A keypress/button is not accepted, so the gate is never returned satisfied. Asked for on a rehearsal too: a rehearsal still signs in to the source tenant. |
+| `Prerequisite` | steps with `Requires` | Soft: lists what is not in hand. A requirement naming an artefact kind is met by the artefact existing, whoever produced it. |
+| `TenantMismatch` | any connecting step | Hard, post-run: the "Connected to ... tenant <guid>" lines in the child's log are compared with the expected side's GUID; a mismatch is flagged regardless of exit code. Not produced by `Test-MigrationStepGate` — it cannot be known until the child has run, so `Invoke-MigrationStep` (7.3) appends it. |
+| `WaveRequired` | live runs of a step whose chosen parameter set takes `-Wave` | Soft: a blank wave means the whole plan. The gate exists so that it is a decision rather than an omission; satisfied once a wave is named. |
 
 ### 7.3 Driver and child process
 
