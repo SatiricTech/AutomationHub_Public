@@ -38,6 +38,13 @@
     drift guard reads them directly, and under Set-StrictMode an absent key is an error rather
     than an empty answer.
 
+    One binding has a fallback the map cannot express. Domains.Release is the vanity domain
+    released from the SOURCE tenant and Domains.Target is the one identities land on in the
+    destination; they coincide only when the domain moves with the users. Release is therefore
+    allowed to be blank, meaning "same as Target" - and because a blank settings value is
+    skipped rather than passed, Resolve-MigrationStepArguments carries that fallback as a named
+    rule rather than leaving -Domain unset. See Docs/Workbench-Design.md, section 4.
+
     An instance may override any key above. Bind, Resolve and Fixed are merged with the
     script's, the instance winning - Bind by target parameter, so an instance that binds the
     destination tenant to -TenantId replaces the script's source-tenant binding rather than
@@ -362,7 +369,7 @@
         Bind      = @{
             'Label'                        = 'Prefix'
             'Defaults.Verbosity'           = 'Verbosity'
-            'Domains.Target'               = 'Domain'
+            'Domains.Release'              = 'Domain'
             'Source.OnMicrosoftDomain'     = 'FallbackDomain'
             'Source.TenantId'              = 'TenantId'
             'Source.DelegatedOrganization' = 'DelegatedOrganization'

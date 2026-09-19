@@ -101,7 +101,12 @@ function Get-MigrationSettingsSchema {
 
         [pscustomobject]@{
             Key = 'Domains.Target'; Type = 'Domain'; Default = ''; Required = $false; Choices = @()
-            Description = 'Vanity domain the identities land on; feeds -TargetDomain and -Domain.'
+            Description = 'Vanity domain the identities land on in the destination; feeds -TargetDomain.'
+        }
+        [pscustomobject]@{
+            Key = 'Domains.Release'; Type = 'Domain'; Default = ''; Required = $false; Choices = @()
+            Description = 'Vanity domain to release from the source tenant; blank = same as Target, ' +
+            'i.e. the domain moves with the users'
         }
         [pscustomobject]@{
             Key = 'Domains.Smtp'; Type = 'Domain'; Default = ''; Required = $false; Choices = @()

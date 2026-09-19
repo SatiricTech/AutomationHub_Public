@@ -19,15 +19,19 @@ function Test-MigrationStepGate {
           DryRunFirst       Soft. Write and Destructive steps only, and only for a live run:
                             a rehearsal is not gated by the demand to rehearse. Satisfied when
                             the ledger holds a dry run of this step for the same waves, started
-                            after the plan was written. Where the ledger has no rehearsal of
-                            this step on record, a -DryRun_ results file newer than the plan
-                            counts instead - a run made from the command line is still a run.
-                            With no plan in the workspace there is nothing for a rehearsal to
-                            be newer than, so any rehearsal counts.
+                            after the plan was written, that was not cancelled and exited 0 or
+                            2 - a rehearsal that was aborted or failed outright proved nothing,
+                            while "some rows failed" is a rehearsal that did its job. Where the
+                            ledger has no rehearsal of this step on record, a -DryRun_ results
+                            file newer than the plan counts instead - a run made from the
+                            command line is still a run. With no plan in the workspace there is
+                            nothing for a rehearsal to be newer than, so any rehearsal counts.
           TypedConfirmation Hard. Every Destructive step, and every write on the SOURCE tenant
                             whatever its impact, because the source tenant is the one with no
-                            undo. The operator types RequiredInput exactly: the source vanity
-                            domain (Domains.Target) for a source-side step, the word REMOVE
+                            undo. The operator types RequiredInput exactly: the effective
+                            release domain for a source-side step (Domains.Release, or
+                            Domains.Target where Release is blank - the same value the
+                            domain-release step's own -Domain comes from), the word REMOVE
                             otherwise, and REMOVE as the fallback when no domain is configured.
                             Never satisfied here - it is satisfied by the operator typing it,
                             which is the point - and asked for on a rehearsal too, because a
@@ -35,9 +39,10 @@ function Test-MigrationStepGate {
           Prerequisite      Soft. Steps with Requires. Lists what is not in hand, where a
                             requirement naming an artefact kind is met by the artefact being
                             there, whoever produced it.
-          WaveRequired      Soft. Live runs of a step whose chosen parameter set takes -Wave.
-                            A blank wave is legal and means the whole plan; the gate exists so
-                            that it is a decision rather than an omission.
+          WaveRequired      Soft. Live runs of a Write or Destructive step whose chosen
+                            parameter set takes -Wave. A blank wave is legal and means the
+                            whole plan; the gate exists so that it is a decision rather than an
+                            omission, and only for the steps that change something.
 
         TenantMismatch is the fifth kind in the vocabulary and is deliberately never produced
         here. It is a post-run gate: it compares the "Connected to ... tenant <guid>" lines in
@@ -107,6 +112,7 @@ function Test-MigrationStepGate {
         if ($null -ne $Workspace.Plan) { $planStamp = $Workspace.Plan.Timestamp }
 
         $rehearsed = $false
+        $failedRehearsal = $null
         $rehearsals = @($Workspace.Ledger | Where-Object {
                 $_.StepId -eq $Step.Id -and
                 [bool](Get-MigrationProperty -InputObject $_ -Name 'DryRun' -Default $false)
@@ -115,10 +121,21 @@ function Test-MigrationStepGate {
         if ($rehearsals.Count -gt 0) {
             foreach ($entry in $rehearsals) {
                 if ((Get-MigrationWaveKey -Wave @($entry.Wave)) -ne $requestedKey) { continue }
-                if ($null -eq $planStamp) { $rehearsed = $true; break }
 
                 $started = Get-MigrationProperty -InputObject $entry -Name 'Started' -Default $null
-                if ($started -is [datetime] -and $started -gt $planStamp) { $rehearsed = $true; break }
+                if ($null -ne $planStamp -and -not ($started -is [datetime] -and $started -gt $planStamp)) {
+                    continue
+                }
+
+                # A rehearsal that was cancelled, or that fell over before it had walked the
+                # plan, proved nothing about the live run. Only "completed" and "some rows
+                # failed" are rehearsals that actually rehearsed: the second one found real
+                # problems, which is exactly what a dry run is for.
+                $exitCode = Get-MigrationProperty -InputObject $entry -Name 'ExitCode' -Default $null
+                $aborted = [bool](Get-MigrationProperty -InputObject $entry -Name 'Aborted' -Default $false)
+                if (-not $aborted -and $exitCode -in @(0, 2)) { $rehearsed = $true; break }
+
+                $failedRehearsal = if ($aborted) { 'was cancelled' } else { "exited $exitCode" }
             }
         }
         else {
@@ -135,6 +152,10 @@ function Test-MigrationStepGate {
 
         $message = if ($rehearsed) {
             "A rehearsal of this step$waveText, newer than the identity plan, is on record."
+        }
+        elseif ($failedRehearsal) {
+            "The last rehearsal of this step$waveText $failedRehearsal; run a dry run again, " +
+            'or override the gate - the override is recorded in the ledger.'
         }
         else {
             "No rehearsal of this step$waveText newer than the identity plan is on record. " +
@@ -158,7 +179,10 @@ function Test-MigrationStepGate {
         # impact; on the destination only a destructive step earns the keyboard.
         $required = 'REMOVE'
         if ($onSource) {
-            $domain = Get-MigrationStepSettingsValue -Workspace $Workspace -Key 'Domains.Target'
+            # The effective release domain: Domains.Release, or Domains.Target where Release is
+            # blank because the domain moves with the users. The same read the domain-release
+            # step's own -Domain comes from, so the operator types what the step will act on.
+            $domain = Get-MigrationStepSettingsValue -Workspace $Workspace -Key 'Domains.Release'
             if ($domain) { $required = [string]$domain }
         }
 
@@ -203,7 +227,10 @@ function Test-MigrationStepGate {
 
     # --- WaveRequired -----------------------------------------------------------------------------
 
-    if ($Live) {
+    # Writers only. A read-only plan consumer that processes the whole plan has read the whole
+    # plan, which costs time and nothing else; the gate exists to make "all of it" a decision
+    # for the steps that change something.
+    if ($Live -and $Step.Impact -in @('Write', 'Destructive')) {
         $waveParameter = @($Step.Parameters | Where-Object { $_.Name -eq 'Wave' })
         $takesWave = $false
         if ($waveParameter.Count -gt 0) {

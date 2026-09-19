@@ -46,6 +46,20 @@ function Test-MigrationStepRequirement {
     $state = @($Workspace.Steps | Where-Object { $_.Id -eq $Requirement })
     if ($state.Count -gt 0) { return ($state[0].State -eq 'Done') }
 
+    # The Produces vocabulary, mapped onto what the scanner's parsed filenames actually look
+    # like. These are the same rules Get-MigrationWorkspace uses to build its artefact-kind set
+    # (section 6), restated here rather than shared because the scanner builds the set once for
+    # a whole scan while this answers one question at a time.
+    #
+    #   Plan       the scanner already chose one - pinned, or newest - so its own answer stands.
+    #   Log        any .log the naming contract parsed, in any prefix folder.
+    #   Results    any '-Results_' file; a '-DryRun_' file is a rehearsal and is not evidence.
+    #   Inventory  the Users tab, which is the one every inventory run writes and so the one
+    #              that proves an inventory happened.
+    #   Mapping    the mapping export has no artefact of its own - the mover's workbook is named
+    #              by the mover's contract, not the toolkit's - so its results file stands in.
+    #   Report:<n> a suffix-less artefact whose whole Name is <n>; 'DomainBlockers-Recheck' is
+    #              one name, not a name plus a suffix.
     $artefacts = @($Workspace.Artefacts)
     switch ($Requirement) {
         'Plan' { return ($null -ne $Workspace.Plan) }

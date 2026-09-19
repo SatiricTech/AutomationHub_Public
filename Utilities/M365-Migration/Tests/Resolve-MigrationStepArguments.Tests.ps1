@@ -99,9 +99,20 @@ Describe 'Resolve-MigrationStepArguments against the committed fixture' {
             Test-HasArgument $script:Result 'LogPath' | Should -BeFalse
         }
 
-        It 'omits -Confirm because the script does not declare ConfirmImpact High' {
+        It 'passes -Confirm:$false even though the script is not High impact' {
+            # The catalogue's Confirm flag says "High impact", which this script is not, but the
+            # child still runs -NonInteractive: a ShouldProcess prompt it cannot answer must not
+            # depend on ConfirmImpact sitting below that process's $ConfirmPreference.
             $script:NewUsers.Confirm | Should -BeFalse
-            Test-HasArgument $script:Result 'Confirm' | Should -BeFalse
+            $argument = Get-Argument $script:Result 'Confirm'
+            $argument.Value | Should -BeFalse
+            $argument.Source | Should -BeExactly 'Common'
+        }
+
+        It 'omits -Confirm for a script that does not support ShouldProcess' {
+            $step = Get-MigrationStep -Id 'Inventory-Source'
+            $result = Resolve-MigrationStepArguments -Step $step -Workspace $script:Workspace
+            Test-HasArgument $result 'Confirm' | Should -BeFalse
         }
 
         It 'omits -DryRun unless it was asked for' {
@@ -273,7 +284,7 @@ Describe 'Resolve-MigrationStepArguments against the committed fixture' {
             Test-HasArgument $result 'IncludeCollisions' | Should -BeFalse
         }
 
-        It 'passes -Confirm:$false because the script declares ConfirmImpact High' {
+        It 'passes -Confirm:$false, as every ShouldProcess script gets' {
             $result = Resolve-MigrationStepArguments -Step $script:Step -Workspace $script:Workspace
             $argument = Get-Argument $result 'Confirm'
             $argument.Value | Should -BeFalse
@@ -285,6 +296,20 @@ Describe 'Resolve-MigrationStepArguments against the committed fixture' {
                 -Override @{ TestUser = 'ada.lovelace@newco.com' }
             (Get-Argument $result 'WordCount').Value | Should -Be 3
             (Get-Argument $result 'TenantId').Source | Should -BeExactly 'Settings'
+        }
+    }
+
+    Context 'the release domain' {
+
+        It 'gives the domain-release step the target domain while Release is blank' {
+            # Domains.Release blank means "the vanity domain moves with the users", so the
+            # domain released from the source is the one the identities land on.
+            $script:Workspace.Settings['Domains']['Release'] | Should -BeExactly ''
+            $step = Get-MigrationStep -Id 'DomainReferences-Remediate'
+            $result = Resolve-MigrationStepArguments -Step $step -Workspace $script:Workspace
+            $argument = Get-Argument $result 'Domain'
+            $argument.Value | Should -BeExactly 'newco.com'
+            $argument.Source | Should -BeExactly 'Settings'
         }
     }
 
@@ -438,6 +463,59 @@ Describe 'Resolve-MigrationStepArguments on workspaces that are not the happy pa
         $argument = Get-Argument $result 'WaveMapPath'
         $argument.Value | Should -BeExactly (Join-Path $workspace.Path 'Waves.csv')
         $argument.Source | Should -BeExactly 'Resolved'
+    }
+
+    It 'releases the domain Release names when it differs from the one identities land on' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'SeparateRelease'
+        Set-SettingsValue -WorkspacePath $workspacePath -Section 'Domains' -Key 'Release' -Value 'contoso.com'
+        $workspace = Get-MigrationWorkspace -Path $workspacePath
+        $step = Get-MigrationStep -Id 'DomainReferences-Remediate'
+
+        $result = Resolve-MigrationStepArguments -Step $step -Workspace $workspace
+        (Get-Argument $result 'Domain').Value | Should -BeExactly 'contoso.com'
+        # The planner still lands identities on the target domain: the two are separate keys
+        # precisely so a rebrand can release one and land on the other.
+        $planner = Resolve-MigrationStepArguments -Step (Get-MigrationStep -Id 'New-IdentityPlan') `
+            -Workspace $workspace
+        (Get-Argument $planner 'TargetDomain').Value | Should -BeExactly 'newco.com'
+    }
+
+    It 'gives each side the tenant its own settings block names' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'TwoTenants'
+        Set-SettingsValue -WorkspacePath $workspacePath -Section 'Source' -Key 'TenantId' `
+            -Value '11111111-1111-1111-1111-111111111111'
+        Set-SettingsValue -WorkspacePath $workspacePath -Section 'Destination' -Key 'TenantId' `
+            -Value '22222222-2222-2222-2222-222222222222'
+        $workspace = Get-MigrationWorkspace -Path $workspacePath
+
+        $source = Resolve-MigrationStepArguments -Step (Get-MigrationStep -Id 'Inventory-Source') `
+            -Workspace $workspace
+        (Get-Argument $source 'TenantId').Value | Should -BeExactly '11111111-1111-1111-1111-111111111111'
+
+        $destination = Resolve-MigrationStepArguments -Step (Get-MigrationStep -Id 'New-Users') `
+            -Workspace $workspace
+        (Get-Argument $destination 'TenantId').Value | Should -BeExactly '22222222-2222-2222-2222-222222222222'
+    }
+
+    It 'leaves a relative value alone unless the schema types its key as a path' {
+        # 'newco.com' is relative and would join happily onto the workspace folder. Only the
+        # schema's Type decides, never the shape of the value or the spelling of the key.
+        $workspace = Get-MigrationWorkspace -Path $script:FixtureRoot
+        $result = Resolve-MigrationStepArguments -Step (Get-MigrationStep -Id 'New-IdentityPlan') `
+            -Workspace $workspace
+        (Get-Argument $result 'TargetDomain').Value | Should -BeExactly 'newco.com'
+    }
+
+    It 'answers with nothing rather than throwing when the Export resolver has no catalogue' {
+        $workspace = Get-MigrationWorkspace -Path $script:FixtureRoot
+        InModuleScope M365Migration -Parameters @{ Workspace = $workspace } {
+            param($Workspace)
+            $resolved = Resolve-MigrationStepInput -Resolver 'Export:Get-TeamsPhoneAssignments' `
+                -Workspace $Workspace -Catalog $null
+            $resolved.Source | Should -BeExactly 'Export:Get-TeamsPhoneAssignments'
+            $resolved.Value | Should -BeNullOrEmpty
+            @($resolved.Candidates).Count | Should -Be 0
+        }
     }
 
     It 'warns about a resolver name it does not know' {

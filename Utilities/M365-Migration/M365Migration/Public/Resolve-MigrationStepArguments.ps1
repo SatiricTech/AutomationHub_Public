@@ -33,14 +33,25 @@ function Resolve-MigrationStepArguments {
                     script's business, and re-stating it in a driver would freeze today's value
                     into a file that outlives the script.
 
-        Five parameters the workbench always owns are added last, under the source 'Common':
-        -OutputPath is the workspace, -Prefix is the instance's fixed prefix or the label,
-        -Verbosity comes from the settings defaults, -DryRun appears only for a rehearsal, and
-        -Confirm:$false appears only for a script whose ConfirmImpact is High (the catalogue's
-        Confirm flag), because an unattended child process cannot answer a prompt. -Wave is
-        added the same way when the caller asks for one and the script takes it. -LogPath is
-        never passed: every script derives it from -OutputPath, and naming it here would move
-        the logs out from under the workspace.
+        The parameters the workbench owns are added last, and only where nothing above has
+        already answered for them: -OutputPath is the workspace, -DryRun appears only for a
+        rehearsal, -Wave when the caller asks for one and the chosen set can hold it, and
+        -Confirm:$false for every script that has a -Confirm parameter at all - that is, every
+        script declaring SupportsShouldProcess. The child runs -NonInteractive and cannot answer
+        a prompt, so whether it would have prompted must not be left to a ConfirmImpact against
+        a preference default that a future PowerShell or a profile could move. (The catalogue's
+        Confirm flag still means "this script is High impact" and is what the UI warns on; it no
+        longer decides whether -Confirm is passed.)
+
+        -Prefix and -Verbosity are owned the same way but usually arrive earlier: nearly every
+        catalogue entry binds Label -> -Prefix and Defaults.Verbosity -> -Verbosity, so they
+        normally come back with Source 'Settings', or 'Fixed' where an instance pins its own
+        prefix (the inventory's Source/Destination/Post). Source 'Common' on either means the
+        workbench chose it because nothing else had - the workspace label for -Prefix, the
+        settings default for -Verbosity.
+
+        -LogPath is never passed: every script derives it from -OutputPath, and naming it here
+        would move the logs out from under the workspace.
 
         -TenantId and -DelegatedOrganization are covered by the catalogue's Bind map on every
         entry that has them; where an entry does not, the side's own settings block is used, so
@@ -217,9 +228,12 @@ function Resolve-MigrationStepArguments {
 
         # Only the Export: resolver needs the catalogue, and building it is not free, so it is
         # read once and only when a step actually asks for another step's output.
+        # The @() wraps the whole if, not each branch: assigning an if-expression unrolls it, so
+        # a one-step answer would arrive as a bare object and an empty one as $null - which
+        # would also defeat the "fetched already" test on the next parameter.
         if ($resolver -like 'Export:*' -and $null -eq $catalog) {
-            $catalog = if ($Workspace.Scenario) { @(Get-MigrationStep -Scenario $Workspace.Scenario) }
-            else { @(Get-MigrationStep) }
+            $catalog = @(if ($Workspace.Scenario) { Get-MigrationStep -Scenario $Workspace.Scenario }
+                else { Get-MigrationStep })
         }
 
         $resolved = Resolve-MigrationStepInput -Resolver $resolver -Workspace $Workspace -Catalog $catalog
@@ -272,7 +286,10 @@ function Resolve-MigrationStepArguments {
         $values['DryRun'] = New-MigrationStepArgument -Name 'DryRun' -Value $true -Source 'Common'
     }
 
-    if ($Step.Confirm -and $byName.ContainsKey('Confirm')) {
+    # Every script that declares SupportsShouldProcess, not only the High-impact ones: the child
+    # runs -NonInteractive, so a prompt it cannot answer must never depend on ConfirmImpact
+    # sitting below whatever $ConfirmPreference happens to be in that process.
+    if ($byName.ContainsKey('Confirm')) {
         $values['Confirm'] = New-MigrationStepArgument -Name 'Confirm' -Value $false -Source 'Common'
     }
 

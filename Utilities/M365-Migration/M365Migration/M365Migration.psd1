@@ -66,8 +66,8 @@
         'Split-MigrationTeamsLineUri'
         'Test-MigrationAddress'
         'Test-MigrationPlanRowActionable'
-        'Test-MigrationStepGate'
         'Test-MigrationProtectedAddress'
+        'Test-MigrationStepGate'
         'Write-MigrationLog'
     )
     CmdletsToExport      = @()

@@ -218,6 +218,18 @@ Describe 'StepCatalog drift guard' {
         }
     }
 
+    It 'Binds the domain release step to Domains.Release, not to the landing domain' {
+        # The domain released from the SOURCE and the domain identities land on in the
+        # destination coincide only when the vanity domain moves with the users. Binding
+        # -Domain to Domains.Target would silently release the wrong domain on a rebrand.
+        $script:settingsKeys | Should -Contain 'Domains.Release'
+        $script:settingsKeys | Should -Contain 'Domains.Target'
+
+        $bind = $script:catalog['Remove-MigrationDomainReferences'].Bind
+        $bind['Domains.Release'] | Should -BeExactly 'Domain'
+        @($bind.Keys) | Should -Not -Contain 'Domains.Target'
+    }
+
     It '<Name>: every Bind source is a settings key' -ForEach $scriptCases {
         foreach ($k in @($script:catalog[$Name].Bind.Keys)) { $script:settingsKeys | Should -Contain $k }
         foreach ($inst in @($script:catalog[$Name].Instances)) {

@@ -4,7 +4,7 @@
   "Scenario": "TenantToTenant",
   "Source":      { "TenantId": "00000000-0000-0000-0000-000000000000", "DisplayName": "", "OnMicrosoftDomain": "contoso.onmicrosoft.com", "DelegatedOrganization": "" },
   "Destination": { "TenantId": "00000000-0000-0000-0000-000000000000", "DisplayName": "", "OnMicrosoftDomain": "newco.onmicrosoft.com",   "DelegatedOrganization": "" },
-  "Domains":     { "Target": "contoso.com", "Smtp": "", "Interim": "" },
+  "Domains":     { "Target": "contoso.com", "Release": "", "Smtp": "", "Interim": "" },
   "Plan":        { "UpnFormat": "First.Last", "SmtpFormat": "", "MailNicknameFormat": "", "DefaultWave": "1",
                    "DefaultUsageLocation": "US", "SkuMapPath": "", "ExclusionRulesPath": "", "WaveMapPath": "",
                    "PreserveAliases": false, "AliasDomainMap": {}, "IncludeDisabled": false, "IncludeGuests": false,

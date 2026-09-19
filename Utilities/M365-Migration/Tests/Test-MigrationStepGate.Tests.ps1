@@ -60,7 +60,10 @@ BeforeAll {
     function Add-LedgerEntry {
         [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
             Justification = 'Pester helper that appends to the ledger of a test workspace.')]
-        param([string]$WorkspacePath, [string]$StepId, [bool]$DryRun, [string[]]$Wave, [string]$Started)
+        param(
+            [string]$WorkspacePath, [string]$StepId, [bool]$DryRun, [string[]]$Wave, [string]$Started,
+            [int]$ExitCode = 0, [bool]$Aborted = $false
+        )
         $entry = [ordered]@{
             Started  = $Started
             Ended    = $Started
@@ -69,7 +72,8 @@ BeforeAll {
             Side     = 'Destination'
             DryRun   = $DryRun
             Wave     = @($Wave)
-            ExitCode = 0
+            ExitCode = $ExitCode
+            Aborted  = $Aborted
             Files    = @()
         }
         $path = Join-Path $WorkspacePath 'Workbench' 'Runs.jsonl'
@@ -224,6 +228,15 @@ Describe 'Test-MigrationStepGate against the committed fixture' {
             Test-HasGate $gates 'WaveRequired' | Should -BeFalse
         }
 
+        It 'is not offered for a step that only reads the plan' {
+            # Compare-Plan takes -Wave and consumes the plan, but reading all of it costs time
+            # and nothing else. The gate is a writer's decision.
+            $step = Get-MigrationStep -Id 'Compare-Plan'
+            $step.Impact | Should -BeExactly 'Read'
+            $gates = Get-StepGate -Workspace $script:Workspace -Id 'Compare-Plan' -Live
+            Test-HasGate $gates 'WaveRequired' | Should -BeFalse
+        }
+
         It 'is not offered when the chosen parameter set has no wave to give' {
             $gates = Get-StepGate -Workspace $script:Workspace -Id 'Reset-CutoverPasswords' -Live `
                 -Override @{ TestUser = 'ada.lovelace@newco.com' }
@@ -295,16 +308,99 @@ Describe 'Test-MigrationStepGate on workspaces the fixture cannot show' {
         (Get-Gate $gates 'DryRunFirst').Satisfied | Should -BeFalse
     }
 
+    It 'refuses a rehearsal that failed outright' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'LedgerFailedRehearsal'
+        Add-LedgerEntry -WorkspacePath $workspacePath -StepId 'New-Users' -DryRun $true -Wave @() `
+            -Started '2026-09-18T10:31:00' -ExitCode 1
+        $workspace = Get-MigrationWorkspace -Path $workspacePath
+
+        $gates = Get-StepGate -Workspace $workspace -Id 'New-Users' -Live
+        $gate = Get-Gate $gates 'DryRunFirst'
+        $gate.Satisfied | Should -BeFalse
+        $gate.Message | Should -Match 'exited 1'
+    }
+
+    It 'refuses a rehearsal that was cancelled part way through' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'LedgerAbortedRehearsal'
+        Add-LedgerEntry -WorkspacePath $workspacePath -StepId 'New-Users' -DryRun $true -Wave @() `
+            -Started '2026-09-18T10:31:00' -ExitCode 0 -Aborted $true
+        $workspace = Get-MigrationWorkspace -Path $workspacePath
+
+        $gates = Get-StepGate -Workspace $workspace -Id 'New-Users' -Live
+        $gate = Get-Gate $gates 'DryRunFirst'
+        $gate.Satisfied | Should -BeFalse
+        $gate.Message | Should -Match 'cancelled'
+    }
+
+    It 'accepts a rehearsal that exited 2, because finding failures is what a dry run is for' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'LedgerPartialRehearsal'
+        Add-LedgerEntry -WorkspacePath $workspacePath -StepId 'New-Users' -DryRun $true -Wave @() `
+            -Started '2026-09-18T10:31:00' -ExitCode 2
+        $workspace = Get-MigrationWorkspace -Path $workspacePath
+
+        $gates = Get-StepGate -Workspace $workspace -Id 'New-Users' -Live
+        (Get-Gate $gates 'DryRunFirst').Satisfied | Should -BeTrue
+    }
+
+    It 'takes a later good rehearsal over an earlier failed one' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'LedgerFailedThenGood'
+        Add-LedgerEntry -WorkspacePath $workspacePath -StepId 'New-Users' -DryRun $true -Wave @() `
+            -Started '2026-09-18T10:31:00' -ExitCode 1
+        Add-LedgerEntry -WorkspacePath $workspacePath -StepId 'New-Users' -DryRun $true -Wave @() `
+            -Started '2026-09-18T10:45:00' -ExitCode 0
+        $workspace = Get-MigrationWorkspace -Path $workspacePath
+
+        $gates = Get-StepGate -Workspace $workspace -Id 'New-Users' -Live
+        (Get-Gate $gates 'DryRunFirst').Satisfied | Should -BeTrue
+    }
+
+    It 'makes the operator type the release domain when it is not the target domain' {
+        $workspacePath = Copy-FixtureWorkspace -Name 'GateSeparateRelease'
+        $settingsPath = Join-Path $workspacePath 'M365Migration.settings.json'
+        $data = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+        $data['Domains']['Release'] = 'contoso.com'
+        ($data | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $settingsPath -Encoding utf8
+        $workspace = Get-MigrationWorkspace -Path $workspacePath
+
+        $gates = Get-StepGate -Workspace $workspace -Id 'DomainReferences-Remediate' -Live
+        (Get-Gate $gates 'TypedConfirmation').RequiredInput | Should -BeExactly 'contoso.com'
+    }
+
     It 'falls back to the word REMOVE when no source domain is configured' {
         $workspacePath = Copy-FixtureWorkspace -Name 'NoDomain'
         $settingsPath = Join-Path $workspacePath 'M365Migration.settings.json'
         $data = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+        # Both, because Release blank falls back to Target: "no domain" has to mean neither.
         $data['Domains']['Target'] = ''
+        $data['Domains']['Release'] = ''
         ($data | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $settingsPath -Encoding utf8
         $workspace = Get-MigrationWorkspace -Path $workspacePath
 
         $gates = Get-StepGate -Workspace $workspace -Id 'DomainReferences-Remediate' -Live
         (Get-Gate $gates 'TypedConfirmation').RequiredInput | Should -BeExactly 'REMOVE'
+    }
+
+    It 'counts the artefact kinds a Requires entry may name' {
+        # Inventory is the Users tab and Mapping is the export's results file - the mapping
+        # workbook itself is named by the mover's contract, not the toolkit's.
+        $workspace = Get-MigrationWorkspace -Path $script:FixtureRoot
+        $bare = Join-Path $TestDrive 'NoArtefacts'
+        $null = New-Item -Path $bare -ItemType Directory -Force
+        $emptyWorkspace = Get-MigrationWorkspace -Path $bare
+
+        InModuleScope M365Migration -Parameters @{ Full = $workspace; Empty = $emptyWorkspace } {
+            param($Full, $Empty)
+            Test-MigrationStepRequirement -Requirement 'Inventory' -Workspace $Full | Should -BeTrue
+            Test-MigrationStepRequirement -Requirement 'Mapping' -Workspace $Full | Should -BeTrue
+            Test-MigrationStepRequirement -Requirement 'Plan' -Workspace $Full | Should -BeTrue
+            Test-MigrationStepRequirement -Requirement 'Log' -Workspace $Full | Should -BeTrue
+            Test-MigrationStepRequirement -Requirement 'Report:TeamsPhoneAssignments' -Workspace $Full |
+                Should -BeTrue
+
+            Test-MigrationStepRequirement -Requirement 'Inventory' -Workspace $Empty | Should -BeFalse
+            Test-MigrationStepRequirement -Requirement 'Mapping' -Workspace $Empty | Should -BeFalse
+            Test-MigrationStepRequirement -Requirement 'NotAKind' -Workspace $Full | Should -BeFalse
+        }
     }
 
     It 'takes any rehearsal at all when the workspace holds no plan to date it against' {

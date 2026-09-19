@@ -80,7 +80,7 @@ committed template is `Templates/M365Migration.settings.example.json`; the real 
   "Scenario": "TenantToTenant",
   "Source":      { "TenantId": "<guid>", "DisplayName": "", "OnMicrosoftDomain": "contoso.onmicrosoft.com", "DelegatedOrganization": "" },
   "Destination": { "TenantId": "<guid>", "DisplayName": "", "OnMicrosoftDomain": "newco.onmicrosoft.com",   "DelegatedOrganization": "" },
-  "Domains":     { "Target": "contoso.com", "Smtp": "", "Interim": "" },
+  "Domains":     { "Target": "contoso.com", "Release": "", "Smtp": "", "Interim": "" },
   "Plan":        { "UpnFormat": "First.Last", "SmtpFormat": "", "MailNicknameFormat": "", "DefaultWave": "1",
                    "DefaultUsageLocation": "US", "SkuMapPath": "", "ExclusionRulesPath": "", "WaveMapPath": "",
                    "PreserveAliases": false, "AliasDomainMap": {}, "IncludeDisabled": false, "IncludeGuests": false,
@@ -97,7 +97,15 @@ Rules:
 - `Scenario` ∈ `TenantToTenant` | `InPlaceRedesign`. In-place: Source and Destination hold the
   same GUID; the phase view hides mapping export, domain release and Fly; identity cutover runs
   with `-MatchOn Source`.
-- `Domains.Target` feeds `-TargetDomain` (planner) and `-Domain` (domain release).
+- `Domains.Target` is the vanity domain the identities land on in the destination, and feeds
+  `-TargetDomain` (planner, Viva import). `Domains.Release` is the vanity domain being released
+  from the **source** tenant, and feeds `-Domain` (domain release). They are the same string
+  only when the vanity domain moves with the users, which is the common case but not the rule:
+  a migration onto a new brand releases one domain and lands on another. `Domains.Release`
+  blank therefore means "same as Target", and the **effective release domain** — the one the
+  domain-release step is given and the one `TypedConfirmation` makes the operator type — is
+  `Domains.Release` if non-empty, else `Domains.Target`. That fallback is a named rule in the
+  argument resolver, because a blank bound value is otherwise simply skipped.
   `Domains.Smtp` blank = same as Target; otherwise it feeds the planner's new `-SmtpDomain`.
   `Domains.Interim` blank = not needed; the settings form reads `Destination_Domains_*.csv`
   and says whether Target is already verified in the destination (KnownDocGaps #6).
@@ -333,14 +341,23 @@ script's own default, **recorded so a form can show it and deliberately not pass
 a default is the script's business and re-stating it would freeze today's value into a driver
 file that outlives the script. A driver emits every argument whose `Source` is not `Default`.
 
-Common parameters are always set explicitly, under the source `Common`: `-OutputPath
-<workspace>`, `-Prefix <instance prefix or Label>` (offline steps take the label too),
-`-Verbosity <settings>`, `-DryRun` when requested, `-Wave` when one is requested and the
-script takes it, and `-Confirm:$false` when the script's `ConfirmImpact` is High (the
-catalogue's `Confirm` flag), because an unattended child cannot answer a prompt. `-LogPath` is
-never passed: every script derives it from `-OutputPath`. `-TenantId` is passed to any script
-that takes it, from the side's settings block where the catalogue does not bind it;
-`-DelegatedOrganization` only when the settings hold one for that side.
+The parameters the workbench owns are always set explicitly: `-OutputPath <workspace>`,
+`-Prefix <instance prefix or Label>` (offline steps take the label too), `-Verbosity
+<settings>`, `-DryRun` when requested, `-Wave` when one is requested and the chosen set can
+hold it, and `-Confirm:$false` for **every script that has a `-Confirm` parameter** — every
+script declaring `SupportsShouldProcess`, not only the High-impact ones. The child runs
+`-NonInteractive` and cannot answer a prompt, so whether it would have prompted must not rest
+on a `ConfirmImpact` sitting below whatever `$ConfirmPreference` that process happens to have.
+The catalogue's `Confirm` flag still means "this script is High impact", which is what the UI
+warns on; it no longer decides whether `-Confirm` is passed.
+
+`-Prefix` and `-Verbosity` are owned the same way but usually arrive earlier, since nearly
+every entry binds `Label` → `-Prefix` and `Defaults.Verbosity` → `-Verbosity`: they normally
+come back as `Settings`, or `Fixed` where an instance pins its own prefix. `Common` on either
+means nothing else had answered. `-LogPath` is never passed: every script derives it from
+`-OutputPath`. `-TenantId` is passed to any script that takes it, from the side's settings
+block where the catalogue does not bind it; `-DelegatedOrganization` only when the settings
+hold one for that side.
 
 `ParameterSet` is the first set the script declares whose mandatory parameters are all
 present, and `MissingMandatory` lists what that set still needs; where no set is satisfiable,
@@ -361,11 +378,11 @@ judge the run that would actually happen.
 
 | Gate | Applies to | Behaviour |
 |---|---|---|
-| `DryRunFirst` | `Impact = Write` and `Destructive`, live runs only | Soft: satisfied by a dry-run ledger entry for that step whose waves match the ones requested (as sets: order and repeats do not count, and two blanks match) and whose `Started` is after the plan's timestamp. Where the ledger records no rehearsal of that step, a `-DryRun_` results file newer than the plan counts instead — a run made from the command line is still a run. With no plan in the workspace, any rehearsal counts. Override allowed, recorded in the ledger. |
-| `TypedConfirmation` | `Impact = Destructive`, and any `Side = Source` step whose `Impact` is not `Read` | Hard: the operator must type `RequiredInput` — the source vanity domain (`Domains.Target`) for a source-side step, otherwise the word `REMOVE`, and `REMOVE` as the fallback where no domain is configured. A keypress/button is not accepted, so the gate is never returned satisfied. Asked for on a rehearsal too: a rehearsal still signs in to the source tenant. |
+| `DryRunFirst` | `Impact = Write` and `Destructive`, live runs only | Soft: satisfied by a dry-run ledger entry for that step whose waves match the ones requested (as sets: order and repeats do not count, and two blanks match), whose `Started` is after the plan's timestamp, that was not `Aborted` and whose `ExitCode` is 0 or 2 — an aborted or exit-1 rehearsal proved nothing, while exit 2 is a rehearsal doing its job. Where the ledger records no rehearsal of that step, a `-DryRun_` results file newer than the plan counts instead — a run made from the command line is still a run. With no plan in the workspace, any rehearsal counts. Override allowed, recorded in the ledger. |
+| `TypedConfirmation` | `Impact = Destructive`, and any `Side = Source` step whose `Impact` is not `Read` | Hard: the operator must type `RequiredInput` — the effective release domain (`Domains.Release`, else `Domains.Target`) for a source-side step, otherwise the word `REMOVE`, and `REMOVE` as the fallback where no domain is configured. A keypress/button is not accepted, so the gate is never returned satisfied. Asked for on a rehearsal too: a rehearsal still signs in to the source tenant. |
 | `Prerequisite` | steps with `Requires` | Soft: lists what is not in hand. A requirement naming an artefact kind is met by the artefact existing, whoever produced it. |
 | `TenantMismatch` | any connecting step | Hard, post-run: the "Connected to ... tenant <guid>" lines in the child's log are compared with the expected side's GUID; a mismatch is flagged regardless of exit code. Not produced by `Test-MigrationStepGate` — it cannot be known until the child has run, so `Invoke-MigrationStep` (7.3) appends it. |
-| `WaveRequired` | live runs of a step whose chosen parameter set takes `-Wave` | Soft: a blank wave means the whole plan. The gate exists so that it is a decision rather than an omission; satisfied once a wave is named. |
+| `WaveRequired` | plan consumers | Soft: a blank wave means the whole plan; confirmed explicitly for writers — live runs of a `Write` or `Destructive` step whose chosen parameter set takes `-Wave`. Satisfied once a wave is named. |
 
 ### 7.3 Driver and child process
 

@@ -130,7 +130,12 @@ function Resolve-MigrationStepInput {
 
         'Export' {
             $token = $segments[1]
-            $producer = @($Catalog | Where-Object {
+            # An absent catalogue arrives as $null, and piping $null sends one $null item into
+            # the filter, where reading .Id off it is a terminating error under strict mode.
+            # A resolver is asked questions by forms as well as by the driver, so it answers
+            # "nothing found" rather than throwing at whoever forgot the catalogue.
+            $known = @($Catalog | Where-Object { $null -ne $_ })
+            $producer = @($known | Where-Object {
                     $_.Id -eq $token -or @($_.ResultIds) -contains $token
                 }) | Select-Object -First 1
 

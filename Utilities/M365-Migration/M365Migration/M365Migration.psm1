@@ -25,6 +25,9 @@ $script:MigrationPlanBackups = [System.Collections.Generic.HashSet[string]]::new
 # so Get-MigrationScriptParameter memoises per path + LastWriteTimeUtc for the session.
 $script:MigrationScriptParameterCache = @{}
 $script:MigrationStepCatalogCache = @{}
+# Which settings keys the schema types as Path. Read once on first use rather than rebuilding
+# the whole schema for every settings value a step resolves.
+$script:MigrationSettingsPathKeys = $null
 
 $privateFiles = @(Get-ChildItem -Path (Join-Path $PSScriptRoot 'Private') -Filter '*.ps1' -ErrorAction SilentlyContinue | Sort-Object Name)
 $publicFiles = @(Get-ChildItem -Path (Join-Path $PSScriptRoot 'Public') -Filter '*.ps1' -ErrorAction SilentlyContinue | Sort-Object Name)
