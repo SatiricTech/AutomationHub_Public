@@ -639,7 +639,8 @@ Describe 'Import-MigrationVivaLearningHistory - a new provider needs -LogoUrl up
 
     It 'Logs the fatal reason' {
         $script:noLogoLog | Should -Match (
-            'Fatal: Registering a learning provider needs -LogoUrl \(used for every logo slot not given individually\)\.')
+            'Fatal: Registering a learning provider needs -LogoUrl \(used for every logo slot not given ' +
+            'individually\)\.')
     }
 }
 

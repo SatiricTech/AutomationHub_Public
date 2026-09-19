@@ -926,7 +926,8 @@ Describe 'Remove-MigrationDomainReferences' {
 
     Context 'Exit code decision' {
 
-        It 'Returns <Expected> for <RemainingCount> remaining, ScanIncomplete=<ScanIncomplete>, <FailedRowCount> failed' -ForEach @(
+        It ('Returns <Expected> for Remaining=<RemainingCount>, Incomplete=<ScanIncomplete>, ' +
+            'Failed=<FailedRowCount>') -ForEach @(
             @{ RemainingCount = 0; ScanIncomplete = $false; FailedRowCount = 0; Expected = 0 }
             @{ RemainingCount = 3; ScanIncomplete = $false; FailedRowCount = 0; Expected = 3 }
             @{ RemainingCount = 0; ScanIncomplete = $true; FailedRowCount = 0; Expected = 3 }

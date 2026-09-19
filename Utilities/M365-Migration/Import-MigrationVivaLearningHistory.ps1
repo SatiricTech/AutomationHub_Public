@@ -539,7 +539,8 @@ try {
                         'needs logo image URLs (-LogoUrl) to register it.') -Level WARNING
                 }
                 else {
-                    throw 'Registering a learning provider needs -LogoUrl (used for every logo slot not given individually).'
+                    throw ('Registering a learning provider needs -LogoUrl (used for every logo slot not ' +
+                        'given individually).')
                 }
             }
 

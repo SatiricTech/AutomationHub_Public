@@ -128,34 +128,64 @@ Describe 'No interactive prompts' {
     #>
 
     $toolkitRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $moduleRoot = Join-Path $toolkitRoot 'M365Migration'
     $topLevelScripts = @(Get-ChildItem -LiteralPath $toolkitRoot -Filter '*.ps1' -File)
-    $moduleScripts = @(Get-ChildItem -LiteralPath (Join-Path $toolkitRoot 'M365Migration') -Filter '*.ps1' -File -Recurse)
+    $moduleScripts = @(Get-ChildItem -LiteralPath $moduleRoot -Filter '*.ps1' -File -Recurse)
 
     $scannedFiles = @(($topLevelScripts + $moduleScripts) | ForEach-Object {
             @{ Path = $_.FullName; Name = $_.Name }
         })
 
-    It 'Never prompts interactively in <Name>' -ForEach $scannedFiles {
-        $parseErrors = $null
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$parseErrors)
-        if ($parseErrors -and @($parseErrors).Count -gt 0) {
-            throw "$Name does not parse: $(@($parseErrors)[0].Message)"
+    BeforeAll {
+        # Shared by the per-file check below and by the detector's own self-check, so the two
+        # can never quietly drift apart.
+        function script:Get-InteractivePromptSurvey {
+            [CmdletBinding()]
+            [OutputType([pscustomobject])]
+            param([Parameter(Mandatory)][string]$Path)
+
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$parseErrors)
+            if ($parseErrors -and @($parseErrors).Count -gt 0) {
+                throw "$Path does not parse: $(@($parseErrors)[0].Message)"
+            }
+
+            # A module-qualified call such as Microsoft.PowerShell.Utility\Read-Host comes back
+            # from GetCommandName() with the module prefix still attached, so only the text after
+            # the last '\' is compared against the bare command name.
+            $readHostCalls = @($ast.FindAll(
+                    {
+                        if ($args[0] -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+                        $name = $args[0].GetCommandName()
+                        $name -and (($name -split '\\')[-1] -ieq 'Read-Host')
+                    }, $true))
+
+            $hostUiPrompts = @($ast.FindAll(
+                    {
+                        $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                        $args[0].Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                        $args[0].Member.Value -in @('PromptForChoice', 'Prompt') -and
+                        $args[0].Expression.Extent.Text -ieq '$Host.UI'
+                    }, $true))
+
+            return [pscustomobject]@{ ReadHostCalls = $readHostCalls; HostUiPrompts = $hostUiPrompts }
         }
+    }
 
-        $readHostCalls = @($ast.FindAll(
-            {
-                $args[0] -is [System.Management.Automation.Language.CommandAst] -and
-                $args[0].GetCommandName() -ieq 'Read-Host'
-            }, $true))
-        $readHostCalls | Should -BeNullOrEmpty -Because "$Name must not call Read-Host"
+    It 'Never prompts interactively in <Name>' -ForEach $scannedFiles {
+        $survey = Get-InteractivePromptSurvey -Path $Path
+        $survey.ReadHostCalls | Should -BeNullOrEmpty -Because "$Name must not call Read-Host"
+        $survey.HostUiPrompts | Should -BeNullOrEmpty -Because "$Name must not call `$Host.UI.Prompt or PromptForChoice"
+    }
 
-        $hostUiPrompts = @($ast.FindAll(
-            {
-                $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
-                $args[0].Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
-                $args[0].Member.Value -in @('PromptForChoice', 'Prompt') -and
-                $args[0].Expression.Extent.Text -ieq '$Host.UI'
-            }, $true))
-        $hostUiPrompts | Should -BeNullOrEmpty -Because "$Name must not call `$Host.UI.Prompt or PromptForChoice"
+    It 'Flags a module-qualified Read-Host call, so the guard is proven against qualification, not assumed' {
+        $sample = Join-Path $TestDrive 'Sample-QualifiedPrompt.ps1'
+        Set-Content -LiteralPath $sample -Value @'
+function Get-Sample {
+    $answer = Microsoft.PowerShell.Utility\Read-Host -Prompt 'Enter a value'
+    return $answer
+}
+'@
+        (Get-InteractivePromptSurvey -Path $sample).ReadHostCalls | Should -Not -BeNullOrEmpty
     }
 }
