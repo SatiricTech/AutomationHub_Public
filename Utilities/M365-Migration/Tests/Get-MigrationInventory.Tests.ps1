@@ -38,6 +38,7 @@ BeforeAll {
         'Test-InventoryTrustee'
         'ConvertTo-InventoryFolderTrustee'
         'Get-InventoryTabColumn'
+        'Get-InventoryTabSummaryPath'
     )
 
     $tokens = $null
@@ -721,5 +722,57 @@ Describe 'The tab writer' {
         $emptyHeader = Get-Content -LiteralPath $emptyPath -TotalCount 1
 
         $emptyHeader | Should -BeExactly $populatedHeader
+    }
+
+    It 'Calls the summary-path helper with the tab name, the run context and the shared timestamp' {
+        # Structural, like the tenant-guard block above: proves Main wires the three pieces
+        # Get-InventoryTabSummaryPath needs into the call, rather than exercising the dry-run
+        # behaviour end to end - the script is tenant-bound, so there is no harness for that here.
+        $calls = @($ast.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+                    $args[0].GetCommandName() -eq 'Get-InventoryTabSummaryPath' }, $true) |
+            ForEach-Object { $_.Extent.Text })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-Tab \$tab\b'
+        $calls[0] | Should -Match '-WrittenPath \$writtenPath\b'
+        $calls[0] | Should -Match '-Run \$run\b'
+        $calls[0] | Should -Match '-Timestamp \$runTimestamp\b'
+    }
+
+    It 'Names the dry-run summary path via Get-MigrationOutputPath, scoped to $Run.DryRun' {
+        # Structural: proves the helper's own dry-run branch is the one calling
+        # Get-MigrationOutputPath with -Name/-Timestamp, not some other code path. The behavioural
+        # half of this (does it return the right string) is the Describe below, which unit-tests
+        # the lifted function directly against a fake $Run.
+        $helperDef = @($ast.FindAll($predicate, $true) | Where-Object { $_.Name -eq 'Get-InventoryTabSummaryPath' })
+        $helperDef.Count | Should -Be 1
+        $bodyText = $helperDef[0].Body.Extent.Text
+        $bodyText | Should -Match (
+            '(?s)if\s*\(\s*\$Run\.DryRun\s*\)\s*\{\s*return Get-MigrationOutputPath -Name \$Tab -Timestamp \$Timestamp')
+    }
+}
+
+Describe 'Get-InventoryTabSummaryPath' {
+
+    <#
+        A behavioural -DryRun harness for the whole script is out of reach offline (the script is
+        tenant-bound), but the helper this logic was extracted into is pure, so it gets a real
+        unit test against a fake $Run - Get-MigrationInventory.Tests.ps1's usual technique of
+        lifting a FunctionDefinitionAst node, applied to this one.
+    #>
+
+    It 'Names the file the run would have written under -DryRun, even though nothing was written' {
+        $fakeRun = [pscustomobject]@{ DryRun = $true }
+        $stamp = Get-Date
+        $path = Get-InventoryTabSummaryPath -Tab 'Contacts' -WrittenPath '' -Run $fakeRun -Timestamp $stamp
+        $expected = Get-MigrationOutputPath -Name 'Contacts' -Timestamp $stamp
+        $path | Should -BeExactly $expected
+    }
+
+    It 'Returns the path Export-MigrationReport actually wrote for a live run' {
+        $fakeRun = [pscustomobject]@{ DryRun = $false }
+        $path = Get-InventoryTabSummaryPath -Tab 'Contacts' -WrittenPath 'C:\already\written.csv' `
+            -Run $fakeRun -Timestamp (Get-Date)
+        $path | Should -BeExactly 'C:\already\written.csv'
     }
 }

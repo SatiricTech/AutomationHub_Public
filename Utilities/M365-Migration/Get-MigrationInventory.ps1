@@ -790,6 +790,29 @@ function Get-InventoryTabColumn {
     return @()
 }
 
+function Get-InventoryTabSummaryPath {
+    <#
+        The path named in the "Inventory summary" log block for one tab: the path
+        Export-MigrationReport actually wrote for a live run, or the path it would have written
+        under -DryRun. Export-MigrationReport returns '' when -SuppressInDryRun suppresses the
+        write, so without this the summary would show nothing for a run whose whole point is to
+        preview the files - the help promises "logs the files it would have written".
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Tab,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$WrittenPath,
+        [Parameter(Mandatory)]$Run,
+        [Parameter(Mandatory)][datetime]$Timestamp
+    )
+
+    if ($Run.DryRun) {
+        return Get-MigrationOutputPath -Name $Tab -Timestamp $Timestamp
+    }
+    return $WrittenPath
+}
+
 function ConvertTo-InventoryFolderTrustee {
     <#
         The trustee of a Get-EXOMailboxFolderPermission entry as a plain string. The REST cmdlet
@@ -1789,11 +1812,8 @@ try {
                 -IncludeOneDriveColumn:$IncludeOneDrive)
         $writtenPath = Export-MigrationReport -Rows $rows -Name $tab -Columns $columns `
             -Timestamp $runTimestamp -SuppressInDryRun
-        # Export-MigrationReport returns '' under -DryRun (nothing was written), but the summary
-        # below still has to name the file the run would have produced, as the help promises.
-        $csvPaths[$tab] = if ($run.DryRun) {
-            Get-MigrationOutputPath -Name $tab -Timestamp $runTimestamp
-        } else { $writtenPath }
+        $csvPaths[$tab] = Get-InventoryTabSummaryPath -Tab $tab -WrittenPath $writtenPath -Run $run `
+            -Timestamp $runTimestamp
 
         if ($useExcel) {
             # Export-Excel cannot write a sheet from an empty pipeline, so an empty tab gets the
