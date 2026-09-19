@@ -46,7 +46,8 @@ Describe 'Resolve-MigrationTeamsUser' {
             Mock Get-CsOnlineUser { throw 'Request throttled (429)' }
 
             { Resolve-MigrationTeamsUser -Identity 'john.smith@contoso.com' } |
-                Should -Throw -ExpectedMessage "*Could not resolve Teams user 'john.smith@contoso.com': Request throttled (429)*"
+                Should -Throw -ExpectedMessage (
+                    "*Could not resolve Teams user 'john.smith@contoso.com': Request throttled (429)*")
         }
     }
 
@@ -55,6 +56,7 @@ Describe 'Resolve-MigrationTeamsUser' {
         @{ Message = 'The user could not be found in the tenant.' }
         @{ Message = 'Identity does not exist.' }
         @{ Message = 'Cannot find the requested object.' }
+        @{ Message = 'Unable to find the user in this tenant.' }
         @{ Message = 'USER NOT FOUND' }
     ) {
         InModuleScope M365Migration -Parameters @{ NotFoundMessage = $Message } {

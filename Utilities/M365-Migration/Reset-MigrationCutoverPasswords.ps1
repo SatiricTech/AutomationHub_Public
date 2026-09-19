@@ -481,6 +481,10 @@ try {
         $generated = ''
         $passwordProfile = $null
 
+        # Read by the per-row catch, which is reachable long before the PATCH, so under
+        # Set-StrictMode it has to exist from the top of every iteration.
+        $patchAttempted = $false
+
         try {
             # A lookup that broke (throttling, 403, expired token) is a Failed row with the
             # Graph message, never a Skipped 'not found' - the wave must not look clean.
@@ -511,6 +515,11 @@ try {
                     # Invoke-MigrationGraphRequest throws on a failed call (after its own retry
                     # budget) so a failed reset lands in catch and is recorded as Failed - never
                     # reported as a success with a credential that was never actually set.
+                    #
+                    # Set before the call, not after: once the PATCH is on the wire Graph may
+                    # have applied it whatever comes back, and from here on the passphrase is
+                    # the only thing that can open the account.
+                    $patchAttempted = $true
                     $null = Invoke-MigrationAction -Description "Reset the password for $identity" -Action {
                         $null = Invoke-MigrationGraphRequest -Method PATCH -Uri "/v1.0/users/$($user.Id)" `
                             -Body @{ passwordProfile = $passwordProfile }
@@ -528,7 +537,11 @@ try {
         }
         catch {
             $status = 'Failed'
-            $generated = ''   # the reset did not take - do not surface a credential
+            # Only a reset that was never sent is credential-free. Once the PATCH went out, a
+            # response that never arrived (timeout, dropped socket) can still have been applied,
+            # and the passphrase below is the only copy of what the account now answers to -
+            # clearing it would lock the user out with nothing to look the credential up by.
+            if (-not $patchAttempted) { $generated = '' }
             $message = $_.Exception.Message
             if ($message -match 'Authorization_RequestDenied|Insufficient privileges') {
                 $detail = 'Access denied - the signed-in account lacks rights to reset this user ' +
@@ -537,6 +550,10 @@ try {
             }
             else {
                 $detail = $message
+            }
+            if ($patchAttempted) {
+                $detail += ' The reset may have applied; verify sign-in with this passphrase ' +
+                    'before resetting again.'
             }
         }
 
@@ -582,13 +599,25 @@ finally {
         catch {
             $exportError = $_.Exception.Message
 
-            # The run folder is unusable (read-only, full, or gone), so the rows go to the temp
-            # folder instead. Get-MigrationOutputPath keeps the filename contract - including
-            # leaving the leader off entirely when the run has no prefix.
-            $fallbackPath = Get-MigrationOutputPath -Directory ([System.IO.Path]::GetTempPath()) `
-                -Prefix $run.Prefix -Name 'Reset-CutoverPasswords' -Suffix 'Results'
+            # Built inside the try: an unusable temp path would otherwise throw out of the
+            # finally itself, taking the loss message with it.
+            $fallbackPath = ''
             try {
-                $resultRows | Export-Csv -LiteralPath $fallbackPath -NoTypeInformation -Encoding utf8
+                # The run folder is unusable (read-only, full, or gone), so the rows go to the
+                # temp folder instead. Get-MigrationOutputPath keeps the filename contract -
+                # including leaving the leader off entirely when the run has no prefix. The
+                # suffix has to track the run's mode: the workbench reads a step's state from
+                # it, and a DryRun file landing as '-Results' would mark the step done.
+                $fallbackSuffix = if ($isDryRun) { 'DryRun' } else { 'Results' }
+                $fallbackPath = Get-MigrationOutputPath -Directory ([System.IO.Path]::GetTempPath()) `
+                    -Prefix $run.Prefix -Name 'Reset-CutoverPasswords' -Suffix $fallbackSuffix
+
+                # Sanitised the same way Export-MigrationResult does it: the rescue copy is
+                # opened in Excel like any other results file, so it needs the same protection
+                # against a cell that starts with '=' being run as a formula.
+                $resultRows |
+                    ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ } |
+                    Export-Csv -LiteralPath $fallbackPath -NoTypeInformation -Encoding utf8 -ErrorAction Stop
                 $resultsExported = $true
                 Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory); a copy was " +
                     "saved to $fallbackPath. Move it into the run folder. Original error: $exportError") -Level ERROR
@@ -597,8 +626,9 @@ finally {
                 # Nowhere left to put them. Naming the count - never the credentials - is the
                 # only thing that still helps: it tells the operator how big the re-run is.
                 $lostCount = @($resultRows | Where-Object { $_.GeneratedPassword }).Count
+                $attempted = if ($fallbackPath) { "'$fallbackPath'" } else { 'the temp folder' }
                 Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory) or to " +
-                    "'$fallbackPath': $($_.Exception.Message) Original error: $exportError") -Level ERROR
+                    "$attempted`: $($_.Exception.Message) Original error: $exportError") -Level ERROR
                 if ($lostCount -gt 0) {
                     Write-MigrationLog -Message ("$lostCount generated credential(s) could not be persisted " +
                         'anywhere; they are lost. Reset the affected accounts again.') -Level ERROR
@@ -608,8 +638,10 @@ finally {
         }
     }
 
-    $anyReset = @($results | Where-Object { $_.Status -eq 'Succeeded' }).Count -gt 0
-    if ($resultsExported -and -not $isDryRun -and $anyReset) {
+    # Any row carrying a passphrase, not just the Succeeded ones: a Failed row whose PATCH may
+    # have applied carries one too, and that file is just as much a password list.
+    $anyCredential = @($results | Where-Object { $_.GeneratedPassword }).Count -gt 0
+    if ($resultsExported -and -not $isDryRun -and $anyCredential) {
         Write-MigrationLog -Message 'Generated passwords were written to the results file, not to this log. Store it securely and delete it once the credentials have been distributed.' -Level WARNING
     }
 

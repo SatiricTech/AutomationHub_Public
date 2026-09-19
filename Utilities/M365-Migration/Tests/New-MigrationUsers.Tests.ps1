@@ -1157,6 +1157,10 @@ Describe 'New-MigrationUsers - a create rejected as a conflict keeps its passwor
 Describe 'New-MigrationUsers - a results export that fails falls back to the temp folder' {
 
     BeforeAll {
+        # Initialised before anything that can throw, so the AfterAll sweep below always has a
+        # list to walk even if the run itself blows up half way through this block.
+        $script:usersFbFiles = @()
+
         function New-MigrationRandomPassword {
             param([int]$Length)
             return 'Pa55-fixed-word'
@@ -1169,7 +1173,9 @@ Describe 'New-MigrationUsers - a results export that fails falls back to the tem
             }
             if ($Uri -like '*/users?$filter=*') { return @() }
             if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
-                return [pscustomobject]@{ id = '99999999-9999-9999-9999-999999999999' }
+                # The object ID leads with '=', so the rescue copy has to sanitise it the way
+                # Export-MigrationResult would before Excel reads the cell as a formula.
+                return [pscustomobject]@{ id = '=cmd|test' }
             }
             return $null
         }
@@ -1186,26 +1192,31 @@ Describe 'New-MigrationUsers - a results export that fails falls back to the tem
         Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:usersFbPlan
 
         # The -Prefix makes the temp fallback file's name unique to this test, which is the only
-        # way to find and clean up a file the script deliberately writes outside its workspace.
+        # way to find and clean it up again; the GUID keeps a stray from an interrupted earlier
+        # run from being counted as this run's output.
+        $script:usersFbPrefix = "UsersFallback$([guid]::NewGuid().ToString('N'))"
+
         & $script:scriptPath -PlanPath $script:usersFbPlan -Wave '1' -DefaultUsageLocation 'US' `
-            -OutputPath $script:usersFbWorkspace -Prefix 'UsersFallback' -Verbosity Low -Confirm:$false
+            -OutputPath $script:usersFbWorkspace -Prefix $script:usersFbPrefix -Verbosity Low -Confirm:$false
         $script:usersFbExitCode = $LASTEXITCODE
 
         $script:usersFbFiles = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
-                -Filter 'UsersFallback_New-Users-Results_*.csv' -ErrorAction SilentlyContinue)
+                -Filter "$($script:usersFbPrefix)_New-Users-*.csv" -ErrorAction SilentlyContinue)
         $script:usersFbRows = if ($script:usersFbFiles.Count -ge 1) {
             @(Import-Csv -LiteralPath $script:usersFbFiles[0].FullName)
         }
         else { @() }
 
         $log = @(Get-ChildItem -LiteralPath $script:usersFbWorkspace -Recurse `
-                -Filter 'UsersFallback_New-MigrationUsers_*.log')
+                -Filter "$($script:usersFbPrefix)_New-MigrationUsers_*.log")
         $script:usersFbLog = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
     }
 
     AfterAll {
-        foreach ($file in $script:usersFbFiles) {
-            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        if (Get-Variable -Name usersFbFiles -Scope Script -ErrorAction SilentlyContinue) {
+            foreach ($file in $script:usersFbFiles) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            }
         }
         if ($script:usersFbWorkspace -and (Test-Path -LiteralPath $script:usersFbWorkspace)) {
             Remove-Item -LiteralPath $script:usersFbWorkspace -Recurse -Force -ErrorAction SilentlyContinue
@@ -1216,9 +1227,19 @@ Describe 'New-MigrationUsers - a results export that fails falls back to the tem
         $script:usersFbFiles.Count | Should -Be 1
     }
 
+    It 'Names the live-run copy -Results, the same as the file it stands in for' {
+        $script:usersFbFiles[0].Name | Should -BeLike "$($script:usersFbPrefix)_New-Users-Results_*.csv"
+    }
+
     It 'Keeps the initial passwords in the fallback file' {
         @($script:usersFbRows | Where-Object { $_.GeneratedPassword -eq 'Pa55-fixed-word' }).Count |
             Should -BeGreaterThan 0
+    }
+
+    It 'Sanitises the rescue copy against formula injection, as the normal export would' {
+        $created = @($script:usersFbRows | Where-Object { $_.Action -eq 'CreateUser' -and $_.TargetObjectId })
+        $created.Count | Should -BeGreaterThan 0
+        $created[0].TargetObjectId | Should -BeExactly "'=cmd|test"
     }
 
     It 'Tells the operator at ERROR where the copy landed' {
@@ -1228,6 +1249,50 @@ Describe 'New-MigrationUsers - a results export that fails falls back to the tem
 
     It 'Never writes the password into the log' {
         $script:usersFbLog | Should -Not -Match 'Pa55-fixed-word'
+    }
+}
+
+Describe 'New-MigrationUsers - a rehearsal that falls back to the temp folder writes a DryRun file' {
+
+    BeforeAll {
+        $script:usersDryFbFiles = @()
+
+        function Export-MigrationResult {
+            param([object[]]$Rows, [string]$Name, [switch]$DryRun)
+            throw 'Access to the path is denied.'
+        }
+
+        $script:usersDryFbWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "M365Migration-Users-DryFb-$([guid]::NewGuid())"
+        New-Item -Path $script:usersDryFbWorkspace -ItemType Directory -Force | Out-Null
+        $script:usersDryFbPlan = Join-Path $script:usersDryFbWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') `
+            -Destination $script:usersDryFbPlan
+
+        $script:usersDryFbPrefix = "UsersDryFallback$([guid]::NewGuid().ToString('N'))"
+
+        & $script:scriptPath -PlanPath $script:usersDryFbPlan -Wave '1' -DefaultUsageLocation 'US' `
+            -OutputPath $script:usersDryFbWorkspace -Prefix $script:usersDryFbPrefix -Verbosity Low -DryRun
+        $script:usersDryFbExitCode = $LASTEXITCODE
+
+        $script:usersDryFbFiles = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
+                -Filter "$($script:usersDryFbPrefix)_New-Users-*.csv" -ErrorAction SilentlyContinue)
+    }
+
+    AfterAll {
+        if (Get-Variable -Name usersDryFbFiles -Scope Script -ErrorAction SilentlyContinue) {
+            foreach ($file in $script:usersDryFbFiles) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if ($script:usersDryFbWorkspace -and (Test-Path -LiteralPath $script:usersDryFbWorkspace)) {
+            Remove-Item -LiteralPath $script:usersDryFbWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Writes the rescue copy as a DryRun file, never as Results' {
+        $script:usersDryFbFiles.Count | Should -Be 1
+        $script:usersDryFbFiles[0].Name | Should -BeLike "$($script:usersDryFbPrefix)_New-Users-DryRun_*.csv"
     }
 }
 
@@ -1257,8 +1322,11 @@ Describe 'New-MigrationUsers - credentials that cannot be written anywhere are r
         }
 
         # Shadows the cmdlet for the script only: the module's own export runs in the module
-        # session state, which a function defined here is not part of.
+        # session state, which a function defined here is not part of. CmdletBinding is what
+        # lets the script's explicit -ErrorAction Stop bind as a common parameter rather than
+        # failing to bind and throwing for the wrong reason.
         function Export-Csv {
+            [CmdletBinding()]
             param(
                 [Parameter(ValueFromPipeline)]$InputObject, [string]$LiteralPath, [string]$Path,
                 [switch]$NoTypeInformation, [string]$Encoding, [switch]$Force
@@ -1272,19 +1340,24 @@ Describe 'New-MigrationUsers - credentials that cannot be written anywhere are r
         $script:usersLostPlan = Join-Path $script:usersLostWorkspace 'IdentityPlan.csv'
         Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:usersLostPlan
 
+        $script:usersLostPrefix = "UsersLost$([guid]::NewGuid().ToString('N'))"
+
         & $script:scriptPath -PlanPath $script:usersLostPlan -Wave '1' -DefaultUsageLocation 'US' `
-            -OutputPath $script:usersLostWorkspace -Prefix 'UsersLost' -Verbosity Low -Confirm:$false
+            -OutputPath $script:usersLostWorkspace -Prefix $script:usersLostPrefix -Verbosity Low -Confirm:$false
         $script:usersLostExitCode = $LASTEXITCODE
 
         $log = @(Get-ChildItem -LiteralPath $script:usersLostWorkspace -Recurse `
-                -Filter 'UsersLost_New-MigrationUsers_*.log')
+                -Filter "$($script:usersLostPrefix)_New-MigrationUsers_*.log")
         $script:usersLostLog = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
     }
 
     AfterAll {
-        foreach ($stray in @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
-                    -Filter 'UsersLost_New-Users-Results_*.csv' -ErrorAction SilentlyContinue)) {
-            Remove-Item -LiteralPath $stray.FullName -Force -ErrorAction SilentlyContinue
+        # Nothing should have been written, but the sweep proves it and cleans up if it was.
+        if (Get-Variable -Name usersLostPrefix -Scope Script -ErrorAction SilentlyContinue) {
+            foreach ($stray in @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
+                        -Filter "$($script:usersLostPrefix)_New-Users-*.csv" -ErrorAction SilentlyContinue)) {
+                Remove-Item -LiteralPath $stray.FullName -Force -ErrorAction SilentlyContinue
+            }
         }
         if ($script:usersLostWorkspace -and (Test-Path -LiteralPath $script:usersLostWorkspace)) {
             Remove-Item -LiteralPath $script:usersLostWorkspace -Recurse -Force -ErrorAction SilentlyContinue

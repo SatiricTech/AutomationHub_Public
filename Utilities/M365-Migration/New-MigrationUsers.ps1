@@ -1074,13 +1074,25 @@ finally {
         catch {
             $exportError = $_.Exception.Message
 
-            # The run folder is unusable (read-only, full, or gone), so the rows go to the temp
-            # folder instead. Get-MigrationOutputPath keeps the filename contract - including
-            # leaving the leader off entirely when the run has no prefix.
-            $fallbackPath = Get-MigrationOutputPath -Directory ([System.IO.Path]::GetTempPath()) `
-                -Prefix $run.Prefix -Name 'New-Users' -Suffix 'Results'
+            # Built inside the try: an unusable temp path would otherwise throw out of the
+            # finally itself, taking the loss message with it.
+            $fallbackPath = ''
             try {
-                $resultRows | Export-Csv -LiteralPath $fallbackPath -NoTypeInformation -Encoding utf8
+                # The run folder is unusable (read-only, full, or gone), so the rows go to the
+                # temp folder instead. Get-MigrationOutputPath keeps the filename contract -
+                # including leaving the leader off entirely when the run has no prefix. The
+                # suffix has to track the run's mode: the workbench reads a step's state from
+                # it, and a DryRun file landing as '-Results' would mark the step done.
+                $fallbackSuffix = if ($run.DryRun) { 'DryRun' } else { 'Results' }
+                $fallbackPath = Get-MigrationOutputPath -Directory ([System.IO.Path]::GetTempPath()) `
+                    -Prefix $run.Prefix -Name 'New-Users' -Suffix $fallbackSuffix
+
+                # Sanitised the same way Export-MigrationResult does it: the rescue copy is
+                # opened in Excel like any other results file, so it needs the same protection
+                # against a cell that starts with '=' being run as a formula.
+                $resultRows |
+                    ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ } |
+                    Export-Csv -LiteralPath $fallbackPath -NoTypeInformation -Encoding utf8 -ErrorAction Stop
                 $resultsExported = $true
                 Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory); a copy was " +
                     "saved to $fallbackPath. Move it into the run folder. Original error: $exportError") -Level ERROR
@@ -1089,8 +1101,9 @@ finally {
                 # Nowhere left to put them. Naming the count - never the credentials - is the
                 # only thing that still helps: it tells the operator how big the re-run is.
                 $lostCount = @($resultRows | Where-Object { $_.GeneratedPassword }).Count
+                $attempted = if ($fallbackPath) { "'$fallbackPath'" } else { 'the temp folder' }
                 Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory) or to " +
-                    "'$fallbackPath': $($_.Exception.Message) Original error: $exportError") -Level ERROR
+                    "$attempted`: $($_.Exception.Message) Original error: $exportError") -Level ERROR
                 if ($lostCount -gt 0) {
                     Write-MigrationLog -Message ("$lostCount generated credential(s) could not be persisted " +
                         'anywhere; they are lost. Reset the affected accounts again.') -Level ERROR
@@ -1106,10 +1119,11 @@ finally {
 
 #region Cleanup -----------------------------------------------------------------------
 
-# Guarded by the export flag: after a run that could not write the rows anywhere, pointing the
-# operator at a results file that does not exist would contradict the loss they were just told about.
-if ($resultsExported -and
-    @($script:results | Where-Object { $_.Status -eq 'Succeeded' -and $_.GeneratedPassword }).Count -gt 0) {
+# Any row carrying a password, not just the Succeeded ones: a Failed row whose create may have
+# landed carries one too, and that file is just as much a password list. Guarded by the export
+# flag as well - after a run that could not write the rows anywhere, pointing the operator at a
+# results file that does not exist would contradict the loss they were just told about.
+if ($resultsExported -and @($script:results | Where-Object { $_.GeneratedPassword }).Count -gt 0) {
     Write-MigrationLog -Message 'Initial passwords were written to the results file. Store it as you would any password list.' -Level WARNING
 }
 

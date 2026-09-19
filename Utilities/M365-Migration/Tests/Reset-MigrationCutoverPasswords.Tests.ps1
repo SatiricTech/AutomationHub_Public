@@ -673,6 +673,9 @@ Describe 'A results export that fails still leaves the generated credentials on 
     #>
 
     BeforeAll {
+        # Initialised before anything that can throw, so the AfterAll sweep below always has a
+        # list to walk even if the run itself blows up half way through this block.
+        $script:fbFiles = @()
         $global:cutoverFallbackExports = 0
 
         function Connect-MigrationGraph {
@@ -686,7 +689,9 @@ Describe 'A results export that fails still leaves the generated credentials on 
                 return @([pscustomobject]@{
                         id                = '22222222-2222-2222-2222-222222222222'
                         userPrincipalName = 'john.smith@newco.com'
-                        displayName       = 'John Smith'
+                        # Leads with '=', so the rescue copy has to sanitise it the way
+                        # Export-MigrationResult would before Excel reads it as a formula.
+                        displayName       = '=cmd|test'
                         '@odata.type'     = '#microsoft.graph.user'
                     })
             }
@@ -706,13 +711,16 @@ Describe 'A results export that fails still leaves the generated credentials on 
         $null = New-Item -Path $script:fbWorkspace -ItemType Directory -Force
 
         # A -Prefix makes the temp fallback file's name unique to this test, which is the only
-        # way to find and clean up a file the script deliberately writes outside its workspace.
+        # way to find and clean it up again; the GUID keeps a stray from an interrupted earlier
+        # run from being counted as this run's output.
+        $script:fbPrefix = "ResetFallback$([guid]::NewGuid().ToString('N'))"
+
         & $script:scriptPath -Group '11111111-1111-1111-1111-111111111111' -OutputPath $script:fbWorkspace `
-            -Prefix 'ResetFallback' -Verbosity Low -Confirm:$false
+            -Prefix $script:fbPrefix -Verbosity Low -Confirm:$false
         $script:fbExitCode = $LASTEXITCODE
 
         $script:fbFiles = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
-                -Filter 'ResetFallback_Reset-CutoverPasswords-Results_*.csv' -ErrorAction SilentlyContinue)
+                -Filter "$($script:fbPrefix)_Reset-CutoverPasswords-*.csv" -ErrorAction SilentlyContinue)
         $script:fbRows = if ($script:fbFiles.Count -ge 1) {
             @(Import-Csv -LiteralPath $script:fbFiles[0].FullName)
         }
@@ -723,8 +731,10 @@ Describe 'A results export that fails still leaves the generated credentials on 
     }
 
     AfterAll {
-        foreach ($file in $script:fbFiles) {
-            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        if (Get-Variable -Name fbFiles -Scope Script -ErrorAction SilentlyContinue) {
+            foreach ($file in $script:fbFiles) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            }
         }
         if ($script:fbWorkspace -and (Test-Path -LiteralPath $script:fbWorkspace)) {
             Remove-Item -LiteralPath $script:fbWorkspace -Recurse -Force -ErrorAction SilentlyContinue
@@ -740,6 +750,10 @@ Describe 'A results export that fails still leaves the generated credentials on 
         $script:fbFiles.Count | Should -Be 1
     }
 
+    It 'names the live-run copy -Results, the same as the file it stands in for' {
+        $script:fbFiles[0].Name | Should -BeLike "$($script:fbPrefix)_Reset-CutoverPasswords-Results_*.csv"
+    }
+
     It 'keeps the generated credential in the fallback file' {
         $script:fbRows.Count | Should -Be 1
         $script:fbRows[0].Identity | Should -BeExactly 'john.smith@newco.com'
@@ -747,9 +761,13 @@ Describe 'A results export that fails still leaves the generated credentials on 
         $script:fbRows[0].GeneratedPassword | Should -Not -BeNullOrEmpty
     }
 
+    It 'sanitises the rescue copy against formula injection, as the normal export would' {
+        $script:fbRows[0].DisplayName | Should -BeExactly "'=cmd|test"
+    }
+
     It 'tells the operator at ERROR where the copy landed and what to do with it' {
         $script:fbLog | Should -Match '\[ERROR\].*Results could not be written to'
-        $script:fbLog | Should -Match 'a copy was saved to .*ResetFallback_Reset-CutoverPasswords-Results'
+        $script:fbLog | Should -Match "a copy was saved to .*$($script:fbPrefix)_Reset-CutoverPasswords-Results"
         $script:fbLog | Should -Match 'Move it into the run folder\.'
     }
 
@@ -759,6 +777,152 @@ Describe 'A results export that fails still leaves the generated credentials on 
 
     It 'still exits 0 - the resets worked and the credentials survived' {
         $script:fbExitCode | Should -Be 0
+    }
+}
+
+Describe 'A rehearsal that falls back to the temp folder still writes a DryRun file' {
+
+    <#
+        The workbench reads a step's state from the results filename's suffix, so a rescue copy
+        of a rehearsal that landed as '-Results' would mark the reset done when nothing happened.
+    #>
+
+    BeforeAll {
+        $script:dryFbFiles = @()
+
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = 'newco.onmicrosoft.com'; Account = 'tech@newco.onmicrosoft.com' }
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Method -eq 'PATCH') { throw 'A PATCH was reached, which -DryRun must have prevented.' }
+            return New-StubGraphUser -Uri $Uri
+        }
+
+        function Export-MigrationResult {
+            param([object[]]$Rows, [string]$Name, [switch]$DryRun)
+            throw 'Access to the path is denied.'
+        }
+
+        $script:dryFbWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "ResetCutover-DryFb-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:dryFbWorkspace -ItemType Directory -Force
+        $script:dryFbPrefix = "ResetDryFallback$([guid]::NewGuid().ToString('N'))"
+
+        & $script:scriptPath -TestUser 'john.smith@newco.com' -OutputPath $script:dryFbWorkspace `
+            -Prefix $script:dryFbPrefix -Verbosity Low -DryRun -Confirm:$false
+
+        $script:dryFbFiles = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
+                -Filter "$($script:dryFbPrefix)_Reset-CutoverPasswords-*.csv" -ErrorAction SilentlyContinue)
+    }
+
+    AfterAll {
+        if (Get-Variable -Name dryFbFiles -Scope Script -ErrorAction SilentlyContinue) {
+            foreach ($file in $script:dryFbFiles) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if ($script:dryFbWorkspace -and (Test-Path -LiteralPath $script:dryFbWorkspace)) {
+            Remove-Item -LiteralPath $script:dryFbWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'writes the rescue copy as a DryRun file, never as Results' {
+        $script:dryFbFiles.Count | Should -Be 1
+        $script:dryFbFiles[0].Name | Should -BeLike "$($script:dryFbPrefix)_Reset-CutoverPasswords-DryRun_*.csv"
+    }
+}
+
+Describe 'A PATCH that was sent and then failed keeps its passphrase on the Failed row' {
+
+    <#
+        Graph may have applied the password profile and simply failed to tell us - a timeout, a
+        dropped socket. Clearing the passphrase there locks the user out of an account whose
+        credential nobody holds. A failure BEFORE the PATCH is a different case: nothing was
+        changed, so surfacing a credential would be a lie.
+    #>
+
+    BeforeAll {
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = 'newco.onmicrosoft.com'; Account = 'tech@newco.onmicrosoft.com' }
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Uri -like '*/members*') {
+                return @(
+                    [pscustomobject]@{
+                        id                = '22222222-2222-2222-2222-222222222222'
+                        userPrincipalName = 'patch.fails@newco.com'
+                        displayName       = 'Patch Fails'
+                        '@odata.type'     = '#microsoft.graph.user'
+                    }
+                    # No id, so the row throws before the PATCH is ever built.
+                    [pscustomobject]@{
+                        userPrincipalName = 'no.id@newco.com'
+                        displayName       = 'No Object Id'
+                        '@odata.type'     = '#microsoft.graph.user'
+                    }
+                )
+            }
+            if ($Uri -like '*/v1.0/groups/11111111-1111-1111-1111-111111111111?*') {
+                return [pscustomobject]@{ id = '11111111-1111-1111-1111-111111111111'; displayName = 'Cutover Group' }
+            }
+            if ($Method -eq 'PATCH') { throw 'The operation timed out waiting for a response.' }
+            return $null
+        }
+
+        $script:patchWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "ResetCutover-Patch-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:patchWorkspace -ItemType Directory -Force
+
+        & $script:scriptPath -Group '11111111-1111-1111-1111-111111111111' -OutputPath $script:patchWorkspace `
+            -Verbosity Low -Confirm:$false
+        $script:patchExitCode = $LASTEXITCODE
+
+        $file = @(Get-ChildItem -LiteralPath $script:patchWorkspace -Filter 'Reset-CutoverPasswords-Results_*.csv')
+        $script:patchRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+
+        $logFile = @(Get-ChildItem -LiteralPath $script:patchWorkspace -Recurse -Filter '*.log')
+        $script:patchLog = if ($logFile.Count -ge 1) {
+            Get-Content -LiteralPath $logFile[0].FullName -Raw
+        }
+        else { '' }
+    }
+
+    AfterAll {
+        if ($script:patchWorkspace -and (Test-Path -LiteralPath $script:patchWorkspace)) {
+            Remove-Item -LiteralPath $script:patchWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'keeps the passphrase on the row whose PATCH was sent' {
+        $row = @($script:patchRows | Where-Object { $_.Identity -eq 'patch.fails@newco.com' })[0]
+        $row.Status | Should -BeExactly 'Failed'
+        $row.GeneratedPassword | Should -Not -BeNullOrEmpty
+    }
+
+    It 'tells the operator the reset may have applied' {
+        $row = @($script:patchRows | Where-Object { $_.Identity -eq 'patch.fails@newco.com' })[0]
+        $row.Detail |
+            Should -BeLike '*The reset may have applied; verify sign-in with this passphrase before resetting again.*'
+    }
+
+    It 'surfaces no credential for a row that failed before the PATCH' {
+        $row = @($script:patchRows | Where-Object { $_.Identity -eq 'no.id@newco.com' })[0]
+        $row.Status | Should -BeExactly 'Failed'
+        $row.GeneratedPassword | Should -BeNullOrEmpty
+        $row.Detail | Should -Not -BeLike '*may have applied*'
+    }
+
+    It 'never writes the kept passphrase into the log' {
+        $row = @($script:patchRows | Where-Object { $_.Identity -eq 'patch.fails@newco.com' })[0]
+        $script:patchLog | Should -Not -Match ([regex]::Escape($row.GeneratedPassword))
+    }
+
+    It 'still warns that the results file is a password list' {
+        $script:patchLog | Should -Match '\[WARNING\].*Generated passwords were written to the results file'
     }
 }
 
@@ -798,8 +962,11 @@ Describe 'Credentials that cannot be written anywhere are reported as lost' {
         }
 
         # Shadows the cmdlet for the script only: the module's own Export-MigrationResult runs
-        # in the module session state, which this function is not part of.
+        # in the module session state, which this function is not part of. CmdletBinding is
+        # what lets the script's explicit -ErrorAction Stop bind as a common parameter rather
+        # than failing to bind and throwing for the wrong reason.
         function Export-Csv {
+            [CmdletBinding()]
             param(
                 [Parameter(ValueFromPipeline)]$InputObject, [string]$LiteralPath, [string]$Path,
                 [switch]$NoTypeInformation, [string]$Encoding, [switch]$Force
@@ -809,9 +976,10 @@ Describe 'Credentials that cannot be written anywhere are reported as lost' {
 
         $script:lostWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "ResetCutover-Lost-$([guid]::NewGuid())"
         $null = New-Item -Path $script:lostWorkspace -ItemType Directory -Force
+        $script:lostPrefix = "ResetLost$([guid]::NewGuid().ToString('N'))"
 
         & $script:scriptPath -Group '11111111-1111-1111-1111-111111111111' -OutputPath $script:lostWorkspace `
-            -Prefix 'ResetLost' -Verbosity Low -Confirm:$false
+            -Prefix $script:lostPrefix -Verbosity Low -Confirm:$false
         $script:lostExitCode = $LASTEXITCODE
 
         $logFile = @(Get-ChildItem -LiteralPath $script:lostWorkspace -Recurse -Filter '*.log')
@@ -819,9 +987,12 @@ Describe 'Credentials that cannot be written anywhere are reported as lost' {
     }
 
     AfterAll {
-        foreach ($stray in @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
-                    -Filter 'ResetLost_Reset-CutoverPasswords-Results_*.csv' -ErrorAction SilentlyContinue)) {
-            Remove-Item -LiteralPath $stray.FullName -Force -ErrorAction SilentlyContinue
+        # Nothing should have been written, but the sweep proves it and cleans up if it was.
+        if (Get-Variable -Name lostPrefix -Scope Script -ErrorAction SilentlyContinue) {
+            foreach ($stray in @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
+                        -Filter "$($script:lostPrefix)_Reset-CutoverPasswords-*.csv" -ErrorAction SilentlyContinue)) {
+                Remove-Item -LiteralPath $stray.FullName -Force -ErrorAction SilentlyContinue
+            }
         }
         if ($script:lostWorkspace -and (Test-Path -LiteralPath $script:lostWorkspace)) {
             Remove-Item -LiteralPath $script:lostWorkspace -Recurse -Force -ErrorAction SilentlyContinue

@@ -48,7 +48,8 @@ function Resolve-MigrationTeamsUser {
 
         # Only the wordings Teams actually uses for an unknown identity mean "missing".
         # -match is case-insensitive, so a service that shouts NOT FOUND still matches.
-        if ($message -match 'not found|could not be found|does not exist|Cannot find') {
+        # 'unable to find' is defensive: the Teams cmdlets have used it as well.
+        if ($message -match 'not found|could not be found|does not exist|Cannot find|unable to find') {
             Write-MigrationLog -Message "Teams user '$Identity' could not be resolved: $message" -Level DEBUG
             return $null
         }
