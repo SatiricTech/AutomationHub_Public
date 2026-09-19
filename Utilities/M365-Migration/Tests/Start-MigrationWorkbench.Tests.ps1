@@ -1098,8 +1098,19 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
         It 'Loads the GUI helpers without building anything' {
             foreach ($name in @('Start-MigrationWorkbenchGui', 'Get-WorkbenchGuiStepList',
                     'ConvertTo-WorkbenchGuiControlKind', 'Format-WorkbenchGuiBanner',
-                    'ConvertTo-WorkbenchGuiOverride', 'Test-WorkbenchGuiTypedConfirmation')) {
+                    'ConvertTo-WorkbenchGuiOverride', 'Test-WorkbenchGuiFormParameter')) {
                 Get-Command -Name $name -CommandType Function | Should -Not -BeNullOrEmpty
+            }
+        }
+
+        It 'Keeps no second copy of a rule the engine now owns' {
+            # Test-WorkbenchGuiCanRun and Test-WorkbenchGuiTypedConfirmation were the window's
+            # own versions of two rules all three front ends apply. They are engine functions
+            # now, and a script-local copy reappearing is a front end about to disagree with the
+            # console and the unattended path about when a run is allowed.
+            foreach ($name in @('Test-WorkbenchGuiCanRun', 'Test-WorkbenchGuiTypedConfirmation')) {
+                Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue |
+                    Should -BeNullOrEmpty
             }
         }
 
@@ -1204,10 +1215,12 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
             DryRunFirst evidence for the next live run was evidence of a different run.
         #>
 
-        It 'Draws no row for a parameter a dedicated control already owns' {
-            foreach ($name in @('Wave', 'DryRun', 'OutputPath')) {
+        It 'Draws no row for a parameter the workbench owns' {
+            # The engine's list, not a copy of it: two lists is how a form comes to draw a box
+            # whose value Resolve-MigrationStepArguments then drops without saying so.
+            foreach ($name in @(Get-MigrationWorkbenchOwnedParameter)) {
                 Test-WorkbenchGuiFormParameter -Parameter (New-GuiParameterStub -Name $name) |
-                    Should -BeFalse -Because "the window has its own control for -$name"
+                    Should -BeFalse -Because "the workbench decides -$name for every run"
             }
         }
 
@@ -1358,31 +1371,31 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
         }
     }
 
-    Context 'Test-WorkbenchGuiTypedConfirmation' {
+    Context 'The typed-confirmation rule the window applies' {
 
         It 'Accepts a domain without case, because DNS has none' {
-            Test-WorkbenchGuiTypedConfirmation -Answer 'NEWCO.COM' -Required 'newco.com' | Should -BeTrue
-            Test-WorkbenchGuiTypedConfirmation -Answer '  newco.com  ' -Required 'newco.com' | Should -BeTrue
+            Test-MigrationTypedConfirmation -Typed 'NEWCO.COM' -Required 'newco.com' | Should -BeTrue
+            Test-MigrationTypedConfirmation -Typed '  newco.com  ' -Required 'newco.com' | Should -BeTrue
         }
 
         It 'Demands the case of a keyword, because shouting it is the point' {
-            Test-WorkbenchGuiTypedConfirmation -Answer 'REMOVE' -Required 'REMOVE' | Should -BeTrue
-            Test-WorkbenchGuiTypedConfirmation -Answer 'remove' -Required 'REMOVE' | Should -BeFalse
+            Test-MigrationTypedConfirmation -Typed 'REMOVE' -Required 'REMOVE' | Should -BeTrue
+            Test-MigrationTypedConfirmation -Typed 'remove' -Required 'REMOVE' | Should -BeFalse
         }
 
         It 'Refuses a gate that names nothing to type rather than treating it as satisfied' {
-            Test-WorkbenchGuiTypedConfirmation -Answer '' -Required '' | Should -BeFalse
-            Test-WorkbenchGuiTypedConfirmation -Answer 'anything' -Required '' | Should -BeFalse
+            Test-MigrationTypedConfirmation -Typed '' -Required '' | Should -BeFalse
+            Test-MigrationTypedConfirmation -Typed 'anything' -Required '' | Should -BeFalse
         }
 
         It 'Agrees with the unattended path on the same fixture gate' {
             # The rule this helper applies is the one Invoke-WorkbenchNonInteractive applies, and
             # the fixture's release domain is what the hard gate asks for there.
-            Test-WorkbenchGuiTypedConfirmation -Answer 'NEWCO.COM' -Required 'newco.com' | Should -BeTrue
+            Test-MigrationTypedConfirmation -Typed 'NEWCO.COM' -Required 'newco.com' | Should -BeTrue
         }
     }
 
-    Context 'Test-WorkbenchGuiCanRun' {
+    Context 'The runnable-workspace refusal the window applies' {
 
         <#
             The window may open a workspace whose settings do not validate - that is how an
@@ -1409,26 +1422,26 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
         }
 
         It 'Lets a workspace whose settings validate run' {
-            $verdict = Test-WorkbenchGuiCanRun -Workspace $script:GuiWorkspace
+            $verdict = Test-MigrationWorkspaceRunnable -Workspace $script:GuiWorkspace
             $verdict.CanRun | Should -BeTrue
             $verdict.Reason | Should -BeExactly ''
         }
 
         It 'Refuses a workspace whose Label was blanked, and names Label' {
             $script:BrokenWorkspace.SettingsResult.IsValid | Should -BeFalse
-            $verdict = Test-WorkbenchGuiCanRun -Workspace $script:BrokenWorkspace
+            $verdict = Test-MigrationWorkspaceRunnable -Workspace $script:BrokenWorkspace
             $verdict.CanRun | Should -BeFalse
             $verdict.Keys | Should -Contain 'Label'
             $verdict.Reason | Should -BeLike '*Label*'
         }
 
         It 'Points the operator at the Settings dialog, which is the way out' {
-            (Test-WorkbenchGuiCanRun -Workspace $script:BrokenWorkspace).Reason |
+            (Test-MigrationWorkspaceRunnable -Workspace $script:BrokenWorkspace).Reason |
                 Should -BeLike '*Settings*'
         }
 
         It 'Refuses before a workspace is open at all' {
-            $verdict = Test-WorkbenchGuiCanRun -Workspace $null
+            $verdict = Test-MigrationWorkspaceRunnable -Workspace $null
             $verdict.CanRun | Should -BeFalse
             $verdict.Reason | Should -BeLike '*workspace*'
         }
@@ -1590,6 +1603,36 @@ Describe 'Start-MigrationWorkbench - WinForms is never loaded before the platfor
 
         $apartment[0].Extent.StartOffset |
             Should -BeLessThan $addType[0].Extent.StartOffset -Because 'the STA check comes first'
+    }
+
+    It 'Reaps an un-run preview driver when the window closes and when a workspace is opened' {
+        # A driver written for Copy command and never run is not evidence of anything, and the
+        # only two ways out of a step - closing the window, opening another workspace - would
+        # otherwise leave a run folder in the workspace for a run that never happened. Asserted
+        # against the parse tree because there is no window on this machine to close; the
+        # reaper itself (Set-WorkbenchGuiPreview, which removes a folder only while it holds no
+        # stdout.txt) is exercised by the step-change path.
+        $closers = @($script:WorkbenchAst.FindAll({
+                    $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                    [string]$args[0].Member.Value -eq 'Add_FormClosed'
+                }, $true))
+        $closers | Should -HaveCount 1 -Because 'the window is closed in exactly one place'
+        @(Get-WorkbenchCommandAst -Ast $closers[0] -Name 'Set-WorkbenchGuiPreview') |
+            Should -Not -BeNullOrEmpty -Because 'closing the window must not leave a driver behind'
+
+        $opener = @($script:WorkbenchAst.FindAll({
+                    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $args[0].Name -eq 'Invoke-WorkbenchGuiOpenWorkspaceAction'
+                }, $true))
+        $opener | Should -HaveCount 1
+
+        $reap = @(Get-WorkbenchCommandAst -Ast $opener[0] -Name 'Set-WorkbenchGuiPreview')
+        $reap | Should -Not -BeNullOrEmpty -Because 'opening another workspace must not leave one either'
+
+        # Before the scan, so a workspace that will not open still clears the old preview.
+        $scan = @(Get-WorkbenchCommandAst -Ast $opener[0] -Name 'Get-MigrationWorkspace')
+        $scan | Should -Not -BeNullOrEmpty
+        $reap[0].Extent.StartOffset | Should -BeLessThan $scan[0].Extent.StartOffset
     }
 
     It 'Builds no window and loads no assembly at load time: the GUI region is functions only' {

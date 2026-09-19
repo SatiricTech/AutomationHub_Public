@@ -195,13 +195,6 @@ $script:WorkbenchGuiPaneLimit = 2000
 # neither the WaveRequired gate nor the ledger could then tell the two screens apart.
 $script:WorkbenchGuiAllWavesLabel = '(all waves)'
 
-# The parameters a dedicated control owns: -Wave is the Waves checked list, -DryRun is the pair
-# of Dry run / Run buttons, and -OutputPath is the workspace box at the top of the window. The
-# generated step form must never draw a second control for any of them - two controls for one
-# parameter is how a ledger comes to record the ticked wave while the driver runs the typed one.
-# One list, read by the form's filter and by the override converter, so the two cannot drift.
-$script:GuiOwnedParameters = @('Wave', 'DryRun', 'OutputPath')
-
 # What a [SecureString] parameter's row says instead of offering a box. The window collects no
 # secret at all: a password box is one more place a client secret can be shoulder-read or land
 # in a screenshot, and the child process reads it from this environment variable instead.
@@ -1159,10 +1152,11 @@ function Test-WorkbenchGuiFormParameter {
         workbench itself for every step, so a row for it would be a box whose value the resolver
         replaces.
 
-        A parameter a dedicated control already owns ($script:GuiOwnedParameters) is worse than
-        redundant: the window would be showing two controls for one value, and -Override wins
-        over the dedicated argument silently. That is exactly how a run comes to be recorded in
-        the ledger as the wave the operator ticked while the driver runs the wave they typed.
+        A parameter the workbench owns (Get-MigrationWorkbenchOwnedParameter - the engine's own
+        list, so the form filter and the resolver cannot drift apart) is worse than redundant:
+        the window would be showing a box whose value the resolver drops, or two controls for
+        one value. That is exactly how a run comes to be recorded in the ledger as the wave the
+        operator ticked while the driver runs the wave they typed.
 
         A pure function of the parameter, so the rule the form applies is the rule the test
         asserts - there is no window on the machine this is written on.
@@ -1196,87 +1190,7 @@ function Test-WorkbenchGuiFormParameter {
 
     $name = [string](Get-MigrationProperty -InputObject $Parameter -Name 'Name' -Default '')
     # -in on strings is case-insensitive, which is what a parameter name is compared by.
-    return ($name -notin $script:GuiOwnedParameters)
-}
-
-function Test-WorkbenchGuiCanRun {
-    <#
-    .SYNOPSIS
-        Decides whether this workspace is in a state anything may be run against, and says why not.
-
-    .DESCRIPTION
-        The window is allowed to open a workspace whose settings do not validate - that is how an
-        operator fixes them through the Settings dialog, and it is the one thing the window can do
-        that the console cannot (Docs/Workbench-Design.md, sections 8 and 9). What it must not do
-        is run a step against one.
-
-        With no valid settings there is no tenant GUID to assert against, so Invoke-MigrationStep
-        is handed no -ExpectedTenantId and TenantVerified comes back $null; there is no label, so
-        the prefix and the output folder fall back to the shared Common folder; and a soft gate
-        answered Yes would start a live writer against a tenant nobody checked. The console
-        (Show-MigrationWorkbench) and the unattended path (Invoke-WorkbenchNonInteractive, exit 2)
-        both refuse outright, and this is the window's version of the same refusal.
-
-        The keys are named because they are what the operator has to fix: every settings error
-        carries the dotted schema key it is about, and the Settings dialog puts its message beside
-        that field.
-
-        A pure function of the scan, so the refusal can be tested on a machine with no WinForms.
-
-    .PARAMETER Workspace
-        The scan from Get-MigrationWorkspace, or $null when no workspace is open yet.
-
-    .EXAMPLE
-        (Test-WorkbenchGuiCanRun -Workspace $ws).CanRun
-
-        Returns $true for a workspace whose settings validate.
-
-    .EXAMPLE
-        (Test-WorkbenchGuiCanRun -Workspace $ws).Reason
-
-        Returns "The settings for this workspace are not usable yet: Label. Nothing can be run
-        until they are fixed - open Settings." for a workspace whose Label was blanked.
-
-    .NOTES
-        Author: AutomationHub
-        Written with assistance from Claude (Anthropic).
-    #>
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [AllowNull()]
-        $Workspace
-    )
-
-    if ($null -eq $Workspace) {
-        return [pscustomobject]@{
-            CanRun = $false
-            Keys   = @()
-            Reason = 'Open a workspace first: a step runs against one migration folder.'
-        }
-    }
-
-    $result = Get-MigrationProperty -InputObject $Workspace -Name 'SettingsResult' -Default $null
-    if ([bool](Get-MigrationProperty -InputObject $result -Name 'IsValid' -Default $false)) {
-        return [pscustomobject]@{ CanRun = $true; Keys = @(); Reason = '' }
-    }
-
-    # The key is the field the operator edits; a file-level problem (no file at all, or one that
-    # is not JSON) carries no key, and naming the file itself is the only useful thing to say.
-    $keys = [System.Collections.Generic.List[string]]::new()
-    foreach ($problem in @(Get-MigrationProperty -InputObject $result -Name 'Errors' -Default @())) {
-        $key = [string](Get-MigrationProperty -InputObject $problem -Name 'Key' -Default '')
-        if (-not $key) { $key = '(the settings file itself)' }
-        if (-not $keys.Contains($key)) { $keys.Add($key) }
-    }
-    if ($keys.Count -eq 0) { $keys.Add('(the settings file itself)') }
-
-    return [pscustomobject]@{
-        CanRun = $false
-        Keys   = @($keys)
-        Reason = ('The settings for this workspace are not usable yet: {0}. Nothing can be run ' -f
-            (@($keys) -join ', ')) + 'until they are fixed - open Settings.'
-    }
+    return ($name -notin (Get-MigrationWorkbenchOwnedParameter))
 }
 
 function Get-WorkbenchGuiStepList {
@@ -1462,9 +1376,14 @@ function ConvertTo-WorkbenchGuiOverride {
         Two parameters can never produce one, whatever they were handed. A [SecureString] has no
         control to read - its row is a line of text - and a secret must never reach an -Override
         hashtable, because that is what New-MigrationStepDriver writes into a file. And a
-        parameter a dedicated control owns ($script:GuiOwnedParameters) would arrive here only
-        through a form that should not have drawn it; returning $null is the second lock on the
-        bug where -Override @{ Wave = ... } silently outranks the wave the run was told to use.
+        parameter the workbench owns (Get-MigrationWorkbenchOwnedParameter) would arrive here
+        only through a form that should not have drawn it; returning $null is the second lock on
+        the bug where -Override @{ Wave = ... } silently outranks the wave the run was told to
+        use. The engine drops such a key as well, which is the third.
+
+        A map is read by the engine's own parser (ConvertFrom-MigrationMapText), the same one
+        the console's settings form and its step form use, so 'old.com=new.com' means the same
+        thing in all three.
 
     .PARAMETER Parameter
         The parameter object the control was generated from.
@@ -1515,15 +1434,7 @@ function ConvertTo-WorkbenchGuiOverride {
     }
 
     if ([bool](Get-MigrationProperty -InputObject $Parameter -Name 'IsHashtable' -Default $false)) {
-        $map = [ordered]@{}
-        foreach ($line in @($value -split "`r?`n")) {
-            $pair = $line -split '=', 2
-            if ($pair.Count -ne 2) { continue }
-            $left = $pair[0].Trim()
-            if (-not $left) { continue }
-            $map[$left] = $pair[1].Trim()
-        }
-        return $map
+        return (ConvertFrom-MigrationMapText -Text $value)
     }
 
     if ([string]::IsNullOrWhiteSpace($value)) { return $null }
@@ -1542,60 +1453,6 @@ function ConvertTo-WorkbenchGuiOverride {
     }
 
     return $value.Trim()
-}
-
-function Test-WorkbenchGuiTypedConfirmation {
-    <#
-    .SYNOPSIS
-        Decides whether what the operator typed clears a hard gate.
-
-    .DESCRIPTION
-        The same rule the console and the unattended path apply, in one testable place
-        (Docs/Workbench-Design.md, section 7.2). A domain is matched without case, because DNS
-        has none and an operator who typed 'NewCo.com' typed the domain; anything else - the
-        word REMOVE - is matched with case, because shouting it is the point.
-
-        A gate that names nothing to type is refused rather than treated as satisfied: 'nothing
-        expected' must never become 'anything is accepted', which would turn the strongest gate
-        in the toolkit into no gate at all.
-
-    .PARAMETER Answer
-        What the operator typed. Surrounding whitespace is ignored.
-
-    .PARAMETER Required
-        The gate's RequiredInput.
-
-    .EXAMPLE
-        Test-WorkbenchGuiTypedConfirmation -Answer 'NEWCO.COM' -Required 'newco.com'
-
-        Returns $true: a domain has no case.
-
-    .EXAMPLE
-        Test-WorkbenchGuiTypedConfirmation -Answer 'remove' -Required 'REMOVE'
-
-        Returns $false: the keyword is matched with case.
-
-    .NOTES
-        Author: AutomationHub
-        Written with assistance from Claude (Anthropic).
-    #>
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Answer,
-
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Required
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Required)) { return $false }
-
-    $typed = if ($null -eq $Answer) { '' } else { $Answer.Trim() }
-    if ($Required -like '*.*') { return ($typed -ieq $Required) }
-    return ($typed -ceq $Required)
 }
 
 function Write-WorkbenchGuiPane {
@@ -1724,7 +1581,7 @@ function Update-WorkbenchGuiRunState {
 
     if ($null -eq $script:Gui) { return }
 
-    $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
+    $canRun = Test-MigrationWorkspaceRunnable -Workspace $script:Gui.Workspace
     if ($canRun.CanRun) {
         Set-WorkbenchGuiStatus -Text 'Ready'
         return
@@ -2062,7 +1919,7 @@ function Show-WorkbenchGuiStepForm {
         step and because the buttons re-resolve for the mode they are: the form is a picture of
         what would run, and the run action never trusts it.
 
-        On a workspace whose settings do not validate (Test-WorkbenchGuiCanRun) nothing is
+        On a workspace whose settings do not validate (Test-MigrationWorkspaceRunnable) nothing is
         resolved at all. The resolver would answer from a settings document that does not exist:
         no tenant to assert against, no label, and a picture of a run that must not be started
         anyway. The rows are drawn empty and the strip says which keys have to be fixed first.
@@ -2128,7 +1985,7 @@ function Show-WorkbenchGuiStepForm {
     # buttons resolve again for the mode they actually are. Nothing is resolved while the
     # settings are unusable - the run actions refuse then, and a form full of values resolved
     # from a document that did not load would be a picture of a run nobody can start.
-    $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
+    $canRun = Test-MigrationWorkspaceRunnable -Workspace $script:Gui.Workspace
     $resolved = $null
     if ($canRun.CanRun) {
         try {
@@ -2417,7 +2274,7 @@ function Show-WorkbenchGuiTypedConfirmation {
     .DESCRIPTION
         A hard gate exists to make somebody type something (Docs/Workbench-Design.md, section
         7.2), so the dialog's OK button stays disabled until the text box holds exactly what the
-        gate asked for - judged by Test-WorkbenchGuiTypedConfirmation, the same rule the console
+        gate asked for - judged by Test-MigrationTypedConfirmation, the same rule the console
         and the unattended path use. A keypress is never accepted in its place, and a gate
         naming nothing to type is refused here rather than shown as a dialog nobody could pass.
 
@@ -2493,7 +2350,7 @@ function Show-WorkbenchGuiTypedConfirmation {
     try {
         $result = $dialog.ShowDialog($script:Gui.Form)
         return (($result -eq [System.Windows.Forms.DialogResult]::OK) -and
-            (Test-WorkbenchGuiTypedConfirmation -Answer $answer.Text -Required $RequiredInput))
+            (Test-MigrationTypedConfirmation -Typed $answer.Text -Required $RequiredInput))
     }
     finally {
         $script:Gui.Confirmation = $null
@@ -2545,13 +2402,15 @@ function Show-WorkbenchGuiResultSummary {
 
     $verified = Get-MigrationProperty -InputObject $Result -Name 'TenantVerified' -Default $null
     if ($verified -eq $false) {
-        $connected = @(Get-MigrationProperty -InputObject $Result -Name 'ConnectedTenantIds' -Default @())
-        $reached = if ($connected.Count -gt 0) { $connected -join ', ' } else { 'no tenant at all' }
-        $warning = ("TENANT MISMATCH`r`n`r`nThis run signed in to $reached, which is not the tenant it " +
-            'was given. Check the tenant GUIDs in Settings before anything else, and read the run log ' +
-            'before trusting what this step reports.')
+        # One sentence, built by the engine, so the window, the console and the unattended path
+        # cannot describe the same outcome three different ways - and so that a run which
+        # printed no tenant line at all is reported as the sign-in failure it is rather than
+        # sending an operator after a GUID nobody saw.
+        $verdict = Format-MigrationTenantVerdict -Result $Result
+        $warning = ("TENANT MISMATCH`r`n`r`n$verdict Check the tenant GUIDs in Settings before " +
+            'anything else, and read the run log before trusting what this step reports.')
         Write-WorkbenchGuiPane -Line '!! TENANT MISMATCH'
-        Write-WorkbenchGuiPane -Line "   This run signed in to $reached, which is not the tenant it was given."
+        Write-WorkbenchGuiPane -Line "   $verdict"
         Show-WorkbenchGuiMessage -Message $warning -Title 'Tenant mismatch' -Icon 'Error'
     }
 
@@ -2574,9 +2433,8 @@ function Show-WorkbenchGuiResultSummary {
 
     $lines.Add('')
     $lines.Add($(
-            if ($null -eq $verified) { 'No tenant was expected for this step, so none was checked.' }
-            elseif ([bool]$verified) { 'Tenant verified.' }
-            else { 'TENANT MISMATCH - see the dialog above.' }))
+            if ($verified -eq $false) { 'TENANT MISMATCH - see the dialog above.' }
+            else { Format-MigrationTenantVerdict -Result $Result }))
 
     $icon = if ($verified -eq $false -or [int]$Result.ExitCode -eq 1) { 'Error' }
     elseif ([int]$Result.ExitCode -ne 0) { 'Warning' }
@@ -2987,7 +2845,7 @@ function Invoke-WorkbenchGuiConfirmationChangedAction {
     if ($null -eq $script:Gui -or $null -eq $script:Gui.Confirmation) { return }
 
     $state = $script:Gui.Confirmation
-    $state.OkButton.Enabled = Test-WorkbenchGuiTypedConfirmation -Answer ([string]$state.AnswerBox.Text) `
+    $state.OkButton.Enabled = Test-MigrationTypedConfirmation -Typed ([string]$state.AnswerBox.Text) `
         -Required ([string]$state.Required)
 }
 
@@ -3238,11 +3096,16 @@ function Invoke-WorkbenchGuiOpenWorkspaceAction {
     try {
         Set-WorkbenchGuiBusy -Busy $true -Activity 'scanning the workspace'
 
+        # Reaped before the new workspace is scanned, not after. A driver written for Copy
+        # command and never run is not evidence of anything, and leaving it behind would put a
+        # run folder in the old workspace for a run that never happened - including when the
+        # scan below is the thing that throws.
+        Set-WorkbenchGuiPreview -Driver $null
+
         $script:Gui.WorkspacePath = $Path
         $script:Gui.WorkspaceBox.Text = $Path
         $script:Gui.Workspace = Get-MigrationWorkspace -Path $Path
         $script:Gui.Step = $null
-        Set-WorkbenchGuiPreview -Driver $null
         $script:Gui.FormPanel.Controls.Clear()
         $script:Gui.Rows = [System.Collections.Generic.List[object]]::new()
         $script:Gui.TitleLabel.Text = 'Pick a step on the left.'
@@ -3256,7 +3119,7 @@ function Invoke-WorkbenchGuiOpenWorkspaceAction {
             Write-WorkbenchGuiPane -Line "  ! $warning"
         }
 
-        $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
+        $canRun = Test-MigrationWorkspaceRunnable -Workspace $script:Gui.Workspace
         if (-not $canRun.CanRun) {
             foreach ($problem in @($script:Gui.Workspace.SettingsResult.Errors)) {
                 Write-WorkbenchGuiPane -Line "  ! $problem"
@@ -3495,7 +3358,7 @@ function Invoke-WorkbenchGuiCopyAction {
         return
     }
 
-    $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
+    $canRun = Test-MigrationWorkspaceRunnable -Workspace $script:Gui.Workspace
     if (-not $canRun.CanRun) {
         Show-WorkbenchGuiMessage -Message ([string]$canRun.Reason) -Title 'Settings' -Icon 'Warning'
         return
@@ -3677,7 +3540,7 @@ function Invoke-WorkbenchGuiStepAction {
         a run, which also means it keeps the buttons capable of raising events, and a second run
         started on top of the first would share this function's state with it. Then the settings:
         a workspace whose settings did not load is refused before the resolver is called at all,
-        the same refusal the console and the unattended path make (Test-WorkbenchGuiCanRun).
+        the same refusal the console and the unattended path make (Test-MigrationWorkspaceRunnable).
 
     .PARAMETER Live
         $true to run the step for real, $false to rehearse it.
@@ -3713,7 +3576,7 @@ function Invoke-WorkbenchGuiStepAction {
     # settings that did not load is handed no -TenantId, so the expected tenant is never set and
     # TenantVerified comes back $null; the prefix and the output folder fall back to Common; and
     # one Yes on a soft gate would start a live writer nobody can say which tenant it reached.
-    $canRun = Test-WorkbenchGuiCanRun -Workspace $script:Gui.Workspace
+    $canRun = Test-MigrationWorkspaceRunnable -Workspace $script:Gui.Workspace
     if (-not $canRun.CanRun) {
         Show-WorkbenchGuiMessage -Message ([string]$canRun.Reason) -Title 'Settings' -Icon 'Warning'
         return
