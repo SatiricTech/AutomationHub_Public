@@ -476,6 +476,42 @@ Describe 'New-MigrationIdentityPlan' {
                 Should -BeExactly 'john.smith@mail.newco.com'
         }
 
+        It 'Resolves a collision against the mail domain, where the address will actually exist' {
+            $listPath = Join-Path $TestDrive 'reserved-mail-domain.txt'
+            @('# already live in the destination', 'john.smith@mail.newco.com') |
+                Set-Content -LiteralPath $listPath -Encoding utf8
+
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-reserved') -Parameter @{
+                SmtpDomain            = 'mail.newco.com'
+                ReservedAddressesPath = $listPath
+            }
+
+            $row = Get-PlanRow -Result $result -Identity 'jsmith@contoso.com'
+            $row.PlanStatus | Should -BeExactly 'Collision'
+            $row.TargetPrimarySmtp | Should -BeExactly 'john.smith2@mail.newco.com'
+            $row.PlanDetail | Should -BeLike '*SMTP john.smith@mail.newco.com is already reserved in the destination*'
+            $row.PlanDetail | Should -BeLike '*used john.smith2@mail.newco.com*'
+            # The UPN lives in a different domain and nothing there is taken, so it keeps its name.
+            $row.TargetUserPrincipalName | Should -BeExactly 'john.smith@newco.com'
+        }
+
+        It 'Leaves the mail address alone when only the target-domain address is reserved' {
+            $listPath = Join-Path $TestDrive 'reserved-target-domain.txt'
+            @('john.smith@newco.com') | Set-Content -LiteralPath $listPath -Encoding utf8
+
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-upnonly') -Parameter @{
+                SmtpDomain            = 'mail.newco.com'
+                ReservedAddressesPath = $listPath
+            }
+
+            $row = Get-PlanRow -Result $result -Identity 'jsmith@contoso.com'
+            $row.TargetPrimarySmtp | Should -BeExactly 'john.smith@mail.newco.com'
+            $row.InterimPrimarySmtp | Should -BeExactly 'john.smith@mail.newco.com'
+            $row.PlanDetail | Should -Not -BeLike '*SMTP*'
+            # The UPN side is the one that collided; only it takes the suffix.
+            $row.TargetUserPrincipalName | Should -BeExactly 'john.smith2@newco.com'
+        }
+
         It 'Changes nothing when it names the target domain itself' {
             $parameters = @{} + $script:FullParameters
             $parameters['SmtpDomain'] = 'newco.com'

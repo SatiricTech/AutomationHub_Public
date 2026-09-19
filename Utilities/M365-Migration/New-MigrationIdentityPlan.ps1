@@ -65,7 +65,9 @@
     a leading '@'. Omit it and mail is addressed in -TargetDomain. Because the sign-in address and
     the mail address then differ, those rows are marked UpnSmtpDiverge; and because the mail
     domain is not the one the source tenant still holds, InterimPrimarySmtp equals
-    TargetPrimarySmtp even when -InterimDomain is given.
+    TargetPrimarySmtp even when -InterimDomain is given. Collisions and reserved addresses are
+    then judged per domain - the SMTP address against this domain, the UPN against -TargetDomain -
+    so only a name already taken in the mail domain suffixes the mail address.
 
 .PARAMETER InterimDomain
     Routing domain used before the vanity domain cuts over, typically newco.onmicrosoft.com.
@@ -1058,24 +1060,33 @@ try {
     # therefore resolved in one pass over one taken set. An item whose UPN and SMTP local parts
     # agree makes a single claim, so both keep the same local part when a suffix or a middle
     # initial is needed; only a deliberately divergent -SmtpFormat claims the two separately.
+    #
+    # Each claim is made in the domain the address will be created in: the UPN always in
+    # -TargetDomain, the SMTP address in -SmtpDomain when one was given. Resolving the SMTP side
+    # against the target domain instead would both miss an address already taken in the mail
+    # domain and suffix a mail address over a name that is only taken somewhere else.
     $namedItems = @($planned | Where-Object { $_.Row.PlanStatus -ne 'NeedsReview' -and -not $_.IsGuest })
     $newCandidate = {
-        param($Item, [string[]]$Slot, [string]$KeySuffix)
+        param($Item, [string[]]$Slot, [string]$KeySuffix, [string]$Domain)
         [pscustomobject]@{
             Key = "$($Item.Key)$KeySuffix"; ItemKey = [string]$Item.Key; Slot = $Slot
-            LocalPart = [string]$Item[$Slot[0]]; MiddleInitial = [string]$Item.Row.MiddleName; Domain = $targetDomainName
+            LocalPart = [string]$Item[$Slot[0]]; MiddleInitial = [string]$Item.Row.MiddleName; Domain = $Domain
         }
     }
     $candidates = [System.Collections.Generic.List[object]]::new()
     foreach ($item in $namedItems) {
         $upnLocalPart = [string]$item['UpnLocalPart']
         $smtpLocalPart = [string]$item['SmtpLocalPart']
-        if ($upnLocalPart -and $smtpLocalPart -and $upnLocalPart -ieq $smtpLocalPart) {
-            $candidates.Add((& $newCandidate $item @('UpnLocalPart', 'SmtpLocalPart') ''))
+
+        # One claim only when the two are the same address - same local part and same domain.
+        # A separate mail domain puts them in different namespaces, so each is claimed on its own.
+        if ($upnLocalPart -and $smtpLocalPart -and $upnLocalPart -ieq $smtpLocalPart -and
+            $smtpDomainName -eq $targetDomainName) {
+            $candidates.Add((& $newCandidate $item @('UpnLocalPart', 'SmtpLocalPart') '' $targetDomainName))
             continue
         }
-        if ($smtpLocalPart) { $candidates.Add((& $newCandidate $item @('SmtpLocalPart') '')) }
-        if ($upnLocalPart) { $candidates.Add((& $newCandidate $item @('UpnLocalPart') '|upn')) }
+        if ($smtpLocalPart) { $candidates.Add((& $newCandidate $item @('SmtpLocalPart') '' $smtpDomainName)) }
+        if ($upnLocalPart) { $candidates.Add((& $newCandidate $item @('UpnLocalPart') '|upn' $targetDomainName)) }
     }
 
     $resolvedClaims = @(Resolve-MigrationCollision -Reserved $reservedAddresses.ToArray() -Candidates $candidates.ToArray())
@@ -1091,9 +1102,12 @@ try {
     $itemByKey = @{}
     foreach ($item in $items) { $itemByKey[[string]$item.Key] = $item }
     $describeClaimant = {
-        param([string]$LocalPart)
+        # The domain is part of the lookup: two claims can hold the same local part when the UPN
+        # and the mail address live in different domains, and only one of them is the winner
+        # being named here.
+        param([string]$LocalPart, [string]$Domain)
         foreach ($entry in $resolvedClaims) {
-            if ([string]$entry.ResolvedLocalPart -ne $LocalPart) { continue }
+            if ([string]$entry.ResolvedLocalPart -ne $LocalPart -or [string]$entry.Domain -ne $Domain) { continue }
             $owner = $itemByKey[[string]$entry.ItemKey]
             if ($null -eq $owner) { return '' }
             return [string](@($owner.Row.SourceUserPrincipalName, $owner.Row.SourcePrimarySmtp,
@@ -1115,16 +1129,19 @@ try {
 
             $wanted = ([string]$claim.LocalPart).Trim().ToLowerInvariant()
             $label = @(@($claim.Slot) | ForEach-Object { $slotLabel[$_] }) -join ' and '
-            $claimant = & $describeClaimant $wanted
+            # The claim's own domain, so the message names the address that was actually contested.
+            $claimDomain = [string]$claim.Domain
+            $claimant = & $describeClaimant $wanted $claimDomain
             $taken = if ($claimant) { "taken by $claimant" } else { 'already reserved in the destination' }
 
             if ($claim.Resolution -eq 'Unresolved') {
                 foreach ($slot in @($claim.Slot)) { $item[$slot] = '' }
                 $unresolved = $true
-                $details.Add("$label ${wanted}@$targetDomainName is $taken and no free alternative was found - assign one by hand.")
+                $details.Add("$label ${wanted}@$claimDomain is $taken and no free alternative was found - " +
+                    'assign one by hand.')
             }
             else {
-                $details.Add("$label ${wanted}@$targetDomainName is $taken; used $($claim.ResolvedLocalPart)@$targetDomainName.")
+                $details.Add("$label ${wanted}@$claimDomain is $taken; used $($claim.ResolvedLocalPart)@$claimDomain.")
             }
         }
 
