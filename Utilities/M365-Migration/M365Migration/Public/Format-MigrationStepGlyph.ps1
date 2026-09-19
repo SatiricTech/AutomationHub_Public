@@ -18,7 +18,6 @@ function Format-MigrationStepGlyph {
 
     .NOTES
         Author: AutomationHub
-        Private module helper - not exported.
         Written with assistance from Claude (Anthropic).
     #>
     [CmdletBinding()]

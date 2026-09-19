@@ -504,6 +504,13 @@ The window holds no logic: every button calls an engine function and renders the
 A test dot-sources the script with `-NoGui` on macOS and asserts the GUI's step list equals
 `Get-MigrationStep`.
 
+The four renderers both front ends draw with — `Format-MigrationWorkbenchView`,
+`Format-MigrationStepGlyph`, `Format-MigrationStepLastRun` and `Get-MigrationScriptSynopsisText`
+— are **exported**, not private. They stopped being the console's own business the moment a
+second front end had to draw the same glyph, the same last-run line and the same results list,
+and the alternative to exporting them is a window that re-renders them by hand and eventually
+describes one workspace differently from the board.
+
 ## 10. Entry script and launcher
 
 `Start-MigrationWorkbench.ps1` parameters: `-Workspace`, `-Console`, `-Step`, `-Wave`,

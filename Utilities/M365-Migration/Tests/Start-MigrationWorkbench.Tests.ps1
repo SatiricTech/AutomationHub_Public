@@ -96,15 +96,34 @@ BeforeAll {
         return $destination
     }
 
+    # When the suite started, so the AfterAll guard can tell a log this run wrote from one that
+    # was already there.
+    $global:WorkbenchSuiteStart = Get-Date
+
     # One non-interactive run, with the shadow's log cleared first and everything the operator
     # would have seen - host output and errors alike - captured as text.
+    #
+    # The workbench's own log goes to <workspace>/Workbench/ when a workspace is known and under
+    # the default output root when one is not - which is the operator's real ~/Migration-Automations
+    # on the machine running this suite. So an invocation with no usable workspace has to name a
+    # -LogPath under TestDrive, and this refuses rather than quietly writing there: a test that
+    # litters a technician's own migration folder is a test nobody notices for months.
     function Invoke-WorkbenchScript {
         [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
             Justification = 'Pester helper that runs the entry script under test.')]
         param([hashtable]$Parameter)
 
+        $hasWorkspace = $Parameter.ContainsKey('Workspace') -and
+            (Test-Path -LiteralPath ([string]$Parameter['Workspace']) -PathType Container)
+        if (-not $hasWorkspace -and -not $Parameter.ContainsKey('LogPath')) {
+            throw ('This invocation has no workspace on disk, so the workbench would log to the real ' +
+                'default output root. Pass -LogPath under TestDrive.')
+        }
+
         $global:WorkbenchStepRuns = [System.Collections.Generic.List[object]]::new()
-        $output = & $script:ScriptPath @Parameter 2>&1 | Out-String
+        # Errors and warnings both: a soft gate the run warned past is a Write-Warning, and the
+        # 2>&1 alone would have left every one of those out of what the assertions can see.
+        $output = & $script:ScriptPath @Parameter 2>&1 3>&1 | Out-String
         return [pscustomobject]@{
             ExitCode = $LASTEXITCODE
             Output   = $output
@@ -114,8 +133,26 @@ BeforeAll {
 }
 
 AfterAll {
+    # Nothing this suite ran may have written a workbench log into the operator's own default
+    # output root. Checked by age rather than by emptying the folder, because that folder is a
+    # technician's real migrations and this suite has no business deleting anything it did not
+    # create. Anything it did create is cleaned up before the failure is raised, so a run that
+    # trips this does not leave the litter behind as well.
+    $strayRoot = Get-MigrationDefaultOutputRoot
+    if (Test-Path -LiteralPath $strayRoot -PathType Container) {
+        $stray = @(Get-ChildItem -LiteralPath $strayRoot -Filter 'Start-MigrationWorkbench_*.log' `
+                -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -ge $global:WorkbenchSuiteStart })
+        foreach ($file in $stray) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
+        if ($stray.Count -gt 0) {
+            throw ("This suite wrote $($stray.Count) workbench log(s) into '$strayRoot': " +
+                (@($stray | ForEach-Object { $_.Name }) -join ', ') +
+                '. Every invocation needs a -Workspace on disk or a -LogPath under TestDrive.')
+        }
+    }
+
     Remove-Variable -Scope Global -ErrorAction SilentlyContinue -Name `
-        WorkbenchStepRuns, WorkbenchStepExitCode, WorkbenchStepAborted
+        WorkbenchStepRuns, WorkbenchStepExitCode, WorkbenchStepAborted, WorkbenchSuiteStart
 }
 
 Describe 'Start-MigrationWorkbench helpers (dot-sourced with -NoGui)' {
@@ -506,9 +543,12 @@ Describe 'Start-MigrationWorkbench Main - a hard gate acknowledged in the wrong 
         $script:AckResult.ExitCode | Should -Be 0
     }
 
-    It 'Records the soft gate it warned past as an override' {
-        @($script:AckResult.Runs[0].GateOverrides) | Should -Not -BeNullOrEmpty
-        ($script:AckResult.Runs[0].GateOverrides -join ' ') | Should -BeLike '*Prerequisite*'
+    # A rehearsal clears only the hard gates - the same rule the console applies
+    # (Docs/Workbench-Design.md, section 8) - so there is nothing to waive and nothing to record.
+    # A soft-gate override in the ledger for a run that changed nothing would be a waiver the
+    # next reader has to explain away.
+    It 'Records no soft-gate override, because a rehearsal is not held to the soft gates' {
+        @($script:AckResult.Runs[0].GateOverrides) | Should -HaveCount 0
     }
 
     It 'Did not pass Acknowledge on to the script as a parameter override' {
@@ -527,6 +567,7 @@ Describe 'Start-MigrationWorkbench Main - a step named with no workspace' {
         $script:NoWorkspaceResult = Invoke-WorkbenchScript -Parameter @{
             Step      = 'New-Users'
             Verbosity = 'Low'
+            LogPath   = (Join-Path $TestDrive 'no-workspace.log')
         }
     }
 
@@ -550,6 +591,7 @@ Describe 'Start-MigrationWorkbench Main - a workspace folder that is not there' 
             Workspace = (Join-Path $TestDrive 'NotAWorkspaceAtAll')
             Step      = 'New-Users'
             Verbosity = 'Low'
+            LogPath   = (Join-Path $TestDrive 'missing-workspace.log')
         }
     }
 
@@ -619,6 +661,139 @@ Describe 'Start-MigrationWorkbench Main - a wave-limited run' {
     It 'Passes the waves through to the runner, so the ledger records them' {
         $script:WaveResult.Runs | Should -HaveCount 1
         @($script:WaveResult.Runs[0].Wave) | Should -Be @('1')
+    }
+}
+
+Describe 'Start-MigrationWorkbench Main - a live run with no wave named' {
+
+    <#
+        The regression this covers: $waves was assigned with 'if ($Wave) { @($Wave) } else { @() }',
+        and an if-statement used as an expression whose taken branch is an empty array yields
+        nothing at all. $waves was therefore $null, every @($waves) downstream was @($null) - one
+        blank wave - and the WaveRequired gate read that as a wave having been named. A live
+        unattended run of a writer was silently reported as "limited to wave ." while it processed
+        the whole plan.
+    #>
+
+    BeforeAll {
+        $script:LiveWaveWorkspace = Copy-FixtureWorkspace -Name 'NonInteractiveLiveNoWave'
+        $script:LiveWaveResult = Invoke-WorkbenchScript -Parameter @{
+            Workspace = $script:LiveWaveWorkspace
+            Step      = 'New-Users'
+            Verbosity = 'Low'
+        }
+    }
+
+    It 'Runs the step' {
+        $script:LiveWaveResult.Runs | Should -HaveCount 1
+    }
+
+    It 'Tells the runner no wave at all, not one blank one' {
+        @($script:LiveWaveResult.Runs[0].Wave) | Should -HaveCount 0
+    }
+
+    It 'Warns that the whole plan will be processed' {
+        $script:LiveWaveResult.Output | Should -BeLike '*WaveRequired*'
+        $script:LiveWaveResult.Output | Should -BeLike '*whole plan*'
+    }
+
+    It 'Records the unsatisfied WaveRequired gate as an override' {
+        ($script:LiveWaveResult.Runs[0].GateOverrides -join ' ') | Should -BeLike '*WaveRequired*'
+    }
+
+    It 'Leaves Wave out of the driver entirely' {
+        $driver = Get-Content -LiteralPath $script:LiveWaveResult.Runs[0].DriverPath -Raw
+        $driver | Should -Not -Match '(?m)^\s*Wave\s*='
+    }
+}
+
+Describe 'Start-MigrationWorkbench Main - a rehearsal is not held to the soft gates' {
+
+    # Parity with the console (Docs/Workbench-Design.md, section 8): a rehearsal exists to be run
+    # before the prerequisites are met, so it clears only the hard gates - and recording an
+    # override for one would put a waiver in the ledger for a run that changed nothing.
+    BeforeAll {
+        $script:SoftGateWorkspace = Copy-FixtureWorkspace -Name 'NonInteractiveRehearsalSoftGates'
+        $script:SoftGateResult = Invoke-WorkbenchScript -Parameter @{
+            Workspace = $script:SoftGateWorkspace
+            Step      = 'New-Users'
+            DryRun    = $true
+            Verbosity = 'Low'
+        }
+    }
+
+    It 'Runs the step' {
+        $script:SoftGateResult.Runs | Should -HaveCount 1
+    }
+
+    It 'Records no gate overrides at all' {
+        @($script:SoftGateResult.Runs[0].GateOverrides) | Should -HaveCount 0
+    }
+}
+
+Describe 'Start-MigrationWorkbench - a workspace path that is a file' {
+
+    BeforeAll {
+        . $script:ScriptPath -NoGui
+    }
+
+    It 'Says it is not a folder, rather than that it does not exist' {
+        $file = Join-Path $TestDrive 'NotAFolder.txt'
+        Set-Content -LiteralPath $file -Value 'a file, not a migration folder'
+        $resolved = Resolve-WorkbenchWorkspacePath -Workspace $file -Mode 'NonInteractive'
+        $resolved.Path | Should -BeNullOrEmpty
+        $resolved.Problem | Should -BeLike '*is a file, not a folder*'
+    }
+}
+
+Describe 'Start-MigrationWorkbench - the recent list treats one path as one workspace' {
+
+    BeforeAll {
+        . $script:ScriptPath -NoGui
+    }
+
+    BeforeEach {
+        $script:WorkbenchRecentPath = Join-Path $TestDrive (
+            'recent-canonical-{0}.json' -f [guid]::NewGuid().ToString('N'))
+    }
+
+    It 'Drops a trailing separator, so the same folder is one entry' {
+        $folder = Join-Path $TestDrive 'Canonical'
+        Add-WorkbenchRecentWorkspace -Path ($folder + [System.IO.Path]::DirectorySeparatorChar)
+        Add-WorkbenchRecentWorkspace -Path $folder
+        $recent = @(Get-WorkbenchRecentWorkspace)
+        $recent | Should -HaveCount 1
+        $recent[0] | Should -BeExactly $folder
+    }
+
+    It 'Treats two spellings of one path as one workspace' {
+        $folder = Join-Path $TestDrive 'CaseFolded'
+        Add-WorkbenchRecentWorkspace -Path $folder
+        Add-WorkbenchRecentWorkspace -Path $folder.ToUpperInvariant()
+        @(Get-WorkbenchRecentWorkspace) | Should -HaveCount 1
+    }
+
+    It 'Reads an empty list from JSON that is valid but is not an array of paths' {
+        Set-Content -LiteralPath $script:WorkbenchRecentPath -Value '{ "Workspace": "/somewhere" }'
+        @(Get-WorkbenchRecentWorkspace) | Should -HaveCount 0
+    }
+
+    It 'Reads an empty list from a JSON document that is only a string' {
+        # Without -NoEnumerate a one-element array comes back unwrapped as a bare string, so this
+        # and a real list of one would be indistinguishable and the picker would offer characters.
+        Set-Content -LiteralPath $script:WorkbenchRecentPath -Value '"/somewhere"'
+        @(Get-WorkbenchRecentWorkspace) | Should -HaveCount 0
+    }
+
+    It 'Still reads a list of exactly one path as a list' {
+        Add-WorkbenchRecentWorkspace -Path (Join-Path $TestDrive 'Solo')
+        @(Get-WorkbenchRecentWorkspace) | Should -HaveCount 1
+    }
+
+    It 'Skips entries that are not strings rather than offering @{...} as a folder' {
+        Set-Content -LiteralPath $script:WorkbenchRecentPath -Value '["/a/real/path", { "not": "a path" }, 7]'
+        $recent = @(Get-WorkbenchRecentWorkspace)
+        $recent | Should -Be @('/a/real/path')
     }
 }
 
@@ -881,6 +1056,38 @@ Describe 'Start-MigrationWorkbench GUI helpers (dot-sourced with -NoGui)' {
             # The rule this helper applies is the one Invoke-WorkbenchNonInteractive applies, and
             # the fixture's release domain is what the hard gate asks for there.
             Test-WorkbenchGuiTypedConfirmation -Answer 'NEWCO.COM' -Required 'newco.com' | Should -BeTrue
+        }
+    }
+
+    Context 'The refusals the window returns to Main' {
+
+        <#
+            The window's two refusals are exit codes, not exceptions, and Main hands whatever it
+            returns straight to Complete-MigrationRun. On this machine only the first is
+            reachable - the STA branch needs Windows - so the platform refusal is run for real
+            and the wiring that carries it out of the script is asserted against the parse tree.
+        #>
+
+        It 'Returns 2 off Windows, having loaded no WinForms assembly' -Skip:([bool]$IsWindows) {
+            $refusal = Start-MigrationWorkbenchGui -WorkspacePath '' 2>&1
+            @($refusal | Where-Object { $_ -is [int] }) | Should -Be @(2)
+            ($refusal | Out-String) | Should -BeLike '*Windows only*'
+            @(Get-Module -Name 'System.Windows.Forms') | Should -HaveCount 0
+        }
+
+        It 'Is the exit code Main uses, not a value Main throws away' {
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$parseErrors)
+            @($parseErrors) | Should -HaveCount 0
+
+            # $exitCode = Start-MigrationWorkbenchGui ... - an assignment, not a bare call.
+            $assignments = @($ast.FindAll({
+                        $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                        $args[0].Left.Extent.Text -eq '$exitCode' -and
+                        $args[0].Right.Extent.Text -like '*Start-MigrationWorkbenchGui*'
+                    }, $true))
+            $assignments | Should -HaveCount 1
         }
     }
 }

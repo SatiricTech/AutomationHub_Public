@@ -679,8 +679,15 @@ Columns: what it does; the parameters beyond the common `-OutputPath -Prefix -Dr
 
 | Script | Purpose | Key parameters | In → Out |
 |---|---|---|---|
-| `Start-MigrationWorkbench.ps1` | Interactive workbench (console on any OS, WinForms on Windows) and non-interactive runner over every script below; reads `M365Migration.settings.json` in the workspace, scans what earlier steps produced, builds and runs the exact command with a live log and a run ledger | `-Workspace`, `-Console`, `-Step`, `-Wave`, `-DryRun`, `-Set`, `-Verbosity`, `-LogPath` | Workspace folder → `Workbench/Runs/<ts>_<Step>/driver.ps1`, `Workbench/Runs.jsonl`, plus whatever the chosen script writes |
+| `Start-MigrationWorkbench.ps1` | Interactive workbench (console on any OS, WinForms on Windows) and non-interactive runner over every script below; reads `M365Migration.settings.json` in the workspace, scans what earlier steps produced, builds and runs the exact command with a live log and a run ledger | `-Workspace`, `-Console`, `-Step`, `-Wave`, `-DryRun`, `-Set`, `-Verbosity`, `-LogPath`, `-NoGui` | Workspace folder → `Workbench/Runs/<ts>_<Step>/driver.ps1`, `Workbench/Runs.jsonl`, plus whatever the chosen script writes |
 | `Start-MigrationWorkbench.cmd` | Windows launcher: locates `pwsh` 7, refuses Windows PowerShell 5.1, passes arguments through, never elevates | (pass-through) | — |
+
+The Viva Learning app-only phase needs a client secret, and the WinForms window has no password
+box by design: set `M365MIGRATION_CLIENT_SECRET` in the environment before starting the
+workbench and it is passed to that one child process and nowhere else — never to the driver
+file, the settings file or the log. Configure `VivaLearning.CertificateThumbprint` in the
+settings instead and no secret is needed at all. (`-NoGui` loads the script's helpers and stops,
+which is what the Pester suite uses; it builds no window and runs nothing.)
 
 ### Phase 1 — Discover (read-only)
 

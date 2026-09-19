@@ -27,7 +27,8 @@
     The workbench's own log lands in <workspace>/Workbench/ beside the run ledger, so a
     technician reading a workspace afterwards finds the front end's account of the session next
     to the runs it started. With no workspace known yet - a console session that has not picked
-    one, or a refusal before the pick - it lands in the default output root instead.
+    one, or a refusal before the pick - it lands in Workbench/ under the default output root,
+    which keeps loose log files out of the folder the migration folders themselves live in.
 
     A non-interactive run answers a hard gate through -Set @{ Acknowledge = '<what it asks for>' }
     and nothing else: there is no console to type into, and a gate that cannot be typed at must
@@ -314,6 +315,52 @@ function Select-WorkbenchMode {
     return 'Console'
 }
 
+function ConvertTo-WorkbenchComparablePath {
+    <#
+    .SYNOPSIS
+        Puts a workspace path in the form two paths are compared in.
+
+    .DESCRIPTION
+        One rule for "these two paths are the same workspace", in one place, because the answer
+        is wanted in three: reading the recent list, adding to it, and building the picker's menu
+        out of the recent list and the folders under the default root together. Three inlined
+        comparisons is how a workspace ends up listed twice with a trailing slash between them.
+
+        A trailing separator is dropped, because a folder is the same folder with or without one
+        and Get-ChildItem never produces one while an operator typing a path often does. The case
+        is left alone - the operator's own capitalisation is what the menu should show - and the
+        comparison the callers make is case-insensitive instead: Windows and macOS both treat
+        two spellings of one path as one folder by default, and offering both would be offering
+        the same migration twice.
+
+    .PARAMETER Path
+        The path to canonicalise.
+
+    .EXAMPLE
+        ConvertTo-WorkbenchComparablePath -Path '/Migrations/Contoso/'
+
+        Returns '/Migrations/Contoso'.
+
+    .NOTES
+        Author: AutomationHub
+        Written with assistance from Claude (Anthropic).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+
+    # Both separators: Windows accepts a forward slash everywhere, so a path an operator pasted
+    # from a script can end in either one.
+    return $Path.Trim().TrimEnd([System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar)
+}
+
 function Get-WorkbenchRecentWorkspace {
     <#
     .SYNOPSIS
@@ -324,6 +371,14 @@ function Get-WorkbenchRecentWorkspace {
         an empty file, a file some other tool wrote, a file half-written when the machine went
         down - is an empty list rather than an error. Losing the list costs the operator one
         typed path; refusing to open the workbench over it would cost them the session.
+
+        A file that is valid JSON but is not an array of paths is one of those ways. -NoEnumerate
+        is what makes that knowable: without it a one-element array comes back unwrapped as a
+        bare string, indistinguishable from a JSON document that was only ever a string, and the
+        picker would offer its characters as workspaces.
+
+        Paths come back canonicalised and de-duplicated without case, so a workspace recorded
+        once with a trailing separator and once without is one entry in the menu rather than two.
 
     .EXAMPLE
         Get-WorkbenchRecentWorkspace | Select-Object -First 3
@@ -343,14 +398,31 @@ function Get-WorkbenchRecentWorkspace {
     try {
         $raw = Get-Content -LiteralPath $script:WorkbenchRecentPath -Raw -ErrorAction Stop
         if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
-        $entries = @($raw | ConvertFrom-Json -ErrorAction Stop)
+        $parsed = ConvertFrom-Json -InputObject $raw -NoEnumerate -ErrorAction Stop
     }
     catch {
         Write-Verbose "The recent-workspace list could not be read: $($_.Exception.Message)"
         return @()
     }
 
-    return @($entries | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($parsed -isnot [System.Array]) {
+        Write-Verbose 'The recent-workspace list is not a JSON array of paths; ignoring it.'
+        return @()
+    }
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $kept = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in $parsed) {
+        # Only strings: an array of numbers or objects is somebody else's file, and '@{a=1}' is
+        # not a folder anyone meant to open.
+        if ($entry -isnot [string]) { continue }
+        $path = ConvertTo-WorkbenchComparablePath -Path $entry
+        if (-not $path) { continue }
+        if (-not $seen.Add($path)) { continue }
+        $kept.Add($path)
+    }
+
+    return @($kept)
 }
 
 function Add-WorkbenchRecentWorkspace {
@@ -386,10 +458,16 @@ function Add-WorkbenchRecentWorkspace {
         [string]$Path
     )
 
+    # Compared the way the reader and the picker compare: canonical form, without case. A
+    # workspace opened as 'C:\Migrations\Contoso' and again as 'c:/migrations/contoso/' is one
+    # workspace, and listing it twice would put the same migration at two menu numbers.
+    $canonical = ConvertTo-WorkbenchComparablePath -Path $Path
+    if (-not $canonical) { return }
+
     $kept = [System.Collections.Generic.List[string]]::new()
-    $kept.Add($Path)
+    $kept.Add($canonical)
     foreach ($entry in @(Get-WorkbenchRecentWorkspace)) {
-        if ($entry -eq $Path) { continue }
+        if ($entry -ieq $canonical) { continue }
         if ($kept.Count -ge $script:WorkbenchRecentLimit) { break }
         $kept.Add($entry)
     }
@@ -469,11 +547,17 @@ function Resolve-WorkbenchWorkspacePath {
         [System.IO.Path]::Combine((Get-Location -PSProvider FileSystem).ProviderPath, $Workspace))
 
     if (-not (Test-Path -LiteralPath $full -PathType Container)) {
-        return [pscustomobject]@{
-            Path    = $null
-            Problem = "The workspace folder '$full' does not exist. Create it first, or point " +
-            '-Workspace at an existing migration folder.'
+        # A path that is there but is a file is a different mistake from a path that is not
+        # there, and 'does not exist' about a file the operator can see would send them looking
+        # for the wrong thing.
+        $problem = if (Test-Path -LiteralPath $full -PathType Leaf) {
+            "'$full' is a file, not a folder. -Workspace takes the migration folder itself."
         }
+        else {
+            "The workspace folder '$full' does not exist. Create it first, or point -Workspace " +
+            'at an existing migration folder.'
+        }
+        return [pscustomobject]@{ Path = $null; Problem = $problem }
     }
 
     return [pscustomobject]@{ Path = $full; Problem = '' }
@@ -519,15 +603,20 @@ function Select-WorkbenchWorkspace {
 
     $root = Get-MigrationDefaultOutputRoot
 
+    # List<string>.Contains is an ordinal, case-sensitive match, which would have offered a
+    # remembered workspace and the folder under the root it actually is as two separate numbers.
+    # One set, canonical and without case, for both sources.
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $choices = [System.Collections.Generic.List[string]]::new()
+
     foreach ($path in @(Get-WorkbenchRecentWorkspace)) {
-        if ((Test-Path -LiteralPath $path -PathType Container) -and -not $choices.Contains($path)) {
-            $choices.Add($path)
-        }
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) { continue }
+        if ($seen.Add($path)) { $choices.Add($path) }
     }
     if (Test-Path -LiteralPath $root -PathType Container) {
         foreach ($folder in @(Get-ChildItem -LiteralPath $root -Directory | Sort-Object -Property Name)) {
-            if (-not $choices.Contains($folder.FullName)) { $choices.Add($folder.FullName) }
+            $path = ConvertTo-WorkbenchComparablePath -Path $folder.FullName
+            if ($seen.Add($path)) { $choices.Add($path) }
         }
     }
 
@@ -668,8 +757,15 @@ function Invoke-WorkbenchNonInteractive {
     )
 
     # @($null) is an array holding one $null, which is not the same as no waves at all - and the
-    # difference reaches the ledger, where a run 'limited to' a blank wave is a lie.
-    $waves = if ($Wave) { @($Wave) } else { @() }
+    # difference reaches the resolver, the driver and the ledger, where a run 'limited to' a
+    # blank wave is a lie the WaveRequired gate then reads as satisfied.
+    #
+    # Assigned in two statements rather than one. 'if ($Wave) { @($Wave) } else { @() }' looks
+    # like it says this, and does not: an if-statement used as an expression whose taken branch
+    # is the empty array yields nothing at all, so $waves became $null and every @($waves) after
+    # it was @($null) - one blank wave, not no waves.
+    $waves = @()
+    if ($Wave) { $waves = @($Wave) }
 
     $workspace = Get-MigrationWorkspace -Path $WorkspacePath
 
@@ -719,12 +815,18 @@ function Invoke-WorkbenchNonInteractive {
 
     $gates = @(Test-MigrationStepGate -Step $step -Arguments $resolved -Workspace $workspace -Live:(-not $DryRun))
 
+    # Soft gates are judged on a live run only, which is the console's rule too: a rehearsal
+    # exists to be run before the prerequisites are met, so holding one to them would leave an
+    # unattended caller with nothing safe to do - and recording an override for a rehearsal would
+    # put a waiver in the ledger for a run that changed nothing.
     $gateOverrides = [System.Collections.Generic.List[string]]::new()
-    foreach ($gate in @($gates | Where-Object { $_.Severity -eq 'Soft' -and -not $_.Satisfied })) {
-        Write-Warning "$($gate.Kind) gate not satisfied, continuing anyway: $($gate.Message)"
-        # The extra parentheses matter: a method call splits its arguments on commas, so without
-        # them the format operator would get only its first value.
-        $gateOverrides.Add(('{0}:{1}' -f $gate.Kind, $gate.Message))
+    if (-not $DryRun) {
+        foreach ($gate in @($gates | Where-Object { $_.Severity -eq 'Soft' -and -not $_.Satisfied })) {
+            Write-Warning "$($gate.Kind) gate not satisfied, continuing anyway: $($gate.Message)"
+            # The extra parentheses matter: a method call splits its arguments on commas, so
+            # without them the format operator would get only its first value.
+            $gateOverrides.Add(('{0}:{1}' -f $gate.Kind, $gate.Message))
+        }
     }
 
     foreach ($gate in @($gates | Where-Object { $_.Severity -eq 'Hard' -and -not $_.Satisfied })) {
@@ -827,61 +929,6 @@ function Invoke-WorkbenchNonInteractive {
 # helpers below and touches no WinForms type at all. The state bag and the two seams the runner
 # is handed live in the Configuration region above, because Set-StrictMode -Version Latest makes
 # reading an unassigned variable an error and the handlers here read them by name.
-
-function Invoke-WorkbenchGuiRenderer {
-    <#
-    .SYNOPSIS
-        Calls one of the engine's own renderers inside the M365Migration module's session state.
-
-    .DESCRIPTION
-        Format-MigrationWorkbenchView, Format-MigrationStepGlyph, Format-MigrationStepLastRun
-        and Get-MigrationScriptSynopsisText are how the console draws a workspace, and they are
-        private to the module: it exports the engine, not the console's opinion of how to print
-        it. The window has to show the same glyphs, the same last-run line, the same synopses
-        and the same results list, and re-rendering them here by hand is precisely how two front
-        ends come to describe one workspace differently.
-
-        So they are called where they live. '& $module $scriptblock' runs a scriptblock in that
-        module's own session state - the documented way to reach a module-private command
-        without exporting it - and all this function adds is the module lookup, a -ValidateSet
-        that keeps the reach to the four renderers named above, and a refusal that names the
-        renderer rather than failing with 'the term is not recognised'.
-
-    .PARAMETER Name
-        The renderer to call.
-
-    .PARAMETER Parameter
-        Its arguments, splatted.
-
-    .EXAMPLE
-        Invoke-WorkbenchGuiRenderer -Name 'Format-MigrationStepGlyph' -Parameter @{ State = $state }
-
-        Returns the console's own glyph for that step state - '[x]', '[ ]', '[~]' and so on.
-
-    .NOTES
-        Author: AutomationHub
-        Written with assistance from Claude (Anthropic).
-    #>
-    [CmdletBinding()]
-    [OutputType([object])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateSet('Format-MigrationWorkbenchView', 'Format-MigrationStepGlyph',
-            'Format-MigrationStepLastRun', 'Get-MigrationScriptSynopsisText')]
-        [string]$Name,
-
-        [AllowNull()]
-        [hashtable]$Parameter
-    )
-
-    $module = Get-Module -Name 'M365Migration'
-    if (-not $module) {
-        throw "The M365Migration module is not loaded, so '$Name' cannot be called."
-    }
-
-    $splat = if ($Parameter) { $Parameter } else { @{} }
-    return (& $module { param([string]$Command, [hashtable]$Splat) & $Command @Splat } $Name $splat)
-}
 
 function ConvertTo-WorkbenchGuiControlKind {
     <#
@@ -1022,10 +1069,8 @@ function Get-WorkbenchGuiStepList {
         $current.Steps.Add([pscustomobject]@{
                 Id      = [string]$step.Id
                 Title   = [string]$step.Title
-                Glyph   = [string](Invoke-WorkbenchGuiRenderer -Name 'Format-MigrationStepGlyph' `
-                        -Parameter @{ State = $state })
-                LastRun = [string](Invoke-WorkbenchGuiRenderer -Name 'Format-MigrationStepLastRun' `
-                        -Parameter @{ State = $state })
+                Glyph   = [string](Format-MigrationStepGlyph -State $state)
+                LastRun = [string](Format-MigrationStepLastRun -State $state)
                 IsNext  = ([string]$step.Id -eq $nextId)
                 Side    = [string]$step.Side
                 Impact  = [string]$step.Impact
@@ -2952,11 +2997,8 @@ function Invoke-WorkbenchGuiResultsAction {
 
     try {
         Set-WorkbenchGuiBusy -Busy $true -Activity 'reading the run ledger'
-        $lines = @(Invoke-WorkbenchGuiRenderer -Name 'Format-MigrationWorkbenchView' -Parameter @{
-                Workspace = $script:Gui.Workspace
-                View      = 'Results'
-                Version   = [string]$script:Gui.Version
-            })
+        $lines = @(Format-MigrationWorkbenchView -Workspace $script:Gui.Workspace -View 'Results' `
+                -Version ([string]$script:Gui.Version))
         Write-WorkbenchGuiPane -Line '--- results & logs ---'
         foreach ($line in $lines) { Write-WorkbenchGuiPane -Line ([string]$line) }
         Write-WorkbenchGuiPane -Line '--- end of results & logs ---'
@@ -3810,8 +3852,8 @@ function Start-MigrationWorkbenchGui {
         $entry = Get-MigrationStep -Script $name
         $item = New-Object System.Windows.Forms.ListViewItem(
             [System.IO.Path]::GetFileName([string]$entry.ScriptPath))
-        $null = $item.SubItems.Add([string](Invoke-WorkbenchGuiRenderer -Name 'Get-MigrationScriptSynopsisText' `
-                    -Parameter @{ Path = [string]$entry.ScriptPath }))
+        $null = $item.SubItems.Add(
+            [string](Get-MigrationScriptSynopsisText -Path ([string]$entry.ScriptPath)))
         $item.Tag = $name
         $null = $toolList.Items.Add($item)
     }
@@ -3889,9 +3931,12 @@ if (-not $NoGui -and $MyInvocation.InvocationName -ne '.') {
 
         # The workbench's own log belongs beside the ledger it is about to append to. With no
         # workspace known - a refusal, or a console session that has not picked one yet - the
-        # default output root is the only place left that is certainly writable.
-        $logRoot = if ($workspacePath) { Join-Path -Path $workspacePath -ChildPath 'Workbench' }
-        else { Get-MigrationDefaultOutputRoot }
+        # default output root is the only place left that is certainly writable, and the log
+        # goes in a Workbench subfolder of it rather than in the root: the root is where an
+        # operator's migration folders live, and a front end that drops loose log files among
+        # them makes its own folder list harder to read every time it refuses.
+        $logRoot = Join-Path -ChildPath 'Workbench' -Path $(
+            if ($workspacePath) { $workspacePath } else { Get-MigrationDefaultOutputRoot })
 
         $null = Initialize-MigrationRun -ScriptName 'Start-MigrationWorkbench' -OutputPath $logRoot `
             -Prefix '' -LogPath $LogPath -Verbosity $Verbosity -BoundParameters $PSBoundParameters
