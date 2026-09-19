@@ -1089,9 +1089,11 @@ finally {
 
                 # Sanitised the same way Export-MigrationResult does it: the rescue copy is
                 # opened in Excel like any other results file, so it needs the same protection
-                # against a cell that starts with '=' being run as a formula.
+                # against a cell that starts with '=' being run as a formula - and the same
+                # exemption for the minted credential, which must stay byte-identical to the
+                # password the account actually has.
                 $resultRows |
-                    ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ } |
+                    ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ -ExcludeProperty 'GeneratedPassword' } |
                     Export-Csv -LiteralPath $fallbackPath -NoTypeInformation -Encoding utf8 -ErrorAction Stop
                 $resultsExported = $true
                 Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory); a copy was " +

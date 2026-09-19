@@ -81,6 +81,12 @@ function Export-MigrationResult {
 
     # The four standard columns lead; everything a script added follows in first-seen order.
     $standardColumns = @('Identity', 'Action', 'Status', 'Detail')
+
+    # Credentials this toolkit minted are exempt from the formula-prefix sanitiser. The
+    # generators draw from a pool containing '-', '=', '+' and '@', so a prefixed copy would
+    # be a password the account does not have - and the value never came from a tenant, so it
+    # cannot carry an injection in the first place. See ConvertTo-MigrationSafeRow.
+    $credentialColumns = @('GeneratedPassword')
     $extraColumns = [System.Collections.Generic.List[string]]::new()
     foreach ($row in @($Rows)) {
         foreach ($property in $row.PSObject.Properties.Name) {
@@ -98,7 +104,13 @@ function Export-MigrationResult {
             if ($row.PSObject.Properties[$column]) { $value = $row.PSObject.Properties[$column].Value }
             # Sanitised here, once, so every writer downstream - Export-Csv today, anything
             # else tomorrow - only ever sees a value a spreadsheet cannot read as a formula.
-            $ordered[$column] = ConvertTo-MigrationSafeCell -Value $value
+            # The credential columns are the documented exception above.
+            $ordered[$column] = if ($credentialColumns -contains $column) {
+                $value
+            }
+            else {
+                ConvertTo-MigrationSafeCell -Value $value
+            }
         }
         $shaped.Add([pscustomobject]$ordered)
     }

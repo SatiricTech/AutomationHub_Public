@@ -20,6 +20,8 @@
     Justification = 'The stubs must accept every parameter the script under test binds, including ones a particular test does not read; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '',
     Justification = 'Shadowing Export-Csv inside one Describe is the only way to make the temp-folder fallback fail without making the real temp folder unwritable. It is scoped to the test file, never shipped.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+    Justification = 'These are stand-ins for the module functions whose names the script under test calls. They return a fixed value and change nothing, so ShouldProcess would be meaningless.')]
 param()
 
 BeforeAll {
@@ -678,6 +680,13 @@ Describe 'A results export that fails still leaves the generated credentials on 
         $script:fbFiles = @()
         $global:cutoverFallbackExports = 0
 
+        # Leads with '-', so the rescue copy has to carry the same credential exemption the
+        # normal export does - a quote-prefixed copy is a passphrase the account does not have.
+        function New-MigrationPassphrase {
+            param([int]$WordCount)
+            return '-silver-copper-Lantern74!'
+        }
+
         function Connect-MigrationGraph {
             param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
             return [pscustomobject]@{ TenantId = 'newco.onmicrosoft.com'; Account = 'tech@newco.onmicrosoft.com' }
@@ -754,11 +763,11 @@ Describe 'A results export that fails still leaves the generated credentials on 
         $script:fbFiles[0].Name | Should -BeLike "$($script:fbPrefix)_Reset-CutoverPasswords-Results_*.csv"
     }
 
-    It 'keeps the generated credential in the fallback file' {
+    It 'keeps the generated credential in the fallback file, byte for byte as it was minted' {
         $script:fbRows.Count | Should -Be 1
         $script:fbRows[0].Identity | Should -BeExactly 'john.smith@newco.com'
         $script:fbRows[0].Status | Should -BeExactly 'Succeeded'
-        $script:fbRows[0].GeneratedPassword | Should -Not -BeNullOrEmpty
+        $script:fbRows[0].GeneratedPassword | Should -BeExactly '-silver-copper-Lantern74!'
     }
 
     It 'sanitises the rescue copy against formula injection, as the normal export would' {

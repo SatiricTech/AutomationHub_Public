@@ -1035,9 +1035,12 @@ Describe 'New-MigrationUsers - a create that returns no object ID keeps its pass
     #>
 
     BeforeAll {
+        # Leads with '-', which ConvertTo-MigrationSafeCell would normally quote-prefix. A
+        # credential is minted here, never read from a tenant, so it must reach the file exactly
+        # as generated - a prefixed copy is a password the account does not have.
         function New-MigrationRandomPassword {
             param([int]$Length)
-            return 'Pa55-fixed-word'
+            return '-Pa55-fixed'
         }
 
         function Invoke-MigrationGraphRequest {
@@ -1082,9 +1085,9 @@ Describe 'New-MigrationUsers - a create that returns no object ID keeps its pass
         $failed.Count | Should -Be 2
     }
 
-    It 'Carries the generated password on the Failed row' {
+    It 'Carries the generated password on the Failed row, byte for byte as it was minted' {
         $row = @($script:noIdRows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' })[0]
-        $row.GeneratedPassword | Should -BeExactly 'Pa55-fixed-word'
+        $row.GeneratedPassword | Should -BeExactly '-Pa55-fixed'
     }
 
     It 'Tells the operator the account may already exist with that password' {
@@ -1093,7 +1096,12 @@ Describe 'New-MigrationUsers - a create that returns no object ID keeps its pass
     }
 
     It 'Never writes the password into the log' {
-        $script:noIdLog | Should -Not -Match 'Pa55-fixed-word'
+        $script:noIdLog | Should -Not -Match ([regex]::Escape('-Pa55-fixed'))
+    }
+
+    It 'Still warns that the results file is a password list, though no row Succeeded' {
+        @($script:noIdRows | Where-Object { $_.Status -eq 'Succeeded' }).Count | Should -Be 0
+        $script:noIdLog | Should -Match '\[WARNING\].*Initial passwords were written to the results file'
     }
 }
 
@@ -1161,9 +1169,11 @@ Describe 'New-MigrationUsers - a results export that fails falls back to the tem
         # list to walk even if the run itself blows up half way through this block.
         $script:usersFbFiles = @()
 
+        # Leads with '-', so the rescue copy has to carry the same credential exemption the
+        # normal export does - a quote-prefixed copy is a password the account does not have.
         function New-MigrationRandomPassword {
             param([int]$Length)
-            return 'Pa55-fixed-word'
+            return '-Pa55-fixed'
         }
 
         function Invoke-MigrationGraphRequest {
@@ -1231,8 +1241,8 @@ Describe 'New-MigrationUsers - a results export that fails falls back to the tem
         $script:usersFbFiles[0].Name | Should -BeLike "$($script:usersFbPrefix)_New-Users-Results_*.csv"
     }
 
-    It 'Keeps the initial passwords in the fallback file' {
-        @($script:usersFbRows | Where-Object { $_.GeneratedPassword -eq 'Pa55-fixed-word' }).Count |
+    It 'Keeps the initial passwords in the fallback file, byte for byte as they were minted' {
+        @($script:usersFbRows | Where-Object { $_.GeneratedPassword -ceq '-Pa55-fixed' }).Count |
             Should -BeGreaterThan 0
     }
 
@@ -1248,7 +1258,7 @@ Describe 'New-MigrationUsers - a results export that fails falls back to the tem
     }
 
     It 'Never writes the password into the log' {
-        $script:usersFbLog | Should -Not -Match 'Pa55-fixed-word'
+        $script:usersFbLog | Should -Not -Match ([regex]::Escape('-Pa55-fixed'))
     }
 }
 

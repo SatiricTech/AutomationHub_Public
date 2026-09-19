@@ -59,6 +59,23 @@ Describe 'ConvertTo-MigrationSafeCell' {
         $safe.Count | Should -Be 1
     }
 
+    It 'copies an excluded property untouched while still sanitising the rest' {
+        # A generated credential is minted by this toolkit, never read from a tenant, so it
+        # cannot carry an injection - but it CAN legitimately start with '-' or '=', and a
+        # quote prefix there would put a password in the file that the account does not have.
+        $row = [pscustomobject]@{ Identity = '=x'; GeneratedPassword = '-abc=def'; Detail = 'ok' }
+        $safe = ConvertTo-MigrationSafeRow -Row $row -ExcludeProperty 'GeneratedPassword'
+
+        @($safe.PSObject.Properties.Name) | Should -Be @('Identity', 'GeneratedPassword', 'Detail')
+        $safe.GeneratedPassword | Should -BeExactly '-abc=def'
+        $safe.Identity | Should -BeExactly "'=x"
+    }
+
+    It 'sanitises every property when nothing is excluded' {
+        $row = [pscustomobject]@{ GeneratedPassword = '-abc=def' }
+        (ConvertTo-MigrationSafeRow -Row $row).GeneratedPassword | Should -BeExactly "'-abc=def"
+    }
+
     It 'round-trips a pure-number phone column unchanged through CSV, alongside a sanitised column' {
         $row = [pscustomobject]@{ PhoneNumber = '+15551234567'; DisplayName = '=x' }
         $safe = ConvertTo-MigrationSafeRow -Row $row
@@ -84,6 +101,32 @@ Describe 'Export-MigrationResult sanitises cells' {
                 [pscustomobject]@{ Identity = '=HYPERLINK("h")'; Action = 'A'; Status = 'Succeeded'; Detail = '' }
             ) -Name 'X'
             (Import-Csv $path)[0].Identity | Should -Be "'=HYPERLINK(""h"")"
+            $script:MigrationRun = $null
+        }
+    }
+
+    It 'writes a generated credential exactly as minted, even when it leads with a sanitised character' {
+        InModuleScope M365Migration {
+            $script:MigrationRun = @{
+                OutputDirectory = $TestDrive; Prefix = 'T'; DryRun = $false
+                LogPath         = (Join-Path $TestDrive 'y.log'); Verbosity = 'Low'
+                ScriptName      = 'y'; StartedAt = Get-Date
+            }
+            $path = Export-MigrationResult -Rows @(
+                [pscustomobject]@{
+                    Identity          = '=x'
+                    Action            = 'CreateUser'
+                    Status            = 'Succeeded'
+                    Detail            = ''
+                    GeneratedPassword = '-Pa55=fixed+word'
+                }
+            ) -Name 'Y'
+            $written = (Import-Csv $path)[0]
+
+            # The credential is the account's actual password and must round-trip byte for byte.
+            $written.GeneratedPassword | Should -BeExactly '-Pa55=fixed+word'
+            # The exemption is scoped to that one column - everything else is still sanitised.
+            $written.Identity | Should -BeExactly "'=x"
             $script:MigrationRun = $null
         }
     }
