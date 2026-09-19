@@ -485,7 +485,14 @@ try {
         # Provider management is delegated-only in the employee learning API, so
         # this step needs its own interactive sign-in before the app-only phase.
         Write-MigrationLog -Message 'Connecting to Microsoft Graph interactively for the provider step (sign in as a Viva-licensed Knowledge Administrator)...' -Level INFO
-        $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId -Reconnect
+        $delegatedContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId -Reconnect
+
+        # This script holds two Graph sessions at disjoint times, and each gets its own check:
+        # the delegated one registers the provider (a PATCH and a POST, below) and is disconnected
+        # before the app-only session that carries the content and activity writes. Asserting only
+        # the app-only session would leave the provider registration unguarded.
+        $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $delegatedContext `
+            -Purpose 'Viva Learning provider registration'
 
         $providers = @(Invoke-MigrationGraphRequest -Method GET -All -Uri '/v1.0/employeeExperience/learningProviders')
         $existing = $providers |

@@ -961,6 +961,7 @@ try {
     }
 
     $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    $graphTenantId = [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '')
 
     # What both sides are held to. -TenantId when the operator named one; otherwise Graph's own
     # tenant, so the Graph-vs-Exchange cross-check happens on every run and not only on pinned
@@ -968,16 +969,18 @@ try {
     # is omitted, which is exactly how every documented -TenantId-only run is invoked, so a
     # leftover session to the source tenant would otherwise run every Exchange-backed check
     # against the wrong tenant while Graph correctly targets the destination.
-    $expectedTenant = if ($TenantId) { $TenantId }
-    else { [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '') }
+    $expectedTenant = if ($TenantId) { $TenantId } else { $graphTenantId }
 
     $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
         -TenantId $expectedTenant
 
-    # Falling back to Graph's tenant means the assert always has something to compare, so it
+    # Falling back to Graph's tenant means the assert normally has something to compare, so it
     # never reaches its own "no tenant was specified" branch. That branch's warning still has to
     # be said out loud, because an unpinned run is exactly the one an operator should notice.
-    if (-not $TenantId) {
+    # If Graph reported no tenant either there is nothing to name, and the assert's own
+    # unverifiable-connection warning covers it - saying it twice, once with a hole in the
+    # sentence, would only be noise.
+    if (-not $TenantId -and $expectedTenant) {
         Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
             'Pass -TenantId to guard against a cached session.') -Level WARNING
     }
@@ -987,7 +990,6 @@ try {
     $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenant -GraphContext $graphContext `
         -ExchangeConnection $exoConnection -Purpose 'Readiness checks'
 
-    $graphTenantId = [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '')
     Write-MigrationLog -Message ("Checking destination tenant $graphTenantId (Graph as " +
         "$(Get-MigrationProperty -InputObject $graphContext -Name 'Account' -Default '?'), EXO as " +
         "$(Get-MigrationProperty -InputObject $exoConnection -Name 'UserPrincipalName' -Default '?')).") -Level INFO

@@ -603,3 +603,33 @@ Describe 'Script structure' {
         }
     }
 }
+
+Describe 'The tenant guard is wired into the Main region' {
+
+    <#
+        A structural test, not a behavioural one. Everything else in this file exercises functions
+        lifted out of the script, and Get-MigrationVivaLearningHistory.ps1 has no end-to-end harness to run its
+        Main region against - so this asserts on the shape of the source instead. It would catch
+        the guard being removed or renamed, and nothing subtler: it proves the wiring exists, not
+        that it behaves correctly at runtime.
+    #>
+
+    BeforeAll {
+        $script:mainScriptPath = (Resolve-Path (
+                Join-Path $PSScriptRoot '..' 'Get-MigrationVivaLearningHistory.ps1')).Path
+        $script:mainAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:mainScriptPath, [ref]$null, [ref]$null)
+        $script:mainText = Get-Content -LiteralPath $script:mainScriptPath -Raw
+
+        $script:commandText = @($script:mainAst.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            ForEach-Object { $_.Extent.Text })
+    }
+
+    It 'Calls Assert-MigrationTenant once with an expected tenant and a purpose' {
+        $calls = @($script:commandText | Where-Object { $_ -like 'Assert-MigrationTenant*' })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-ExpectedTenantId \$TenantId'
+        $calls[0] | Should -Match "-Purpose 'Viva Learning export'"
+    }
+}

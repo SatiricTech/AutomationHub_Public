@@ -663,15 +663,21 @@ Describe 'Import-MigrationVivaLearningHistory - the tenant guard runs once over 
         }
     }
 
-    It 'Asserts the -TenantId it was given against the app-only context exactly once' {
+    It 'Asserts the -TenantId it was given once per held session, delegated then app-only' {
+        # Two sessions held at disjoint times, so two asserts is the correct count here: the
+        # delegated one registers the provider before the app-only one writes content and
+        # activities. One assert would leave the provider registration's PATCH/POST unguarded.
         & $script:scriptPath -CsvPath (Join-Path $script:guardWorkspace 'VivaLearningHistory.csv') `
             -TenantId $script:tenantId -ClientId $script:clientId -ClientSecret $script:clientSecret `
             -PlanPath (Join-Path $script:guardWorkspace 'IdentityPlan.csv') `
             -OutputPath $script:guardWorkspace -Verbosity Low -DryRun
 
-        $global:AssertCalls.Count | Should -Be 1
-        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:tenantId
-        $global:AssertCalls[0].Purpose | Should -BeExactly 'Viva Learning import'
-        $global:AssertCalls[0].GraphContext.TenantId | Should -BeExactly $script:tenantId
+        $global:AssertCalls.Count | Should -Be 2
+        @($global:AssertCalls | ForEach-Object { $_.ExpectedTenantId }) |
+            Should -Be @($script:tenantId, $script:tenantId)
+        @($global:AssertCalls | ForEach-Object { $_.Purpose }) |
+            Should -Be @('Viva Learning provider registration', 'Viva Learning import')
+        @($global:AssertCalls | ForEach-Object { $_.GraphContext.TenantId }) |
+            Should -Be @($script:tenantId, $script:tenantId)
     }
 }

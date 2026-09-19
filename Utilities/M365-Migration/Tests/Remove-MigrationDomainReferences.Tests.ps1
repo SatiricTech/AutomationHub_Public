@@ -924,3 +924,48 @@ Describe 'Remove-MigrationDomainReferences' {
         }
     }
 }
+
+Describe 'The tenant guard is wired into the Main region' {
+
+    <#
+        A structural test, not a behavioural one. Everything else in this file exercises functions
+        lifted out of the script, and Remove-MigrationDomainReferences.ps1 has no end-to-end harness to run its
+        Main region against - so this asserts on the shape of the source instead. It would catch
+        the guard being removed or renamed, and nothing subtler: it proves the wiring exists, not
+        that it behaves correctly at runtime.
+    #>
+
+    BeforeAll {
+        $script:mainScriptPath = (Resolve-Path (
+                Join-Path $PSScriptRoot '..' 'Remove-MigrationDomainReferences.ps1')).Path
+        $script:mainAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:mainScriptPath, [ref]$null, [ref]$null)
+        $script:mainText = Get-Content -LiteralPath $script:mainScriptPath -Raw
+
+        $script:commandText = @($script:mainAst.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            ForEach-Object { $_.Extent.Text })
+    }
+
+    It 'Calls Assert-MigrationTenant once with an expected tenant and a purpose' {
+        $calls = @($script:commandText | Where-Object { $_ -like 'Assert-MigrationTenant*' })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-ExpectedTenantId \$expectedTenant'
+        $calls[0] | Should -Match "-Purpose 'Domain release'"
+    }
+
+    It 'Pins the Exchange connector to the same expected tenant' {
+        $calls = @($script:commandText | Where-Object { $_ -like 'Connect-MigrationExchange*' })
+        $calls.Count | Should -Be 2
+        foreach ($call in $calls) { $call | Should -Match '-TenantId \$expectedTenant' }
+    }
+
+    It 'Falls back to the Graph tenant so the cross-check runs on an unpinned run too' {
+        $script:mainText |
+            Should -Match '\$expectedTenant = if \(\$TenantId\) \{ \$TenantId \} else \{ \$graphTenantId \}'
+    }
+
+    It 'Still says out loud that an unpinned run was not verified' {
+        $script:mainText | Should -Match 'No -TenantId was given; this run acts on tenant \$expectedTenant'
+    }
+}

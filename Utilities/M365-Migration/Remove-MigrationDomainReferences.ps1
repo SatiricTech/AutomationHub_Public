@@ -1218,11 +1218,13 @@ try {
         if ($exoMismatch) { throw "$exoMismatch. Disconnect-ExchangeOnline and sign in to the source tenant." }
     }
 
-    # Falling back to Graph's tenant means the assert always has something to compare, so it
+    # Falling back to Graph's tenant means the assert normally has something to compare, so it
     # never reaches its own "no tenant was specified" branch. That branch's warning still has to
     # be said out loud, because an unpinned destructive cleanup is exactly the run an operator
-    # should notice.
-    if (-not $TenantId) {
+    # should notice. If Graph reported no tenant either there is nothing to name, and the assert's
+    # own unverifiable-connection warning covers it - saying it twice, once with a hole in the
+    # sentence, would only be noise.
+    if (-not $TenantId -and $expectedTenant) {
         Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
             'Pass -TenantId to guard against a cached session.') -Level WARNING
     }

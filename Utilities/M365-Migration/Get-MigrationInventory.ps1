@@ -1284,8 +1284,7 @@ try {
     # tenant, which keeps Exchange Online pinned to whatever Graph signed in to even on a run
     # that was given no pin at all. Running Source then Destination in one console would
     # otherwise pair the new tenant's Graph tabs with the old tenant's Exchange tabs, silently.
-    $expectedTenant = if ($TenantId) { $TenantId }
-    else { [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '') }
+    $expectedTenant = if ($TenantId) { $TenantId } else { $graphTenantId }
 
     # Connect-MigrationExchange drops and reconnects a cached session that targets a different
     # tenant, the same guard -DelegatedOrganization already gave it, closing the gap for the
@@ -1294,10 +1293,13 @@ try {
         -TenantId $expectedTenant
     $exchangeTenantId = [string](Get-InventoryValue $exchangeInformation 'TenantID' '')
 
-    # Falling back to Graph's tenant means the assert always has something to compare, so it
+    # Falling back to Graph's tenant means the assert normally has something to compare, so it
     # never reaches its own "no tenant was specified" branch. That branch's warning still has to
     # be said out loud, because an unpinned run is exactly the one an operator should notice.
-    if (-not $TenantId) {
+    # If Graph reported no tenant either there is nothing to name, and the assert's own
+    # unverifiable-connection warning covers it - saying it twice, once with a hole in the
+    # sentence, would only be noise.
+    if (-not $TenantId -and $expectedTenant) {
         Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
             'Pass -TenantId to guard against a cached session.') -Level WARNING
     }

@@ -498,8 +498,8 @@ try {
     # What both sides are held to. -TenantId when the operator named one; otherwise Graph's own
     # tenant, because a cutover writes both sides of the same object: the tenant Graph signed in
     # to is by definition the one the mailbox edits have to land in, pinned or not.
-    $expectedTenant = if ($TenantId) { $TenantId }
-    else { [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '') }
+    $graphTenantId = [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '')
+    $expectedTenant = if ($TenantId) { $TenantId } else { $graphTenantId }
 
     $needsExchange = @($requestedActions | Where-Object { $exchangeActions -contains $_ }).Count -gt 0
     $exoConnection = $null
@@ -508,10 +508,13 @@ try {
             -TenantId $expectedTenant
     }
 
-    # Falling back to Graph's tenant means the assert always has something to compare, so it
+    # Falling back to Graph's tenant means the assert normally has something to compare, so it
     # never reaches its own "no tenant was specified" branch. That branch's warning still has to
     # be said out loud, because an unpinned run is exactly the one an operator should notice.
-    if (-not $TenantId) {
+    # If Graph reported no tenant either there is nothing to name, and the assert's own
+    # unverifiable-connection warning covers it - saying it twice, once with a hole in the
+    # sentence, would only be noise.
+    if (-not $TenantId -and $expectedTenant) {
         Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
             'Pass -TenantId to guard against a cached session.') -Level WARNING
     }
