@@ -220,7 +220,24 @@ Warnings = header-only CSVs, unparseable filenames, a plan newer than the pinned
 
 Filenames are parsed by `ConvertFrom-MigrationOutputPath` (new, the single owner of the
 `<Prefix>_<Name>[-<Suffix>]_<yyyyMMdd-HHmmss>.<ext>` contract; `Get-MigrationOutputPath`
-is its inverse and every writer in the module uses it). `.bak` files are ignored.
+is its inverse and every writer in the module uses it). `.bak` files are ignored, and so is
+any other name the contract does not describe — notes and exports live beside the artefacts
+and are not the scanner's business, so they are skipped without a warning.
+
+Which step a file belongs to: a `Results`/`DryRun` file whose name is one of the instance's
+result tokens, in the folder that instance writes to (its fixed `-Prefix`, else the label);
+an inventory by `Prefix` equal to the instance's fixed `-Prefix` and the name `Users`; the
+plan by the name `IdentityPlan` in the label folder; a report by a name the instance's
+`Produces` lists as `Report:<name>`, taken whole (`DomainBlockers-Recheck` is one name).
+Where two instances of one script could claim the same file (the three readiness stages, the
+domain-release report and remediation) the catalogue's attribution rule decides: the file
+belongs to the instance whose ledger entry recorded it, matched on the entry's `Files` list
+or on its `Started`..`Ended` window, and otherwise to the lowest-ordered instance.
+
+Without a settings file the label is inferred: exactly one prefix folder that is not
+`Source`/`Destination`/`Post` and holds at least one parseable artefact is the label folder;
+zero or several leaves `Label` empty and warns, because a guessed label would attribute files
+to the wrong step.
 
 State per step instance:
 
@@ -233,6 +250,13 @@ State per step instance:
 | `WorkRemains` | ledger exit code 3 (domain references remain) |
 | `Failed` | ledger exit code 1 |
 | `Stale` | done, but the plan it consumed is older than the pinned plan |
+
+Where two rules could both apply, they are settled in this order: `Failed`, `WorkRemains`,
+`DryRun`, `PartlyFailed`, `Done` — a ledger that says the run failed outranks the file it
+managed to write before it did, and a dry run newer than the last live run outranks that run.
+`Stale` is judged afterwards, only for a step that reads the plan (`Requires` names `Plan`,
+or `Resolve` maps a parameter to the `Plan` resolver), and against the plan's own filename
+timestamp.
 
 "Next step" is the lowest-ordered instance whose `Requires` are all `Done` and whose own
 state is not `Done`. A `Requires` entry that names an artefact kind rather than a step

@@ -39,6 +39,7 @@
         'Get-MigrationSkuCatalog'
         'Get-MigrationStep'
         'Get-MigrationTeamsPolicyName'
+        'Get-MigrationWorkspace'
         'Import-MigrationCsv'
         'Import-MigrationPlan'
         'Initialize-MigrationModule'
