@@ -19,10 +19,16 @@ function Get-MigrationSettingsSchema {
         though its JSON value is an object - its keys are operator-supplied domain names, not
         part of this schema, so they are never validated against it.
 
-        Type is one of: String, Guid, Bool, Int, Domain, Path, Map, Choice. Domain values are
-        validated against the pattern Resolve-MigrationSettings enforces
-        ('^@?[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$'); Choice values are validated against
-        the entry's own Choices list.
+        Type is one of: String, Guid, Bool, Int, Domain, Path, Map, Choice. A Domain value is
+        normalised - trimmed, a leading '@' stripped, lower-cased - before it is validated
+        against the pattern ('^@?[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$') and before it is
+        stored, on both a load and a save, so '@Contoso.COM' is accepted and is thereafter
+        always 'contoso.com'. Choice values are validated against the entry's own Choices
+        list.
+
+        Required documents which keys the settings form (a later task) should treat as
+        mandatory input; Resolve-MigrationSettings does not itself enforce it beyond the
+        SchemaVersion, Label and Scenario rules that are already spelled out explicitly.
 
     .EXAMPLE
         Get-MigrationSettingsSchema | Where-Object Key -eq 'Defaults.Verbosity'

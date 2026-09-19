@@ -65,6 +65,36 @@ Describe 'Resolve-MigrationSettings' {
             Set-Content $p
         (Resolve-MigrationSettings -Path $p).Errors -join ' ' | Should -Match 'secret'
     }
+
+    It 'rejects Plan.AliasDomainMap when it is an empty JSON array instead of an object' {
+        $s = New-MigrationSettings -Label 'X'
+        $s.Plan.AliasDomainMap = @()
+        $p = Join-Path $TestDrive 'array-map.json'
+        ($s | ConvertTo-Json -Depth 6) | Set-Content $p
+        $r = Resolve-MigrationSettings -Path $p
+        $r.IsValid | Should -BeFalse
+        ($r.Errors -join ' ') | Should -Match 'Plan\.AliasDomainMap must be an object'
+    }
+
+    It 'rejects an entire section written as an empty JSON array' {
+        $s = New-MigrationSettings -Label 'X'
+        $s['Plan'] = @()
+        $p = Join-Path $TestDrive 'array-section.json'
+        ($s | ConvertTo-Json -Depth 6) | Set-Content $p
+        $r = Resolve-MigrationSettings -Path $p
+        $r.IsValid | Should -BeFalse
+        ($r.Errors -join ' ') | Should -Match 'Plan must be an object'
+    }
+
+    It 'normalises a Domain value on load: trims, strips a leading @, lower-cases' {
+        $s = New-MigrationSettings -Label 'X'
+        $s.Domains.Target = ' @Contoso.COM '
+        $p = Join-Path $TestDrive 'domain-load.json'
+        ($s | ConvertTo-Json -Depth 6) | Set-Content $p
+        $r = Resolve-MigrationSettings -Path $p
+        $r.IsValid | Should -BeTrue -Because ($r.Errors -join '; ')
+        $r.Settings.Domains.Target | Should -Be 'contoso.com'
+    }
 }
 
 Describe 'Save-MigrationSettings' {
@@ -83,5 +113,43 @@ Describe 'Save-MigrationSettings' {
     It 'refuses to write an invalid document' {
         $s = New-MigrationSettings -Label ''
         { Save-MigrationSettings -Path (Join-Path $TestDrive 'x.json') -Settings $s } | Should -Throw '*Label*'
+    }
+
+    It 'refuses to write when the parent folder does not exist' {
+        $p = Join-Path $TestDrive 'does-not-exist' 'settings.json'
+        { Save-MigrationSettings -Path $p -Settings (New-MigrationSettings -Label 'X') } |
+            Should -Throw '*folder*does not exist*'
+        Test-Path -LiteralPath $p | Should -BeFalse
+    }
+
+    It 'normalises a Domain value on save' {
+        $p = Join-Path $TestDrive 'domain-save.json'
+        $s = New-MigrationSettings -Label 'X'
+        $s.Domains.Target = '@Contoso.COM'
+        Save-MigrationSettings -Path $p -Settings $s | Out-Null
+        (Resolve-MigrationSettings -Path $p).Settings.Domains.Target | Should -Be 'contoso.com'
+    }
+
+    It 'leaves the original file and content intact, and cleans up the .tmp, when the final move fails' {
+        $p = Join-Path $TestDrive 'atomic.json'
+        Save-MigrationSettings -Path $p -Settings (New-MigrationSettings -Label 'Original') | Out-Null
+        $originalContent = Get-Content -LiteralPath $p -Raw
+
+        InModuleScope M365Migration -Parameters @{ SettingsPath = $p } {
+            param($SettingsPath)
+
+            Mock Move-Item { throw 'simulated move failure' }
+            $threw = $false
+            try {
+                Save-MigrationSettings -Path $SettingsPath -Settings (New-MigrationSettings -Label 'Changed')
+            }
+            catch {
+                $threw = $true
+            }
+            $threw | Should -BeTrue -Because 'the mocked Move-Item must make the save fail'
+        }
+
+        (Get-Content -LiteralPath $p -Raw) | Should -Be $originalContent
+        Test-Path -LiteralPath "$p.tmp" | Should -BeFalse
     }
 }
