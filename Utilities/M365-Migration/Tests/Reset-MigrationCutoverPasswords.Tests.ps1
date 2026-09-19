@@ -18,6 +18,8 @@
     Justification = 'The Connect-MigrationGraph stub runs inside the script under test, whose scope chain does not reach this file''s script scope, so the scopes it was asked for are captured in a global list and removed again in AfterAll.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
     Justification = 'The stubs must accept every parameter the script under test binds, including ones a particular test does not read; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '',
+    Justification = 'Shadowing Export-Csv inside one Describe is the only way to make the temp-folder fallback fail without making the real temp folder unwritable. It is scoped to the test file, never shipped.')]
 param()
 
 BeforeAll {
@@ -657,5 +659,182 @@ Describe 'The tenant guard runs once over the Graph session' {
         $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
         $global:AssertCalls[0].Purpose | Should -BeExactly 'Cutover password reset'
         $global:AssertCalls[0].GraphContext.TenantId | Should -BeExactly $script:guardTenantId
+    }
+}
+
+Describe 'A results export that fails still leaves the generated credentials on disk' {
+
+    <#
+        The passphrase this script mints exists in exactly two places: the account it was set
+        on, and the results file. If the results file cannot be written the credential is gone
+        and every account in the wave is locked out, so the export is retried into the temp
+        folder rather than abandoned. Export-MigrationResult is shadowed to throw, standing in
+        for a read-only or full run folder.
+    #>
+
+    BeforeAll {
+        $global:cutoverFallbackExports = 0
+
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = 'newco.onmicrosoft.com'; Account = 'tech@newco.onmicrosoft.com' }
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Uri -like '*/members*') {
+                return @([pscustomobject]@{
+                        id                = '22222222-2222-2222-2222-222222222222'
+                        userPrincipalName = 'john.smith@newco.com'
+                        displayName       = 'John Smith'
+                        '@odata.type'     = '#microsoft.graph.user'
+                    })
+            }
+            if ($Uri -like '*/v1.0/groups/11111111-1111-1111-1111-111111111111?*') {
+                return [pscustomobject]@{ id = '11111111-1111-1111-1111-111111111111'; displayName = 'Cutover Group' }
+            }
+            return $null
+        }
+
+        function Export-MigrationResult {
+            param([object[]]$Rows, [string]$Name, [switch]$DryRun)
+            $global:cutoverFallbackExports++
+            throw 'Access to the path is denied.'
+        }
+
+        $script:fbWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "ResetCutover-Fallback-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:fbWorkspace -ItemType Directory -Force
+
+        # A -Prefix makes the temp fallback file's name unique to this test, which is the only
+        # way to find and clean up a file the script deliberately writes outside its workspace.
+        & $script:scriptPath -Group '11111111-1111-1111-1111-111111111111' -OutputPath $script:fbWorkspace `
+            -Prefix 'ResetFallback' -Verbosity Low -Confirm:$false
+        $script:fbExitCode = $LASTEXITCODE
+
+        $script:fbFiles = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
+                -Filter 'ResetFallback_Reset-CutoverPasswords-Results_*.csv' -ErrorAction SilentlyContinue)
+        $script:fbRows = if ($script:fbFiles.Count -ge 1) {
+            @(Import-Csv -LiteralPath $script:fbFiles[0].FullName)
+        }
+        else { @() }
+
+        $logFile = @(Get-ChildItem -LiteralPath $script:fbWorkspace -Recurse -Filter '*.log')
+        $script:fbLog = if ($logFile.Count -ge 1) { Get-Content -LiteralPath $logFile[0].FullName -Raw } else { '' }
+    }
+
+    AfterAll {
+        foreach ($file in $script:fbFiles) {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        }
+        if ($script:fbWorkspace -and (Test-Path -LiteralPath $script:fbWorkspace)) {
+            Remove-Item -LiteralPath $script:fbWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Variable -Name cutoverFallbackExports -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'tried the run folder first' {
+        $global:cutoverFallbackExports | Should -Be 1
+    }
+
+    It 'writes exactly one fallback file into the temp folder' {
+        $script:fbFiles.Count | Should -Be 1
+    }
+
+    It 'keeps the generated credential in the fallback file' {
+        $script:fbRows.Count | Should -Be 1
+        $script:fbRows[0].Identity | Should -BeExactly 'john.smith@newco.com'
+        $script:fbRows[0].Status | Should -BeExactly 'Succeeded'
+        $script:fbRows[0].GeneratedPassword | Should -Not -BeNullOrEmpty
+    }
+
+    It 'tells the operator at ERROR where the copy landed and what to do with it' {
+        $script:fbLog | Should -Match '\[ERROR\].*Results could not be written to'
+        $script:fbLog | Should -Match 'a copy was saved to .*ResetFallback_Reset-CutoverPasswords-Results'
+        $script:fbLog | Should -Match 'Move it into the run folder\.'
+    }
+
+    It 'never writes the credential itself into the log' {
+        $script:fbLog | Should -Not -Match ([regex]::Escape($script:fbRows[0].GeneratedPassword))
+    }
+
+    It 'still exits 0 - the resets worked and the credentials survived' {
+        $script:fbExitCode | Should -Be 0
+    }
+}
+
+Describe 'Credentials that cannot be written anywhere are reported as lost' {
+
+    <#
+        Both writes fail: the run folder through the shadowed Export-MigrationResult, the temp
+        folder through a shadowed Export-Csv. The accounts have new passwords nobody holds, so
+        the run has to end 1 and say so in words an operator can act on.
+    #>
+
+    BeforeAll {
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = 'newco.onmicrosoft.com'; Account = 'tech@newco.onmicrosoft.com' }
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Uri -like '*/members*') {
+                return @([pscustomobject]@{
+                        id                = '22222222-2222-2222-2222-222222222222'
+                        userPrincipalName = 'john.smith@newco.com'
+                        displayName       = 'John Smith'
+                        '@odata.type'     = '#microsoft.graph.user'
+                    })
+            }
+            if ($Uri -like '*/v1.0/groups/11111111-1111-1111-1111-111111111111?*') {
+                return [pscustomobject]@{ id = '11111111-1111-1111-1111-111111111111'; displayName = 'Cutover Group' }
+            }
+            return $null
+        }
+
+        function Export-MigrationResult {
+            param([object[]]$Rows, [string]$Name, [switch]$DryRun)
+            throw 'Access to the path is denied.'
+        }
+
+        # Shadows the cmdlet for the script only: the module's own Export-MigrationResult runs
+        # in the module session state, which this function is not part of.
+        function Export-Csv {
+            param(
+                [Parameter(ValueFromPipeline)]$InputObject, [string]$LiteralPath, [string]$Path,
+                [switch]$NoTypeInformation, [string]$Encoding, [switch]$Force
+            )
+            process { throw 'The temp folder is not writable either.' }
+        }
+
+        $script:lostWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "ResetCutover-Lost-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:lostWorkspace -ItemType Directory -Force
+
+        & $script:scriptPath -Group '11111111-1111-1111-1111-111111111111' -OutputPath $script:lostWorkspace `
+            -Prefix 'ResetLost' -Verbosity Low -Confirm:$false
+        $script:lostExitCode = $LASTEXITCODE
+
+        $logFile = @(Get-ChildItem -LiteralPath $script:lostWorkspace -Recurse -Filter '*.log')
+        $script:lostLog = if ($logFile.Count -ge 1) { Get-Content -LiteralPath $logFile[0].FullName -Raw } else { '' }
+    }
+
+    AfterAll {
+        foreach ($stray in @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
+                    -Filter 'ResetLost_Reset-CutoverPasswords-Results_*.csv' -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $stray.FullName -Force -ErrorAction SilentlyContinue
+        }
+        if ($script:lostWorkspace -and (Test-Path -LiteralPath $script:lostWorkspace)) {
+            Remove-Item -LiteralPath $script:lostWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'exits 1' {
+        $script:lostExitCode | Should -Be 1
+    }
+
+    It 'counts the lost credentials and says they are lost' {
+        $script:lostLog |
+            Should -Match '\[ERROR\].*1 generated credential\(s\) could not be persisted anywhere; they are lost'
+        $script:lostLog | Should -Match 'Reset the affected accounts again\.'
     }
 }

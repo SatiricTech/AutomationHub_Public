@@ -335,9 +335,14 @@ $exitCode = 0
 $run = Initialize-MigrationRun -ScriptName 'Reset-MigrationCutoverPasswords' -OutputPath $OutputPath `
     -Prefix $Prefix -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
 
-try {
-    $isDryRun = [bool]$run.DryRun
+$isDryRun = [bool]$run.DryRun
+$resultsExported = $false
 
+# Declared out here, not in the try: the finally block writes these rows, and a passphrase that
+# only exists in this list and on the account it was set on must survive whatever ended the run.
+$results = [System.Collections.Generic.List[object]]::new()
+
+try {
     # Fail on bad input paths before a sign-in prompt is put in front of the operator.
     switch ($PSCmdlet.ParameterSetName) {
         'Csv' { if (-not (Test-Path -LiteralPath $CsvPath)) { throw "CSV not found: $CsvPath" } }
@@ -459,7 +464,6 @@ try {
 
     Write-MigrationLog -Message "Users to process: $($targets.Count)" -Level INFO
 
-    $results = [System.Collections.Generic.List[object]]::new()
     $index = 0
 
     foreach ($target in $targets) {
@@ -558,11 +562,6 @@ try {
     }
 
     Write-Progress -Activity 'Resetting cutover passwords' -Completed
-
-    $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Reset-CutoverPasswords'
-    if (-not $isDryRun -and @($results | Where-Object { $_.Status -eq 'Succeeded' }).Count -gt 0) {
-        Write-MigrationLog -Message 'Generated passwords were written to the results file, not to this log. Store it securely and delete it once the credentials have been distributed.' -Level WARNING
-    }
 }
 catch {
     Write-MigrationLog -Message "Fatal: $($_.Exception.Message)" -Level ERROR
@@ -571,6 +570,49 @@ catch {
 }
 finally {
     #region Cleanup ------------------------------------------------------------
+    # The export lives here rather than at the end of the try: a passphrase that has already
+    # been set on an account exists nowhere but this list, so a dropped session between rows
+    # must not take the credentials of the rows that did succeed with it.
+    if (-not $resultsExported) {
+        $resultRows = $results.ToArray()
+        try {
+            $null = Export-MigrationResult -Rows $resultRows -Name 'Reset-CutoverPasswords'
+            $resultsExported = $true
+        }
+        catch {
+            $exportError = $_.Exception.Message
+
+            # The run folder is unusable (read-only, full, or gone), so the rows go to the temp
+            # folder instead. Get-MigrationOutputPath keeps the filename contract - including
+            # leaving the leader off entirely when the run has no prefix.
+            $fallbackPath = Get-MigrationOutputPath -Directory ([System.IO.Path]::GetTempPath()) `
+                -Prefix $run.Prefix -Name 'Reset-CutoverPasswords' -Suffix 'Results'
+            try {
+                $resultRows | Export-Csv -LiteralPath $fallbackPath -NoTypeInformation -Encoding utf8
+                $resultsExported = $true
+                Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory); a copy was " +
+                    "saved to $fallbackPath. Move it into the run folder. Original error: $exportError") -Level ERROR
+            }
+            catch {
+                # Nowhere left to put them. Naming the count - never the credentials - is the
+                # only thing that still helps: it tells the operator how big the re-run is.
+                $lostCount = @($resultRows | Where-Object { $_.GeneratedPassword }).Count
+                Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory) or to " +
+                    "'$fallbackPath': $($_.Exception.Message) Original error: $exportError") -Level ERROR
+                if ($lostCount -gt 0) {
+                    Write-MigrationLog -Message ("$lostCount generated credential(s) could not be persisted " +
+                        'anywhere; they are lost. Reset the affected accounts again.') -Level ERROR
+                }
+                $exitCode = 1
+            }
+        }
+    }
+
+    $anyReset = @($results | Where-Object { $_.Status -eq 'Succeeded' }).Count -gt 0
+    if ($resultsExported -and -not $isDryRun -and $anyReset) {
+        Write-MigrationLog -Message 'Generated passwords were written to the results file, not to this log. Store it securely and delete it once the credentials have been distributed.' -Level WARNING
+    }
+
     # The Graph session is deliberately left connected: Connect-MigrationGraph reuses a live
     # context, so disconnecting here would force a fresh sign-in for the next script in the run.
     $null = Complete-MigrationRun -ExitCode $exitCode

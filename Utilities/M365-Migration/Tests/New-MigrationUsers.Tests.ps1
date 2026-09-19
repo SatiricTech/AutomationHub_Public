@@ -29,6 +29,8 @@
     Justification = 'The stubs must accept every parameter the script passes, including ones a particular test does not assert on; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
     Justification = 'These are stand-ins for the Graph-facing module functions whose names the script under test calls. They exist to record that a call happened and change nothing, so ShouldProcess would be meaningless.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '',
+    Justification = 'Shadowing Export-Csv inside one Describe is the only way to make the temp-folder fallback fail without making the real temp folder unwritable. It is scoped to the test file, never shipped.')]
 param()
 
 BeforeAll {
@@ -40,6 +42,11 @@ BeforeAll {
 
     $script:scriptPath = Join-Path $PSScriptRoot '..' 'New-MigrationUsers.ps1'
     $script:fixtureRoot = Join-Path $PSScriptRoot 'Fixtures' 'New-MigrationUsers'
+
+    # The sentence a Failed row carries when the account may already exist with the password
+    # this run minted. Held once so the two Describes that assert on it cannot drift apart.
+    $script:verifyFirstHint =
+    '*The account may exist with this password; verify in the destination tenant before re-running.*'
 
     # --- Technique 1: load the script's functions without running its Main region ---------
     $parseErrors = $null
@@ -637,7 +644,9 @@ Describe 'New-MigrationUsers - a fatal error still leaves the plan and the resul
             param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
             $global:usersGraphCalls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri })
             if ($Method -ne 'GET') { $global:usersMutations.Add("$Method $Uri") }
-            if ($Uri -like '*/domains*') { return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true }) }
+            if ($Uri -like '*/domains*') {
+                return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true })
+            }
             if ($Uri -like '*/users?$filter=*') { return @() }
             if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
                 return [pscustomobject]@{ id = '99999999-9999-9999-9999-999999999999' }
@@ -821,7 +830,9 @@ Describe 'New-MigrationUsers - a rejected assignLicense call is a Failed row of 
             param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
             $global:usersGraphCalls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri })
             if ($Method -ne 'GET') { $global:usersMutations.Add("$Method $Uri") }
-            if ($Uri -like '*/domains*') { return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true }) }
+            if ($Uri -like '*/domains*') {
+                return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true })
+            }
             if ($Uri -like '*/users?$filter=*') { return @() }
             if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
                 return [pscustomobject]@{ id = '99999999-9999-9999-9999-999999999999' }
@@ -895,7 +906,9 @@ Describe 'New-MigrationUsers - a planned SKU the tenant does not own fails the l
             param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
             $global:usersGraphCalls.Add([pscustomobject]@{ Method = $Method; Uri = $Uri })
             if ($Method -ne 'GET') { $global:usersMutations.Add("$Method $Uri") }
-            if ($Uri -like '*/domains*') { return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true }) }
+            if ($Uri -like '*/domains*') {
+                return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true })
+            }
             if ($Uri -like '*/users?$filter=*') { return @() }
             if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
                 $upn = [string]$Body['userPrincipalName']
@@ -1010,5 +1023,281 @@ Describe 'New-MigrationUsers - the tenant guard runs once over the Graph session
         $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
         $global:AssertCalls[0].Purpose | Should -BeExactly 'User creation'
         $global:AssertCalls[0].GraphContext.TenantId | Should -BeExactly $script:guardTenantId
+    }
+}
+
+Describe 'New-MigrationUsers - a create that returns no object ID keeps its password on the Failed row' {
+
+    <#
+        Graph accepted the POST but the response carried no id, so the account may well exist
+        with the password this run minted. Dropping the credential here would leave an account
+        nobody can sign in to and no record of what was set on it.
+    #>
+
+    BeforeAll {
+        function New-MigrationRandomPassword {
+            param([int]$Length)
+            return 'Pa55-fixed-word'
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Uri -like '*/domains*') {
+                return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true })
+            }
+            if ($Uri -like '*/users?$filter=*') { return @() }
+            # The create is accepted, but the response has no id - the exact shape the script
+            # has to treat as 'the account may be there'.
+            if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
+                return [pscustomobject]@{ userPrincipalName = 'created-but-unidentified@newco.onmicrosoft.com' }
+            }
+            return $null
+        }
+
+        $script:noIdWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "M365Migration-Users-NoId-$([guid]::NewGuid())"
+        New-Item -Path $script:noIdWorkspace -ItemType Directory -Force | Out-Null
+        $script:noIdPlan = Join-Path $script:noIdWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:noIdPlan
+
+        & $script:scriptPath -PlanPath $script:noIdPlan -Wave '1' -DefaultUsageLocation 'US' `
+            -OutputPath $script:noIdWorkspace -Verbosity Low -Confirm:$false
+        $script:noIdExitCode = $LASTEXITCODE
+
+        $file = @(Get-ChildItem -LiteralPath $script:noIdWorkspace -Filter 'New-Users-Results_*.csv')
+        $script:noIdRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+
+        $log = @(Get-ChildItem -LiteralPath $script:noIdWorkspace -Filter 'New-MigrationUsers_*.log')
+        $script:noIdLog = if ($log.Count -eq 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
+    }
+
+    AfterAll {
+        if ($script:noIdWorkspace -and (Test-Path -LiteralPath $script:noIdWorkspace)) {
+            Remove-Item -LiteralPath $script:noIdWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Records the row as Failed' {
+        $failed = @($script:noIdRows | Where-Object { $_.Action -eq 'CreateUser' -and $_.Status -eq 'Failed' })
+        $failed.Count | Should -Be 2
+    }
+
+    It 'Carries the generated password on the Failed row' {
+        $row = @($script:noIdRows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' })[0]
+        $row.GeneratedPassword | Should -BeExactly 'Pa55-fixed-word'
+    }
+
+    It 'Tells the operator the account may already exist with that password' {
+        $row = @($script:noIdRows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' })[0]
+        $row.Detail | Should -BeLike $script:verifyFirstHint
+    }
+
+    It 'Never writes the password into the log' {
+        $script:noIdLog | Should -Not -Match 'Pa55-fixed-word'
+    }
+}
+
+Describe 'New-MigrationUsers - a create rejected as a conflict keeps its password on the Failed row' {
+
+    BeforeAll {
+        function New-MigrationRandomPassword {
+            param([int]$Length)
+            return 'Pa55-fixed-word'
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Uri -like '*/domains*') {
+                return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true })
+            }
+            if ($Uri -like '*/users?$filter=*') { return @() }
+            if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
+                # The existing-object pre-check missed it (a race, or a soft-deleted namesake),
+                # so the conflict arrives from the create itself - and the account it collided
+                # with may be the one this very run just made on a retry.
+                throw ('Request_MultipleObjectsWithSameKeyValue: Another object with the same value ' +
+                    'for property userPrincipalName already exists.')
+            }
+            return $null
+        }
+
+        $script:conflictWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "M365Migration-Users-Conflict-$([guid]::NewGuid())"
+        New-Item -Path $script:conflictWorkspace -ItemType Directory -Force | Out-Null
+        $script:conflictPlan = Join-Path $script:conflictWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:conflictPlan
+
+        & $script:scriptPath -PlanPath $script:conflictPlan -Wave '1' -DefaultUsageLocation 'US' `
+            -OutputPath $script:conflictWorkspace -Verbosity Low -Confirm:$false
+        $script:conflictExitCode = $LASTEXITCODE
+
+        $file = @(Get-ChildItem -LiteralPath $script:conflictWorkspace -Filter 'New-Users-Results_*.csv')
+        $script:conflictRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+    }
+
+    AfterAll {
+        if ($script:conflictWorkspace -and (Test-Path -LiteralPath $script:conflictWorkspace)) {
+            Remove-Item -LiteralPath $script:conflictWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Carries the generated password and the verify-first warning' {
+        $row = @($script:conflictRows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' })[0]
+        $row.Status | Should -BeExactly 'Failed'
+        $row.GeneratedPassword | Should -BeExactly 'Pa55-fixed-word'
+        $row.Detail | Should -BeLike $script:verifyFirstHint
+    }
+
+    It 'Still gives the conflict its own actionable wording' {
+        $row = @($script:conflictRows | Where-Object { $_.Identity -eq 'jsmith@contoso.com' })[0]
+        $row.Detail | Should -BeLike '*Another object already holds*'
+    }
+}
+
+Describe 'New-MigrationUsers - a results export that fails falls back to the temp folder' {
+
+    BeforeAll {
+        function New-MigrationRandomPassword {
+            param([int]$Length)
+            return 'Pa55-fixed-word'
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Uri -like '*/domains*') {
+                return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true })
+            }
+            if ($Uri -like '*/users?$filter=*') { return @() }
+            if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
+                return [pscustomobject]@{ id = '99999999-9999-9999-9999-999999999999' }
+            }
+            return $null
+        }
+
+        function Export-MigrationResult {
+            param([object[]]$Rows, [string]$Name, [switch]$DryRun)
+            throw 'Access to the path is denied.'
+        }
+
+        $script:usersFbWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "M365Migration-Users-Fb-$([guid]::NewGuid())"
+        New-Item -Path $script:usersFbWorkspace -ItemType Directory -Force | Out-Null
+        $script:usersFbPlan = Join-Path $script:usersFbWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:usersFbPlan
+
+        # The -Prefix makes the temp fallback file's name unique to this test, which is the only
+        # way to find and clean up a file the script deliberately writes outside its workspace.
+        & $script:scriptPath -PlanPath $script:usersFbPlan -Wave '1' -DefaultUsageLocation 'US' `
+            -OutputPath $script:usersFbWorkspace -Prefix 'UsersFallback' -Verbosity Low -Confirm:$false
+        $script:usersFbExitCode = $LASTEXITCODE
+
+        $script:usersFbFiles = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
+                -Filter 'UsersFallback_New-Users-Results_*.csv' -ErrorAction SilentlyContinue)
+        $script:usersFbRows = if ($script:usersFbFiles.Count -ge 1) {
+            @(Import-Csv -LiteralPath $script:usersFbFiles[0].FullName)
+        }
+        else { @() }
+
+        $log = @(Get-ChildItem -LiteralPath $script:usersFbWorkspace -Recurse `
+                -Filter 'UsersFallback_New-MigrationUsers_*.log')
+        $script:usersFbLog = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
+    }
+
+    AfterAll {
+        foreach ($file in $script:usersFbFiles) {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        }
+        if ($script:usersFbWorkspace -and (Test-Path -LiteralPath $script:usersFbWorkspace)) {
+            Remove-Item -LiteralPath $script:usersFbWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Writes exactly one fallback file into the temp folder' {
+        $script:usersFbFiles.Count | Should -Be 1
+    }
+
+    It 'Keeps the initial passwords in the fallback file' {
+        @($script:usersFbRows | Where-Object { $_.GeneratedPassword -eq 'Pa55-fixed-word' }).Count |
+            Should -BeGreaterThan 0
+    }
+
+    It 'Tells the operator at ERROR where the copy landed' {
+        $script:usersFbLog | Should -Match '\[ERROR\].*Results could not be written to'
+        $script:usersFbLog | Should -Match 'Move it into the run folder\.'
+    }
+
+    It 'Never writes the password into the log' {
+        $script:usersFbLog | Should -Not -Match 'Pa55-fixed-word'
+    }
+}
+
+Describe 'New-MigrationUsers - credentials that cannot be written anywhere are reported as lost' {
+
+    BeforeAll {
+        function New-MigrationRandomPassword {
+            param([int]$Length)
+            return 'Pa55-fixed-word'
+        }
+
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            if ($Uri -like '*/domains*') {
+                return @([pscustomobject]@{ id = 'newco.onmicrosoft.com'; isVerified = $true })
+            }
+            if ($Uri -like '*/users?$filter=*') { return @() }
+            if ($Method -eq 'POST' -and $Uri -eq '/v1.0/users') {
+                return [pscustomobject]@{ id = '99999999-9999-9999-9999-999999999999' }
+            }
+            return $null
+        }
+
+        function Export-MigrationResult {
+            param([object[]]$Rows, [string]$Name, [switch]$DryRun)
+            throw 'Access to the path is denied.'
+        }
+
+        # Shadows the cmdlet for the script only: the module's own export runs in the module
+        # session state, which a function defined here is not part of.
+        function Export-Csv {
+            param(
+                [Parameter(ValueFromPipeline)]$InputObject, [string]$LiteralPath, [string]$Path,
+                [switch]$NoTypeInformation, [string]$Encoding, [switch]$Force
+            )
+            process { throw 'The temp folder is not writable either.' }
+        }
+
+        $script:usersLostWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "M365Migration-Users-Lost-$([guid]::NewGuid())"
+        New-Item -Path $script:usersLostWorkspace -ItemType Directory -Force | Out-Null
+        $script:usersLostPlan = Join-Path $script:usersLostWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:usersLostPlan
+
+        & $script:scriptPath -PlanPath $script:usersLostPlan -Wave '1' -DefaultUsageLocation 'US' `
+            -OutputPath $script:usersLostWorkspace -Prefix 'UsersLost' -Verbosity Low -Confirm:$false
+        $script:usersLostExitCode = $LASTEXITCODE
+
+        $log = @(Get-ChildItem -LiteralPath $script:usersLostWorkspace -Recurse `
+                -Filter 'UsersLost_New-MigrationUsers_*.log')
+        $script:usersLostLog = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
+    }
+
+    AfterAll {
+        foreach ($stray in @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) `
+                    -Filter 'UsersLost_New-Users-Results_*.csv' -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $stray.FullName -Force -ErrorAction SilentlyContinue
+        }
+        if ($script:usersLostWorkspace -and (Test-Path -LiteralPath $script:usersLostWorkspace)) {
+            Remove-Item -LiteralPath $script:usersLostWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits 1' {
+        $script:usersLostExitCode | Should -Be 1
+    }
+
+    It 'Counts the lost credentials and says they are lost' {
+        $script:usersLostLog |
+            Should -Match '\[ERROR\].*2 generated credential\(s\) could not be persisted anywhere; they are lost'
+        $script:usersLostLog | Should -Match 'Reset the affected accounts again\.'
     }
 }

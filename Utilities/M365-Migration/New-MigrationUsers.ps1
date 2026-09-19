@@ -404,6 +404,31 @@ function ConvertTo-UserRequestBody {
     return $body
 }
 
+function Test-ConflictMessage {
+    <#
+    .SYNOPSIS
+        Says whether a Graph error means the object already exists.
+
+    .DESCRIPTION
+        Two callers need this answer and must never disagree about it: the one that words the
+        failure for the operator, and the one that decides whether the password this run minted
+        may already be live on an account. Keeping the wordings in one place is what stops a
+        change to the first from quietly throwing away credentials in the second.
+
+    .EXAMPLE
+        Test-ConflictMessage -Message $_.Exception.Message
+
+        Returns $true for 'ObjectConflict' or a 409, $false for a password-policy rejection.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Message
+    )
+
+    return [bool]($Message -match 'already exist|ObjectConflict|Request_MultipleObjectsWithSameKeyValue|\b409\b')
+}
+
 function ConvertTo-FailureDetail {
     <#
     .SYNOPSIS
@@ -428,7 +453,7 @@ function ConvertTo-FailureDetail {
 
     $text = [string]$Message
 
-    if ($text -match 'already exist|ObjectConflict|Request_MultipleObjectsWithSameKeyValue') {
+    if (Test-ConflictMessage -Message $text) {
         return ("Another object already holds '$UserPrincipalName'. A soft-deleted user can hold it too - " +
             "check GET /directory/deletedItems/microsoft.graph.user and either restore or permanently delete it. " +
             "Original error: $text")
@@ -605,7 +630,7 @@ function Add-ResultRow {
 
 #region Main --------------------------------------------------------------------------
 
-$null = Initialize-MigrationRun -ScriptName 'New-MigrationUsers' -OutputPath $OutputPath -Prefix $Prefix `
+$run = Initialize-MigrationRun -ScriptName 'New-MigrationUsers' -OutputPath $OutputPath -Prefix $Prefix `
     -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
 
 try {
@@ -748,6 +773,12 @@ try {
         $usageLocation = ''
         $upn = ''
 
+        # Both are read by the per-row catch, which can be reached long before the create, so
+        # under Set-StrictMode they have to exist from the top of every iteration. $password
+        # holds the minted credential; $postAttempted records whether the create was sent.
+        $password = ''
+        $postAttempted = $false
+
         try {
             $chosen = Resolve-RowIdentity -Row $row -VerifiedDomain $verifiedDomains -UseInterim:$UseInterim
             $upn = $chosen.UserPrincipalName
@@ -796,6 +827,9 @@ try {
                 -UsageLocation $usageLocation -Password $password -ForceChangePassword $ForceChangePassword `
                 -HideFromAddressLists:$HideFromAddressLists
 
+            # Set before the call, not after: once the request is on the wire the account may
+            # exist whatever comes back, and the password is only worth keeping from here on.
+            $postAttempted = $true
             $created = Invoke-MigrationAction -Description "Create user $upn" -PassThru -Action {
                 Invoke-MigrationGraphRequest -Method POST -Uri '/v1.0/users' -Body $body
             }
@@ -895,13 +929,27 @@ try {
             }
         }
         catch {
-            $mapped = ConvertTo-FailureDetail -Message $_.Exception.Message -UserPrincipalName $upn
+            $failureMessage = $_.Exception.Message
+            $mapped = ConvertTo-FailureDetail -Message $failureMessage -UserPrincipalName $upn
+
+            # A create that was sent and then failed on a conflict, or came back without an
+            # object ID, may still have left an account behind - and the only copy of the
+            # password it would answer to is this variable. A Failed row that drops it leaves
+            # an account nobody can sign in to and nothing to look it up by.
+            $failedPassword = ''
+            if ($postAttempted -and $password -and
+                ($failureMessage -match 'returned no object ID' -or (Test-ConflictMessage -Message $failureMessage))) {
+                $failedPassword = $password
+                $mapped += ' The account may exist with this password; verify in the destination ' +
+                    'tenant before re-running.'
+            }
+
             $row.ProvisionStatus = 'Failed'
             $row.ProvisionDetail = $mapped
             $planChanged = $true
             Write-MigrationLog -Message "$identity - $mapped" -Level ERROR
             Add-ResultRow @common -Action 'CreateUser' -Status 'Failed' -Detail $mapped `
-                -TargetUserPrincipalName $upn -UsageLocation $usageLocation
+                -TargetUserPrincipalName $upn -UsageLocation $usageLocation -GeneratedPassword $failedPassword
         }
     }
 
@@ -1018,14 +1066,38 @@ finally {
     # The flag is what keeps a fatal run from producing two results files for one run: whoever
     # exports first sets it, and this block then leaves the file alone.
     if (-not $resultsExported) {
+        $resultRows = $script:results.ToArray()
         try {
-            $null = Export-MigrationResult -Rows $script:results.ToArray() -Name 'New-Users'
+            $null = Export-MigrationResult -Rows $resultRows -Name 'New-Users'
             $resultsExported = $true
         }
         catch {
-            # The run is already ending; a results file that cannot be written must not mask the
-            # reason it ended, so the failure is logged and the exit code stands.
-            Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
+            $exportError = $_.Exception.Message
+
+            # The run folder is unusable (read-only, full, or gone), so the rows go to the temp
+            # folder instead. Get-MigrationOutputPath keeps the filename contract - including
+            # leaving the leader off entirely when the run has no prefix.
+            $fallbackPath = Get-MigrationOutputPath -Directory ([System.IO.Path]::GetTempPath()) `
+                -Prefix $run.Prefix -Name 'New-Users' -Suffix 'Results'
+            try {
+                $resultRows | Export-Csv -LiteralPath $fallbackPath -NoTypeInformation -Encoding utf8
+                $resultsExported = $true
+                Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory); a copy was " +
+                    "saved to $fallbackPath. Move it into the run folder. Original error: $exportError") -Level ERROR
+            }
+            catch {
+                # Nowhere left to put them. Naming the count - never the credentials - is the
+                # only thing that still helps: it tells the operator how big the re-run is.
+                $lostCount = @($resultRows | Where-Object { $_.GeneratedPassword }).Count
+                Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory) or to " +
+                    "'$fallbackPath': $($_.Exception.Message) Original error: $exportError") -Level ERROR
+                if ($lostCount -gt 0) {
+                    Write-MigrationLog -Message ("$lostCount generated credential(s) could not be persisted " +
+                        'anywhere; they are lost. Reset the affected accounts again.') -Level ERROR
+                }
+                # Losing the only record of what this run created is a failed run, not a soft one.
+                $exitCode = 1
+            }
         }
     }
 }
@@ -1034,7 +1106,10 @@ finally {
 
 #region Cleanup -----------------------------------------------------------------------
 
-if (@($script:results | Where-Object { $_.Status -eq 'Succeeded' -and $_.GeneratedPassword }).Count -gt 0) {
+# Guarded by the export flag: after a run that could not write the rows anywhere, pointing the
+# operator at a results file that does not exist would contradict the loss they were just told about.
+if ($resultsExported -and
+    @($script:results | Where-Object { $_.Status -eq 'Succeeded' -and $_.GeneratedPassword }).Count -gt 0) {
     Write-MigrationLog -Message 'Initial passwords were written to the results file. Store it as you would any password list.' -Level WARNING
 }
 

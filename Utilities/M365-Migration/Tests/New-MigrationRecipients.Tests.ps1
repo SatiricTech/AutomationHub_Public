@@ -848,3 +848,53 @@ Describe 'New-MigrationRecipients - the tenant guard runs once over the Exchange
         $global:AssertCalls[0].ExchangeConnection.TenantId | Should -BeExactly $script:guardTenantId
     }
 }
+
+Describe 'New-MigrationRecipients - a results export that fails ends the run as failed' {
+
+    <#
+        No credentials are minted here, so there is nothing to rescue into a temp file. What a
+        lost results file does cost is the record of what this run changed in Exchange, which
+        is enough to make the run a failure rather than a silent success.
+    #>
+
+    BeforeAll {
+        function Export-MigrationResult {
+            param([object[]]$Rows, [string]$Name, [switch]$DryRun)
+            throw 'Access to the path is denied.'
+        }
+
+        $script:exportFailWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "M365Migration-Recipients-ExportFail-$([guid]::NewGuid())"
+        New-Item -Path $script:exportFailWorkspace -ItemType Directory -Force | Out-Null
+
+        $script:exportFailPlan = Join-Path $script:exportFailWorkspace 'IdentityPlan.csv'
+        Copy-Item -LiteralPath (Join-Path $script:fixtureRoot 'IdentityPlan.csv') -Destination $script:exportFailPlan
+
+        & $script:scriptPath -PlanPath $script:exportFailPlan -Wave '1' `
+            -GroupsCsv (Join-Path $script:fixtureRoot 'Groups.csv') `
+            -OutputPath $script:exportFailWorkspace -Verbosity Low
+        $script:exportFailExitCode = $LASTEXITCODE
+
+        $log = @(Get-ChildItem -LiteralPath $script:exportFailWorkspace -Filter 'New-MigrationRecipients_*.log')
+        $script:exportFailLog = if ($log.Count -eq 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
+    }
+
+    AfterAll {
+        if ($script:exportFailWorkspace -and (Test-Path -LiteralPath $script:exportFailWorkspace)) {
+            Remove-Item -LiteralPath $script:exportFailWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits 1' {
+        $script:exportFailExitCode | Should -Be 1
+    }
+
+    It 'Logs why the results file is missing' {
+        $script:exportFailLog |
+            Should -Match '\[ERROR\].*Could not write the results file.*Access to the path is denied'
+    }
+
+    It 'Writes no results file' {
+        @(Get-ChildItem -LiteralPath $script:exportFailWorkspace -Filter 'New-Recipients-*.csv').Count | Should -Be 0
+    }
+}

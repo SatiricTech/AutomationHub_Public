@@ -1501,9 +1501,11 @@ finally {
             $resultsExported = $true
         }
         catch {
-            # The run is already ending; a results file that cannot be written must not mask the
-            # reason it ended, so the failure is logged and the exit code stands.
+            # No credentials are minted here, so there is nothing to rescue to a temp copy - but
+            # the results file is the only record of what this run changed in Exchange, and a run
+            # that cannot produce it has not finished, whatever its rows said.
             Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
+            $exitCode = 1
         }
     }
 }
