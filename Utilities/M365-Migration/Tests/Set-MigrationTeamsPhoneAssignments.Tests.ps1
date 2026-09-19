@@ -363,6 +363,38 @@ Describe '-ListUnassigned' {
     }
 }
 
+Describe '-ListUnassigned with nothing free in the inventory' {
+
+    <#
+        Zero unassigned numbers must write no report file at all - not the module's Info-row
+        placeholder, which would be a confusing "found nothing" file rather than no file.
+    #>
+
+    BeforeAll {
+        # Shadows the Describe-level stub (top of file). The script trusts this function's
+        # -Filter @{ PstnAssignmentStatus = 'Unassigned' } result as-is with no local
+        # re-filtering, so returning nothing here is what "no free numbers" means to it.
+        function Get-MigrationPhoneNumberInventory {
+            [CmdletBinding()]
+            param([hashtable]$Filter, [int]$PageSize)
+            return @()
+        }
+
+        $script:noneFreeRun = Invoke-ScriptUnderTest -Arguments @{ ListUnassigned = $true }
+    }
+
+    It 'Exits 0 and writes no unassigned-numbers report' {
+        $script:noneFreeRun.ExitCode | Should -Be 0
+        $reportFiles = @(Get-ChildItem -LiteralPath $script:noneFreeRun.Workspace `
+                -Filter 'TeamsPhoneNumbers-Unassigned_*.csv')
+        $reportFiles.Count | Should -Be 0
+    }
+
+    It 'Still writes the results file' {
+        $script:noneFreeRun.ResultFile | Should -Not -BeNullOrEmpty
+    }
+}
+
 Describe 'The tenant guard runs once over the Teams session' {
 
     <#

@@ -1787,8 +1787,13 @@ try {
         # rather than as nothing of that kind to plan.
         $columns = @(Get-InventoryTabColumn -Name $tab -IncludeAuthMethodColumn:$IncludeAuthMethods `
                 -IncludeOneDriveColumn:$IncludeOneDrive)
-        $csvPaths[$tab] = Export-MigrationReport -Rows $rows -Name $tab -Columns $columns `
+        $writtenPath = Export-MigrationReport -Rows $rows -Name $tab -Columns $columns `
             -Timestamp $runTimestamp -SuppressInDryRun
+        # Export-MigrationReport returns '' under -DryRun (nothing was written), but the summary
+        # below still has to name the file the run would have produced, as the help promises.
+        $csvPaths[$tab] = if ($run.DryRun) {
+            Get-MigrationOutputPath -Name $tab -Timestamp $runTimestamp
+        } else { $writtenPath }
 
         if ($useExcel) {
             # Export-Excel cannot write a sheet from an empty pipeline, so an empty tab gets the

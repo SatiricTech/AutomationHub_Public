@@ -209,19 +209,29 @@ Describe 'Script versions' {
             @{ Path = $_.FullName; Name = $_.Name }
         })
 
-    It 'Stamps <Name> with a Version line in .NOTES' -ForEach $topLevelScripts {
+    It 'Stamps <Name> with Version: 1.2.0 in .NOTES' -ForEach $topLevelScripts {
         $help = Get-Help -Name $Path -Full -ErrorAction Stop
         $notesText = ($help.alertSet.alert.Text -join "`n")
-        $notesText | Should -Match 'Version\s*:\s+\d+\.\d+\.\d+' -Because "$Name needs a Version: line in .NOTES"
+        $notesText | Should -Match 'Version\s*:\s+1\.2\.0' -Because "$Name needs a Version: 1.2.0 line in .NOTES"
     }
 
+    # Each script's specific exit codes, not just that an 'Exit codes:' label exists - a
+    # generic label match would still pass if a code were quietly dropped from the list.
     $nonStandardExitCodeScripts = @(
-        'Remove-MigrationDomainReferences.ps1', 'Compare-MigrationUserData.ps1', 'Test-MigrationReadiness.ps1'
-    ) | ForEach-Object { @{ Name = $_; Path = (Join-Path $toolkitRoot $_) } }
+        @{ Name = 'Remove-MigrationDomainReferences.ps1'; Codes = @(0, 1, 2, 3) }
+        @{ Name = 'Compare-MigrationUserData.ps1'; Codes = @(0, 1, 2) }
+        @{ Name = 'Test-MigrationReadiness.ps1'; Codes = @(0, 1, 2) }
+    ) | ForEach-Object { @{ Name = $_.Name; Path = (Join-Path $toolkitRoot $_.Name); Codes = $_.Codes } }
 
-    It 'Documents non-standard exit codes for <Name>' -ForEach $nonStandardExitCodeScripts {
+    It 'Documents exit codes <Codes> for <Name>' -ForEach $nonStandardExitCodeScripts {
         $help = Get-Help -Name $Path -Full -ErrorAction Stop
         $notesText = ($help.alertSet.alert.Text -join "`n")
-        $notesText | Should -Match 'Exit codes\s*:' -Because "$Name has non-standard exit codes to document"
+
+        $match = [regex]::Match($notesText, 'Exit codes\s*:(.*?)(\r?\n\r?\n|\z)', 'Singleline')
+        $match.Success | Should -BeTrue -Because "$Name needs an Exit codes: line in .NOTES"
+
+        foreach ($code in $Codes) {
+            $match.Groups[1].Value | Should -Match "\b$code\b" -Because "$Name must document exit code $code"
+        }
     }
 }

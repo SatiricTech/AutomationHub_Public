@@ -209,6 +209,9 @@ $run = Initialize-MigrationRun -ScriptName 'Set-MigrationTeamsPhoneAssignments' 
 
 try {
     $isDryRun = [bool]$run.DryRun
+    # Shared by every Export-MigrationReport call in this run, matching the convention the
+    # other toolkit scripts use even though this script only ever writes one report per run.
+    $runTimestamp = Get-Date
 
     # Fail on a bad input path before a sign-in prompt is put in front of the operator.
     if ($PSCmdlet.ParameterSetName -eq 'Csv' -and -not (Test-Path -LiteralPath $CsvPath)) {
@@ -260,12 +263,14 @@ try {
         if ($unassigned.Count -eq 0) {
             Write-MigrationLog -Message 'No unassigned numbers found in the tenant inventory.' -Level WARNING
         }
-
-        # Same file name Get-MigrationTeamsPhoneAssignments.ps1 -IncludeUnassignedNumbers
-        # writes, so the two scripts' output is interchangeable. -SuppressInDryRun matches the
-        # old writer, which never touched disk under -DryRun.
-        $null = Export-MigrationReport -Rows $unassignedReport.ToArray() -Name 'TeamsPhoneNumbers' `
-            -Suffix 'Unassigned' -SuppressInDryRun
+        else {
+            # Same file name Get-MigrationTeamsPhoneAssignments.ps1 -IncludeUnassignedNumbers
+            # writes, so the two scripts' output is interchangeable. -SuppressInDryRun matches the
+            # old writer, which never touched disk under -DryRun; nothing is written for zero rows
+            # either, matching the old writer's -gt 0 guard.
+            $null = Export-MigrationReport -Rows $unassignedReport.ToArray() -Name 'TeamsPhoneNumbers' `
+                -Suffix 'Unassigned' -Timestamp $runTimestamp -SuppressInDryRun
+        }
 
         $null = Export-MigrationResult -Rows $listResults.ToArray() -Name 'Set-TeamsPhoneAssignments'
 

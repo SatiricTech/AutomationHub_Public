@@ -21,6 +21,11 @@
       <Prefix>_VivaLearningHistory_<timestamp>.json     - raw Graph objects (fidelity backup)
       <Prefix>_Get-VivaLearningHistory-Results_<ts>.csv - one row per user read
 
+    Every cell in the CSV is sanitised before writing - a CourseTitle or other value starting
+    with =, +, - or @ (a formula-triggering character in Excel/Calc/Sheets) gains a leading
+    apostrophe. Import-MigrationVivaLearningHistory reads the CSV back as-is, apostrophe
+    included, since it never round-trips the file through a spreadsheet.
+
     API quirks this script works around (documented behaviour as of Aug 2026):
       - Listing course activities supports DELEGATED sign-in only; app-only
         (client credential) tokens are rejected. The delegated scopes are

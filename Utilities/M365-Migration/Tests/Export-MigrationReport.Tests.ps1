@@ -117,6 +117,13 @@ Describe 'Export-MigrationReport' {
             @(Import-Csv -LiteralPath $path) | Should -HaveCount 0
         }
 
+        It 'Escapes a literal quote in a column name the way Export-Csv would' {
+            $null = Initialize-MigrationRun -ScriptName 'Remove-DomainReferences' -OutputPath $script:workspace
+            $path = Export-MigrationReport -Rows @() -Name 'QuotedHeader' -Columns @('Say "Hi"', 'B')
+            (Get-Content -LiteralPath $path -TotalCount 1) | Should -BeExactly '"Say ""Hi""","B"'
+            @(Import-Csv -LiteralPath $path) | Should -HaveCount 0
+        }
+
         It 'Ignores -Columns when -Rows has at least one row' {
             $null = Initialize-MigrationRun -ScriptName 'Remove-DomainReferences' -OutputPath $script:workspace
             $path = Export-MigrationReport -Rows $script:sampleRows -Name 'ColumnsIgnored' -Columns @('X', 'Y')

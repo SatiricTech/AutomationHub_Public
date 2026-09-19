@@ -141,8 +141,11 @@ function Export-MigrationReport {
     if ($headerOnly) {
         # The header line Export-Csv would have written for a typed, empty collection whose
         # columns were $headerColumns - so a populated and an empty run of the same report
-        # are one Import-Csv contract, never two.
-        $headerLine = '"' + ($headerColumns -join '","') + '"'
+        # are one Import-Csv contract, never two. A literal quote in a column name is escaped
+        # the same way Export-Csv escapes one, even though every caller today passes plain
+        # identifiers with no quotes to escape.
+        $quotedColumns = @($headerColumns | ForEach-Object { $_ -replace '"', '""' })
+        $headerLine = '"' + ($quotedColumns -join '","') + '"'
         try {
             Set-Content -LiteralPath $filePath -Value $headerLine -Encoding utf8 -ErrorAction Stop
         }

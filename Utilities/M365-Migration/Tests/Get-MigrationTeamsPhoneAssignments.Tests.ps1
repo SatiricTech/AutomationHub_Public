@@ -372,6 +372,84 @@ Describe 'Get-MigrationTeamsPhoneAssignments - dry run' {
     }
 }
 
+Describe 'Get-MigrationTeamsPhoneAssignments - no users match' {
+
+    <#
+        A zero-row export must write no assignments CSV at all - not the module's Info-row
+        placeholder. That file is read back by Set-/Remove-MigrationTeamsPhoneAssignments as a
+        list of users to act on, and a placeholder with an Info column instead of
+        UserPrincipalName fails there with a missing-user-column error, not a clean "nothing to
+        do" - a worse failure mode than the empty run itself.
+    #>
+
+    BeforeAll {
+        # Shadows the Describe-level stub: no users at all, the tenant-with-nothing case.
+        function Get-CsOnlineUser {
+            [CmdletBinding()]
+            param([string]$Filter, [string]$Identity)
+            return @()
+        }
+
+        $script:noneWorkspace = New-TeamsPhoneTestWorkspace
+        & $script:scriptPath -OutputPath $script:noneWorkspace -Verbosity Low
+        $script:noneExitCode = $LASTEXITCODE
+
+        $logFile = Get-TeamsPhoneTestFile -Workspace $script:noneWorkspace `
+            -Pattern 'Get-MigrationTeamsPhoneAssignments_*.log'
+        $script:noneLog = if ($logFile) { Get-Content -LiteralPath $logFile -Raw } else { '' }
+    }
+
+    AfterAll {
+        Remove-TeamsPhoneTestWorkspace -Path $script:noneWorkspace
+    }
+
+    It 'Exits 0 and writes no assignments CSV' {
+        $script:noneExitCode | Should -Be 0
+        @(Get-ChildItem -LiteralPath $script:noneWorkspace -Filter 'TeamsPhoneAssignments_*.csv') | Should -HaveCount 0
+    }
+
+    It 'Logs that nothing matched' {
+        $script:noneLog | Should -Match '\[WARNING\] No users matched - nothing to export\.'
+    }
+}
+
+Describe 'Get-MigrationTeamsPhoneAssignments - no unassigned numbers' {
+
+    <#
+        Same reasoning as above, for the -IncludeUnassignedNumbers report: zero free numbers
+        must write no report file, not an Info-row placeholder.
+    #>
+
+    BeforeAll {
+        # Shadows the Describe-level stub: every number in the inventory is assigned to someone.
+        function Get-MigrationPhoneNumberInventory {
+            [CmdletBinding()]
+            param([hashtable]$Filter, [int]$PageSize)
+            return @($global:teamsPhoneTestInventory |
+                    Where-Object { [string]$_.PstnAssignmentStatus -ne 'Unassigned' })
+        }
+
+        $script:noFreeWorkspace = New-TeamsPhoneTestWorkspace
+        & $script:scriptPath -OutputPath $script:noFreeWorkspace -Verbosity Low -IncludeUnassignedNumbers
+        $script:noFreeExitCode = $LASTEXITCODE
+    }
+
+    AfterAll {
+        Remove-TeamsPhoneTestWorkspace -Path $script:noFreeWorkspace
+    }
+
+    It 'Exits 0 and writes no unassigned-numbers report' {
+        $script:noFreeExitCode | Should -Be 0
+        @(Get-ChildItem -LiteralPath $script:noFreeWorkspace -Filter 'TeamsPhoneNumbers-Unassigned_*.csv') |
+            Should -HaveCount 0
+    }
+
+    It 'Still writes the assignments CSV, since users did match' {
+        @(Get-ChildItem -LiteralPath $script:noFreeWorkspace -Filter 'TeamsPhoneAssignments_*.csv') |
+            Should -HaveCount 1
+    }
+}
+
 Describe 'Get-MigrationTeamsPhoneAssignments - server-side filter fallback' {
 
     BeforeAll {

@@ -361,29 +361,36 @@ try {
         Write-MigrationLog -Message "$usersWithAdditionalNumbers user(s) hold Alternate/Private numbers beyond the one in PhoneNumber. They are listed in the AdditionalNumbers column; Set-MigrationTeamsPhoneAssignments will not carry them." -Level WARNING
     }
 
+    # Nothing is written for zero rows: this file is read back by Set-/Remove-, and a
+    # placeholder file in that chain-input slot would fail whatever reads it next
+    # (a missing user column, not an empty result) rather than reporting cleanly.
     if ($exportRows.Count -eq 0) {
         Write-MigrationLog -Message 'No users matched - nothing to export.' -Level WARNING
     }
-    $null = Export-MigrationReport -Rows $exportRows.ToArray() -Name 'TeamsPhoneAssignments' `
-        -Timestamp $runTimestamp -SuppressInDryRun
+    else {
+        $null = Export-MigrationReport -Rows $exportRows.ToArray() -Name 'TeamsPhoneAssignments' `
+            -Timestamp $runTimestamp -SuppressInDryRun
+    }
 
     if ($IncludeUnassignedNumbers) {
         $unassigned = @($allNumbers | Where-Object { [string]$_.PstnAssignmentStatus -eq 'Unassigned' })
         Write-MigrationLog -Message "Unassigned numbers in inventory: $($unassigned.Count)" -Level INFO
 
-        $unassignedReport = @($unassigned | ForEach-Object {
-                [pscustomobject][ordered]@{
-                    PhoneNumber        = $_.TelephoneNumber
-                    PhoneNumberType    = [string]$_.NumberType
-                    AssignmentCategory = [string]$_.AssignmentCategory
-                    Capability         = ($_.Capability -join ';')
-                    IsoCountryCode     = $_.IsoCountryCode
-                    LocationId         = [string]$_.LocationId
-                    ActivationState    = [string]$_.ActivationState
-                }
-            })
-        $null = Export-MigrationReport -Rows $unassignedReport -Name 'TeamsPhoneNumbers' -Suffix 'Unassigned' `
-            -Timestamp $runTimestamp -SuppressInDryRun
+        if ($unassigned.Count -gt 0) {
+            $unassignedReport = @($unassigned | ForEach-Object {
+                    [pscustomobject][ordered]@{
+                        PhoneNumber        = $_.TelephoneNumber
+                        PhoneNumberType    = [string]$_.NumberType
+                        AssignmentCategory = [string]$_.AssignmentCategory
+                        Capability         = ($_.Capability -join ';')
+                        IsoCountryCode     = $_.IsoCountryCode
+                        LocationId         = [string]$_.LocationId
+                        ActivationState    = [string]$_.ActivationState
+                    }
+                })
+            $null = Export-MigrationReport -Rows $unassignedReport -Name 'TeamsPhoneNumbers' -Suffix 'Unassigned' `
+                -Timestamp $runTimestamp -SuppressInDryRun
+        }
     }
 
     $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Get-TeamsPhoneAssignments'

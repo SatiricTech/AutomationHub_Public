@@ -379,7 +379,7 @@ with a warning; the planner gains `-SmtpDomain`; `Get-MigrationOutputPath` /
 `Get-MigrationPlanSchema` (new) and `Get-MigrationDefaultOutputRoot` are exported; every
 script's `.NOTES` gets `Version:`; results tokens follow one rule — the script name with
 `Migration` removed (`Set-Licenses`, `Test-Readiness`, `Export-MappingFile`), and a
-secondary output of the same script uses `-Suffix` (`Set-TeamsPhoneAssignments-Unassigned`)
+secondary output of the same script uses `-Suffix` (`TeamsPhoneNumbers-Unassigned`)
 — so the four outliers are renamed and the README notes it; README fixes (LogPath claim, wildcard and relative-path
 examples, "connect read-only" claim, log filename leader); `Templates/WaveMap.sample.csv`
 and the `MatchType` column in `ExclusionRules.sample.csv`; tests for the Main regions of
