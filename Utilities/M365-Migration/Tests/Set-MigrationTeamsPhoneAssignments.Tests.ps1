@@ -108,13 +108,16 @@ BeforeAll {
         if ($global:currentDryRun) {
             throw 'Grant-CsOnlineVoiceRoutingPolicy was reached, which -DryRun must have prevented.'
         }
+        # The number is already on the account by the time this runs, which is exactly the
+        # partial success the Failed row has to keep hold of.
+        if ($global:grantPolicyFails) { throw 'Simulated policy grant failure.' }
         $global:grantPolicyCalls.Add([pscustomobject]@{ Identity = $Identity; PolicyName = $PolicyName })
     }
 
     # Runs the script into a throwaway workspace and hands back everything a test may need.
     # 'exit' inside a script run with '&' ends that script only and sets $LASTEXITCODE.
     function Invoke-ScriptUnderTest {
-        param([hashtable]$Arguments)
+        param([hashtable]$Arguments, [switch]$FailPolicyGrant)
 
         $workspace = Join-Path ([System.IO.Path]::GetTempPath()) "SetTeamsPhone-$([guid]::NewGuid())"
         $null = New-Item -Path $workspace -ItemType Directory -Force
@@ -123,6 +126,7 @@ BeforeAll {
         $global:setPhoneCalls = [System.Collections.Generic.List[object]]::new()
         $global:grantPolicyCalls = [System.Collections.Generic.List[object]]::new()
         $global:currentDryRun = $Arguments.ContainsKey('DryRun') -and [bool]$Arguments['DryRun']
+        $global:grantPolicyFails = [bool]$FailPolicyGrant
 
         & $script:scriptPath @Arguments -OutputPath $workspace -Verbosity Low
         $exitCode = $LASTEXITCODE
@@ -146,7 +150,8 @@ AfterAll {
             Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    Remove-Variable -Name setPhoneCalls, grantPolicyCalls, currentDryRun -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name setPhoneCalls, grantPolicyCalls, currentDryRun, grantPolicyFails `
+        -Scope Global -ErrorAction SilentlyContinue
 }
 
 Describe 'DryRun over a CSV of assignments' {
@@ -233,6 +238,41 @@ Describe 'A live run assigns and grants the policy' {
 
     It 'Exits 0' {
         $script:live.ExitCode | Should -Be 0
+    }
+}
+
+Describe 'A voice routing policy grant that fails after the number was assigned' {
+
+    <#
+        The row is Failed - the run did not do what was asked - but the number is on the account
+        and re-running the assignment would hit the 'already assigned to another target' guard.
+        So the Detail has to say what succeeded before it says what did not.
+    #>
+
+    BeforeAll {
+        $script:partial = Invoke-ScriptUnderTest -FailPolicyGrant -Arguments @{
+            User               = 'solo.user@newco.onmicrosoft.com'
+            PhoneNumber        = '+15559996666'
+            VoiceRoutingPolicy = 'US-East'
+            Confirm            = $false
+        }
+    }
+
+    It 'Keeps the completed assignment in the Detail of the Failed row' {
+        $row = $script:partial.Rows[0]
+        $row.Status | Should -BeExactly 'Failed'
+        $row.Detail | Should -BeLike 'Assigned +15559996666 (DirectRouting).*'
+        $row.Detail | Should -BeLike '*Voice routing policy grant failed: Simulated policy grant failure.*'
+    }
+
+    It 'Really did assign the number before the grant failed' {
+        $script:partial.SetPhoneCalls.Count | Should -Be 1
+        $script:partial.SetPhoneCalls[0].PhoneNumber | Should -Be '+15559996666'
+        $script:partial.GrantPolicyCalls.Count | Should -Be 0
+    }
+
+    It 'Exits 2 for the failed row' {
+        $script:partial.ExitCode | Should -Be 2
     }
 }
 

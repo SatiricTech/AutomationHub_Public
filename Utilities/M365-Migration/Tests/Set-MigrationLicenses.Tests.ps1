@@ -561,6 +561,88 @@ Describe 'Set-PlanRowLicense' {
     }
 }
 
+Describe 'The -RemoveUnplanned acknowledgement' {
+
+    <#
+        These are the only tests here that run the whole script. They stay offline because the
+        plan they are given has no eligible row, so Main reaches the end without connecting to
+        Graph - and the acknowledgement gate sits ahead of even that, which is the point: the
+        refusal must happen before a sign-in prompt, not halfway through a licence sweep.
+    #>
+
+    BeforeAll {
+        $script:licenseScript = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Set-MigrationLicenses.ps1')).Path
+
+        $script:ackPlanPath = Join-Path $script:workspace 'AcknowledgePlan.csv'
+        $ackRow = New-MigrationPlanRow
+        $ackRow.ObjectType = 'User'
+        $ackRow.PlanStatus = 'Excluded'
+        $ackRow.ExcludeReason = 'Service account'
+        $ackRow.SourceUserPrincipalName = 'svc-backup@contoso.com'
+        $ackRow.TargetUserPrincipalName = 'svc-backup@newco.com'
+        @($ackRow) | Export-Csv -LiteralPath $script:ackPlanPath -NoTypeInformation -Encoding utf8
+
+        function Invoke-LicenseScript {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Pester helper that runs the script under test in a temporary workspace.')]
+            param([hashtable]$Arguments)
+
+            $runPath = Join-Path $script:workspace ([guid]::NewGuid().ToString())
+            $null = New-Item -Path $runPath -ItemType Directory -Force
+
+            & $script:licenseScript @Arguments -PlanPath $script:ackPlanPath -OutputPath $runPath `
+                -Verbosity Low -Confirm:$false
+            $exitCode = $LASTEXITCODE
+
+            $log = @(Get-ChildItem -LiteralPath $runPath -Filter '*.log')
+            [pscustomobject]@{
+                ExitCode    = $exitCode
+                Log         = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
+                ResultFiles = @(Get-ChildItem -LiteralPath $runPath -Filter '*.csv').Count
+            }
+        }
+    }
+
+    It 'Declares the script high impact' {
+        $binding = (Get-Command $script:licenseScript).ScriptBlock.Attributes |
+            Where-Object { $_ -is [System.Management.Automation.CmdletBindingAttribute] }
+        $binding.ConfirmImpact | Should -Be 'High'
+        $binding.SupportsShouldProcess | Should -BeTrue
+    }
+
+    It 'Refuses -RemoveUnplanned without -AcknowledgeLicenseRemoval and says why' {
+        $result = Invoke-LicenseScript -Arguments @{ RemoveUnplanned = $true; DryRun = $true }
+
+        $result.ExitCode | Should -Be 1
+        $result.Log | Should -BeLike ('*Fatal: -RemoveUnplanned strips every direct licence not in the plan; ' +
+            'mailboxes on removed SKUs are deleted after 30 days. Re-run with -AcknowledgeLicenseRemoval.*')
+        $result.ResultFiles | Should -Be 0
+    }
+
+    It 'Stops before it reads the plan, let alone connects' {
+        $result = Invoke-LicenseScript -Arguments @{ RemoveUnplanned = $true; DryRun = $true }
+        $result.Log | Should -Not -BeLike '*eligible for licensing*'
+        $result.Log | Should -Not -BeLike '*skipping the tenant connection*'
+    }
+
+    It 'Proceeds once the acknowledgement is given' {
+        $result = Invoke-LicenseScript -Arguments @{
+            RemoveUnplanned = $true; AcknowledgeLicenseRemoval = $true; DryRun = $true
+        }
+
+        $result.ExitCode | Should -Be 0
+        $result.Log | Should -Not -BeLike '*Re-run with -AcknowledgeLicenseRemoval*'
+        $result.Log | Should -BeLike '*0 of 1 plan row(s) are eligible for licensing*'
+        $result.ResultFiles | Should -Be 1
+    }
+
+    It 'Leaves a run without -RemoveUnplanned alone' {
+        $result = Invoke-LicenseScript -Arguments @{ DryRun = $true }
+        $result.ExitCode | Should -Be 0
+        $result.Log | Should -Not -BeLike '*AcknowledgeLicenseRemoval*'
+    }
+}
+
 Describe 'The tenant guard is wired into the Main region' {
 
     <#

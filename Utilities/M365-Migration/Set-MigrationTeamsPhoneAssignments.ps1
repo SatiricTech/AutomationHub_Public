@@ -381,6 +381,9 @@ try {
         $status = 'Failed'
         $detail = ''
         $displayName = ''
+        # Set once the number is on the account, so a later failure in the same row can still
+        # report what the tenant now holds.
+        $assigned = $false
         $number = Format-MigrationE164 -Value $item.PhoneNumber
         $numberType = $item.PhoneNumberType
         $policy = $item.VoiceRoutingPolicy
@@ -474,6 +477,7 @@ try {
                     $null = Invoke-MigrationAction -Description "Assign $number ($numberType) to $identity" -Action {
                         Set-CsPhoneNumberAssignment @assignParameters
                     }
+                    $assigned = $true
                     $status = 'Succeeded'
                     $detail = "Assigned $number ($numberType).$locationNote"
 
@@ -495,7 +499,14 @@ try {
         catch {
             $status = 'Failed'
             $message = $_.Exception.Message
-            if ($message -match 'license|licence|capability') {
+            if ($assigned) {
+                # Only the policy grant can fail once the assignment is through, and the number
+                # stays on the account. Re-running this row without knowing that would hit the
+                # 'already assigned to another target' guard instead of retrying the grant, so
+                # the row keeps saying what the tenant now holds - it is still a Failed row.
+                $detail = "$detail Voice routing policy grant failed: $message"
+            }
+            elseif ($message -match 'license|licence|capability') {
                 $detail = 'The user likely lacks a Teams Phone license (assignment needs e.g. Teams Phone ' +
                     "Standard). Original error: $message"
             }
