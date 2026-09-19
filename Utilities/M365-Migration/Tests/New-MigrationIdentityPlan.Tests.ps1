@@ -710,6 +710,60 @@ Describe 'New-MigrationIdentityPlan' {
         }
     }
 
+    Context 'Reserved addresses read from a destination inventory the exporter defused' {
+
+        BeforeAll {
+            # '=old@old.com' - an alias a previous migration tool left behind - is the case
+            # ConvertTo-MigrationSafeCell's own help cites, and it is the one that reaches
+            # here: a shared mailbox is named with the 'Keep' template, which preserves every
+            # character of the source local part except a leading '.' or '-', so an '='
+            # survives into the computed destination address. A destination inventory holding
+            # that address comes back from Export-MigrationReport defused, and the reserved
+            # list has to recognise it anyway or the collision goes unnoticed.
+            $script:ReservedInventoryDir = Join-Path $TestDrive 'reserved-inventory'
+            $null = Initialize-MigrationRun -ScriptName 'Get-Inventory' -OutputPath $script:ReservedInventoryDir
+
+            $script:ReservedCsv = Export-MigrationReport -Name 'Users' -Rows @(
+                [pscustomobject]@{
+                    UserPrincipalName  = '=reception@newco.com'
+                    PrimarySmtpAddress = '=reception@newco.com'
+                }
+            )
+
+            $script:SharedCsv = Join-Path $TestDrive 'shared-formula-leader.csv'
+            @(
+                [pscustomobject]@{
+                    UserPrincipalName    = '=reception@contoso.com'
+                    DisplayName          = 'Reception'
+                    PrimarySmtpAddress   = '=reception@contoso.com'
+                    RecipientTypeDetails = 'SharedMailbox'
+                    EmailAddresses       = 'SMTP:=reception@contoso.com'
+                }
+            ) | Export-Csv -LiteralPath $script:SharedCsv -NoTypeInformation -Encoding utf8
+
+            $script:ReservedInventory = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'reserved-csv') `
+                -Parameter @{
+                    SharedMailboxesCsv    = $script:SharedCsv
+                    ReservedAddressesPath = $script:ReservedCsv
+                }
+        }
+
+        It 'Writes the address to the reserved file with its formula leader defused' {
+            # Proves the fixture really is the shape the finding describes, rather than a
+            # file the exporter happened to leave alone.
+            (@(Import-Csv -LiteralPath $script:ReservedCsv)[0]).PrimarySmtpAddress |
+                Should -BeExactly "'=reception@newco.com"
+        }
+
+        It 'Still recognises the address as reserved and flags the collision' {
+            $row = Get-PlanRow -Result $script:ReservedInventory -Identity '=reception@contoso.com'
+            $row | Should -Not -BeNullOrEmpty
+            $row.PlanStatus | Should -BeExactly 'Collision'
+            $row.TargetPrimarySmtp | Should -Not -BeExactly '=reception@newco.com'
+            $row.PlanDetail | Should -Match 'already reserved in the destination'
+        }
+    }
+
     Context 'Include switches' {
 
         BeforeAll {

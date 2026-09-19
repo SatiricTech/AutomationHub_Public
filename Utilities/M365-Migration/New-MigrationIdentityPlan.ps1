@@ -589,6 +589,12 @@ function Get-PlanReservedAddress {
         is harvested - or a plain text list of one address per line. Detecting the shape rather
         than demanding a format means an operator can paste addresses into a text file and it
         just works.
+
+        A CSV is assumed to have come from Export-MigrationReport, so every cell is passed
+        through ConvertFrom-MigrationSafeCell before it is parsed: the exporter defuses a
+        formula-looking cell with a leading apostrophe, and an address left carrying one would
+        never match the address the planner computes. The plain-text branch needs no such
+        treatment - nothing in this toolkit writes that file.
     .PARAMETER Path
         One or more files to read.
     .EXAMPLE
@@ -637,7 +643,16 @@ function Get-PlanReservedAddress {
 
             foreach ($row in $rows) {
                 foreach ($column in $script:ReservedAddressColumns) {
-                    & $addValue (Get-MigrationCsvValue -Row $row -Name $column -Default '')
+                    # A destination inventory arrives through Export-MigrationReport, which
+                    # prefixes an apostrophe onto any cell leading with a formula character -
+                    # an alias such as '=old@old.com' among them. Undone here because this
+                    # file is a chain input: a shared mailbox, room or group is named with
+                    # the 'Keep' template, so an '=' in its source local part survives into
+                    # the computed destination address, and a reserved entry still carrying
+                    # the apostrophe would not match it. The collision would go unnoticed
+                    # and two objects would be planned onto one address.
+                    $cell = Get-MigrationCsvValue -Row $row -Name $column -Default ''
+                    & $addValue (ConvertFrom-MigrationSafeCell -Value $cell)
                 }
             }
         }
