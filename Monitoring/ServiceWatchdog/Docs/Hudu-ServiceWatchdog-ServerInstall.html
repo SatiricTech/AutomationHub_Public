@@ -1,60 +1,162 @@
 <div class="callout callout-info">
   <div class="callout-title">What this page is for</div>
   <p>Follow it to register one Windows server with the service watchdog. Once registered, the
-  server restarts any listed Windows service that stops and emails IT when it cannot. Nothing
+  server restarts any watched Windows service that stops and emails IT when it cannot. Nothing
   here touches the Azure side; that is already deployed. Registering another server means
   repeating these steps on that server.</p>
+  <p>There are two ways to do it. <strong>Option A</strong>, the drop-and-deploy package, is
+  the default: copy a folder, double-click one file, tick services, press a button. <strong>Option
+  B</strong> is the manual PowerShell path, for servers without a desktop session or when you
+  are scripting the install.</p>
 </div>
 
 <div class="callout callout-accent">
   <div class="callout-title">Source</div>
   <p>The scripts, the deployment template and the full technical documentation are published in
-  the public repository: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog</a>. Always take the <strong>Endpoint</strong> folder
-  from there so servers get the current version.</p>
+  the public repository: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog</a>.
+  The package for Option A is built from there for each deployment and carries a pinned copy of
+  the <strong>Endpoint</strong> scripts; for Option B, take the <strong>Endpoint</strong> folder
+  from the repository so servers get the current version.</p>
 </div>
 
-<h2>Values you need before you start</h2>
+<h2>Values for this deployment</h2>
 <table>
   <thead><tr><th>Item</th><th>Value</th><th>Notes</th></tr></thead>
   <tbody>
-    <tr><td>Function URL</td><td><strong>[FUNCTION URL]</strong></td><td>Goes in <code>Webhook.Url</code>. Same for every server.</td></tr>
-    <tr><td>Function key</td><td><strong>[FUNCTION KEY OR VAULT ENTRY]</strong></td><td>Goes in <code>Webhook.FunctionKey</code>. Treat it like a password: never email it, never paste it into a ticket.</td></tr>
-    <tr><td>Site name</td><td><strong>[SITE NAME]</strong></td><td>Goes in <code>SiteName</code>; appears in the subject line of every alert.</td></tr>
-    <tr><td>Install files</td><td><strong>[WHERE THE ENDPOINT FOLDER IS KEPT]</strong></td><td>The <code>Endpoint</code> folder: three scripts and an example config.</td></tr>
-    <tr><td>Who to ask</td><td><strong>[CONTACT]</strong></td><td>For the values above, or if a step fails.</td></tr>
+    <tr><td>Package folder (Option A)</td><td><strong>[WHERE THE SERVICEWATCHDOG PACKAGE IS KEPT]</strong></td><td>Built with <code>New-ServiceWatchdogClientPackage.ps1</code>. Holds the function URL and key. Treat it like a password: never email it, never attach it to a ticket.</td></tr>
+    <tr><td>Function URL (Option B)</td><td><strong>[FUNCTION URL]</strong></td><td>Goes in <code>Webhook.Url</code>. Same for every server.</td></tr>
+    <tr><td>Function key (Option B)</td><td><strong>[FUNCTION KEY OR VAULT ENTRY]</strong></td><td>Goes in <code>Webhook.FunctionKey</code>. Treat it like a password.</td></tr>
+    <tr><td>Site name</td><td><strong>[SITE NAME]</strong></td><td>Appears in the subject line of every alert. Option A pre-fills the computer name.</td></tr>
+    <tr><td>Who to ask</td><td><strong>[CONTACT]</strong></td><td>For the package or the values above, or if a step fails.</td></tr>
   </tbody>
 </table>
 
 <h2>Requirements</h2>
 <ul>
   <li>Windows Server 2016 or later. Windows PowerShell 5.1, which is built in, is enough.</li>
-  <li>A local Administrator account; every command below runs in an <strong>elevated</strong> PowerShell.</li>
-  <li>Outbound HTTPS (TCP 443) from the server to the function URL.</li>
-  <li>The names of the Windows services to watch (see the service-name rule in step 3).</li>
+  <li>A local Administrator account. Option A asks for elevation (UAC) itself; Option B runs in an <strong>elevated</strong> PowerShell.</li>
+  <li>Outbound HTTPS (TCP 443) from the server to the function URL. If the server uses a proxy, it must be the machine-wide WinHTTP proxy.</li>
 </ul>
-
-<h2>Step 1: copy the files</h2>
-<p>Copy the <code>Endpoint</code> folder to any temporary location on the server, for example
-<code>C:\Temp\Endpoint</code>.</p>
 
 <div class="callout callout-warning">
   <div class="callout-title">The installer does not install where you run it from</div>
-  <p>The folder you copied is only the source. The installer creates and uses
-  <strong>C:\ProgramData\ServiceWatchdog</strong> for the config file, the state
-  file, the logs and its own copy of the worker script. The file you edit in step 3 is
-  <strong>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</strong>; it will
-  not appear next to the scripts you ran. You can delete the temporary folder after step 5.</p>
+  <p>Whatever folder you copy to the server is only the source. The installer creates and uses
+  <strong>C:\ProgramData\ServiceWatchdog</strong> for the config file, the state file, the logs
+  and its own copy of the worker script, locked down to SYSTEM and Administrators. The scheduled
+  task runs from there.</p>
 </div>
 
-<h2>Step 2: first run of the installer</h2>
+<h2>Which services to watch</h2>
+<p>The ones a user would notice within minutes if they stopped: the line-of-business application
+service, SQL Server, IIS, the print spooler on a print server. Do not pick services that are meant
+to stop on their own (manual-start helpers, update services), or the watchdog will keep restarting
+them and emailing about it. When in doubt, ask <strong>[CONTACT]</strong>.</p>
+
+<h1>Option A: drop-and-deploy package (default)</h1>
+
+<h2>A1: copy the folder</h2>
+<p>Copy the whole <strong>ServiceWatchdog</strong> package folder to the server, for example to
+<code>C:\Temp\ServiceWatchdog</code>. Any location works, including one with spaces in the path.
+It contains <code>Run-ServiceWatchdog.cmd</code>, <code>Install-WinServiceWatchdogGui.ps1</code>,
+<code>ServiceWatchdog.settings.json</code>, <code>PACKAGE-VERSION.txt</code> and an
+<code>Endpoint</code> folder. Keep it together; do not copy files out of it.</p>
+
+<h2>A2: double-click Run-ServiceWatchdog.cmd</h2>
+<p>Accept the UAC prompt. The launcher runs the window in Windows PowerShell (never
+PowerShell 7) in the mode WinForms needs. A window titled <strong>ServiceWatchdog – [client
+name]</strong> opens. From top to bottom it shows:</p>
+<ul>
+  <li><strong>Site name</strong> box (appears in the alert emails; up to 64 characters), the
+  <strong>Filter services</strong> box and a count of ticked services.</li>
+  <li>The service list, each shown as <em>Display Name (ShortName) [Status]</em>, running
+  services first, then the rest alphabetically.</li>
+  <li>The buttons <strong>Install</strong>, <strong>Send test alert</strong>, <strong>Check
+  status</strong> and <strong>Uninstall</strong>.</li>
+  <li>A <strong>Logs</strong> drop-down with a <strong>View logs</strong> button.</li>
+  <li>A read-only log pane that streams the underlying scripts' output (the function key is
+  never shown), and a status bar with the task's state, last run and last result.</li>
+</ul>
+<p>If a message box appears and the window closes instead, it names the problem; see
+<strong>If something fails</strong> below.</p>
+
+<h2>A3: check the site name and tick the services</h2>
+<p>The site name is pre-filled with the computer name (or, on a server that already has the
+watchdog, the installed site name). Leave it unless a friendlier name is wanted. Tick every
+service the server must keep running; type in the filter box to narrow the list by either the
+short name or the display name. You do not need to know short names; the window writes them for
+you. At least one service must be ticked.</p>
+
+<h2>A4: press Install, then Send test alert</h2>
+<p>Press <strong>Install</strong>. The controls grey out and the log pane fills while the
+installer works; allow one to three minutes. It writes the config, locks down the install folder,
+copies the worker, validates everything, registers the scheduled task and runs it once. Expected
+result: a message box saying the install succeeded and that no test email was sent. From now on
+the server checks its services every 5 minutes and 5 minutes after every reboot, as the SYSTEM
+account.</p>
+<p>Then press <strong>Send test alert</strong>. Within a minute an email with <code>[TEST]</code>
+in the subject should reach the IT mailbox. If it does not, the task is still registered and
+working; the problem is on the email path. Use <strong>View logs</strong> and see
+<strong>If something fails</strong> below.</p>
+
+<h2>A5: confirm it is running</h2>
+<p>Press <strong>Check status</strong>. It shows whether the task exists, its last run and
+result, whether the installed config still validates, and the last 20 lines of today's log. A
+last result of <em>0 - Healthy, or every stopped service was restarted</em> with a recent run time
+means the task ran. <em>267011 - the task has not run yet</em> right after Install is normal;
+press it again a minute later.</p>
+
+<h2>A6: delete the copied folder</h2>
+<p>The task runs from <code>C:\ProgramData\ServiceWatchdog</code>, so the copied folder is no
+longer needed. <strong>Delete it.</strong> It holds the function key, and wherever it was copied
+it keeps that folder's ordinary permissions, which usually let any local user read it. Ask
+<strong>[CONTACT]</strong> for the package again when a service needs adding or removing.</p>
+
+<h2>The buttons</h2>
+<table>
+  <thead><tr><th>Button</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Install</strong></td><td>Writes <code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code> from the package defaults, the site name and your ticks, then registers (or re-registers) the task and runs it once. Does not send an email. Safe to press again at any time.</td></tr>
+    <tr><td><strong>Send test alert</strong></td><td>Runs the installed worker with <code>-TestAlert</code>: sends only the <code>[TEST]</code> email and changes nothing. Use it to prove the email path after a firewall, proxy or mailbox change.</td></tr>
+    <tr><td><strong>Check status</strong></td><td>Task state, last run and result, a config validation pass and the last 20 lines of today's worker log.</td></tr>
+    <tr><td><strong>View logs</strong></td><td>Pick one from the drop-down and press the button; it prints into the log pane. <em>Today's worker log</em> (in full), <em>Last 50 worker log lines</em>, <em>Last 50 events (Application log)</em>, <em>Registrar / uninstaller logs</em> (last 50 lines of the newest) and <em>This session's GUI log</em> (last 50 lines).</td></tr>
+    <tr><td><strong>Uninstall</strong></td><td>After a confirmation, removes the scheduled task only. The config and logs stay on the server, so reinstalling later is just Install again with no new key.</td></tr>
+  </tbody>
+</table>
+
+<h2>Adding or removing a service later</h2>
+<p>Copy the package back to the server, double-click <code>Run-ServiceWatchdog.cmd</code>, change
+the ticks (the current site name and services are pre-filled) and press <strong>Install</strong>.
+That rewrites the config and re-registers the task. Delete the folder again afterwards.</p>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Install rewrites the whole config</div>
+  <p>On a server set up with the package, make every change through the window. Hand edits to
+  <code>ServiceWatchdog.json</code> are overwritten by the next Install. If the function key has
+  been rotated, use a freshly built package: an old one still holds the old key and would put it
+  back.</p>
+</div>
+
+<h1>Option B: manual PowerShell install</h1>
+
+<h2>B1: copy the files</h2>
+<p>Copy the repository's <code>Monitoring/ServiceWatchdog/Endpoint</code> folder to any temporary
+location on the server, for example <code>C:\Temp\Endpoint</code>. The file you edit in B3 is
+<strong>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</strong>; it will not appear next to
+the scripts you ran. You can delete the temporary folder after B4.</p>
+
+<h2>B2: first run of the installer</h2>
 <pre><code>cd C:\Temp\Endpoint
 .\Register-WinServiceWatchdogTask.ps1</code></pre>
 <p>Expected result: one line ending in <em>Edit it (Services, Webhook.Url, Webhook.FunctionKey)
 and re-run this script</em>, and exit code 2. That is success for the first run: the install
 folder now exists, is locked down to SYSTEM and Administrators, and holds a config file for
 you to fill in.</p>
+<p>One-pass alternative: put a filled-in <code>ServiceWatchdog.json</code> next to the script in
+<code>C:\Temp\Endpoint</code> first. The first run then seeds the install folder from it and goes
+straight on to validation and registration (add <code>-TestAlert -RunNow</code>). Delete that
+source copy afterwards; it holds the key.</p>
 
-<h2>Step 3: edit the config file</h2>
+<h2>B3: edit the config file</h2>
 <p>Open <code>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</code> in Notepad (as
 administrator) and set these four values. Leave everything else at its default unless
 <strong>[CONTACT]</strong> says otherwise.</p>
@@ -72,8 +174,7 @@ administrator) and set these four values. Leave everything else at its default u
   <div class="callout-title">Use the service Name, not the Display Name</div>
   <p>Windows services have two names. The watchdog wants the short <strong>Name</strong>, which is
   what the logs, the emails and Windows itself key on. The friendly <strong>Display Name</strong>
-  is what the Services console shows in its first column. The table and commands below show
-  the difference.</p>
+  is what the Services console shows in its first column.</p>
 </div>
 
 <table>
@@ -88,36 +189,40 @@ administrator) and set these four values. Leave everything else at its default u
 <p>To look a name up, or for one service by its display name:</p>
 <pre><code>Get-Service | Sort-Object DisplayName | Select-Object Name, DisplayName
 (Get-Service -DisplayName 'Print Spooler').Name</code></pre>
-<p>In the Services console the Name is on the General tab of a service's properties, labelled
-"Service name".</p>
-
 <p>Any value still containing <code>REPLACE</code> is rejected. Use straight double quotes and
 a comma between list items, as in the example.</p>
 
-<h2>Step 4: register the task and send a test</h2>
+<h2>B4: register the task and send a test</h2>
 <pre><code>cd C:\Temp\Endpoint
 .\Register-WinServiceWatchdogTask.ps1 -TestAlert -RunNow</code></pre>
 <p>Expected result: a summary ending with the task name, the next run time and the log path,
 exit code 0, and within a minute an email with <code>[TEST]</code> in the subject in the IT
-mailbox. From now on the server checks its services every 5 minutes and 5 minutes after every
-reboot, as the SYSTEM account.</p>
-<p>Optional: add <code>-SetServiceRecovery</code> to the command to also have Windows restart
-each listed service on its own if it crashes.</p>
+mailbox.</p>
+<p>Optional: add <code>-SetServiceRecovery</code> to also have Windows restart each listed service
+on its own if it crashes (restart after 1 and 2 minutes). Every re-run after the first install
+needs <code>-Force</code>.</p>
 
-<h2>Step 5: confirm it is running</h2>
+<h2>B5: confirm it is running</h2>
 <pre><code>Get-ScheduledTask -TaskName ServiceWatchdog | Get-ScheduledTaskInfo
 Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'ServiceWatchdog' } -MaxEvents 5</code></pre>
 <p><code>LastTaskResult</code> of 0 and a recent <code>LastRunTime</code> mean the task ran.
 Event 1030 is the test alert; event 1000 or 1001 means a normal run. The daily log file is in
 <code>C:\ProgramData\ServiceWatchdog\Logs</code>.</p>
 
+<h2>Changing the service list later (Option B servers)</h2>
+<p>Edit the JSON file, then check it from the install folder. No re-registration is needed;
+the next scheduled run picks the change up.</p>
+<pre><code>cd C:\ProgramData\ServiceWatchdog
+.\Invoke-WinServiceWatchdog.ps1 -ValidateConfig</code></pre>
+
+<h1>Either option</h1>
+
 <h3>Running a check right away</h3>
 <p>You do not have to wait for the next 5-minute run:</p>
 <pre><code>Start-ScheduledTask -TaskName ServiceWatchdog</code></pre>
-<p>That runs the same check the schedule would, as SYSTEM; read the outcome from the event log
-command above or the daily log file. To watch a run on screen instead, run the worker from the
-install folder; add <code>-DryRun</code> to only see what it would do without starting services
-or sending mail:</p>
+<p>To watch a run on screen instead, run the worker from the install folder in an elevated
+PowerShell; add <code>-DryRun</code> to only see what it would do without starting services or
+sending mail:</p>
 <pre><code>cd C:\ProgramData\ServiceWatchdog
 .\Invoke-WinServiceWatchdog.ps1 -Verbosity High</code></pre>
 
@@ -126,16 +231,15 @@ or sending mail:</p>
 watchdog doing its job. Event 1001 is written every time it starts a service:</p>
 <pre><code>Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'ServiceWatchdog'; Id = 1001 } -MaxEvents 25</code></pre>
 <p>Each entry names the service and the attempt it succeeded on. Use <code>Id = 1002</code> for
-failed starts instead, or drop the <code>Id</code> filter for the last 25 events of any kind.</p>
-
-<h2>Changing the service list later</h2>
-<p>Edit the JSON file, then check it from the install folder. No re-registration is needed;
-the next scheduled run picks the change up.</p>
-<pre><code>cd C:\ProgramData\ServiceWatchdog
-.\Invoke-WinServiceWatchdog.ps1 -ValidateConfig</code></pre>
+failed starts instead, or drop the <code>Id</code> filter for the last 25 events of any kind. In
+the window, <strong>View logs</strong> with <em>Last 50 events (Application log)</em> shows the
+same thing.</p>
 
 <h2>Removing the watchdog from a server</h2>
-<pre><code>cd C:\Temp\Endpoint
+<p>Option A: open the window and press <strong>Uninstall</strong>. That removes the task and keeps
+the config and logs for a later reinstall. For a complete removal, including the install folder
+and the config that holds the key, use the command below.</p>
+<pre><code>cd C:\Temp\Endpoint     # or the Endpoint folder inside the package
 .\Unregister-WinServiceWatchdogTask.ps1 -RemoveEventSource -RemoveFiles -Force</code></pre>
 <p>Tell <strong>[CONTACT]</strong> afterwards so the server is removed from the daily check-in report;
 otherwise it is reported as silent.</p>
@@ -144,17 +248,27 @@ otherwise it is reported as silent.</p>
 <table>
   <thead><tr><th>What you see</th><th>Meaning</th><th>What to do</th></tr></thead>
   <tbody>
-    <tr><td>Installer stops at once mentioning elevation (exit 1)</td><td>PowerShell is not running as administrator</td><td>Open PowerShell with "Run as administrator" and try again</td></tr>
-    <tr><td>Exit 2 naming a config key</td><td>The JSON is invalid or still has a REPLACE value</td><td>Fix the named key; check quotes and commas</td></tr>
-    <tr><td>Exit 2 saying the worker already exists</td><td>The installer was already run on this server</td><td>Re-run with <code>-Force</code> added</td></tr>
-    <tr><td>Exit 10, or event 1013 in the Application log</td><td>The function rejected the key</td><td>Check <code>Webhook.FunctionKey</code> for a copy error; ask <strong>[CONTACT]</strong> if it persists</td></tr>
-    <tr><td>Event 1011</td><td>The server could not reach the function URL</td><td>Check outbound HTTPS and any proxy; the alert is retried automatically</td></tr>
-    <tr><td>Event 1003 or 1004 after registration</td><td>A listed service is not installed, or is Disabled</td><td>Fix the name (step 3) or remove it from the list</td></tr>
+    <tr><td>Console says "Elevation was cancelled or failed"</td><td>The UAC prompt was declined, or the account is not a local administrator</td><td>Run it again and accept the prompt, or right-click it and choose "Run as administrator"</td></tr>
+    <tr><td>Console says Install-WinServiceWatchdogGui.ps1 was not found</td><td>Only the .cmd was copied</td><td>Copy the whole package folder</td></tr>
+    <tr><td>Message box about <code>ServiceWatchdog.settings.json</code> (missing, REPLACE, empty key, not https)</td><td>The package is incomplete or was never filled in</td><td>Ask <strong>[CONTACT]</strong> for a complete package; do not fill the file in yourself</td></tr>
+    <tr><td>Error that no services could be read</td><td>The account could not enumerate services</td><td>Confirm you are a local administrator; check the GUI log named below</td></tr>
+    <tr><td>Status bar shows a result like <code>0xFFFD0000 - the last run ended abnormally</code></td><td>A task from an earlier attempt is registered and its last run was killed or crashed; it is not protecting anything</td><td>Tick the services, press Install to re-register, then Check status</td></tr>
+    <tr><td>Install fails with exit 2 mentioning the install folder's owner</td><td><code>C:\ProgramData\ServiceWatchdog</code> already exists and is owned by another account</td><td>As administrator, take ownership of that folder or remove it, then install again</td></tr>
+    <tr><td>Installer stops at once mentioning elevation (exit 1, Option B)</td><td>PowerShell is not running as administrator</td><td>Open PowerShell with "Run as administrator" and try again</td></tr>
+    <tr><td>Exit 2 naming a config key (Option B)</td><td>The JSON is invalid or still has a REPLACE value</td><td>Fix the named key; check quotes and commas</td></tr>
+    <tr><td>Exit 2 saying the worker already exists (Option B)</td><td>The installer was already run on this server</td><td>Re-run with <code>-Force</code> added</td></tr>
+    <tr><td>Exit 10, or event 1013 in the Application log</td><td>The function rejected the key</td><td>The key is wrong or has been rotated; Option A: ask <strong>[CONTACT]</strong> for a current package; Option B: check <code>Webhook.FunctionKey</code></td></tr>
+    <tr><td>Event 1011</td><td>The server could not reach the function URL</td><td>Check outbound HTTPS and the WinHTTP proxy; the alert is retried automatically</td></tr>
+    <tr><td>Event 1003 or 1004 after registration</td><td>A watched service is not installed, or is Disabled</td><td>Option A: untick it and press Install. Option B: fix or remove the name in the JSON</td></tr>
   </tbody>
 </table>
+<p>Two logs matter when asking for help, both in <code>C:\ProgramData\ServiceWatchdog\Logs</code>:
+the window's own log <code>Install-WinServiceWatchdogGui-&lt;timestamp&gt;.log</code> and the
+watchdog's daily log <code>ServiceWatchdog-&lt;date&gt;.log</code>. Attach those to the ticket,
+never the package folder or the config.</p>
 
 <div class="callout callout-info">
   <div class="callout-title">Do not</div>
-  <p>Do not edit the scripts, do not copy the key anywhere else, and do not change the
-  scheduled task by hand. Everything the watchdog needs is in the JSON file.</p>
+  <p>Do not edit the scripts, do not copy the key or <code>ServiceWatchdog.settings.json</code>
+  anywhere else, and do not change the scheduled task by hand.</p>
 </div>

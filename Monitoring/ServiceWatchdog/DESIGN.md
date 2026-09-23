@@ -45,7 +45,8 @@ Monitoring/ServiceWatchdog/
 ├── README.md                          operator documentation (PerUserMfaAudit precedent)
 ├── DESIGN.md                          this document
 ├── .gitignore                         ServiceWatchdog.json, *.state.json, local.settings.json,
-│                                      Deploy/main.parameters.json, *.zip, test output
+│                                      Deploy/main.parameters.json,
+│                                      Package/ServiceWatchdog.settings.json, *.zip, test output
 ├── Endpoint/
 │   ├── Invoke-WinServiceWatchdog.ps1          the 5-minute worker
 │   ├── Register-WinServiceWatchdogTask.ps1    installer
@@ -69,8 +70,15 @@ Monitoring/ServiceWatchdog/
 │   ├── main.bicep
 │   ├── main.parameters.example.json           copy to main.parameters.json (ignored) if deploying by hand
 │   └── Install-AzureServiceWatchdogFunction.ps1
+├── Package/                                   drop-and-deploy GUI (added after v1.0.0 design; see Docs/Reference.md#package)
+│   ├── Run-ServiceWatchdog.cmd                double-click launcher: self-elevates, Windows PowerShell -STA
+│   ├── Install-WinServiceWatchdogGui.ps1      WinForms front end; drives the three endpoint scripts in child processes
+│   ├── New-ServiceWatchdogClientPackage.ps1   builds a filled-in package per client (URL, key, defaults, pinned Endpoint/)
+│   └── ServiceWatchdog.settings.example.json  template for the package settings file (real one is git-ignored)
 ├── Docs/
-│   └── Hudu-ServiceWatchdog.html              knowledge-base article draft
+│   ├── Reference.md                           full configuration, parameter, contract and troubleshooting reference
+│   ├── Hudu-ServiceWatchdog.html              knowledge-base article draft
+│   └── Hudu-ServiceWatchdog-ServerInstall.html  server registration hand-off guide
 └── Tests/
     ├── Test-WindowsPowerShellCompat.ps1       AST scan for PowerShell 7-only syntax
     ├── Test-WindowsPowerShellCompat.Tests.ps1
@@ -80,7 +88,10 @@ Monitoring/ServiceWatchdog/
     ├── ServiceWatchdogAlert.Tests.ps1
     ├── SendServiceWatchdogAlert.Tests.ps1
     ├── SendServiceWatchdogDigest.Tests.ps1
-    └── Install-AzureServiceWatchdogFunction.Tests.ps1
+    ├── ServiceWatchdogContract.Tests.ps1      worker-to-function payload contract
+    ├── Install-AzureServiceWatchdogFunction.Tests.ps1
+    ├── Install-WinServiceWatchdogGui.Tests.ps1
+    └── New-ServiceWatchdogClientPackage.Tests.ps1
 ```
 
 Naming follows the `powershell-naming` skill: `Win` is the Windows OS scope token,
@@ -877,6 +888,10 @@ prevents purging the vault).
 
 - Endpoint: secrets only in the ACLed config file, never in task arguments; key sent in a
   header, not the query string; TLS 1.2 enforced; state and config parsed defensively.
+  Exception: a GUI package's `ServiceWatchdog.settings.json` also holds the key, in
+  whatever folder the technician copied the package to, with that folder's inherited
+  permissions. The package is treated like a password in transit and deleted from the
+  server once the task is registered (README, Docs/Reference.md#package).
 - Function: dedicated named function key per deployment, function-level auth, HTTPS only,
   admin endpoints isolated, strict payload validation with unknown-key rejection and size
   limits, HTML encoding of every field in the HTML part, plain-text part always present,
@@ -960,6 +975,10 @@ prevents purging the vault).
   callout and table classes from the Hudu stylesheet. Same sections as the README plus
   placeholders for the real function URL, key location, recipient list, and change log.
   Publishing happens only after the user reviews the draft.
+- `Docs/Hudu-ServiceWatchdog-ServerInstall.html`: hand-off article for the staff who
+  register servers, covering the GUI package (default) and the manual PowerShell path.
+- `Docs/Reference.md`: the full reference split out of the README (configuration,
+  parameters, HTTP contract, app settings, rotation, troubleshooting, the Package GUI).
 
 ## 11. Versioning
 
