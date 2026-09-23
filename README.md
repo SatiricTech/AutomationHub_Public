@@ -88,7 +88,7 @@ By downloading, copying, or executing any code found within this repository, you
 | | `Endpoint/Register-WinServiceWatchdogTask.ps1` | Install the worker, lock down its folder, validate `ServiceWatchdog.json`, register the event source and scheduled task (optional SCM recovery actions, test alert) |
 | | `Endpoint/Unregister-WinServiceWatchdogTask.ps1` | Remove the scheduled task and, optionally, the event source and install folder |
 | | `Deploy/Install-AzureServiceWatchdogFunction.ps1` | One-shot Azure deployment of the email relay (Bicep: Function App, Key Vault, storage tables, App Insights), seeds the SMTP2GO/SMTP secret, publishes the function and prints the alert URL and key |
-| | `Package/Install-WinServiceWatchdogGui.ps1` | WinForms front end for the endpoint scripts: tick the services to watch and press Install & test — writes the config, registers the task and sends a test alert, with no JSON to edit and the function key never displayed |
+| | `Package/Install-WinServiceWatchdogGui.ps1` | WinForms front end for the endpoint scripts, launched by double-clicking `Package/Run-ServiceWatchdog.cmd` (self-elevates, runs Windows PowerShell with `-STA`): tick the services to watch and press Install (writes the config and registers the task), then Send test alert; also Check status, an in-window log viewer and Uninstall, with no JSON to edit and the function key never displayed |
 | | `Package/New-ServiceWatchdogClientPackage.ps1` | Build a filled-in, hand-over-ready copy of the GUI package for one client (URL, key and defaults baked in, endpoint scripts pinned, git SHA stamped) |
 
 ### [`macOS/`](macOS/) - Apple Device Management

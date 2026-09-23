@@ -15,8 +15,10 @@
 <div class="callout callout-accent">
   <div class="callout-title">Source</div>
   <p>The scripts, the deployment template and the full technical documentation are published in
-  the public repository: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog</a>. Always take the <strong>Endpoint</strong> folder
-  from there so servers get the current version.</p>
+  the public repository: <a href="https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog">https://github.com/SatiricTech/AutomationHub_Public/tree/main/Monitoring/ServiceWatchdog</a>
+  (quick start in <code>README.md</code>, full reference in <code>Docs/Reference.md</code>).
+  Build the drop-and-deploy package from there, or take the <strong>Endpoint</strong> folder
+  from there for a manual install, so servers get the current version.</p>
 </div>
 
 <h2>Deployment details</h2>
@@ -33,6 +35,8 @@ publishing.</p>
         <td><strong>[FUNCTION URL]</strong></td></tr>
     <tr><td>Function key storage (never paste the key into this article)</td>
         <td><strong>[PASSWORD VAULT ENTRY OR KEY VAULT NAME]</strong></td></tr>
+    <tr><td>Drop-and-deploy package (built with <code>New-ServiceWatchdogClientPackage.ps1</code>; holds the key)</td>
+        <td><strong>[WHERE THE BUILT PACKAGE IS KEPT] / built from commit [SHA in PACKAGE-VERSION.txt]</strong></td></tr>
     <tr><td>Alert recipients (<code>WATCHDOG_MAIL_TO</code>)</td>
         <td><strong>[RECIPIENT LIST]</strong></td></tr>
     <tr><td>Sender address (<code>WATCHDOG_MAIL_FROM</code>, verified in SMTP2GO)</td>
@@ -61,6 +65,8 @@ publishing.</p>
         <td>The worker. Reads <code>ServiceWatchdog.json</code>, checks every listed service, starts stopped ones in up to <code>MaxStartAttempts</code> rounds inside <code>MaxRunSeconds</code>, compares with the previous run's state file, POSTs at most one event per run, writes a daily log and Application event log entries (source <code>ServiceWatchdog</code>).</td></tr>
     <tr><td>Scheduled task <code>ServiceWatchdog</code></td><td>Task Scheduler root folder</td>
         <td>Runs the worker as SYSTEM every 5 minutes and 5 minutes after boot; one instance at a time; 7-minute execution limit.</td></tr>
+    <tr><td>Package (<code>Run-ServiceWatchdog.cmd</code> + <code>Install-WinServiceWatchdogGui.ps1</code>)</td><td>Copied to a server only while installing or changing it</td>
+        <td>WinForms front end that writes the config and drives the endpoint scripts; owns no monitoring logic.</td></tr>
     <tr><td><code>SendServiceWatchdogAlert</code></td><td>Azure Function App (PowerShell, Windows Consumption plan)</td>
         <td>HTTP endpoint (<code>POST /api/servicewatchdog/alert</code>, function key in the <code>x-functions-key</code> header). Validates the payload strictly, deduplicates on <code>EventId</code>, rate-limits per host, renders HTML plus plain-text email, sends it, records the host's last-seen time.</td></tr>
     <tr><td><code>SendServiceWatchdogDigest</code></td><td>Same Function App, timer</td>
@@ -155,8 +161,11 @@ $apiKey = Read-Host -Prompt 'SMTP2GO API key' -AsSecureString
   <div class="callout-title">Secrets</div>
   <p>The function key and the SMTP2GO API key never go into a ticket, chat, this article or
   the log files. The function key lives only in <strong>ServiceWatchdog.json</strong> on each
-  server (a folder restricted to SYSTEM and Administrators) and in
-  <strong>[PASSWORD VAULT ENTRY]</strong>.
+  server (a folder restricted to SYSTEM and Administrators), in
+  <strong>[PASSWORD VAULT ENTRY]</strong>, and in the drop-and-deploy package's
+  <strong>ServiceWatchdog.settings.json</strong>. Treat the package like a password: send it
+  zipped through a password-grade channel, and delete it from each server once the task is
+  registered (a copied folder keeps ordinary permissions that most local users can read).
   The SMTP2GO key lives only in Key Vault (secret <strong>Smtp2GoApiKey</strong>) and in the
   SMTP2GO console. Recipients are fixed in the Function App settings; nothing a server sends
   can redirect mail.</p>
@@ -196,10 +205,10 @@ semicolon-separated list. Alerts and the daily digest both go to it. Two ways to
 
 <div class="callout callout-warning">
   <div class="callout-title">The installer does not install where you run it from</div>
-  <p>Wherever you copied the <strong>Endpoint</strong> folder is only the <em>source</em>. The
-  installer creates and uses <strong>C:\ProgramData\ServiceWatchdog</strong> for
+  <p>Wherever you copied the package or the <strong>Endpoint</strong> folder is only the
+  <em>source</em>. The installer creates and uses <strong>C:\ProgramData\ServiceWatchdog</strong> for
   the config file, the state file, the logs and its own copy of the worker script, unless you
-  pass <strong>-InstallPath</strong> on every run. So after the first run, the file to edit is
+  pass <strong>-InstallPath</strong> on every run of the manual installer. So after the first run, the config is
   <strong>C:\ProgramData\ServiceWatchdog\ServiceWatchdog.json</strong>, and it
   will not appear next to the scripts you ran. The source folder can be deleted once the
   task is registered.</p>
@@ -210,16 +219,66 @@ semicolon-separated list. Alerts and the daily digest both go to it. Two ways to
   <p>The Services list takes the short <strong>Name</strong> that Get-Service shows:
   <strong>Spooler</strong>, not Print Spooler; <strong>W3SVC</strong>, not World Wide Web Publishing
   Service. A display name is resolved as a courtesy, but the short name is what the logs,
-  emails and state file key on. To look one up by its display name:</p>
+  emails and state file key on. The package window writes short names for you. To look one up
+  by its display name:</p>
 </div>
 <pre><code>(Get-Service -DisplayName 'Print Spooler').Name</code></pre>
 
 <div class="callout callout-info">
   <div class="callout-title">Handing registration to another team</div>
-  <p>The separate article <strong>ServiceWatchdog: registering a server</strong> covers only these
-  steps, with fill-in fields for the URL, key and site name, and can be given to the staff
-  who register servers without the rest of this page.</p>
+  <p>The separate article <strong>ServiceWatchdog: registering a server</strong> covers only the
+  server steps, for both the drop-and-deploy package and the manual path, and can be given to
+  the staff who register servers without the rest of this page.</p>
 </div>
+
+<h3>Option A: drop-and-deploy package (GUI, default)</h3>
+
+<p>Build one package per deployment on your own workstation (PowerShell 7 or 5.1, any OS). It
+holds the launcher, the WinForms installer, a filled-in <code>ServiceWatchdog.settings.json</code>
+(URL, key and defaults) and a pinned copy of the <code>Endpoint</code> scripts, stamped with the
+git commit it was cut from.</p>
+<pre><code>$key = Read-Host -Prompt 'Function key' -AsSecureString
+cd Monitoring/ServiceWatchdog/Package
+./New-ServiceWatchdogClientPackage.ps1 -ClientName '[CLIENT NAME]' `
+    -FunctionUrl '[FUNCTION URL]' -FunctionKey $key -OutputPath ~/Handover</code></pre>
+<p><code>-ClientName</code> only sets the window title; the site name in the emails is chosen per
+server. <code>-DefaultsPath</code> overrides the retry, alerting and logging defaults (the window
+has no controls for them); <code>-DryRun</code> shows the plan. The builder refuses to write into a
+git working tree unless <code>-Force</code> is passed, because the output holds the live key.</p>
+<p>On the server the technician:</p>
+<ol>
+  <li>Copies the <code>ServiceWatchdog</code> folder to the server (for example
+  <code>C:\Temp\ServiceWatchdog</code>).</li>
+  <li>Double-clicks <strong>Run-ServiceWatchdog.cmd</strong> and accepts UAC. The launcher
+  self-elevates and starts the window in Windows PowerShell 5.1 with <code>-STA</code>; on any
+  error it keeps the console open so the message can be read.</li>
+  <li>Checks the site name (pre-filled with the computer name) and ticks the services to watch.
+  Services are listed as <em>Display Name (ShortName) [Status]</em>, running ones first; the
+  filter matches either name.</li>
+  <li>Presses <strong>Install</strong>: writes the config into
+  <code>C:\ProgramData\ServiceWatchdog</code> and runs
+  <code>Register-WinServiceWatchdogTask.ps1 -RunNow -Force</code>. No email is sent.</li>
+  <li>Presses <strong>Send test alert</strong> (runs the installed worker with
+  <code>-TestAlert</code>) and confirms the <code>[TEST]</code> email.</li>
+  <li>Deletes the copied package folder.</li>
+</ol>
+<p>The window also has <strong>Check status</strong> (task state, last run and result, a
+<code>-ValidateConfig</code> pass, last 20 log lines), <strong>View logs</strong> (today's worker
+log, last 50 worker lines, last 50 Application-log events, newest registrar/uninstaller log, this
+session's GUI log) and <strong>Uninstall</strong> (removes the task only; config and logs stay).
+Re-running it later pre-fills the installed site name and services. The window's own log is
+<code>C:\ProgramData\ServiceWatchdog\Logs\Install-WinServiceWatchdogGui-&lt;timestamp&gt;.log</code>;
+the function key is scrubbed from everything it shows or writes.</p>
+
+<div class="callout callout-warning">
+  <div class="callout-title">A GUI Install rewrites the whole config</div>
+  <p>Install writes <code>ServiceWatchdog.json</code> from the package's settings, the site name and
+  the ticks every time, so hand edits on a GUI-managed server are lost at the next Install.
+  Change tuning by rebuilding the package with <code>-DefaultsPath</code>, and rebuild it whenever
+  the function key is rotated: an old package puts the old key back.</p>
+</div>
+
+<h3>Option B: manual PowerShell install</h3>
 
 <ol>
   <li>Copy the repository's <code>Monitoring/ServiceWatchdog/Endpoint</code> folder to the
@@ -256,7 +315,9 @@ semicolon-separated list. Alerts and the daily digest both go to it. Two ways to
 
 <h3>Editing the service list later</h3>
 
-<p>Edit <code>Services</code> in <code>ServiceWatchdog.json</code> and confirm with
+<p>On a server installed with the package, copy the package back, re-run
+<code>Run-ServiceWatchdog.cmd</code>, change the ticks and press <strong>Install</strong>. On a
+manually installed server, edit <code>Services</code> in <code>ServiceWatchdog.json</code> and confirm with
 <code>.\Invoke-WinServiceWatchdog.ps1 -ValidateConfig</code> from the install folder (exit 0).
 No re-registration is needed; the next run picks the change up. A service removed from the
 list while unhealthy is logged once as event 1006 and forgotten. Delete
@@ -397,15 +458,17 @@ $created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watc
 ($created.Content | ConvertFrom-Json).properties.value   # the new key; paste it into the vault</code></pre></li>
   <li>Update <code>Webhook.FunctionKey</code> on every server (RMM script or by hand) and
   verify each with <code>.\Invoke-WinServiceWatchdog.ps1 -TestAlert</code> (exit 0). Update
-  <strong>[PASSWORD VAULT ENTRY]</strong>.</li>
+  <strong>[PASSWORD VAULT ENTRY]</strong>. Rebuild the drop-and-deploy package with the new key
+  (<code>New-ServiceWatchdogClientPackage.ps1 -Force</code>) and destroy old copies: pressing
+  Install from an old package writes the old key back.</li>
   <li>Delete the old key:
   <code>Invoke-AzRestMethod -Method DELETE -Path "$site/functions/SendServiceWatchdogAlert/keys/watchdog?api-version=2024-04-01"</code>.
   Any server that was missed starts logging event 1013 and exit 10, which is the signal
   to fix it.</li>
   <li>If the rotation is because the key leaked, also review the <code>WatchdogHosts</code>
   table (Storage browser in the portal) and delete rows for host names that are not real
-  servers; the README section "Recovering from a leaked function key" has the CLI
-  commands. A real server writes its row again on its next heartbeat.</li>
+  servers; the section "Recovering from a leaked function key" in
+  <code>Docs/Reference.md</code> has the CLI commands. A real server writes its row again on its next heartbeat.</li>
 </ol>
 
 <h3>SMTP2GO API key (or SMTP password)</h3>
@@ -450,6 +513,15 @@ $created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watc
     <tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
   </thead>
   <tbody>
+    <tr><td>Package window closes with a message about <code>ServiceWatchdog.settings.json</code></td>
+        <td>The package is incomplete: missing or invalid settings file, a literal REPLACE, an empty key or a non-https URL</td>
+        <td>Rebuild it with <code>New-ServiceWatchdogClientPackage.ps1</code> rather than editing the file on the server.</td></tr>
+    <tr><td>Package status bar shows a result like <code>0xFFFD0000 - the last run ended abnormally</code></td>
+        <td>The task's process was killed or crashed rather than exiting, often a task left from an earlier attempt</td>
+        <td>Tick the services, press Install to re-register the task, then Check status.</td></tr>
+    <tr><td>A removed service keeps alerting as Missing and the package window cannot untick it</td>
+        <td>Names in the installed config that no longer exist on the server stay selected but are not listed</td>
+        <td>Remove the name from <code>ServiceWatchdog.json</code> by hand once.</td></tr>
     <tr><td>Install script exits 50 at the publish step with a 401 from <code>Publish-AzWebApp</code></td>
         <td>SCM basic authentication is disabled on the app or by Azure Policy</td>
         <td>Update Az to 9.7.1 or later, or allow basic auth on the SCM site (<code>Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"allow":true}}' -Path "$site/basicPublishingCredentialsPolicies/scm?api-version=2024-04-01"</code>) and re-run. A policy assignment may set it back.</td></tr>
@@ -464,7 +536,7 @@ $created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watc
         <td><code>netsh winhttp show proxy</code>; set it with <code>netsh winhttp set proxy proxy-server="proxy.example.com:8080" bypass-list="&lt;local&gt;"</code> or <code>netsh winhttp import proxy source=ie</code>. Confirm outbound 443 to the Function App host name is allowed.</td></tr>
     <tr><td>Event 1013 on every run</td>
         <td>401: wrong or deleted function key. 403 with <code>site_not_allowed</code>: <code>SiteName</code> not in <code>WATCHDOG_ALLOWED_SITES</code></td>
-        <td>Paste the current key from <strong>[PASSWORD VAULT ENTRY]</strong>; or add the site to the allowlist.</td></tr>
+        <td>Paste the current key (or use a package rebuilt with it) from <strong>[PASSWORD VAULT ENTRY]</strong>; or add the site to the allowlist.</td></tr>
     <tr><td>Event 1014 on every run</td>
         <td>The function rejected the payload (the log line carries the function's error list); usually a server on a different worker version than the function</td>
         <td>Keep the endpoint scripts and the function on the same version.</td></tr>
@@ -494,7 +566,8 @@ $created = Invoke-AzRestMethod -Method PUT -Payload '{"properties":{"name":"watc
 
 <h2>Removing the watchdog from a server</h2>
 
-<p>Elevated: <code>.\Unregister-WinServiceWatchdogTask.ps1</code> removes the task and keeps
+<p>From the package window, <strong>Uninstall</strong> removes the task and keeps the config and
+logs. From an elevated PowerShell: <code>.\Unregister-WinServiceWatchdogTask.ps1</code> removes the task and keeps
 the config for later re-registration; add <code>-RemoveEventSource -RemoveFiles -Force</code>
 for a complete unattended removal (the install folder, including the config with the key,
 is deleted). Service Control Manager failure actions set with

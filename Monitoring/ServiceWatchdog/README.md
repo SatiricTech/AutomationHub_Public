@@ -84,7 +84,7 @@ Event types sent by the endpoint: `alert`, `flapping`, `reminder`, `recovered`,
 | `Package/New-ServiceWatchdogClientPackage.ps1` | Builds a filled-in, hand-over-ready copy of the package for one client (PowerShell 7 or 5.1, any OS) |
 | `Package/ServiceWatchdog.settings.example.json` | Template for the package's settings file (URL, key, defaults); the filled-in `ServiceWatchdog.settings.json` is git-ignored |
 | `Docs/Hudu-ServiceWatchdog.html` | Knowledge-base article draft (callout and table classes from the house stylesheet) |
-| `Docs/Hudu-ServiceWatchdog-ServerInstall.html` | Server registration hand-off guide for the staff who register servers, with fill-in fields for the URL, key and site name |
+| `Docs/Hudu-ServiceWatchdog-ServerInstall.html` | Server registration hand-off guide for the staff who register servers: the drop-and-deploy package (default) and the manual PowerShell path, with fill-in fields for the package location, URL, key, site name and contact |
 | `Tests/` | Pester suites for every script and the module, the worker-to-function payload contract check, and the Windows PowerShell 5.1 compatibility checker |
 
 `.gitignore` excludes the real `ServiceWatchdog.json`,
@@ -233,8 +233,9 @@ list. Alerts and the daily digest both go to it. Two ways to change it:
 > A display name is resolved as a courtesy, but the short name is what the logs, emails and
 > state file key on.
 
-For a step-by-step page to hand to the people who register servers, with fill-in fields
-for the URL, key and site name, see `Docs/Hudu-ServiceWatchdog-ServerInstall.html`.
+For a step-by-step page to hand to the people who register servers, covering both this
+manual path and the drop-and-deploy package below, see
+`Docs/Hudu-ServiceWatchdog-ServerInstall.html`.
 
 Copy the `Endpoint/` folder to the server and, in an elevated PowerShell:
 
@@ -288,8 +289,9 @@ cd Monitoring/ServiceWatchdog/Package
 ```
 
 That produces `~/Handover/ServiceWatchdog/` with the launcher, the GUI, a filled-in
-`ServiceWatchdog.settings.json`, a pinned copy of `Endpoint/` and two version stamps
-carrying the git short SHA it was cut from. `-FunctionUrl` also accepts just the Function
+`ServiceWatchdog.settings.json`, the example settings file, a pinned copy of `Endpoint/` and
+two version stamps carrying the git short SHA it was cut from (`no-git-<yyyyMMdd>` when git
+is not available). `-FunctionUrl` also accepts just the Function
 App host name. `-DefaultsPath` overrides the retry, alerting and logging defaults from a JSON
 file; `-DryRun` reports the plan without writing anything. The builder refuses to write into
 a git working tree unless `-Force` is passed, because **the finished folder holds a live
@@ -304,13 +306,23 @@ The technician then:
 4. Presses **Install** and waits a minute or two.
 5. Presses **Send test alert** and confirms the `[TEST]` email. Installing and proving
    delivery are separate buttons, so a webhook problem never leaves a half-finished install.
+6. Deletes the copied `ServiceWatchdog` folder. The task runs from
+   `C:\ProgramData\ServiceWatchdog`, and the copied folder keeps the function key in a
+   location most local users can read.
 
 **View logs** then shows any of five things in the pane without leaving the window: today's
 worker log in full, the last 50 worker log lines, the last 50 `ServiceWatchdog` events from the
-Application log, the newest registrar or uninstaller log, or this launch's own GUI log.
+Application log, the last 50 lines of the newest registrar or uninstaller log, or the last 50
+lines of this launch's own GUI log. **Check status** shows the task state, last run and result,
+a config validation pass and the last 20 lines of today's log; **Uninstall** removes the task
+but keeps the config and logs.
 
-Re-running it later loads the installed config, pre-fills the site name and pre-ticks the
-services already watched, so adding or removing one is a tick and another **Install**.
+Re-running it later (from the same package, copied back to the server) loads the installed
+config, pre-fills the site name and pre-ticks the services already watched, so adding or
+removing one is a tick and another **Install**. Install rewrites the whole config from the
+package each time, so on a GUI-managed server make changes through the GUI rather than by
+editing `ServiceWatchdog.json`, and rebuild the package whenever the function key is
+rotated.
 The buttons, the on-device paths and the GUI's own log file are documented in
 [Docs/Reference.md](Docs/Reference.md#package).
 

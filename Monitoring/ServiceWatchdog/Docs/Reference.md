@@ -107,6 +107,11 @@ below it.
 - The installer, uninstaller and Azure install script each write one file per run to
   `%ProgramData%\ServiceWatchdog\Logs\<ScriptName>-<yyyyMMdd-HHmmss>.log` (the Azure
   install script uses `$HOME/.ServiceWatchdog/Logs` on macOS and Linux).
+- The package GUI writes one file per launch to
+  `%ProgramData%\ServiceWatchdog\Logs\Install-WinServiceWatchdogGui-<yyyyMMdd-HHmmss>.log`.
+- Log retention (`Logging.LogRetentionDays`) prunes only the worker's own
+  `ServiceWatchdog-*.log` files. The installer, uninstaller and GUI logs are small and are
+  never pruned; delete old ones by hand if the folder needs tidying.
 
 ## Endpoint scripts
 
@@ -248,21 +253,45 @@ live in this repository, so the GUI also runs straight from a clone.
 | **Install** | Writes `%ProgramData%\ServiceWatchdog\ServiceWatchdog.json` from the settings `Defaults`, the site name and the ticked services, then runs `Register-WinServiceWatchdogTask.ps1 -RunNow -Force`. Writing the config first is what stops the registrar taking its "edit the config and re-run" exit 2 path. On a server that already has the watchdog this is an update: the previous selection was pre-ticked at startup and is simply rewritten. No test email is sent — `-TestAlert` is deliberately not passed, so an Azure-side delivery problem cannot turn a good install into exit 10 — and the success dialog points at **Send test alert**. |
 | **Send test alert** | Runs the *installed* worker (not the pinned source copy) with `-TestAlert`, so what is exercised is what the scheduled task actually executes. Changes nothing else. |
 | **Check status** | Task state, last run time, last result mapped to its documented meaning, a `-ValidateConfig` pass on the installed config, and the last 20 lines of today's worker log. |
-| **View logs** | Writes the chosen item into the log pane, headed and footed so two viewings do not run together: *Today's worker log* (all of `ServiceWatchdog-<yyyyMMdd>.log`), *Last 50 worker log lines* (tail of the newest `ServiceWatchdog-*.log`), *Last 50 events (Application log)* (source `ServiceWatchdog`, one line per event), *Registrar / uninstaller logs* (tail of the newest `Register-*`/`Unregister-*` log) and *This session's GUI log*. An absent log or an empty event list is reported as a sentence, not an error. A single dump is capped at 2000 lines with a note naming the file to open. |
+| **View logs** | Writes the chosen item into the log pane, headed and footed so two viewings do not run together: *Today's worker log* (all of `ServiceWatchdog-<yyyyMMdd>.log`), *Last 50 worker log lines* (tail of the newest `ServiceWatchdog-*.log`), *Last 50 events (Application log)* (source `ServiceWatchdog`, one line per event), *Registrar / uninstaller logs* (last 50 lines of the single newest `Register-*`/`Unregister-*` log) and *This session's GUI log* (its last 50 lines). Only today's worker log is shown in full; every other file choice is a 50 line tail. An absent log or an empty event list is reported as a sentence, not an error. A single dump is capped at 2000 lines with a note naming the file to open. Both View logs and Check status read `%ProgramData%\ServiceWatchdog\Logs`; a custom `Logging.LogRoot` is not followed. |
 | **Uninstall** | Confirms, then runs `Unregister-WinServiceWatchdogTask.ps1` for the task only. `-RemoveFiles` and `-RemoveEventSource` are deliberately not passed: the install folder, config and logs stay, so a re-install needs no new function key. |
 
-Refusals, each a message box and exit `2`: not Windows, not elevated, not `-STA`,
-`ServiceWatchdog.settings.json` missing or still carrying a literal `REPLACE`, a
-`Defaults.MaxRunSeconds` and `Webhook.TimeoutSeconds` pair whose worst-case run
-(`MaxRunSeconds + 2 * (2 * TimeoutSeconds + 5) + 15`) exceeds the scheduled task's 420 second
-execution limit, or no `Register-WinServiceWatchdogTask.ps1` in either endpoint location. The
-`REPLACE` check is case-sensitive, so a real client called *Replacement Parts Co* is accepted.
+Refusals, each a message box and exit `2`, checked in this order: not Windows, not elevated,
+not `-STA`, no `Register-WinServiceWatchdogTask.ps1` in either endpoint location, then the
+settings file. The settings file is refused when it is missing or not valid JSON, when
+`SchemaVersion` is not `1`, when the `Webhook` section is missing, when `Webhook.Url` is not
+an `https://` URL, when `Webhook.FunctionKey` is empty, when `Webhook.Url`,
+`Webhook.FunctionKey` or `ClientName` still carries a literal `REPLACE`, or when the
+`Defaults.MaxRunSeconds` and `Webhook.TimeoutSeconds` pair gives a worst-case run
+(`MaxRunSeconds + 2 * (2 * TimeoutSeconds + 5) + 15`) above the scheduled task's 420 second
+execution limit. The `REPLACE` check is case-sensitive, so a real client called *Replacement
+Parts Co* is accepted.
+
+Install itself also refuses to start, with a message box and no exit, when the site name is
+empty or contains `REPLACE`, or when no service is ticked. The site name is limited to 64
+characters and is pre-filled from the installed config, or with the computer name on a first
+install. Services named in an existing config that no longer exist on the server stay
+selected even though they are not in the list; they count in the "ticked" total and are
+written back on Install, where the worker reports them as `Missing`. The filter matches the
+short name or the display name, case-insensitively, and treats `*` and `?` as wildcards.
+
+What the window does **not** set: recipients (those are the Function App's
+`WATCHDOG_MAIL_TO`), the retry, alerting and logging tuning (the settings file's `Defaults`,
+fixed when the package is built with `-DefaultsPath`), the task interval, and
+`-SetServiceRecovery`. Install writes the whole config from the settings file each time, so
+**hand edits to `ServiceWatchdog.json` on a server are overwritten by the next GUI Install**;
+on a server managed with the GUI, make every change through the GUI or a rebuilt package.
 
 The function key is never shown: every line of child output is scrubbed of it before it
 reaches the log pane, the GUI's log file or a dialog. A scheduled task's `LastTaskResult` of
 `267011`, `267009` or `267014` is named ("has not run yet", "is running now", "was stopped")
 rather than mapped through the worker exit codes, so a freshly registered task does not read
-as a fault.
+as a fault. `LastTaskResult` is read as an unsigned 32-bit value: a result above `0x7FFFFFFF`
+(an HRESULT-style code such as `0xFFFD0000`, left when the task's process was killed or
+crashed rather than exiting) is shown as *the last run ended abnormally (not a worker exit
+code); press Install to re-register the task, then Check status again*. If the status line
+cannot be built at all, the GUI logs a warning and shows *Status unavailable* in the status
+bar instead of closing, so an odd task state never stops the window opening.
 
 On-device paths:
 
@@ -277,8 +306,12 @@ On-device paths:
 Package files on the server: `Run-ServiceWatchdog.cmd`, `Install-WinServiceWatchdogGui.ps1`,
 `ServiceWatchdog.settings.json` (**holds the function key**),
 `ServiceWatchdog.settings.example.json`, `PACKAGE-VERSION.txt` and `Endpoint\` (the three
-scripts, the example config and `VERSION.txt`). The folder can be deleted once the task is
-registered; the install folder is what the task runs from.
+scripts, the example config and `VERSION.txt`). The install folder is what the task runs
+from, so the package folder is not needed once the task is registered, and it **should be
+deleted** then: wherever the technician copied it (`C:\Temp`, a desktop, a download folder)
+it keeps that folder's inherited permissions, which usually let any local user read
+`ServiceWatchdog.settings.json` and the function key in it. Bring the package back when a
+service needs adding or removing.
 
 ### New-ServiceWatchdogClientPackage.ps1
 
@@ -441,7 +474,11 @@ Keys are named, and several can be valid at once, so rotation has no outage wind
    (`az functionapp function keys set ... --key-name watchdog-2027q1` and `keys list` do
    the same from the Azure CLI.)
 2. Update `Webhook.FunctionKey` on every server (RMM script or hand edit) and verify each
-   with `.\Invoke-WinServiceWatchdog.ps1 -TestAlert` (exit 0).
+   with `.\Invoke-WinServiceWatchdog.ps1 -TestAlert` (exit 0). **Rebuild every client
+   package** with `New-ServiceWatchdogClientPackage.ps1 -Force` and the new key, and
+   destroy the old copies: an old package still carries the old key, and pressing Install
+   from it rewrites `ServiceWatchdog.json` with that key, silently undoing the rotation on
+   that server (it then logs event 1013 once the old key is deleted).
 3. Delete the old key:
    `Invoke-AzRestMethod -Method DELETE -Path "$site/functions/SendServiceWatchdogAlert/keys/watchdog?api-version=2024-04-01"`.
    A server still using it starts logging event 1013 and exit 10, which is the signal that
@@ -609,6 +646,32 @@ worker is run by hand without elevation it cannot, and continues with file loggi
 the parameters file is still the all-zero placeholder; set it to
 `(Get-AzADUser -SignedIn).Id` (or the service principal's object id and
 `deployerPrincipalType: ServicePrincipal`).
+
+**`Run-ServiceWatchdog.cmd` shows "Elevation was cancelled or failed".** The UAC prompt
+was declined or the account is not a local administrator. Run it again and accept the
+prompt, or right-click it and choose *Run as administrator*. The launcher's own exit code is
+0 in this case; the message and pause are the signal.
+
+**The GUI shows a message box about `ServiceWatchdog.settings.json` and closes (exit 2).**
+The package is incomplete or was never filled in (a literal `REPLACE`, an empty key, a
+non-https URL, invalid JSON). Rebuild it with `New-ServiceWatchdogClientPackage.ps1` rather
+than editing the file on the server.
+
+**Status bar shows `0xFFFD0000 - the last run ended abnormally`** (or another `0x8`/`0xF`
+code). The task's process was killed or crashed rather than exiting, often a task left over
+from an earlier attempt. The watchdog is not protecting anything until it runs cleanly:
+tick the services, press **Install** to re-register the task, then **Check status**.
+
+**A service that was uninstalled from the server keeps alerting as `Missing`, and the GUI
+cannot untick it.** Names from the installed config that are not on the server are kept
+selected but not listed, so they survive every GUI Install (Uninstall keeps the config, so
+it does not clear them either). Remove the name from
+`%ProgramData%\ServiceWatchdog\ServiceWatchdog.json` by hand once; the next GUI launch no
+longer carries it.
+
+**Hand edits to `ServiceWatchdog.json` disappeared.** A GUI **Install** rewrote the config
+from the package's settings file (see [Package](#package)). Change tuning in the package
+with `-DefaultsPath` and rebuild it.
 
 **PowerShell 7.4 end of support.** See [Runtime version check](#runtime-version-check).
 
