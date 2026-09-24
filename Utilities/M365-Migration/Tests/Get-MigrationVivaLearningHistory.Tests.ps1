@@ -582,13 +582,24 @@ Describe 'Script structure' {
         $script:AllCommandNames | Should -Not -Contain 'Disconnect-MgGraph'
     }
 
-    It 'Writes the export only through Invoke-MigrationAction' {
+    It 'Writes the history CSV through Export-MigrationReport, DryRun-safe' {
+        $reportCalls = @($script:Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Export-MigrationReport'
+                }, $true))
+        $reportCalls.Count | Should -Be 1
+        $reportCalls[0].Extent.Text | Should -Match "-Name 'VivaLearningHistory'"
+        $reportCalls[0].Extent.Text | Should -Match '-SuppressInDryRun'
+    }
+
+    It 'Writes the raw JSON backup only through Invoke-MigrationAction' {
         $writers = @($script:Ast.FindAll({
                     param($node)
                     $node -is [System.Management.Automation.Language.CommandAst] -and
                     $node.GetCommandName() -in @('Export-Csv', 'Set-Content')
                 }, $true))
-        $writers.Count | Should -Be 2
+        $writers.Count | Should -Be 1
         foreach ($writer in $writers) {
             $wrapped = $false
             $parent = $writer.Parent
@@ -601,5 +612,52 @@ Describe 'Script structure' {
             }
             $wrapped | Should -BeTrue -Because "$($writer.GetCommandName()) at line $($writer.Extent.StartLineNumber) must be wrapped"
         }
+    }
+
+    It 'Names the CSV report and the JSON backup so both parse back to VivaLearningHistory, sharing a stamp' {
+        $stamp = Get-Date
+        $csvPath = Get-MigrationOutputPath -Name 'VivaLearningHistory' -Directory $TestDrive -Timestamp $stamp
+        $jsonPath = Get-MigrationOutputPath -Name 'VivaLearningHistory' -Extension 'json' `
+            -Directory $TestDrive -Timestamp $stamp
+
+        $csv = ConvertFrom-MigrationOutputPath -Path $csvPath
+        $csv.Name | Should -BeExactly 'VivaLearningHistory'
+        $csv.Extension | Should -BeExactly 'csv'
+
+        $json = ConvertFrom-MigrationOutputPath -Path $jsonPath
+        $json.Name | Should -BeExactly 'VivaLearningHistory'
+        $json.Extension | Should -BeExactly 'json'
+
+        $csv.Timestamp | Should -Be $json.Timestamp
+    }
+}
+
+Describe 'The tenant guard is wired into the Main region' {
+
+    <#
+        A structural test, not a behavioural one. Everything else in this file exercises functions
+        lifted out of the script, and Get-MigrationVivaLearningHistory.ps1 has no end-to-end harness to run its
+        Main region against - so this asserts on the shape of the source instead. It would catch
+        the guard being removed or renamed, and nothing subtler: it proves the wiring exists, not
+        that it behaves correctly at runtime.
+    #>
+
+    BeforeAll {
+        $script:mainScriptPath = (Resolve-Path (
+                Join-Path $PSScriptRoot '..' 'Get-MigrationVivaLearningHistory.ps1')).Path
+        $script:mainAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:mainScriptPath, [ref]$null, [ref]$null)
+        $script:mainText = Get-Content -LiteralPath $script:mainScriptPath -Raw
+
+        $script:commandText = @($script:mainAst.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            ForEach-Object { $_.Extent.Text })
+    }
+
+    It 'Calls Assert-MigrationTenant once with an expected tenant and a purpose' {
+        $calls = @($script:commandText | Where-Object { $_ -like 'Assert-MigrationTenant*' })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-ExpectedTenantId \$TenantId'
+        $calls[0] | Should -Match "-Purpose 'Viva Learning export'"
     }
 }

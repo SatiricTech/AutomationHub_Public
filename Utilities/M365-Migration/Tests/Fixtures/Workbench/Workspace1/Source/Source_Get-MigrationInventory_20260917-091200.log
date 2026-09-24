@@ -1,0 +1,4 @@
+[2026-09-17 09:12:00] [INFO] Log file: Source_Get-MigrationInventory_20260917-091200.log
+[2026-09-17 09:12:01] [INFO] Connected to Graph tenant 00000000-0000-0000-0000-000000000000
+[2026-09-17 09:12:40] [INFO] Exported 2 user(s) to Source_Users_20260917-091200.csv
+[2026-09-17 09:12:52] [SUCCESS] Inventory complete

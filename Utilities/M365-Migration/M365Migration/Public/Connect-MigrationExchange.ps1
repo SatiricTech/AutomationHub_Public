@@ -18,12 +18,13 @@ function Connect-MigrationExchange {
         'contoso.onmicrosoft.com'. Omit when signing in to your own tenant.
 
     .PARAMETER TenantId
-        The tenant ID (GUID) the caller expects to be connected to - typically the GUID
-        already returned by Connect-MigrationGraph in the same run. A cached session
-        whose TenantID does not match is dropped and reconnected. Exchange Online does
-        not expose the connected tenant's domain outside CBA/managed-identity
-        connections, so this check only works with the GUID form; pass a domain here and
-        it is ignored.
+        The tenant the caller expects to be connected to - a GUID (typically the one
+        already returned by Connect-MigrationGraph in the same run) or a domain, which
+        is resolved to its GUID via Resolve-MigrationTenantId before any comparison. A
+        cached session whose TenantID does not match is dropped and reconnected, and a
+        freshly established session is checked again after Connect-ExchangeOnline
+        returns: a mismatch there disconnects and throws, because a cutover run cannot
+        be allowed to silently proceed against the wrong tenant.
 
     .PARAMETER Reconnect
         Forces a fresh connection.
@@ -65,6 +66,11 @@ function Connect-MigrationExchange {
 
     Initialize-MigrationModule -Name 'ExchangeOnlineManagement'
 
+    # Resolved once so a domain is only looked up a single time and both the cached-
+    # session check below and the post-connect check further down compare against the
+    # same GUID.
+    $expectedTenantId = if ($TenantId) { Resolve-MigrationTenantId -Tenant $TenantId } else { '' }
+
     $existing = $null
     try {
         $existing = @(Get-ConnectionInformation -ErrorAction SilentlyContinue |
@@ -82,13 +88,14 @@ function Connect-MigrationExchange {
         # actually be checked against. Get-MigrationProperty is used throughout because a
         # mocked or thin Get-ConnectionInformation object may not carry every property, and
         # the module runs under Set-StrictMode -Version Latest.
-        $existingDelegatedOrganization = Get-MigrationProperty -InputObject $existing -Name 'DelegatedOrganization' -Default ''
+        $existingDelegatedOrganization = Get-MigrationProperty -InputObject $existing `
+            -Name 'DelegatedOrganization' -Default ''
         $existingTenantId = Get-MigrationProperty -InputObject $existing -Name 'TenantId' -Default ''
         $existingUpn = Get-MigrationProperty -InputObject $existing -Name 'UserPrincipalName' -Default ''
 
         $wrongOrganization = $DelegatedOrganization -and $existingDelegatedOrganization -and
             ($existingDelegatedOrganization -ne $DelegatedOrganization)
-        $wrongTenantId = $TenantId -and $existingTenantId -and ($existingTenantId -ne $TenantId)
+        $wrongTenantId = $expectedTenantId -and $existingTenantId -and ($existingTenantId -ne $expectedTenantId)
         $wrongTenant = $wrongOrganization -or $wrongTenantId
 
         if ($Reconnect -or $wrongTenant) {
@@ -99,7 +106,10 @@ function Connect-MigrationExchange {
             try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
         }
         else {
-            Write-MigrationLog -Message ("Reusing the existing Exchange Online session for tenant " +
+            # Wording is load-bearing: Invoke-MigrationStep reads the tenant GUID back out of
+            # the child's log to verify which tenant the step actually reached, so both this
+            # line and the success line below must name it in the shape the runner matches.
+            Write-MigrationLog -Message ("Reusing the cached Exchange Online session for tenant " +
                 "$existingTenantId as $existingUpn.") -Level SUCCESS
             return $existing
         }
@@ -123,10 +133,36 @@ function Connect-MigrationExchange {
     }
 
     $connectedOrganization = Get-MigrationProperty -InputObject $information -Name 'DelegatedOrganization' -Default ''
-    if (-not $connectedOrganization) { $connectedOrganization = Get-MigrationProperty -InputObject $information -Name 'Organization' -Default '' }
+    if (-not $connectedOrganization) {
+        $connectedOrganization = Get-MigrationProperty -InputObject $information -Name 'Organization' -Default ''
+    }
     $connectedUpn = Get-MigrationProperty -InputObject $information -Name 'UserPrincipalName' -Default ''
     $connectedTenantId = Get-MigrationProperty -InputObject $information -Name 'TenantId' -Default ''
+
+    # Nothing above told Connect-ExchangeOnline which tenant to use: on the interactive
+    # path it has no -TenantId to honour, and the account chooser can land the session in
+    # any tenant the technician holds an account in - including the one the cached session
+    # was just dropped for. So the freshly established session is checked as well, which is
+    # the only place the expected tenant can be enforced at all. The comparison itself lives
+    # in Assert-MigrationTenant, so every connector and script shares one implementation of
+    # "does this session match the tenant I was told to expect".
+    if ($expectedTenantId) {
+        try {
+            $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenantId -ExchangeConnection $information `
+                -Purpose 'Exchange Online sign-in'
+        }
+        catch {
+            try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
+            throw ("$($_.Exception.Message) The wrong account was probably picked in the account chooser; " +
+                'sign in again with an account in the expected tenant.')
+        }
+    }
+
+    # The organisation is what a technician recognises; the tenant GUID is what the workbench
+    # verifies against, so the line carries both whenever the session reported a GUID at all.
     $organizationText = if ($connectedOrganization) { $connectedOrganization } else { $connectedTenantId }
-    Write-MigrationLog -Message "Connected to Exchange Online - organisation $organizationText as $connectedUpn." -Level SUCCESS
+    $tenantText = if ($connectedTenantId) { " (tenant $connectedTenantId)" } else { '' }
+    Write-MigrationLog -Level SUCCESS -Message ("Connected to Exchange Online - organisation " +
+        "$organizationText$tenantText as $connectedUpn.")
     return $information
 }

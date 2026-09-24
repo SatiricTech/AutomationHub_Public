@@ -90,6 +90,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4+ and the bundled M365Migration module. ImportExcel 7.1.0 or
                   later is needed only for the workbook. No tenant connection is made and no
                   Graph scope or Exchange Online role is required, so GDAP does not apply.
@@ -267,11 +268,16 @@ try {
     if ($mappings.Count -eq 0) {
         # Every selected row was Skipped. The results file is the whole point in that case - it
         # names why each row was left out - so it is written before the run is failed.
-        $null = Export-MigrationResult -Rows $results.ToArray() -Name 'MappingFile'
+        $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Export-MappingFile'
         throw ("None of the $($planRows.Count) selected plan row(s) could be mapped - see the results file. " +
             'Resolve the NeedsReview and Invalid rows, pass -IncludeCollisions to map Collision rows, ' +
             'or widen -Wave / -ObjectType.')
     }
+
+    # Sanitised once, here, so the CSV twin and the workbook - written from the same
+    # collection below - can never disagree, and neither can carry a formula-looking source
+    # or destination address into a spreadsheet.
+    $mappings = @($mappings | ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ })
 
     $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
     $mappingPath = Join-Path -Path $run.OutputDirectory -ChildPath (
@@ -298,7 +304,7 @@ try {
     # The results file is the operator's check that nothing was left behind, so it is written
     # as soon as the deliverable is settled: whatever the workbook step does next cannot take
     # the report with it.
-    $null = Export-MigrationResult -Rows $results.ToArray() -Name 'MappingFile'
+    $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Export-MappingFile'
 
     if ($format.FileType -eq 'Xlsx') {
         if ($SkipExcel) {

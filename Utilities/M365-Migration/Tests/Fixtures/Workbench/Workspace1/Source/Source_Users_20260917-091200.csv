@@ -1,0 +1,3 @@
+"ObjectId","UserPrincipalName","DisplayName","FirstName","LastName","Mail","JobTitle","Department","UsageLocation","AccountEnabled","UserType","IsSynced","ManagerUpn","Licenses","ProxyAddresses"
+"00000000-0000-0000-0000-000000000001","ada.lovelace@contoso.com","Ada Lovelace","Ada","Lovelace","ada.lovelace@contoso.com","Analyst","Engineering","US","True","Member","False","","ENTERPRISEPACK","SMTP:ada.lovelace@contoso.com"
+"00000000-0000-0000-0000-000000000002","grace.hopper@contoso.com","Grace Hopper","Grace","Hopper","grace.hopper@contoso.com","Engineer","Engineering","US","True","Member","False","","ENTERPRISEPACK","SMTP:grace.hopper@contoso.com"

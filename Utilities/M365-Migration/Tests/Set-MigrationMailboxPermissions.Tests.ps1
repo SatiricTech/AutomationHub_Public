@@ -23,6 +23,9 @@
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
     Justification = 'The stubs must accept every parameter the script under test binds, including ones a particular test does not read; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+    Justification = 'The stubs run inside the script under test, whose scope chain does not reach
+    this file''s script scope. The calls they record go in a global list, removed again in AfterAll.')]
 param()
 
 BeforeAll {
@@ -637,5 +640,186 @@ Describe 'An unmapped forwarding target is not passed through into the source te
         $row = $script:ForwardingRows | Where-Object { $_.SourceMailbox -eq 'adean@contoso.com' }
         $row.Status | Should -BeExactly 'Planned'
         $row.Detail | Should -Match 'team@fabrikam.com'
+    }
+}
+
+Describe 'The tenant guard runs once with the -TenantId the run was given' {
+
+    <#
+        -TenantId is the gate on re-applying permissions into the wrong tenant, so two things
+        have to hold: the value reaches Connect-MigrationExchange (which drops a cached session
+        pointed somewhere else) and it reaches Assert-MigrationTenant, which is what compares the
+        session that was actually established. Assert-MigrationTenant is shadowed rather than
+        mocked so the call is recorded without the module's real resolver touching the network.
+    #>
+
+    BeforeAll {
+        $script:GuardTenantId = '00000000-0000-0000-0000-0000000000a1'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
+            $global:GuardConnectTenantIds += $TenantId
+            return [pscustomobject]@{ TenantId = $TenantId; Organization = 'newco.onmicrosoft.com' }
+        }
+        function Get-AcceptedDomain {
+            param($ErrorAction)
+            return @(
+                [pscustomobject]@{ DomainName = 'newco.com' }
+                [pscustomobject]@{ DomainName = 'newco.onmicrosoft.com' }
+            )
+        }
+        function Get-EXOMailboxPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-EXORecipientPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-MailboxFolderPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-EXOMailbox {
+            param($Identity, $Properties, $ErrorAction)
+            return [pscustomobject]@{
+                PrimarySmtpAddress    = [string]$Identity
+                GrantSendOnBehalfTo   = @()
+                ForwardingAddress     = ''
+                ForwardingSmtpAddress = ''
+            }
+        }
+
+        $script:GuardWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "SetMailboxPermissions-Guard-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:GuardWorkspace -ItemType Directory -Force
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+        $global:GuardConnectTenantIds = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls, GuardConnectTenantIds -Scope Global -ErrorAction SilentlyContinue
+        if ($script:GuardWorkspace -and (Test-Path -LiteralPath $script:GuardWorkspace)) {
+            Remove-Item -LiteralPath $script:GuardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Binds -TenantId, hands it to the connector and asserts the tenant exactly once' {
+        & $script:ScriptPath -PlanPath $script:PlanFixture -MailboxPermissionsCsv $script:PermissionFixture `
+            -TenantId $script:GuardTenantId -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $global:GuardConnectTenantIds | Should -Be @($script:GuardTenantId)
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:GuardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Mailbox permissions'
+        $global:AssertCalls[0].ExchangeConnection.TenantId | Should -BeExactly $script:GuardTenantId
+    }
+}
+
+Describe 'The accepted-domain check is a hard stop only on an unpinned run' {
+
+    <#
+        -TenantId decides which of the two checks is load-bearing. Pinned, the assert is the gate
+        and a domain disagreement is a second opinion worth a WARNING. Unpinned, nothing else has
+        verified the tenant, so the domain check has to stop the run exactly as it did before
+        -TenantId existed - an unpinned run must not come out weaker than it used to be.
+
+        Both blocks answer Get-AcceptedDomain with a tenant that does not accept the plan's
+        destination domain. The mutating cmdlets keep the file-level stubs, which record nothing:
+        reaching one during the unpinned run would be the bug this exists to catch.
+    #>
+
+    BeforeAll {
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{
+                TenantId     = '00000000-0000-0000-0000-0000000000a2'
+                Organization = 'fabrikam.onmicrosoft.com'
+            }
+        }
+        # A tenant that accepts nothing the plan maps into.
+        function Get-AcceptedDomain {
+            param($ErrorAction)
+            return @([pscustomobject]@{ DomainName = 'fabrikam.com' })
+        }
+        function Get-EXOMailboxPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-EXORecipientPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-MailboxFolderPermission {
+            param($Identity, $ErrorAction)
+            return @()
+        }
+        function Get-EXOMailbox {
+            param($Identity, $Properties, $ErrorAction)
+            return [pscustomobject]@{
+                PrimarySmtpAddress    = [string]$Identity
+                GrantSendOnBehalfTo   = @()
+                ForwardingAddress     = ''
+                ForwardingSmtpAddress = ''
+            }
+        }
+
+        $script:DomainWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) `
+            "SetMailboxPermissions-Domain-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:DomainWorkspace -ItemType Directory -Force
+    }
+
+    AfterAll {
+        if ($script:DomainWorkspace -and (Test-Path -LiteralPath $script:DomainWorkspace)) {
+            Remove-Item -LiteralPath $script:DomainWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Stops before the first row when no -TenantId was given' {
+        $workspace = Join-Path $script:DomainWorkspace 'unpinned'
+        $null = New-Item -Path $workspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:PlanFixture -MailboxPermissionsCsv $script:PermissionFixture `
+            -OutputPath $workspace -Verbosity Low -DryRun -Confirm:$false
+        $LASTEXITCODE | Should -Be 1
+
+        $log = @(Get-ChildItem -LiteralPath $workspace -Filter 'Set-MigrationMailboxPermissions_*.log')
+        $log.Count | Should -Be 1
+        (Get-Content -LiteralPath $log[0].FullName -Raw) |
+            Should -Match "\[ERROR\] Fatal error: Connected to 'fabrikam\.onmicrosoft\.com', which does not accept mail"
+
+        # A run that stopped at the gate never reached a row, so there is no DryRun results file.
+        @(Get-ChildItem -LiteralPath $workspace -Filter 'Set-MailboxPermissions-DryRun_*.csv').Count | Should -Be 0
+    }
+
+    It 'Only warns and carries on into the rows when -TenantId was given' {
+        $workspace = Join-Path $script:DomainWorkspace 'pinned'
+        $null = New-Item -Path $workspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:PlanFixture -MailboxPermissionsCsv $script:PermissionFixture `
+            -TenantId '00000000-0000-0000-0000-0000000000a2' `
+            -OutputPath $workspace -Verbosity Low -DryRun -Confirm:$false
+        $LASTEXITCODE | Should -Be 0
+
+        $log = @(Get-ChildItem -LiteralPath $workspace -Filter 'Set-MigrationMailboxPermissions_*.log')
+        $log.Count | Should -Be 1
+        (Get-Content -LiteralPath $log[0].FullName -Raw) |
+            Should -Match "\[WARNING\] Connected to 'fabrikam\.onmicrosoft\.com', which does not accept mail"
+
+        $file = @(Get-ChildItem -LiteralPath $workspace -Filter 'Set-MailboxPermissions-DryRun_*.csv')
+        $file.Count | Should -Be 1
+        @(Import-Csv -LiteralPath $file[0].FullName).Count | Should -BeGreaterThan 0
     }
 }

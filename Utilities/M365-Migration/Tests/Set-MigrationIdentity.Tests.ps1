@@ -23,6 +23,9 @@
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
     Justification = 'The stubs must accept every parameter the script under test binds, including ones a particular test does not read; dropping them would turn a real call into a parameter-binding error and hide the behaviour under test.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+    Justification = 'The stubs run inside the script under test, whose scope chain does not reach
+    this file''s script scope. The calls they record go in a global list, removed again in AfterAll.')]
 param()
 
 BeforeAll {
@@ -216,11 +219,18 @@ Describe 'DryRun makes no changes' {
 
         Set-MailboxAddress -Identity 'john.smith@newco.com' -Address @('SMTP:john.smith@newco.com') -Operation Add
         Set-MailboxAddress -Identity 'john.smith@newco.com' -Address @('smtp:jsmith@contoso.com') -Operation Remove
+        # The promote path writes through a different helper, and a replace-all write is the one
+        # call in the toolkit that could strip a mailbox bare, so DryRun has to cover it too.
+        Set-MailboxAddressList -Identity 'john.smith@newco.com' `
+            -Address @('smtp:jsmith@contoso.com', 'SMTP:john.smith@newco.com')
         Set-MailboxAttribute -Identity 'john.smith@newco.com' -Name 'Alias' -Value 'john.smith' -Description 'Set alias'
         Set-MailboxAttribute -Identity 'john.smith@newco.com' -Name 'HiddenFromAddressListsEnabled' -Value $true `
             -Description 'Hide from the GAL'
 
         Should -Invoke Set-Mailbox -Times 0 -Exactly
+        Should -Invoke Set-Mailbox -Times 0 -Exactly -ParameterFilter {
+            @($EmailAddresses) -ccontains 'SMTP:john.smith@newco.com'
+        }
     }
 
     It 'Does nothing at all for an empty address list' {
@@ -241,6 +251,30 @@ Describe 'DryRun makes no changes' {
             -Address @('X500:/o=First Organization/cn=jsmith') -Operation Add
 
         Should -Invoke Set-Mailbox -Times 1 -Exactly
+    }
+
+    It 'Sends the replacement list as the bare collection that replaces every proxy address' {
+        Mock Set-Mailbox { } -ParameterFilter {
+            # A bare collection, not an Add/Remove hashtable: that is what makes the write a
+            # replace-all, and so atomic.
+            $EmailAddresses -isnot [hashtable] -and
+            @($EmailAddresses) -ccontains 'SMTP:john.smith@newco.com' -and
+            @($EmailAddresses) -ccontains 'smtp:jsmith@contoso.com'
+        }
+        Initialize-TestRun
+        Set-MailboxAddressList -Identity 'john.smith@newco.com' `
+            -Address @('smtp:jsmith@contoso.com', 'SMTP:john.smith@newco.com')
+
+        Should -Invoke Set-Mailbox -Times 1 -Exactly
+    }
+
+    It 'Refuses an empty replacement list rather than stripping the mailbox bare' {
+        Mock Set-Mailbox { }
+        Initialize-TestRun
+
+        { Set-MailboxAddressList -Identity 'john.smith@newco.com' -Address @() } |
+            Should -Throw -ExpectedMessage '*would strip every address*'
+        Should -Invoke Set-Mailbox -Times 0 -Exactly
     }
 
     It 'Produces Planned result rows for the operations a DryRun would perform' {
@@ -272,9 +306,15 @@ Describe 'A declined confirmation is a Skip, not a Plan' {
     #>
 
     BeforeAll {
+        # A GUID, as Get-MgContext really reports: this run passes no -TenantId, so the script
+        # falls back to the Graph context's tenant and the real Assert-MigrationTenant compares
+        # against it. A domain here would send Resolve-MigrationTenantId to the network.
         function Connect-MigrationGraph {
             param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
-            return [pscustomobject]@{ TenantId = 'newco.onmicrosoft.com'; Account = 'tech@newco.onmicrosoft.com' }
+            return [pscustomobject]@{
+                TenantId = '00000000-0000-0000-0000-0000000000ba'
+                Account  = 'tech@newco.onmicrosoft.com'
+            }
         }
 
         function Invoke-MigrationGraphRequest {
@@ -321,5 +361,270 @@ Describe 'A declined confirmation is a Skip, not a Plan' {
 
     It 'Leaves no row claiming an outcome the tenant never saw' {
         @($script:WhatIfRows | Where-Object { $_.Status -in @('Planned', 'Succeeded') }).Count | Should -Be 0
+    }
+}
+
+Describe 'Promoting an alias to primary never leaves the address absent' {
+
+    <#
+        Same shadowing technique as the block above, with one difference: this run is live rather
+        than a rehearsal, because the behaviour under test is which Set-Mailbox calls reach
+        Exchange. The mailbox already carries the target address as a lowercase alias - the case
+        that used to be applied as a Remove followed by an Add, which leaves the mailbox with no
+        vanity address at all if the Add fails.
+    #>
+
+    BeforeAll {
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{
+                TenantId = '00000000-0000-0000-0000-0000000000ba'
+                Account  = 'tech@newco.onmicrosoft.com'
+            }
+        }
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
+            return [pscustomobject]@{ TenantId = $TenantId; UserPrincipalName = 'tech@newco.onmicrosoft.com' }
+        }
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            # -Apply PrimarySmtp writes through Exchange alone, so Graph must stay read-only here.
+            if ($Method -ne 'GET') { throw "The run reached a $Method call on $Uri." }
+            return [pscustomobject]@{
+                id                    = 'bbbbbbbb-0000-0000-0000-000000000001'
+                userPrincipalName     = 'old@contoso.com'
+                mail                  = 'old@contoso.com'
+                mailNickname          = 'old'
+                displayName           = 'Pat Promote'
+                onPremisesSyncEnabled = $false
+                proxyAddresses        = @('SMTP:old@contoso.com', 'smtp:new@newco.com')
+            }
+        }
+        # The mailbox already holds the target address, as a lowercase alias.
+        function Get-EXOMailbox {
+            param($Identity, $Properties, $ErrorAction)
+            return [pscustomobject]@{
+                PrimarySmtpAddress = 'old@contoso.com'
+                EmailAddresses     = @('SMTP:old@contoso.com', 'smtp:new@newco.com')
+                Alias              = 'old'
+            }
+        }
+
+        $script:PromoteRoot = Join-Path ([System.IO.Path]::GetTempPath()) "SetIdentity-Promote-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:PromoteRoot -ItemType Directory -Force
+
+        # Built here rather than shipped as a fixture so the one row the promotion needs sits next
+        # to the mailbox it describes.
+        $planRow = New-MigrationPlanRow
+        $planRow.ObjectType = 'User'
+        $planRow.Wave = '1'
+        $planRow.PlanStatus = 'Planned'
+        $planRow.TargetObjectId = 'bbbbbbbb-0000-0000-0000-000000000001'
+        $planRow.SourceUserPrincipalName = 'old@contoso.com'
+        $planRow.TargetPrimarySmtp = 'new@newco.com'
+
+        $script:PromotePlanPath = Join-Path -Path $script:PromoteRoot -ChildPath 'PromotePlan.csv'
+        $planRow | Export-Csv -LiteralPath $script:PromotePlanPath -NoTypeInformation
+
+        # The same mailbox, targeted at an address it does not hold: the add case, which still
+        # runs as an Add followed by a separate Remove of the demoted primary.
+        $addRow = New-MigrationPlanRow
+        $addRow.ObjectType = 'User'
+        $addRow.Wave = '1'
+        $addRow.PlanStatus = 'Planned'
+        $addRow.TargetObjectId = 'bbbbbbbb-0000-0000-0000-000000000001'
+        $addRow.SourceUserPrincipalName = 'old@contoso.com'
+        $addRow.TargetPrimarySmtp = 'spare@newco.com'
+
+        $script:AddPlanPath = Join-Path -Path $script:PromoteRoot -ChildPath 'AddPlan.csv'
+        $addRow | Export-Csv -LiteralPath $script:AddPlanPath -NoTypeInformation
+    }
+
+    AfterAll {
+        if ($script:PromoteRoot -and (Test-Path -LiteralPath $script:PromoteRoot)) {
+            Remove-Item -LiteralPath $script:PromoteRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Writes the whole address list in a single call, with no Remove before it' {
+        Mock Set-Mailbox { }
+        $workspace = Join-Path -Path $script:PromoteRoot -ChildPath 'promoted'
+        $null = New-Item -Path $workspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:PromotePlanPath -Apply 'PrimarySmtp' `
+            -OutputPath $workspace -Verbosity Low -Confirm:$false
+
+        # -ccontains, not -contains: the uppercase prefix is what makes the address primary, so a
+        # case-insensitive match would pass on the alias form the mailbox already had.
+        Should -Invoke Set-Mailbox -Times 1 -Exactly -ParameterFilter {
+            @($EmailAddresses) -ccontains 'SMTP:new@newco.com' -and @($EmailAddresses) -ccontains 'smtp:old@contoso.com'
+        }
+        Should -Invoke Set-Mailbox -Times 1 -Exactly
+        # The old two-call promotion released the alias first with @{ Remove = ... }.
+        Should -Invoke Set-Mailbox -Times 0 -Exactly -ParameterFilter {
+            $EmailAddresses -is [hashtable] -and $EmailAddresses.ContainsKey('Remove')
+        }
+    }
+
+    It 'Reports the row Failed and names the step when the replacement call is refused' {
+        Mock Set-Mailbox { throw 'Exchange refused the address list.' }
+        $workspace = Join-Path -Path $script:PromoteRoot -ChildPath 'refused'
+        $null = New-Item -Path $workspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:PromotePlanPath -Apply 'PrimarySmtp' `
+            -OutputPath $workspace -Verbosity Low -Confirm:$false
+
+        $file = @(Get-ChildItem -LiteralPath $workspace -Filter 'Set-Identity-Results_*.csv')
+        $file.Count | Should -Be 1
+        $rows = @(Import-Csv -LiteralPath $file[0].FullName)
+        $primary = @($rows | Where-Object { $_.Action -eq 'PrimarySmtp' })
+        $primary.Count | Should -Be 1
+        $primary[0].Status | Should -BeExactly 'Failed'
+        $primary[0].Detail | Should -Match 'Completed: none\. Failed at: replace'
+        $primary[0].Detail | Should -Match 'Exchange refused the address list\.'
+    }
+
+    It 'Names the step and what already landed when the add case fails halfway' {
+        Mock Set-Mailbox {
+            if ($EmailAddresses -is [hashtable] -and $EmailAddresses.ContainsKey('Remove')) {
+                throw 'Exchange refused the removal.'
+            }
+        }
+        $workspace = Join-Path -Path $script:PromoteRoot -ChildPath 'halfway'
+        $null = New-Item -Path $workspace -ItemType Directory -Force
+
+        & $script:ScriptPath -PlanPath $script:AddPlanPath -Apply 'PrimarySmtp' -RemoveOldPrimaryAlias `
+            -OutputPath $workspace -Verbosity Low -Confirm:$false
+
+        $file = @(Get-ChildItem -LiteralPath $workspace -Filter 'Set-Identity-Results_*.csv')
+        $file.Count | Should -Be 1
+        $primary = @(@(Import-Csv -LiteralPath $file[0].FullName) | Where-Object { $_.Action -eq 'PrimarySmtp' })
+        $primary.Count | Should -Be 1
+        $primary[0].Status | Should -BeExactly 'Failed'
+        # The new primary is on the mailbox and the old one is still there too, which is the
+        # state the operator has to be told about.
+        $primary[0].Detail | Should -Match 'Completed: add\. Failed at: remove demoted old@contoso\.com'
+    }
+}
+
+Describe 'The tenant guard runs once over both connections' {
+
+    <#
+        Same shadowing technique as the block above. -Apply PrimarySmtp is chosen so the Exchange
+        branch is exercised too: the point of the guard here is that Graph and Exchange Online are
+        signed in to the same tenant, which only means anything when both sessions exist.
+        Assert-MigrationTenant is shadowed rather than mocked so the call is recorded without the
+        module's real resolver touching the network.
+    #>
+
+    BeforeAll {
+        $script:GuardTenantId = '00000000-0000-0000-0000-0000000000b2'
+        # What the stub sign-in reports when the run pinned nothing. The literal is repeated in
+        # the stub because a function defined in BeforeAll does not share the $script: scope
+        # Pester gives the It blocks.
+        $script:GuardSignedInTenantId = '00000000-0000-0000-0000-0000000000b9'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+        # Echoes a requested tenant back, and otherwise reports the tenant the session is actually
+        # signed in to - which is what the no--TenantId fallback has to pick up.
+        function Connect-MigrationGraph {
+            param([string[]]$Scopes, [string]$TenantId, [switch]$Reconnect)
+            $connected = if ($TenantId) { $TenantId } else { '00000000-0000-0000-0000-0000000000b9' }
+            return [pscustomobject]@{ TenantId = $connected; Account = 'tech@newco.onmicrosoft.com' }
+        }
+        function Connect-MigrationExchange {
+            param([string]$DelegatedOrganization, [string]$TenantId, [switch]$Reconnect)
+            $global:GuardConnectTenantIds += $TenantId
+            return [pscustomobject]@{ TenantId = $TenantId; UserPrincipalName = 'tech@newco.onmicrosoft.com' }
+        }
+        function Invoke-MigrationGraphRequest {
+            param([string]$Method, [string]$Uri, $Body, [switch]$All, [int]$MaxRetry = 5)
+            return [pscustomobject]@{
+                id                    = 'bbbbbbbb-0000-0000-0000-000000000001'
+                userPrincipalName     = 'jsmith@contoso.com'
+                mail                  = 'jsmith@contoso.com'
+                mailNickname          = 'jsmith'
+                displayName           = 'John Q. Smith'
+                onPremisesSyncEnabled = $false
+                proxyAddresses        = @('SMTP:jsmith@contoso.com')
+            }
+        }
+        function Get-EXOMailbox {
+            param($Identity, $Properties, $ErrorAction)
+            return [pscustomobject]@{
+                PrimarySmtpAddress = 'jsmith@contoso.com'
+                EmailAddresses     = @('SMTP:jsmith@contoso.com')
+                Alias              = 'jsmith'
+            }
+        }
+
+        $script:GuardWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) "SetIdentity-Guard-$([guid]::NewGuid())"
+        $null = New-Item -Path $script:GuardWorkspace -ItemType Directory -Force
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+        $global:GuardConnectTenantIds = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls, GuardConnectTenantIds -Scope Global -ErrorAction SilentlyContinue
+        if ($script:GuardWorkspace -and (Test-Path -LiteralPath $script:GuardWorkspace)) {
+            Remove-Item -LiteralPath $script:GuardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Asserts the expected tenant once, naming both the Graph and the Exchange connection' {
+        & $script:ScriptPath -PlanPath (Join-Path -Path $script:FixtureRoot -ChildPath 'IdentityPlan.csv') `
+            -Wave '1' -Apply 'PrimarySmtp' -TenantId $script:GuardTenantId `
+            -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:GuardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Identity cutover'
+        $global:AssertCalls[0].GraphContext.TenantId | Should -BeExactly $script:GuardTenantId
+        $global:AssertCalls[0].ExchangeConnection.TenantId | Should -BeExactly $script:GuardTenantId
+    }
+
+    It 'Hands the Graph tenant to the Exchange connector so a cached session cannot differ' {
+        & $script:ScriptPath -PlanPath (Join-Path -Path $script:FixtureRoot -ChildPath 'IdentityPlan.csv') `
+            -Wave '1' -Apply 'PrimarySmtp' -TenantId $script:GuardTenantId `
+            -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $global:GuardConnectTenantIds | Should -Be @($script:GuardTenantId)
+    }
+
+    It 'Falls back to the Graph tenant when no -TenantId was given, so the cross-check still runs' {
+        # Without the fallback both the connector and the assert are handed an empty expected
+        # tenant and compare nothing at all, which is how a leftover source-tenant Exchange
+        # session survives an unpinned run.
+        & $script:ScriptPath -PlanPath (Join-Path -Path $script:FixtureRoot -ChildPath 'IdentityPlan.csv') `
+            -Wave '1' -Apply 'PrimarySmtp' `
+            -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $global:GuardConnectTenantIds | Should -Be @($script:GuardSignedInTenantId)
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:GuardSignedInTenantId
+    }
+
+    It 'Says out loud that an unpinned run was not verified' {
+        & $script:ScriptPath -PlanPath (Join-Path -Path $script:FixtureRoot -ChildPath 'IdentityPlan.csv') `
+            -Wave '1' -Apply 'PrimarySmtp' `
+            -OutputPath $script:GuardWorkspace -Verbosity Low -DryRun -Confirm:$false
+
+        $log = @(Get-ChildItem -LiteralPath $script:GuardWorkspace -Filter 'Set-MigrationIdentity_*.log' |
+            Sort-Object -Property LastWriteTime -Descending)
+        $log.Count | Should -BeGreaterThan 0
+        (Get-Content -LiteralPath $log[0].FullName -Raw) |
+            Should -Match ('\[WARNING\] No -TenantId was given; this run acts on tenant ' +
+                "$($script:GuardSignedInTenantId)\. Pass -TenantId to guard against a cached session\.")
     }
 }

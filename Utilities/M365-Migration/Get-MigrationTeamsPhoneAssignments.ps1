@@ -90,6 +90,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
                   the MicrosoftTeams module (installed on demand).
     Permissions : Teams Administrator, or Teams Communications Administrator / Global Reader
@@ -134,30 +135,18 @@ $run = Initialize-MigrationRun -ScriptName 'Get-MigrationTeamsPhoneAssignments' 
 
 try {
     $isDryRun = [bool]$run.DryRun
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $assignmentsCsv = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}TeamsPhoneAssignments_$timestamp.csv"
-    $unassignedCsv = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}TeamsPhoneNumbers-Unassigned_$timestamp.csv"
-
-    # These two CSVs are read back by the Set-/Remove- scripts, so they are written here
-    # rather than through Export-MigrationReport: a dry run must not leave a stale export
-    # behind for the next script in the chain to pick up.
-    $writeCsv = {
-        param([object[]]$Rows, [string]$Path, [string]$Label)
-        if ($isDryRun) {
-            Write-MigrationLog -Message "[DRYRUN] Would write $($Rows.Count) $Label row(s) to $Path" -Level WARNING
-            return
-        }
-        try {
-            $Rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding utf8 -ErrorAction Stop
-        }
-        catch {
-            throw "Could not write the $Label CSV '$Path': $($_.Exception.Message)"
-        }
-        Write-MigrationLog -Message "$Label CSV ($($Rows.Count) row(s)): $Path" -Level SUCCESS
-    }
+    # Both CSVs are read back by the Set-/Remove- scripts, so they share one timestamp - the
+    # set reads as one export - and -SuppressInDryRun is what keeps a dry run from leaving a
+    # stale file behind for the next script in the chain to pick up.
+    $runTimestamp = Get-Date
 
     $tenant = Connect-MigrationTeams -TenantId $TenantId
+
+    # The guard runs on a read too: an inventory taken from the wrong tenant is not just wasted,
+    # it becomes the input every later phase trusts. With no -TenantId it writes the WARNING
+    # banner naming the tenant instead of stopping.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -TeamsTenant $tenant `
+        -Purpose 'Teams phone inventory'
 
     # Name the tenant at SUCCESS, which every verbosity shows on the console. A session reused
     # from an earlier script in the same console is logged by Connect-MigrationTeams at INFO
@@ -372,11 +361,15 @@ try {
         Write-MigrationLog -Message "$usersWithAdditionalNumbers user(s) hold Alternate/Private numbers beyond the one in PhoneNumber. They are listed in the AdditionalNumbers column; Set-MigrationTeamsPhoneAssignments will not carry them." -Level WARNING
     }
 
+    # Nothing is written for zero rows: this file is read back by Set-/Remove-, and a
+    # placeholder file in that chain-input slot would fail whatever reads it next
+    # (a missing user column, not an empty result) rather than reporting cleanly.
     if ($exportRows.Count -eq 0) {
         Write-MigrationLog -Message 'No users matched - nothing to export.' -Level WARNING
     }
     else {
-        & $writeCsv $exportRows.ToArray() $assignmentsCsv 'Assignments'
+        $null = Export-MigrationReport -Rows $exportRows.ToArray() -Name 'TeamsPhoneAssignments' `
+            -Timestamp $runTimestamp -SuppressInDryRun
     }
 
     if ($IncludeUnassignedNumbers) {
@@ -395,7 +388,8 @@ try {
                         ActivationState    = [string]$_.ActivationState
                     }
                 })
-            & $writeCsv $unassignedReport $unassignedCsv 'Unassigned numbers'
+            $null = Export-MigrationReport -Rows $unassignedReport -Name 'TeamsPhoneNumbers' -Suffix 'Unassigned' `
+                -Timestamp $runTimestamp -SuppressInDryRun
         }
     }
 

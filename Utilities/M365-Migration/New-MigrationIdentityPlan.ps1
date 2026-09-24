@@ -27,6 +27,12 @@
     non-Latin script) is marked NeedsReview with the target columns left empty, which is the
     operator's cue to fill it in by hand.
 
+    The UPN and the SMTP address are built from their own templates (-UpnFormat, -SmtpFormat) and
+    may live in different domains: -SmtpDomain addresses mail somewhere other than -TargetDomain,
+    for a tenant that signs in as newco.com and mails as mail.newco.com. Either kind of divergence
+    marks the row UpnSmtpDiverge, because the user then signs in with an address that is not their
+    email and the service desk has to know.
+
     Re-running against an updated inventory is safe: with -ExistingPlanPath, any row already
     provisioned (a non-empty TargetObjectId) or marked ManualOverride keeps its destination
     identity verbatim, and its addresses are treated as reserved. A preserved row whose source
@@ -53,6 +59,15 @@
 .PARAMETER TargetDomain
     Destination vanity domain, with or without a leading '@'. Every templated address is built
     in this domain.
+
+.PARAMETER SmtpDomain
+    Domain for the primary SMTP address when mail does not live in -TargetDomain, with or without
+    a leading '@'. Omit it and mail is addressed in -TargetDomain. Because the sign-in address and
+    the mail address then differ, those rows are marked UpnSmtpDiverge; and because the mail
+    domain is not the one the source tenant still holds, InterimPrimarySmtp equals
+    TargetPrimarySmtp even when -InterimDomain is given. Collisions and reserved addresses are
+    then judged per domain - the SMTP address against this domain, the UPN against -TargetDomain -
+    so only a name already taken in the mail domain suffixes the mail address.
 
 .PARAMETER InterimDomain
     Routing domain used before the vanity domain cuts over, typically newco.onmicrosoft.com.
@@ -163,6 +178,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4+ and the bundled M365Migration module. Entirely offline - no
                   Graph scope or Exchange Online role is needed, so GDAP does not apply.
     Exit codes  : 0 success (rows needing review are the operator's to-do, not a failure),
@@ -191,6 +207,9 @@ param(
     [Parameter(Mandatory)]
     [ValidatePattern('^@?[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$')]
     [string]$TargetDomain,
+
+    [ValidatePattern('^@?[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$')]
+    [string]$SmtpDomain,
 
     [ValidatePattern('^@?[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$')]
     [string]$InterimDomain,
@@ -301,9 +320,67 @@ $script:PreservedFields = @(
 )
 $script:IdentityColumns = @('SourceObjectId', 'SourcePrimarySmtp', 'SourceUserPrincipalName')
 
+# Import-MigrationCsv and Resolve-MigrationSkuMap both refuse a file whose header is followed by
+# nothing. For the required -UsersCsv that is right; for an optional input it is not, so the three
+# readers that can meet one say the same thing about it.
+$script:EmptyOptionalCsvError = '*contains no data rows*'
+$script:EmptyOptionalCsvMessage = "{0} '{1}' has a header but no rows; nothing was taken from it."
+
 #endregion -----------------------------------------------------------------------------
 
 #region Functions ----------------------------------------------------------------------
+
+function Import-OptionalPlanCsv {
+    <#
+    .SYNOPSIS
+        Reads an optional input CSV, treating a header with no rows as an empty file.
+    .DESCRIPTION
+        Get-MigrationInventory writes every tab it was asked for, so a tenant with no shared
+        mailboxes, no contacts or no groups still produces that file with its header and nothing
+        under it. Import-MigrationCsv refuses such a file, which is correct for the required
+        -UsersCsv and wrong for everything else: an empty optional inventory means there is
+        nothing of that kind to plan, not that the operator made a mistake. Every other import
+        error - a missing file, a missing required column - still propagates.
+
+        Import-MigrationCsv counts the rows before it looks at the columns, so a header-only file
+        whose columns are wrong, and a zero-byte file, are both reported here as having a header
+        and no rows rather than as a column problem. Supply a file with at least one row to see
+        the column error.
+    .PARAMETER Path
+        The file to read. An empty or unsupplied path returns an empty set without reading
+        anything, so a caller can hand over an optional parameter unguarded.
+    .PARAMETER RequiredColumns
+        Columns Import-MigrationCsv must find, after its own alias mapping.
+    .PARAMETER Label
+        How the file is named in the warning - the parameter the operator typed.
+    .EXAMPLE
+        Import-OptionalPlanCsv -Path $ContactsCsv -RequiredColumns 'DisplayName' -Label '-ContactsCsv'
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [AllowNull()][AllowEmptyString()]
+        [string]$Path,
+
+        [AllowNull()][AllowEmptyCollection()]
+        [string[]]$RequiredColumns,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Label
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
+
+    try {
+        return @(Import-MigrationCsv -Path $Path -RequiredColumns $RequiredColumns)
+    }
+    catch {
+        if ($_.Exception.Message -notlike $script:EmptyOptionalCsvError) { throw }
+        Write-MigrationLog -Level WARNING -Message ($script:EmptyOptionalCsvMessage -f $Label, $Path)
+        return @()
+    }
+}
 
 function Split-PlanAddress {
     <#
@@ -442,7 +519,8 @@ function Import-PlanExclusionRule {
     $rules = [System.Collections.Generic.List[object]]::new()
     $lineNumber = 1
 
-    foreach ($row in @(Import-MigrationCsv -Path $Path -RequiredColumns @('Pattern', 'MatchOn'))) {
+    foreach ($row in @(Import-OptionalPlanCsv -Path $Path -RequiredColumns @('Pattern', 'MatchOn') `
+                -Label '-ExclusionRulesPath')) {
         $lineNumber++
         $pattern = Get-MigrationCsvValue -Row $row -Name 'Pattern' -Default ''
         $matchOn = Get-MigrationCsvValue -Row $row -Name 'MatchOn' -Default ''
@@ -511,6 +589,12 @@ function Get-PlanReservedAddress {
         is harvested - or a plain text list of one address per line. Detecting the shape rather
         than demanding a format means an operator can paste addresses into a text file and it
         just works.
+
+        A CSV is assumed to have come from Export-MigrationReport, so every cell is passed
+        through ConvertFrom-MigrationSafeCell before it is parsed: the exporter defuses a
+        formula-looking cell with a leading apostrophe, and an address left carrying one would
+        never match the address the planner computes. The plain-text branch needs no such
+        treatment - nothing in this toolkit writes that file.
     .PARAMETER Path
         One or more files to read.
     .EXAMPLE
@@ -549,9 +633,26 @@ function Get-PlanReservedAddress {
             try { $rows = @(Import-Csv -LiteralPath $file -Encoding utf8 -ErrorAction Stop) }
             catch { throw "Could not read the reserved address CSV '$file': $($_.Exception.Message)" }
 
+            # Import-Csv does not object to a header with nothing under it, but the operator
+            # still gets told - a destination inventory that reserved nothing is worth knowing.
+            if ($rows.Count -eq 0) {
+                Write-MigrationLog -Level WARNING -Message (
+                    $script:EmptyOptionalCsvMessage -f '-ReservedAddressesPath', $file)
+                continue
+            }
+
             foreach ($row in $rows) {
                 foreach ($column in $script:ReservedAddressColumns) {
-                    & $addValue (Get-MigrationCsvValue -Row $row -Name $column -Default '')
+                    # A destination inventory arrives through Export-MigrationReport, which
+                    # prefixes an apostrophe onto any cell leading with a formula character -
+                    # an alias such as '=old@old.com' among them. Undone here because this
+                    # file is a chain input: a shared mailbox, room or group is named with
+                    # the 'Keep' template, so an '=' in its source local part survives into
+                    # the computed destination address, and a reserved entry still carrying
+                    # the apostrophe would not match it. The collision would go unnoticed
+                    # and two objects would be planned onto one address.
+                    $cell = Get-MigrationCsvValue -Row $row -Name $column -Default ''
+                    & $addValue (ConvertFrom-MigrationSafeCell -Value $cell)
                 }
             }
         }
@@ -624,12 +725,17 @@ function Get-PlanTargetLicense {
 $exitCode = 0
 
 try {
-    $run = Initialize-MigrationRun -ScriptName 'New-MigrationIdentityPlan' -OutputPath $OutputPath `
+    # Discarded on purpose: the run context is read back through Get-MigrationOutputPath and
+    # Write-MigrationLog when they need it, so nothing here has to hold on to it.
+    $null = Initialize-MigrationRun -ScriptName 'New-MigrationIdentityPlan' -OutputPath $OutputPath `
         -Prefix $Prefix -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity `
         -BoundParameters $PSBoundParameters
 
     $targetDomainName = $TargetDomain.TrimStart('@').ToLowerInvariant()
     $interimDomainName = if ($InterimDomain) { $InterimDomain.TrimStart('@').ToLowerInvariant() } else { '' }
+    # Mail defaults to the domain people sign in with; -SmtpDomain is the tenant that deliberately
+    # splits the two.
+    $smtpDomainName = if ($SmtpDomain) { $SmtpDomain.TrimStart('@').ToLowerInvariant() } else { $targetDomainName }
     $smtpTemplate = if ($PSBoundParameters.ContainsKey('SmtpFormat')) { $SmtpFormat } else { $UpnFormat }
     $nicknameTemplate = if ($PSBoundParameters.ContainsKey('MailNicknameFormat')) { $MailNicknameFormat } else { '' }
 
@@ -643,6 +749,15 @@ try {
     elseif ($interimDomainName -and $interimDomainName -notlike '*.onmicrosoft.com') {
         Write-MigrationLog -Message ("-InterimDomain '$interimDomainName' is not an onmicrosoft.com routing domain. " +
             'It is used as given; make sure it is verified in the destination tenant before cutover.') -Level WARNING
+    }
+
+    # Said out loud because the plan then shows InterimPrimarySmtp identical to TargetPrimarySmtp
+    # while the UPN columns differ, which reads like a bug unless the operator knows the interim
+    # domain never applied to the mail address in the first place.
+    if ($interimDomainName -and $smtpDomainName -ne $targetDomainName) {
+        Write-MigrationLog -Message ('-InterimDomain applies to the sign-in address only: the primary SMTP ' +
+            "address is planned directly on $smtpDomainName because -SmtpDomain differs from -TargetDomain.") `
+            -Level WARNING
     }
 
     if ($PreserveAliases -and (-not $AliasDomainMap -or $AliasDomainMap.Count -eq 0)) {
@@ -660,13 +775,25 @@ try {
     }
 
     # --- Supporting files ---------------------------------------------------------------------
-    $skuMap = if ($SkuMapPath) { Resolve-MigrationSkuMap -Path $SkuMapPath } else { $null }
+    # Resolve-MigrationSkuMap does its own reading and its own validation, so the header-only
+    # case is caught here rather than routed through Import-OptionalPlanCsv; everything else it
+    # objects to - a duplicate mapping, an empty source SKU - is still fatal.
+    $skuMap = $null
+    if ($SkuMapPath) {
+        try { $skuMap = Resolve-MigrationSkuMap -Path $SkuMapPath }
+        catch {
+            if ($_.Exception.Message -notlike $script:EmptyOptionalCsvError) { throw }
+            Write-MigrationLog -Level WARNING -Message ($script:EmptyOptionalCsvMessage -f '-SkuMapPath', $SkuMapPath)
+        }
+    }
+
     $exclusionRules = @(if ($ExclusionRulesPath) { Import-PlanExclusionRule -Path $ExclusionRulesPath })
 
     $waveMap = @{}
     $waveMapHits = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if ($WaveMapPath) {
-        foreach ($row in @(Import-MigrationCsv -Path $WaveMapPath -RequiredColumns @('UserPrincipalName', 'Wave'))) {
+        foreach ($row in @(Import-OptionalPlanCsv -Path $WaveMapPath -Label '-WaveMapPath' `
+                    -RequiredColumns @('UserPrincipalName', 'Wave'))) {
             $identity = Get-MigrationCsvValue -Row $row -Name 'UserPrincipalName' -Default ''
             $wave = Get-MigrationCsvValue -Row $row -Name 'Wave' -Default ''
             if (-not $identity -or -not $wave) { throw "The wave map '$WaveMapPath' has a row with an empty UserPrincipalName or Wave." }
@@ -718,13 +845,11 @@ try {
     # Entra ID knows nothing of LegacyExchangeDN, the proxy addresses or the recipient type, so a
     # user's mailbox row is looked up by either of its addresses.
     $mailboxIndex = @{}
-    if ($UserMailboxesCsv) {
-        foreach ($mailbox in @(Import-MigrationCsv -Path $UserMailboxesCsv)) {
-            foreach ($keyColumn in @('UserPrincipalName', 'PrimarySmtpAddress')) {
-                $keyValue = Get-MigrationCsvValue -Row $mailbox -Name $keyColumn -Default ''
-                if ($keyValue -and -not $mailboxIndex.ContainsKey($keyValue.ToLowerInvariant())) {
-                    $mailboxIndex[$keyValue.ToLowerInvariant()] = $mailbox
-                }
+    foreach ($mailbox in @(Import-OptionalPlanCsv -Path $UserMailboxesCsv -Label '-UserMailboxesCsv')) {
+        foreach ($keyColumn in @('UserPrincipalName', 'PrimarySmtpAddress')) {
+            $keyValue = Get-MigrationCsvValue -Row $mailbox -Name $keyColumn -Default ''
+            if ($keyValue -and -not $mailboxIndex.ContainsKey($keyValue.ToLowerInvariant())) {
+                $mailboxIndex[$keyValue.ToLowerInvariant()] = $mailbox
             }
         }
     }
@@ -759,65 +884,62 @@ try {
             })
     }
 
-    if ($SharedMailboxesCsv) {
-        foreach ($source in @(Import-MigrationCsv -Path $SharedMailboxesCsv -RequiredColumns @('PrimarySmtpAddress'))) {
-            $primary = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
-            $recipientType = Get-MigrationCsvValue -Row $source -Name 'RecipientTypeDetails' -Default 'SharedMailbox'
+    foreach ($source in @(Import-OptionalPlanCsv -Path $SharedMailboxesCsv -Label '-SharedMailboxesCsv' `
+                -RequiredColumns @('PrimarySmtpAddress'))) {
+        $primary = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
+        $recipientType = Get-MigrationCsvValue -Row $source -Name 'RecipientTypeDetails' -Default 'SharedMailbox'
 
-            $row = New-PlanSourceRow -Source $source -Kind 'SharedMailbox' -Primary $primary `
-                -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
-            $row.ObjectType = if ($script:MailboxTypeMap.ContainsKey($recipientType)) { $script:MailboxTypeMap[$recipientType] } else { 'Shared' }
-            $row.SourceUserPrincipalName = Get-MigrationCsvValue -Row $source -Name 'UserPrincipalName' -Default ''
-            $row.MailboxType = $recipientType
+        $row = New-PlanSourceRow -Source $source -Kind 'SharedMailbox' -Primary $primary `
+            -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
+        $row.ObjectType = if ($script:MailboxTypeMap.ContainsKey($recipientType)) { $script:MailboxTypeMap[$recipientType] } else { 'Shared' }
+        $row.SourceUserPrincipalName = Get-MigrationCsvValue -Row $source -Name 'UserPrincipalName' -Default ''
+        $row.MailboxType = $recipientType
 
-            $items.Add(@{
-                    Row = $row; Source = $source; SourceKind = 'SharedMailbox'; IsGuest = $false; UsesTemplate = $false
-                    Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
-                })
-        }
+        $items.Add(@{
+                Row = $row; Source = $source; SourceKind = 'SharedMailbox'; IsGuest = $false; UsesTemplate = $false
+                Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
+            })
     }
 
-    if ($GroupsCsv) {
-        foreach ($source in @(Import-MigrationCsv -Path $GroupsCsv -RequiredColumns @('DisplayName'))) {
-            $primary = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
-            $groupType = Get-MigrationCsvValue -Row $source -Name 'GroupType' -Default 'Distribution'
+    foreach ($source in @(Import-OptionalPlanCsv -Path $GroupsCsv -Label '-GroupsCsv' `
+                -RequiredColumns @('DisplayName'))) {
+        $primary = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
+        $groupType = Get-MigrationCsvValue -Row $source -Name 'GroupType' -Default 'Distribution'
 
-            $row = New-PlanSourceRow -Source $source -Kind 'Group' -Primary $primary `
-                -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
-            $row.ObjectType = if ($script:GroupTypeMap.ContainsKey($groupType)) { $script:GroupTypeMap[$groupType] } else { 'Distribution' }
-            # The plan enum has no SecurityGroup member, so the real Entra group type is kept in
-            # MailboxType where the operator - and the readiness check - can still see it.
-            $row.MailboxType = $groupType
+        $row = New-PlanSourceRow -Source $source -Kind 'Group' -Primary $primary `
+            -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
+        $row.ObjectType = if ($script:GroupTypeMap.ContainsKey($groupType)) { $script:GroupTypeMap[$groupType] } else { 'Distribution' }
+        # The plan enum has no SecurityGroup member, so the real Entra group type is kept in
+        # MailboxType where the operator - and the readiness check - can still see it.
+        $row.MailboxType = $groupType
 
-            $items.Add(@{
-                    Row = $row; Source = $source; SourceKind = 'Group'; IsGuest = $false; UsesTemplate = $false
-                    Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $row.DisplayName }
-                    PresetExcludeWhy = if ($script:GroupExcludeReasons.ContainsKey($groupType)) { $script:GroupExcludeReasons[$groupType] }
-                    elseif (-not $primary) { 'Not mail-enabled' }
-                    else { '' }
-                })
-        }
+        $items.Add(@{
+                Row = $row; Source = $source; SourceKind = 'Group'; IsGuest = $false; UsesTemplate = $false
+                Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $row.DisplayName }
+                PresetExcludeWhy = if ($script:GroupExcludeReasons.ContainsKey($groupType)) { $script:GroupExcludeReasons[$groupType] }
+                elseif (-not $primary) { 'Not mail-enabled' }
+                else { '' }
+            })
     }
 
-    if ($ContactsCsv) {
-        foreach ($source in @(Import-MigrationCsv -Path $ContactsCsv -RequiredColumns @('DisplayName'))) {
-            $primary = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
+    foreach ($source in @(Import-OptionalPlanCsv -Path $ContactsCsv -Label '-ContactsCsv' `
+                -RequiredColumns @('DisplayName'))) {
+        $primary = Get-MigrationCsvValue -Row $source -Name 'PrimarySmtpAddress' -Default ''
 
-            $row = New-PlanSourceRow -Source $source -Kind 'Contact' -Primary $primary `
-                -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
-            $row.ObjectType = 'Contact'
-            $row.MailboxType = 'MailContact'
-            # What a contact actually points at. A contact has no user principal name, so the
-            # external address is parked in that column rather than in SourcePrimarySmtp, which
-            # has to keep the source-tenant address the destination address is derived from.
-            # New-MigrationRecipients reads it back from here when no -ContactsCsv is supplied.
-            $row.SourceUserPrincipalName = Get-MigrationCsvValue -Row $source -Name 'ExternalEmailAddress' -Default ''
+        $row = New-PlanSourceRow -Source $source -Kind 'Contact' -Primary $primary `
+            -ProxyValue (Get-MigrationCsvValue -Row $source -Name 'EmailAddresses' -Default '')
+        $row.ObjectType = 'Contact'
+        $row.MailboxType = 'MailContact'
+        # What a contact actually points at. A contact has no user principal name, so the
+        # external address is parked in that column rather than in SourcePrimarySmtp, which
+        # has to keep the source-tenant address the destination address is derived from.
+        # New-MigrationRecipients reads it back from here when no -ContactsCsv is supplied.
+        $row.SourceUserPrincipalName = Get-MigrationCsvValue -Row $source -Name 'ExternalEmailAddress' -Default ''
 
-            $items.Add(@{
-                    Row = $row; Source = $source; SourceKind = 'Contact'; IsGuest = $false; UsesTemplate = $false
-                    Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
-                })
-        }
+        $items.Add(@{
+                Row = $row; Source = $source; SourceKind = 'Contact'; IsGuest = $false; UsesTemplate = $false
+                Key = if ($row.SourceObjectId) { $row.SourceObjectId } else { $primary }
+            })
     }
 
     Write-MigrationLog -Message "Prepared $($items.Count) source object(s) for planning." -Level INFO
@@ -970,24 +1092,33 @@ try {
     # therefore resolved in one pass over one taken set. An item whose UPN and SMTP local parts
     # agree makes a single claim, so both keep the same local part when a suffix or a middle
     # initial is needed; only a deliberately divergent -SmtpFormat claims the two separately.
+    #
+    # Each claim is made in the domain the address will be created in: the UPN always in
+    # -TargetDomain, the SMTP address in -SmtpDomain when one was given. Resolving the SMTP side
+    # against the target domain instead would both miss an address already taken in the mail
+    # domain and suffix a mail address over a name that is only taken somewhere else.
     $namedItems = @($planned | Where-Object { $_.Row.PlanStatus -ne 'NeedsReview' -and -not $_.IsGuest })
     $newCandidate = {
-        param($Item, [string[]]$Slot, [string]$KeySuffix)
+        param($Item, [string[]]$Slot, [string]$KeySuffix, [string]$Domain)
         [pscustomobject]@{
             Key = "$($Item.Key)$KeySuffix"; ItemKey = [string]$Item.Key; Slot = $Slot
-            LocalPart = [string]$Item[$Slot[0]]; MiddleInitial = [string]$Item.Row.MiddleName; Domain = $targetDomainName
+            LocalPart = [string]$Item[$Slot[0]]; MiddleInitial = [string]$Item.Row.MiddleName; Domain = $Domain
         }
     }
     $candidates = [System.Collections.Generic.List[object]]::new()
     foreach ($item in $namedItems) {
         $upnLocalPart = [string]$item['UpnLocalPart']
         $smtpLocalPart = [string]$item['SmtpLocalPart']
-        if ($upnLocalPart -and $smtpLocalPart -and $upnLocalPart -ieq $smtpLocalPart) {
-            $candidates.Add((& $newCandidate $item @('UpnLocalPart', 'SmtpLocalPart') ''))
+
+        # One claim only when the two are the same address - same local part and same domain.
+        # A separate mail domain puts them in different namespaces, so each is claimed on its own.
+        if ($upnLocalPart -and $smtpLocalPart -and $upnLocalPart -ieq $smtpLocalPart -and
+            $smtpDomainName -eq $targetDomainName) {
+            $candidates.Add((& $newCandidate $item @('UpnLocalPart', 'SmtpLocalPart') '' $targetDomainName))
             continue
         }
-        if ($smtpLocalPart) { $candidates.Add((& $newCandidate $item @('SmtpLocalPart') '')) }
-        if ($upnLocalPart) { $candidates.Add((& $newCandidate $item @('UpnLocalPart') '|upn')) }
+        if ($smtpLocalPart) { $candidates.Add((& $newCandidate $item @('SmtpLocalPart') '' $smtpDomainName)) }
+        if ($upnLocalPart) { $candidates.Add((& $newCandidate $item @('UpnLocalPart') '|upn' $targetDomainName)) }
     }
 
     $resolvedClaims = @(Resolve-MigrationCollision -Reserved $reservedAddresses.ToArray() -Candidates $candidates.ToArray())
@@ -1003,9 +1134,12 @@ try {
     $itemByKey = @{}
     foreach ($item in $items) { $itemByKey[[string]$item.Key] = $item }
     $describeClaimant = {
-        param([string]$LocalPart)
+        # The domain is part of the lookup: two claims can hold the same local part when the UPN
+        # and the mail address live in different domains, and only one of them is the winner
+        # being named here.
+        param([string]$LocalPart, [string]$Domain)
         foreach ($entry in $resolvedClaims) {
-            if ([string]$entry.ResolvedLocalPart -ne $LocalPart) { continue }
+            if ([string]$entry.ResolvedLocalPart -ne $LocalPart -or [string]$entry.Domain -ne $Domain) { continue }
             $owner = $itemByKey[[string]$entry.ItemKey]
             if ($null -eq $owner) { return '' }
             return [string](@($owner.Row.SourceUserPrincipalName, $owner.Row.SourcePrimarySmtp,
@@ -1027,16 +1161,19 @@ try {
 
             $wanted = ([string]$claim.LocalPart).Trim().ToLowerInvariant()
             $label = @(@($claim.Slot) | ForEach-Object { $slotLabel[$_] }) -join ' and '
-            $claimant = & $describeClaimant $wanted
+            # The claim's own domain, so the message names the address that was actually contested.
+            $claimDomain = [string]$claim.Domain
+            $claimant = & $describeClaimant $wanted $claimDomain
             $taken = if ($claimant) { "taken by $claimant" } else { 'already reserved in the destination' }
 
             if ($claim.Resolution -eq 'Unresolved') {
                 foreach ($slot in @($claim.Slot)) { $item[$slot] = '' }
                 $unresolved = $true
-                $details.Add("$label ${wanted}@$targetDomainName is $taken and no free alternative was found - assign one by hand.")
+                $details.Add("$label ${wanted}@$claimDomain is $taken and no free alternative was found - " +
+                    'assign one by hand.')
             }
             else {
-                $details.Add("$label ${wanted}@$targetDomainName is $taken; used $($claim.ResolvedLocalPart)@$targetDomainName.")
+                $details.Add("$label ${wanted}@$claimDomain is $taken; used $($claim.ResolvedLocalPart)@$claimDomain.")
             }
         }
 
@@ -1076,8 +1213,14 @@ try {
                 $row.InterimUserPrincipalName = if ($interimDomainName) { "$upnLocalPart@$interimDomainName" } else { $row.TargetUserPrincipalName }
             }
             if ($smtpLocalPart) {
-                $row.TargetPrimarySmtp = "$smtpLocalPart@$targetDomainName"
-                $row.InterimPrimarySmtp = if ($interimDomainName) { "$smtpLocalPart@$interimDomainName" } else { $row.TargetPrimarySmtp }
+                $row.TargetPrimarySmtp = "$smtpLocalPart@$smtpDomainName"
+                # The interim domain exists because the source tenant still holds the vanity
+                # domain, so the destination cannot verify it yet. A separate mail domain is not
+                # the domain in dispute: it can be verified up front and needs no stand-in.
+                $row.InterimPrimarySmtp = if ($interimDomainName -and $smtpDomainName -eq $targetDomainName) {
+                    "$smtpLocalPart@$interimDomainName"
+                }
+                else { $row.TargetPrimarySmtp }
             }
 
             $nickname = if ($item['NicknameLocalPart']) { [string]$item['NicknameLocalPart'] } else { $smtpLocalPart }
@@ -1148,6 +1291,9 @@ try {
             $row.PlanDetail = (@($row.PlanDetail, $invalidReason) | Where-Object { $_ }) -join ' '
         }
         elseif ($row.PlanStatus -ne 'Collision') {
+            # Comparing the whole address covers both ways the two can part company: a -SmtpFormat
+            # that builds a different local part, and a -SmtpDomain that puts mail in a different
+            # domain. Either one is something the service desk has to be told about.
             $divergent = (-not $item.IsGuest) -and $row.TargetUserPrincipalName -and $row.TargetPrimarySmtp -and
                 ($row.TargetUserPrincipalName -ne $row.TargetPrimarySmtp)
             $row.PlanStatus = if ($divergent) { 'UpnSmtpDiverge' } else { 'Planned' }
@@ -1215,8 +1361,10 @@ try {
         }
     }
 
-    $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $planPath = Join-Path -Path $run.OutputDirectory -ChildPath ("${leader}IdentityPlan_{0}.csv" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    # Get-MigrationOutputPath owns the <Prefix>_<Name>_<timestamp>.<ext> contract, so the
+    # plan is named through it rather than assembled here: the run context already supplies
+    # the directory and the prefix, and this filename has always matched the contract.
+    $planPath = Get-MigrationOutputPath -Name 'IdentityPlan'
 
     if ($PSCmdlet.ShouldProcess($planPath, "Write $($planRows.Count) identity plan row(s)")) {
         Invoke-MigrationAction -Description "Write the identity plan to $planPath" -Action {

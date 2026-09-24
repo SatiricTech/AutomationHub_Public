@@ -576,6 +576,74 @@ Describe 'Import-MigrationVivaLearningHistory - unattended import under a suppli
     }
 }
 
+Describe 'Import-MigrationVivaLearningHistory - the destination mapping cannot be left to a prompt' {
+
+    BeforeAll {
+        $script:noDomainWorkspace = New-VivaWorkspace -Label 'NoDomain'
+        Reset-VivaCallLog
+        $global:vivaProviders = @()
+        $global:vivaExistingActivityIds = @()
+
+        # No -TargetDomain, -KeepCsvDomains or -PlanPath: the destination mapping is
+        # ambiguous and must fail fast rather than fall back to a prompt.
+        & $script:scriptPath -CsvPath (Join-Path $script:noDomainWorkspace 'VivaLearningHistory.csv') `
+            -TenantId $script:tenantId -ClientId $script:clientId -ClientSecret $script:clientSecret `
+            -OutputPath $script:noDomainWorkspace -Verbosity Low -DryRun
+        $script:noDomainExitCode = $LASTEXITCODE
+        $script:noDomainLog = Get-VivaLogText -Workspace $script:noDomainWorkspace
+    }
+
+    AfterAll {
+        if ($script:noDomainWorkspace -and (Test-Path -LiteralPath $script:noDomainWorkspace)) {
+            Remove-Item -LiteralPath $script:noDomainWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits 1 rather than prompting for a domain mapping' {
+        $script:noDomainExitCode | Should -Be 1
+    }
+
+    It 'Logs the fatal reason' {
+        $script:noDomainLog | Should -Match (
+            'Fatal: Pass -TargetDomain, -KeepCsvDomains or -PlanPath so the destination UPN mapping is explicit\.')
+    }
+}
+
+Describe 'Import-MigrationVivaLearningHistory - a new provider needs -LogoUrl up front' {
+
+    BeforeAll {
+        $script:noLogoWorkspace = New-VivaWorkspace -Label 'NoLogo'
+        Reset-VivaCallLog
+        $global:vivaProviders = @()
+        $global:vivaExistingActivityIds = @()
+
+        # No provider exists and none of the logo URLs were supplied, on a real run
+        # (not -DryRun): registration must fail fast rather than fall back to a prompt.
+        & $script:scriptPath -CsvPath (Join-Path $script:noLogoWorkspace 'VivaLearningHistory.csv') `
+            -TenantId $script:tenantId -ClientId $script:clientId -ClientSecret $script:clientSecret `
+            -PlanPath (Join-Path $script:noLogoWorkspace 'IdentityPlan.csv') `
+            -OutputPath $script:noLogoWorkspace -Verbosity Low
+        $script:noLogoExitCode = $LASTEXITCODE
+        $script:noLogoLog = Get-VivaLogText -Workspace $script:noLogoWorkspace
+    }
+
+    AfterAll {
+        if ($script:noLogoWorkspace -and (Test-Path -LiteralPath $script:noLogoWorkspace)) {
+            Remove-Item -LiteralPath $script:noLogoWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Exits 1 rather than prompting for a logo URL' {
+        $script:noLogoExitCode | Should -Be 1
+    }
+
+    It 'Logs the fatal reason' {
+        $script:noLogoLog | Should -Match (
+            'Fatal: Registering a learning provider needs -LogoUrl \(used for every logo slot not given ' +
+            'individually\)\.')
+    }
+}
+
 Describe 'Import-MigrationVivaLearningHistory - rows the CSV cannot describe fail individually' {
 
     BeforeAll {
@@ -628,5 +696,98 @@ Describe 'Import-MigrationVivaLearningHistory - rows the CSV cannot describe fai
         $row = @($script:badRows | Where-Object { $_.SourceUserPrincipalName -eq 'bjones@contoso.com' })[0]
         $row.Status | Should -BeExactly 'Failed'
         $row.Detail | Should -Match 'Missing CourseTitle or CourseWebUrl'
+    }
+}
+
+Describe 'Import-MigrationVivaLearningHistory - the tenant guard runs once over the app-only session' {
+
+    <#
+        The app-only session is the one every catalog and activity write goes through, so that is
+        what the guard checks. Assert-MigrationTenant is shadowed rather than mocked so the call
+        can be recorded without the module's real resolver touching the network.
+    #>
+
+    BeforeAll {
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+
+        $script:guardWorkspace = New-VivaWorkspace -Label 'Guard'
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+        Reset-VivaCallLog
+        $global:vivaProviders = @()
+        $global:vivaExistingActivityIds = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+        if ($script:guardWorkspace -and (Test-Path -LiteralPath $script:guardWorkspace)) {
+            Remove-Item -LiteralPath $script:guardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Asserts the -TenantId it was given once per held session, delegated then app-only' {
+        # Two sessions held at disjoint times, so two asserts is the correct count here: the
+        # delegated one registers the provider before the app-only one writes content and
+        # activities. One assert would leave the provider registration's PATCH/POST unguarded.
+        & $script:scriptPath -CsvPath (Join-Path $script:guardWorkspace 'VivaLearningHistory.csv') `
+            -TenantId $script:tenantId -ClientId $script:clientId -ClientSecret $script:clientSecret `
+            -PlanPath (Join-Path $script:guardWorkspace 'IdentityPlan.csv') `
+            -OutputPath $script:guardWorkspace -Verbosity Low -DryRun
+
+        $global:AssertCalls.Count | Should -Be 2
+        @($global:AssertCalls | ForEach-Object { $_.ExpectedTenantId }) |
+            Should -Be @($script:tenantId, $script:tenantId)
+        @($global:AssertCalls | ForEach-Object { $_.Purpose }) |
+            Should -Be @('Viva Learning provider registration', 'Viva Learning import')
+        @($global:AssertCalls | ForEach-Object { $_.GraphContext.TenantId }) |
+            Should -Be @($script:tenantId, $script:tenantId)
+    }
+}
+
+Describe 'Import-MigrationVivaLearningHistory - a history CSV the exporter defused' {
+
+    BeforeAll {
+        # Get-MigrationVivaLearningHistory writes its export through Export-MigrationReport,
+        # which prefixes a formula-looking cell with an apostrophe so Excel shows it rather
+        # than evaluating it. This script reads that same file back as a chain input, so the
+        # apostrophe has to come off again before the title reaches Graph.
+        $script:defusedWorkspace = New-VivaWorkspace -Label 'Defused'
+        Reset-VivaCallLog
+        $global:vivaProviders = @()
+        $global:vivaExistingActivityIds = @()
+
+        $historyPath = Join-Path $script:defusedWorkspace 'VivaLearningHistory.csv'
+        @(Import-Csv -LiteralPath $historyPath) |
+            ForEach-Object {
+                if ($_.CourseTitle -eq 'Security Awareness 101') { $_.CourseTitle = "'=Security Awareness 101" }
+                $_
+            } |
+            Export-Csv -LiteralPath $historyPath -NoTypeInformation -Encoding utf8
+
+        & $script:scriptPath -CsvPath $historyPath `
+            -TenantId $script:tenantId -ClientId $script:clientId -ClientSecret $script:clientSecret `
+            -PlanPath (Join-Path $script:defusedWorkspace 'IdentityPlan.csv') `
+            -OutputPath $script:defusedWorkspace -Verbosity Low -DryRun
+
+        $file = @(Get-ChildItem -LiteralPath $script:defusedWorkspace -Filter 'Import-VivaLearningHistory-DryRun_*.csv')
+        $script:defusedRows = if ($file.Count -eq 1) { @(Import-Csv -LiteralPath $file[0].FullName) } else { @() }
+    }
+
+    AfterAll {
+        if ($script:defusedWorkspace -and (Test-Path -LiteralPath $script:defusedWorkspace)) {
+            Remove-Item -LiteralPath $script:defusedWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Strips the exporter''s apostrophe before the title is used' {
+        $row = @($script:defusedRows |
+                Where-Object { $_.Identity -eq 'john.smith@newco.com' -and $_.ActivityType -eq 'Assignment' })[0]
+        $row.Detail | Should -Match "Would create Assignment '=Security Awareness 101' for john.smith@newco.com"
     }
 }

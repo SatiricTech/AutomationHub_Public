@@ -12,18 +12,29 @@
       Upn           PATCH /users/{id} { userPrincipalName } via Microsoft Graph.
       PrimarySmtp   Set-Mailbox -EmailAddresses @{ Add = 'SMTP:<target>' } - the uppercase prefix is
                     what makes the address primary, and Exchange demotes the previous primary to a
-                    lowercase 'smtp:' alias by itself.
+                    lowercase 'smtp:' alias by itself. When the mailbox already carries the target
+                    as an alias it is promoted in place instead: one Set-Mailbox -EmailAddresses
+                    call rewrites the whole address list, so the address is never absent from the
+                    mailbox even for an instant.
       Aliases       Adds every TargetAliases entry that is not already on the object.
       X500          Adds X500:<LegacyExchangeDN> (or each SourceX500 entry) so mail sent to the old
                     address and cached Outlook entries still resolve after the move.
       MailNickname  Set-Mailbox -Alias.
       GalVisibility Set-Mailbox -HiddenFromAddressListsEnabled (True, or False with -Unhide).
 
-    Address handling is deliberately additive. The script computes an add/remove set from the
-    object's current EmailAddresses and never removes the tenant routing (MOERA) address, a SIP
-    address, or any existing X500 address - removing any of those breaks Teams sign-in, mail
-    routing, or reply-ability from cached address entries. The only address it will ever remove is
-    the previous primary, and only when you ask for it with -RemoveOldPrimaryAlias.
+    Address handling is deliberately conservative. Every change is computed from the object's
+    current EmailAddresses and applied one of two ways: promoting an address the mailbox already
+    carries rewrites the whole address list in a single call - the only way to promote it without
+    the address being absent in between - while everything else is an additive Add. Either way the
+    tenant routing (MOERA) address, SIP addresses and existing X500 addresses are carried through
+    untouched; removing any of those breaks Teams sign-in, mail routing, or reply-ability from
+    cached address entries. The only address the script will ever drop is the previous primary, and
+    only when you ask for it with -RemoveOldPrimaryAlias.
+
+    One consequence of the promotion rewriting the whole list: it is computed from the mailbox as
+    read at the start of the row, so an address added to that mailbox by someone else between the
+    read and the write is overwritten. Cutover runs own their mailboxes for the evening, which is
+    why that trade is worth making against leaving the vanity address absent.
 
     Because it can match on the source UPN (-MatchOn Source), the same script performs the in-place
     UPN/address redesign inside a single tenant: build a plan whose Source* columns describe today
@@ -125,6 +136,7 @@
 
 .NOTES
     Author       : AutomationHub
+    Version      : 1.2.0
     Requires     : PowerShell 7.4, Microsoft.Graph.Authentication, ExchangeOnlineManagement
     Graph scopes : User.ReadWrite.All, Directory.ReadWrite.All
     EXO roles    : Exchange Administrator (or a role group holding the Mail Recipients and
@@ -204,6 +216,11 @@ $requiredGraphScopes = @('User.ReadWrite.All', 'Directory.ReadWrite.All')
 
 # Canonical execution order. Whatever order -Apply arrives in, the UPN moves first (it is the
 # cheapest to reverse), addresses next, cosmetics last.
+#
+# PrimarySmtp MUST stay ahead of Aliases and X500. When the target address is already on the
+# mailbox, PrimarySmtp promotes it by writing the whole address list as read at the top of the
+# row - so any alias or X500 added before it would be silently erased by that write, with the
+# results file still reporting both as Succeeded.
 $actionOrder = @('Upn', 'PrimarySmtp', 'Aliases', 'X500', 'MailNickname', 'GalVisibility')
 
 # Operations that need an Exchange Online session.
@@ -398,6 +415,50 @@ function Set-MailboxAddress {
     }
 }
 
+function Set-MailboxAddressList {
+    <#
+    .SYNOPSIS
+        Replaces the whole EmailAddresses collection with a single Set-Mailbox call.
+
+    .DESCRIPTION
+        Exchange's documented "replace all existing proxy addresses with the values you specify"
+        form. It is the only way to promote an address the object already carries without first
+        releasing it: one call, so the address is never absent from the mailbox - where a Remove
+        followed by an Add leaves it absent if the Add fails.
+
+        The caller must hand over the object's complete address list. Anything left out of it is
+        removed from the mailbox, which is why Get-MigrationAddressChangeSet builds that list
+        rather than each call site, and why an empty list throws rather than being ignored: it
+        would leave the mailbox with no addresses at all.
+
+    .EXAMPLE
+        Set-MailboxAddressList -Identity 'john.smith@newco.com' `
+            -Address @('smtp:jsmith@contoso.com', 'SMTP:john.smith@newco.com')
+
+        Promotes the alias john.smith@newco.com to primary and demotes the old primary, in one call.
+    #>
+    [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'The caller gates the row with ShouldProcess and Invoke-MigrationAction honours -DryRun.')]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Identity,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Address
+    )
+
+    # An empty list would strip every address off the mailbox, so it can only be a caller bug -
+    # and a silent return would hand the row a Succeeded it never earned.
+    if (@($Address).Count -eq 0) {
+        throw 'Set-MailboxAddressList was given an empty address list; a replace-all write with ' +
+            'no entries would strip every address.'
+    }
+
+    $description = "Replace addresses on ${Identity}: $(@($Address) -join ', ')"
+
+    Invoke-MigrationAction -Description $description -Action {
+        Set-Mailbox -Identity $Identity -EmailAddresses $Address -ErrorAction Stop
+    }
+}
+
 function Set-MailboxAttribute {
     <#
     .SYNOPSIS
@@ -493,12 +554,35 @@ try {
     $planRows = @(Import-MigrationPlan -Path $PlanPath -Wave $Wave)
     Write-MigrationLog -Message "Loaded $($planRows.Count) plan row(s) from $PlanPath" -Level INFO
 
-    $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+
+    # What both sides are held to. -TenantId when the operator named one; otherwise Graph's own
+    # tenant, because a cutover writes both sides of the same object: the tenant Graph signed in
+    # to is by definition the one the mailbox edits have to land in, pinned or not.
+    $graphTenantId = [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '')
+    $expectedTenant = if ($TenantId) { $TenantId } else { $graphTenantId }
 
     $needsExchange = @($requestedActions | Where-Object { $exchangeActions -contains $_ }).Count -gt 0
+    $exoConnection = $null
     if ($needsExchange) {
-        $null = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+        $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
+            -TenantId $expectedTenant
     }
+
+    # Falling back to Graph's tenant means the assert normally has something to compare, so it
+    # never reaches its own "no tenant was specified" branch. That branch's warning still has to
+    # be said out loud, because an unpinned run is exactly the one an operator should notice.
+    # If Graph reported no tenant either there is nothing to name, and the assert's own
+    # unverifiable-connection warning covers it - saying it twice, once with a hole in the
+    # sentence, would only be noise.
+    if (-not $TenantId -and $expectedTenant) {
+        Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
+            'Pass -TenantId to guard against a cached session.') -Level WARNING
+    }
+
+    # One check over whatever this run connected.
+    $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenant -GraphContext $graphContext `
+        -ExchangeConnection $exoConnection -Purpose 'Identity cutover'
 
     $index = 0
     foreach ($row in $planRows) {
@@ -673,14 +757,41 @@ try {
                                     break
                                 }
 
-                                if ($changeSet.RemoveBeforeAdd.Count -gt 0) {
-                                    Set-MailboxAddress -Identity $objectId -Address $changeSet.RemoveBeforeAdd -Operation Remove
+                                # Which calls have actually landed. A promotion that fails halfway
+                                # leaves the mailbox in a state the operator has to know about, and
+                                # the exception alone never says how far the row got.
+                                $completed = [System.Collections.Generic.List[string]]::new()
+                                $step = ''
+                                try {
+                                    if ($changeSet.PromoteInPlace) {
+                                        # The mailbox already carries the address as an alias:
+                                        # rewrite the whole list in one call rather than releasing
+                                        # it and adding it back, which would leave the mailbox
+                                        # without the address if the second call failed.
+                                        $step = 'replace'
+                                        Set-MailboxAddressList -Identity $objectId -Address $changeSet.ReplaceWith
+                                        $completed.Add($step)
+                                    }
+                                    else {
+                                        $step = 'add'
+                                        Set-MailboxAddress -Identity $objectId `
+                                            -Address @("SMTP:$($changeSet.NewPrimary)") -Operation Add
+                                        $completed.Add($step)
+
+                                        if ($changeSet.RemoveAfterAdd.Count -gt 0) {
+                                            $step = "remove demoted $($changeSet.CurrentPrimary)"
+                                            Set-MailboxAddress -Identity $objectId `
+                                                -Address $changeSet.RemoveAfterAdd -Operation Remove
+                                            $completed.Add($step)
+                                        }
+                                    }
+                                    $detail = $changeSet.PrimaryDetail
                                 }
-                                Set-MailboxAddress -Identity $objectId -Address @("SMTP:$($changeSet.NewPrimary)") -Operation Add
-                                if ($changeSet.RemoveAfterAdd.Count -gt 0) {
-                                    Set-MailboxAddress -Identity $objectId -Address $changeSet.RemoveAfterAdd -Operation Remove
+                                catch {
+                                    $status = 'Failed'
+                                    $done = if ($completed.Count -gt 0) { $completed -join '; ' } else { 'none' }
+                                    $detail = "Completed: $done. Failed at: $step - $($_.Exception.Message)"
                                 }
-                                $detail = $changeSet.PrimaryDetail
                             }
 
                             'Aliases' {

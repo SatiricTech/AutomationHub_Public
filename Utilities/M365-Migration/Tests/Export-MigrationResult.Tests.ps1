@@ -51,6 +51,14 @@ Describe 'Export-MigrationResult' {
             $path = Export-MigrationResult -Rows $script:sampleRows -Name 'Set-Identity' -DryRun
             [System.IO.Path]::GetFileName($path) | Should -Match 'DryRun'
         }
+
+        It 'Produces a filename ConvertFrom-MigrationOutputPath parses back to Name Set-Identity and Suffix Results' {
+            $null = Initialize-MigrationRun -ScriptName 'Set-Identity' -OutputPath $script:workspace
+            $path = Export-MigrationResult -Rows $script:sampleRows -Name 'Set-Identity'
+            $parsed = ConvertFrom-MigrationOutputPath -Path $path
+            $parsed.Name | Should -Be 'Set-Identity'
+            $parsed.Suffix | Should -Be 'Results'
+        }
     }
 
     Context 'Row shape' {

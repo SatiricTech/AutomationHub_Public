@@ -46,10 +46,23 @@ Describe 'Initialize-MigrationRun' {
         $run.Prefix | Should -BeExactly 'Contoso-Wave-1'
     }
 
+    It 'Replaces an underscore in the prefix, since it is the output filename contract''s separator' {
+        $run = Initialize-MigrationRun -ScriptName 'Test-Script' -OutputPath $script:workspace -Prefix 'Client_A'
+        $run.Prefix | Should -BeExactly 'Client-A'
+    }
+
     It 'Honours an explicit -LogPath' {
         $logPath = Join-Path $script:workspace 'explicit.log'
         $run = Initialize-MigrationRun -ScriptName 'Test-Script' -OutputPath $script:workspace -LogPath $logPath
         $run.LogPath | Should -BeExactly $logPath
+    }
+
+    It 'Produces a log filename ConvertFrom-MigrationOutputPath parses back to Name Test-Script' {
+        $run = Initialize-MigrationRun -ScriptName 'Test-Script' -OutputPath $script:workspace -Prefix 'Contoso'
+        $parsed = ConvertFrom-MigrationOutputPath -Path $run.LogPath
+        $parsed.Name | Should -Be 'Test-Script'
+        $parsed.Suffix | Should -Be ''
+        $parsed.Extension | Should -Be 'log'
     }
 
     It 'Records bound parameters in the log' {
@@ -138,6 +151,16 @@ Describe 'Invoke-MigrationAction' {
         { Invoke-MigrationAction -Description 'explode' -Action { throw 'boom' } } |
             Should -Throw -ExpectedMessage '*boom*'
         (Get-Content -LiteralPath $run.LogPath -Raw) | Should -Match '\[ERROR\] Failed: explode - boom'
+    }
+
+    It 'throws when no run context exists instead of executing the action' {
+        InModuleScope M365Migration {
+            $script:MigrationRun = $null
+            $script:ran = $false
+            { Invoke-MigrationAction -Description 'x' -Action { $script:ran = $true } } |
+                Should -Throw '*outside a run*'
+            $script:ran | Should -BeFalse
+        }
     }
 }
 

@@ -123,6 +123,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
                   the MicrosoftTeams module (installed on demand).
     Permissions : Teams Administrator, or Teams Communications Administrator. No Graph scopes
@@ -208,6 +209,9 @@ $run = Initialize-MigrationRun -ScriptName 'Set-MigrationTeamsPhoneAssignments' 
 
 try {
     $isDryRun = [bool]$run.DryRun
+    # Shared by every Export-MigrationReport call in this run, matching the convention the
+    # other toolkit scripts use even though this script only ever writes one report per run.
+    $runTimestamp = Get-Date
 
     # Fail on a bad input path before a sign-in prompt is put in front of the operator.
     if ($PSCmdlet.ParameterSetName -eq 'Csv' -and -not (Test-Path -LiteralPath $CsvPath)) {
@@ -215,6 +219,11 @@ try {
     }
 
     $teamsTenant = Connect-MigrationTeams -TenantId $TenantId
+    # The guard, called unconditionally: with no -TenantId it writes the WARNING banner naming
+    # the tenant the numbers are about to be assigned in, which is the only notice an operator
+    # gets that nothing verified it.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -TeamsTenant $teamsTenant `
+        -Purpose 'Teams phone assignment'
     # Connect-MigrationTeams silently reuses whatever Teams session is already live when
     # -TenantId is omitted, so the connected tenant is surfaced here - before any prompt -
     # rather than trusting the operator to notice a bare GUID buried in an earlier log line.
@@ -254,25 +263,16 @@ try {
         if ($unassigned.Count -eq 0) {
             Write-MigrationLog -Message 'No unassigned numbers found in the tenant inventory.' -Level WARNING
         }
-        elseif ($isDryRun) {
-            Write-MigrationLog -Message "[DRYRUN] Would write $($unassigned.Count) unassigned number(s) to the unassigned-numbers CSV." -Level WARNING
-        }
         else {
             # Same file name Get-MigrationTeamsPhoneAssignments.ps1 -IncludeUnassignedNumbers
-            # writes, so the two scripts' output is interchangeable.
-            $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-            $unassignedCsv = Join-Path -Path $run.OutputDirectory `
-                -ChildPath ("${leader}TeamsPhoneNumbers-Unassigned_" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.csv')
-            try {
-                $unassignedReport | Export-Csv -LiteralPath $unassignedCsv -NoTypeInformation -Encoding utf8 -ErrorAction Stop
-            }
-            catch {
-                throw "Could not write the unassigned-numbers CSV '$unassignedCsv': $($_.Exception.Message)"
-            }
-            Write-MigrationLog -Message "Unassigned numbers CSV: $unassignedCsv" -Level SUCCESS
+            # writes, so the two scripts' output is interchangeable. -SuppressInDryRun matches the
+            # old writer, which never touched disk under -DryRun; nothing is written for zero rows
+            # either, matching the old writer's -gt 0 guard.
+            $null = Export-MigrationReport -Rows $unassignedReport.ToArray() -Name 'TeamsPhoneNumbers' `
+                -Suffix 'Unassigned' -Timestamp $runTimestamp -SuppressInDryRun
         }
 
-        $null = Export-MigrationResult -Rows $listResults.ToArray() -Name 'Set-TeamsPhoneNumbers-Unassigned'
+        $null = Export-MigrationResult -Rows $listResults.ToArray() -Name 'Set-TeamsPhoneAssignments'
 
         # The finally block below still runs on exit, so Complete-MigrationRun is called
         # exactly once and the exit code survives.
@@ -376,6 +376,9 @@ try {
         $status = 'Failed'
         $detail = ''
         $displayName = ''
+        # Set once the number is on the account, so a later failure in the same row can still
+        # report what the tenant now holds.
+        $assigned = $false
         $number = Format-MigrationE164 -Value $item.PhoneNumber
         $numberType = $item.PhoneNumberType
         $policy = $item.VoiceRoutingPolicy
@@ -469,6 +472,7 @@ try {
                     $null = Invoke-MigrationAction -Description "Assign $number ($numberType) to $identity" -Action {
                         Set-CsPhoneNumberAssignment @assignParameters
                     }
+                    $assigned = $true
                     $status = 'Succeeded'
                     $detail = "Assigned $number ($numberType).$locationNote"
 
@@ -490,7 +494,14 @@ try {
         catch {
             $status = 'Failed'
             $message = $_.Exception.Message
-            if ($message -match 'license|licence|capability') {
+            if ($assigned) {
+                # Only the policy grant can fail once the assignment is through, and the number
+                # stays on the account. Re-running this row without knowing that would hit the
+                # 'already assigned to another target' guard instead of retrying the grant, so
+                # the row keeps saying what the tenant now holds - it is still a Failed row.
+                $detail = "$detail Voice routing policy grant failed: $message"
+            }
+            elseif ($message -match 'license|licence|capability') {
                 $detail = 'The user likely lacks a Teams Phone license (assignment needs e.g. Teams Phone ' +
                     "Standard). Original error: $message"
             }

@@ -74,11 +74,14 @@ BeforeAll {
 
         $files = @(Get-ChildItem -Path $OutputPath -Filter 'IdentityPlan_*.csv' -Recurse -ErrorAction SilentlyContinue)
         $rows = if ($files.Count -gt 0) { @(Import-Csv -LiteralPath $files[0].FullName -Encoding utf8) } else { @() }
+        $logs = @(Get-ChildItem -Path $OutputPath -Filter '*.log' -Recurse -ErrorAction SilentlyContinue)
+        $log = if ($logs.Count -gt 0) { Get-Content -LiteralPath $logs[0].FullName -Raw -Encoding utf8 } else { '' }
 
         [pscustomobject]@{
             ExitCode = $exitCode
             Path     = if ($files.Count -gt 0) { $files[0].FullName } else { '' }
             Rows     = $rows
+            Log      = $log
         }
     }
 
@@ -132,7 +135,7 @@ Describe 'New-MigrationIdentityPlan' {
         }
 
         It 'Plans one row per source object' {
-            $script:Full.Rows.Count | Should -Be 17
+            $script:Full.Rows.Count | Should -Be 18
         }
 
         It 'Gives the first John Smith the unsuffixed name' {
@@ -359,6 +362,265 @@ Describe 'New-MigrationIdentityPlan' {
         }
     }
 
+    Context 'An optional inventory with a header and no rows' {
+
+        <#
+            A tenant with no shared mailboxes still produces the SharedMailboxes tab, header and
+            all. Refusing that file would stop the plan over an inventory that is simply empty.
+        #>
+
+        BeforeAll {
+            $script:EmptySharedCsv = Join-Path $TestDrive 'empty-shared.csv'
+            Set-Content -LiteralPath $script:EmptySharedCsv -Encoding utf8 `
+                -Value 'PrimarySmtpAddress,DisplayName,RecipientTypeDetails'
+
+            $parameters = @{} + $script:FullParameters
+            $parameters['SharedMailboxesCsv'] = $script:EmptySharedCsv
+            $script:EmptyShared = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'emptyshared') `
+                -Parameter $parameters
+        }
+
+        It 'Still plans everything else' {
+            $script:EmptyShared.ExitCode | Should -Be 0
+            (Get-PlanRow -Result $script:EmptyShared -Identity 'jsmith@contoso.com').TargetUserPrincipalName |
+                Should -BeExactly 'john.smith@newco.com'
+        }
+
+        It 'Warns that the file had a header and no rows' {
+            $script:EmptyShared.Log | Should -Match ([regex]::Escape(
+                    "[WARNING] -SharedMailboxesCsv '$script:EmptySharedCsv' has a header but no rows; " +
+                    'nothing was taken from it.'))
+        }
+
+        It 'Takes nothing from it' {
+            @($script:EmptyShared.Rows | Where-Object { $_.ObjectType -eq 'Shared' }) | Should -HaveCount 0
+        }
+
+        It 'Tolerates a header-only file in every optional input at once, and names each one' {
+            # The whole point of the rule: a small tenant can legitimately have nothing in any of
+            # these tabs, and the planner's job is still to plan the users.
+            $headerOnly = [ordered]@{
+                UserMailboxesCsv      = 'UserPrincipalName,PrimarySmtpAddress,EmailAddresses'
+                SharedMailboxesCsv    = 'PrimarySmtpAddress,DisplayName,RecipientTypeDetails'
+                GroupsCsv             = 'DisplayName,PrimarySmtpAddress,GroupType'
+                ContactsCsv           = 'DisplayName,ExternalEmailAddress'
+                SkuMapPath            = 'SourceSkuPartNumber,TargetSkuPartNumber'
+                ExclusionRulesPath    = 'Pattern,MatchOn,Reason,MatchType'
+                WaveMapPath           = 'UserPrincipalName,Wave'
+                ReservedAddressesPath = 'UserPrincipalName,PrimarySmtpAddress'
+            }
+
+            $parameters = @{}
+            foreach ($name in $headerOnly.Keys) {
+                $path = Join-Path $TestDrive "headeronly-$name.csv"
+                Set-Content -LiteralPath $path -Encoding utf8 -Value $headerOnly[$name]
+                $parameters[$name] = $path
+            }
+
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'headeronly') -Parameter $parameters
+
+            $result.ExitCode | Should -Be 0
+            (Get-PlanRow -Result $result -Identity 'jsmith@contoso.com').TargetUserPrincipalName |
+                Should -BeExactly 'john.smith@newco.com'
+            foreach ($name in $headerOnly.Keys) {
+                $result.Log | Should -Match ([regex]::Escape(
+                        "-$name '$($parameters[$name])' has a header but no rows; nothing was taken from it."))
+            }
+        }
+
+        It 'Accepts an empty SharedMailboxes tab produced by Export-MigrationReport -Columns' {
+            <#
+                The real round trip: Get-MigrationInventory writes an empty optional tab through
+                Export-MigrationReport -Columns (Task 18/19 correction), and the planner has to
+                read that file the same way it reads a hand-built header-only CSV. The column
+                list comes from the real populated fixture's own header, not a hardcoded copy, so
+                this cannot silently drift from what Get-MigrationInventory actually produces.
+            #>
+            $realHeader = (Get-Content -LiteralPath (Join-Path $script:Fixtures 'SharedMailboxes.csv') `
+                    -TotalCount 1) -replace '"', '' -split ','
+
+            $reportDir = Join-Path $TestDrive 'export-migration-report-shared'
+            $null = New-Item -Path $reportDir -ItemType Directory -Force
+            $null = Initialize-MigrationRun -ScriptName 'Get-MigrationInventory' -OutputPath $reportDir -Verbosity Low
+            $emptySharedPath = Export-MigrationReport -Rows @() -Name 'SharedMailboxes' -Columns $realHeader
+
+            $parameters = @{} + $script:FullParameters
+            $parameters['SharedMailboxesCsv'] = $emptySharedPath
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'emptyshared-viareport') -Parameter $parameters
+
+            $result.ExitCode | Should -Be 0
+            $result.Log | Should -Match ([regex]::Escape(
+                    "-SharedMailboxesCsv '$emptySharedPath' has a header but no rows; nothing was taken from it."))
+            @($result.Rows | Where-Object { $_.ObjectType -eq 'Shared' }) | Should -HaveCount 0
+        }
+
+        It 'Still fails the run when the required users CSV is the empty one' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'emptyusers') -Parameter @{
+                UsersCsv = $script:EmptySharedCsv
+            }
+            $result.ExitCode | Should -Be 1
+            $result.Log | Should -BeLike '*contains no data rows*'
+        }
+    }
+
+    Context 'A mail domain of its own' {
+
+        BeforeAll {
+            $parameters = @{} + $script:FullParameters
+            $parameters['SmtpDomain'] = 'mail.newco.com'
+            $script:MailDomain = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain') `
+                -Parameter $parameters
+        }
+
+        It 'Signs users in on the target domain and mails them in the SMTP domain' {
+            $row = Get-PlanRow -Result $script:MailDomain -Identity 'jsmith@contoso.com'
+            $row.TargetUserPrincipalName | Should -BeExactly 'john.smith@newco.com'
+            $row.TargetPrimarySmtp | Should -BeExactly 'john.smith@mail.newco.com'
+            $row.PlanStatus | Should -BeExactly 'UpnSmtpDiverge'
+        }
+
+        It 'Keeps the interim mail address equal to the target one even with an interim domain' {
+            # The interim domain stands in for a vanity domain the source still holds. A separate
+            # mail domain is not that domain, so there is nothing for it to stand in for.
+            $row = Get-PlanRow -Result $script:MailDomain -Identity 'jsmith@contoso.com'
+            $row.InterimUserPrincipalName | Should -BeExactly 'john.smith@newco.onmicrosoft.com'
+            $row.InterimPrimarySmtp | Should -BeExactly $row.TargetPrimarySmtp
+        }
+
+        It 'Moves recipients that have no UPN too, and leaves them Planned' {
+            $row = Get-PlanRow -Result $script:MailDomain -Identity 'accounts@contoso.com'
+            $row.TargetPrimarySmtp | Should -BeExactly 'accounts@mail.newco.com'
+            $row.TargetUserPrincipalName | Should -BeExactly ''
+            $row.PlanStatus | Should -BeExactly 'Planned'
+        }
+
+        It 'Normalises a leading @ and upper case the way -TargetDomain does' {
+            $parameters = @{} + $script:FullParameters
+            $parameters['SmtpDomain'] = '@Mail.NewCo.COM'
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-normalise') -Parameter $parameters
+            (Get-PlanRow -Result $result -Identity 'jsmith@contoso.com').TargetPrimarySmtp |
+                Should -BeExactly 'john.smith@mail.newco.com'
+        }
+
+        It 'Warns that the interim domain covers the sign-in address only' {
+            # Interim and target SMTP being identical while the UPNs differ reads like a bug unless
+            # the log says why, and this is the run where an operator would notice it.
+            $script:MailDomain.Log | Should -Match ([regex]::Escape(
+                    '[WARNING] -InterimDomain applies to the sign-in address only: the primary SMTP address ' +
+                    'is planned directly on mail.newco.com because -SmtpDomain differs from -TargetDomain.'))
+        }
+
+        It 'Says nothing of the sort when mail stays in the target domain' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-quiet') `
+                -Parameter $script:FullParameters
+            $result.Log | Should -Not -BeLike '*applies to the sign-in address only*'
+        }
+
+        It 'Resolves a collision against the mail domain, where the address will actually exist' {
+            $listPath = Join-Path $TestDrive 'reserved-mail-domain.txt'
+            @('# already live in the destination', 'john.smith@mail.newco.com') |
+                Set-Content -LiteralPath $listPath -Encoding utf8
+
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-reserved') -Parameter @{
+                SmtpDomain            = 'mail.newco.com'
+                ReservedAddressesPath = $listPath
+            }
+
+            $row = Get-PlanRow -Result $result -Identity 'jsmith@contoso.com'
+            $row.PlanStatus | Should -BeExactly 'Collision'
+            $row.TargetPrimarySmtp | Should -BeExactly 'john.smith2@mail.newco.com'
+            $row.PlanDetail | Should -BeLike '*SMTP john.smith@mail.newco.com is already reserved in the destination*'
+            $row.PlanDetail | Should -BeLike '*used john.smith2@mail.newco.com*'
+            # The UPN lives in a different domain and nothing there is taken, so it keeps its name.
+            $row.TargetUserPrincipalName | Should -BeExactly 'john.smith@newco.com'
+        }
+
+        It 'Leaves the mail address alone when only the target-domain address is reserved' {
+            $listPath = Join-Path $TestDrive 'reserved-target-domain.txt'
+            @('john.smith@newco.com') | Set-Content -LiteralPath $listPath -Encoding utf8
+
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-upnonly') -Parameter @{
+                SmtpDomain            = 'mail.newco.com'
+                ReservedAddressesPath = $listPath
+            }
+
+            $row = Get-PlanRow -Result $result -Identity 'jsmith@contoso.com'
+            $row.TargetPrimarySmtp | Should -BeExactly 'john.smith@mail.newco.com'
+            $row.InterimPrimarySmtp | Should -BeExactly 'john.smith@mail.newco.com'
+            $row.PlanDetail | Should -Not -BeLike '*SMTP*'
+            # The UPN side is the one that collided; only it takes the suffix.
+            $row.TargetUserPrincipalName | Should -BeExactly 'john.smith2@newco.com'
+        }
+
+        It 'Changes nothing when it names the target domain itself' {
+            $parameters = @{} + $script:FullParameters
+            $parameters['SmtpDomain'] = 'newco.com'
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'smtpdomain-same') -Parameter $parameters
+            $row = Get-PlanRow -Result $result -Identity 'jsmith@contoso.com'
+            $row.TargetPrimarySmtp | Should -BeExactly 'john.smith@newco.com'
+            $row.InterimPrimarySmtp | Should -BeExactly 'john.smith@newco.onmicrosoft.com'
+            $row.PlanStatus | Should -BeExactly 'Planned'
+        }
+    }
+
+    Context 'The shipped templates' {
+
+        BeforeAll {
+            # The samples are run for real against the fixture inventory: shipping a template that
+            # the planner cannot act on is exactly the kind of rot a test has to catch.
+            $templates = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Templates')).ProviderPath
+            $script:Templated = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'templates') -Parameter @{
+                SharedMailboxesCsv = (Join-Path $script:Fixtures 'SharedMailboxes.csv')
+                GroupsCsv          = (Join-Path $script:Fixtures 'Groups.csv')
+                ExclusionRulesPath = (Join-Path $templates 'ExclusionRules.sample.csv')
+                WaveMapPath        = (Join-Path $templates 'WaveMap.sample.csv')
+            }
+        }
+
+        It 'Runs with the samples as shipped' {
+            $script:Templated.ExitCode | Should -Be 0
+            $script:Templated.Path | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Gives each mapped recipient the wave the sample names, not -DefaultWave' {
+            (Get-PlanRow -Result $script:Templated -Identity 'accounts@contoso.com').Wave | Should -BeExactly '2'
+            (Get-PlanRow -Result $script:Templated -Identity 'allstaff@contoso.com').Wave | Should -BeExactly '3'
+            # Unlisted recipients fall back to the default, so the two above are the wave map working.
+            (Get-PlanRow -Result $script:Templated -Identity 'rdubois@contoso.com').Wave | Should -BeExactly '1'
+        }
+
+        It 'Excludes by the sample wildcard rule' {
+            $row = Get-PlanRow -Result $script:Templated -Identity 'break-glass-admin@contoso.com'
+            $row.PlanStatus | Should -BeExactly 'Excluded'
+            $row.ExcludeReason | Should -BeExactly (
+                'Emergency access account - must never be migrated or have its password reset')
+        }
+
+        It 'Excludes by the sample Regex rule, which the wildcard rules cannot match' {
+            # ops.breakglass@contoso.com is in the inventory precisely because only
+            # '^.+\.breakglass@.+$' catches it - 'break-glass*' does not.
+            $row = Get-PlanRow -Result $script:Templated -Identity 'ops.breakglass@contoso.com'
+            $row.PlanStatus | Should -BeExactly 'Excluded'
+            $row.ExcludeReason | Should -BeExactly (
+                'Emergency access account held outside the normal naming scheme')
+        }
+
+        It 'Offers MatchType in the exclusion rules sample and uses it at least once' {
+            $sample = Join-Path $PSScriptRoot '..' 'Templates' 'ExclusionRules.sample.csv'
+            $rules = @(Import-Csv -LiteralPath $sample)
+            @($rules[0].PSObject.Properties.Name) | Should -Contain 'MatchType'
+            @($rules | Where-Object { $_.MatchType -eq 'Regex' }).Count | Should -BeGreaterThan 0
+            @($rules | Where-Object { $_.MatchType -notin @('Wildcard', 'Regex') }).Count | Should -Be 0
+        }
+
+        It 'Ships a wave map sample with the columns the planner requires' {
+            $sample = Join-Path $PSScriptRoot '..' 'Templates' 'WaveMap.sample.csv'
+            $waves = @(Import-Csv -LiteralPath $sample)
+            @($waves[0].PSObject.Properties.Name) | Should -Be @('UserPrincipalName', 'Wave')
+            $waves.Count | Should -Be 3
+        }
+    }
+
     Context 'Re-planning against an existing plan' {
 
         BeforeAll {
@@ -448,6 +710,60 @@ Describe 'New-MigrationIdentityPlan' {
         }
     }
 
+    Context 'Reserved addresses read from a destination inventory the exporter defused' {
+
+        BeforeAll {
+            # '=old@old.com' - an alias a previous migration tool left behind - is the case
+            # ConvertTo-MigrationSafeCell's own help cites, and it is the one that reaches
+            # here: a shared mailbox is named with the 'Keep' template, which preserves every
+            # character of the source local part except a leading '.' or '-', so an '='
+            # survives into the computed destination address. A destination inventory holding
+            # that address comes back from Export-MigrationReport defused, and the reserved
+            # list has to recognise it anyway or the collision goes unnoticed.
+            $script:ReservedInventoryDir = Join-Path $TestDrive 'reserved-inventory'
+            $null = Initialize-MigrationRun -ScriptName 'Get-Inventory' -OutputPath $script:ReservedInventoryDir
+
+            $script:ReservedCsv = Export-MigrationReport -Name 'Users' -Rows @(
+                [pscustomobject]@{
+                    UserPrincipalName  = '=reception@newco.com'
+                    PrimarySmtpAddress = '=reception@newco.com'
+                }
+            )
+
+            $script:SharedCsv = Join-Path $TestDrive 'shared-formula-leader.csv'
+            @(
+                [pscustomobject]@{
+                    UserPrincipalName    = '=reception@contoso.com'
+                    DisplayName          = 'Reception'
+                    PrimarySmtpAddress   = '=reception@contoso.com'
+                    RecipientTypeDetails = 'SharedMailbox'
+                    EmailAddresses       = 'SMTP:=reception@contoso.com'
+                }
+            ) | Export-Csv -LiteralPath $script:SharedCsv -NoTypeInformation -Encoding utf8
+
+            $script:ReservedInventory = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'reserved-csv') `
+                -Parameter @{
+                    SharedMailboxesCsv    = $script:SharedCsv
+                    ReservedAddressesPath = $script:ReservedCsv
+                }
+        }
+
+        It 'Writes the address to the reserved file with its formula leader defused' {
+            # Proves the fixture really is the shape the finding describes, rather than a
+            # file the exporter happened to leave alone.
+            (@(Import-Csv -LiteralPath $script:ReservedCsv)[0]).PrimarySmtpAddress |
+                Should -BeExactly "'=reception@newco.com"
+        }
+
+        It 'Still recognises the address as reserved and flags the collision' {
+            $row = Get-PlanRow -Result $script:ReservedInventory -Identity '=reception@contoso.com'
+            $row | Should -Not -BeNullOrEmpty
+            $row.PlanStatus | Should -BeExactly 'Collision'
+            $row.TargetPrimarySmtp | Should -Not -BeExactly '=reception@newco.com'
+            $row.PlanDetail | Should -Match 'already reserved in the destination'
+        }
+    }
+
     Context 'Include switches' {
 
         BeforeAll {
@@ -527,6 +843,77 @@ Describe 'New-MigrationIdentityPlan' {
             $row.City | Should -BeExactly ''
             $row.EmployeeId | Should -BeExactly ''
             $row.BusinessPhone | Should -BeExactly ''
+        }
+    }
+
+    Context 'The plan filename is on the output contract' {
+
+        It 'Parses back through ConvertFrom-MigrationOutputPath as Name IdentityPlan' {
+            # The plan is named through Get-MigrationOutputPath, the single owner of the
+            # <Prefix>_<Name>_<timestamp>.<ext> contract. This pins the shape so a future
+            # change to either side has to keep the file readable by the parser.
+            $outputPath = Join-Path $TestDrive 'named-plan'
+            # Invoke-PlanRun's own file search only matches the unprefixed name, so the
+            # prefixed one is located here.
+            $null = Invoke-PlanRun -OutputPath $outputPath -Parameter @{ Prefix = 'Contoso' }
+            $file = @(Get-ChildItem -Path $outputPath -Filter '*IdentityPlan_*.csv' -Recurse)
+            $file.Count | Should -Be 1
+            $parsed = ConvertFrom-MigrationOutputPath -Path $file[0].FullName
+
+            $parsed | Should -Not -BeNullOrEmpty
+            $parsed.Prefix | Should -BeExactly 'Contoso'
+            $parsed.Name | Should -BeExactly 'IdentityPlan'
+            $parsed.Suffix | Should -BeExactly ''
+            $parsed.Extension | Should -BeExactly 'csv'
+        }
+    }
+
+    Context 'A users inventory written by Export-MigrationReport' {
+
+        BeforeAll {
+            # The real chain: Get-MigrationInventory writes its Users tab through
+            # Export-MigrationReport, which defuses formula-looking cells, and the planner
+            # reads that same file. Anything the exporter changed on the way out has to be
+            # changed back on the way in, because these columns are copied verbatim into the
+            # plan and from there into the destination tenant by New-MigrationUsers.
+            $script:ChainInventory = Join-Path $TestDrive 'chain-inventory'
+            $null = Initialize-MigrationRun -ScriptName 'Get-Inventory' -OutputPath $script:ChainInventory
+
+            $script:ChainUsersCsv = Export-MigrationReport -Name 'Users' -Rows @(
+                [pscustomobject]@{
+                    UserPrincipalName = 'chain.user@contoso.com'
+                    DisplayName       = 'Chain User'
+                    FirstName         = 'Chain'
+                    LastName          = 'User'
+                    Department        = '-'
+                    MobilePhone       = '+1 (425) 555-0100'
+                    BusinessPhone     = '(425) 555-0199'
+                    JobTitle          = '=Analyst'
+                    UsageLocation     = 'IE'
+                }
+            )
+        }
+
+        It 'Carries a formatted phone number into the plan unchanged' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'chain-plan') `
+                -Parameter @{ UsersCsv = $script:ChainUsersCsv }
+            $row = Get-PlanRow -Result $result -Identity 'chain.user@contoso.com'
+            $row.MobilePhone | Should -BeExactly '+1 (425) 555-0100'
+            $row.BusinessPhone | Should -BeExactly '(425) 555-0199'
+        }
+
+        It 'Carries a hyphen placeholder into the plan as a hyphen' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'chain-plan-2') `
+                -Parameter @{ UsersCsv = $script:ChainUsersCsv }
+            $row = Get-PlanRow -Result $result -Identity 'chain.user@contoso.com'
+            $row.Department | Should -BeExactly '-'
+        }
+
+        It 'Undoes the exporter''s apostrophe on a value that really did start with =' {
+            $result = Invoke-PlanRun -OutputPath (Join-Path $TestDrive 'chain-plan-3') `
+                -Parameter @{ UsersCsv = $script:ChainUsersCsv }
+            $row = Get-PlanRow -Result $result -Identity 'chain.user@contoso.com'
+            $row.JobTitle | Should -BeExactly '=Analyst'
         }
     }
 }

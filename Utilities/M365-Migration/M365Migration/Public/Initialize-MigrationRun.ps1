@@ -95,11 +95,13 @@ function Initialize-MigrationRun {
         }
     }
 
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $resolvedLogPath = $LogPath
     if ([string]::IsNullOrWhiteSpace($resolvedLogPath)) {
-        $logName = if ($cleanPrefix) { "${cleanPrefix}_${ScriptName}_$timestamp.log" } else { "${ScriptName}_$timestamp.log" }
-        $resolvedLogPath = Join-Path -Path $directory -ChildPath $logName
+        # The run context does not exist yet at this point (it is built a few lines below),
+        # so -Directory and -Prefix are passed explicitly rather than left for
+        # Get-MigrationOutputPath to resolve from Get-MigrationRunContext.
+        $resolvedLogPath = Get-MigrationOutputPath -Directory $directory -Prefix $cleanPrefix -Name $ScriptName `
+            -Extension 'log'
     }
 
     $script:MigrationRun = @{
@@ -126,7 +128,9 @@ function Initialize-MigrationRun {
     if ($BoundParameters -and $BoundParameters.Count -gt 0) {
         # Anything whose name reads like a secret is masked. The pattern is deliberately
         # broad: a false positive costs a masked log line, a false negative leaks a credential.
-        $secretPattern = 'password|passphrase|secret|credential|token|apikey|api-key|certificate|thumbprint|key$'
+        # It is shared with the settings validator and the driver writer so the three cannot
+        # drift apart (Get-MigrationSecretNamePattern).
+        $secretPattern = Get-MigrationSecretNamePattern
         foreach ($name in ($BoundParameters.Keys | Sort-Object)) {
             $value = if ($name -match $secretPattern) {
                 '***masked***'

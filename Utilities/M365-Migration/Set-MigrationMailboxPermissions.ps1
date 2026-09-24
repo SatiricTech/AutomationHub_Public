@@ -66,6 +66,19 @@
     Also act on mailboxes whose plan row has PlanStatus Collision. By default only Planned,
     ManualOverride and UpnSmtpDiverge rows are actioned.
 
+.PARAMETER TenantId
+    Pins the run to the destination tenant: its onmicrosoft.com domain or its tenant ID. This is
+    the gate. Exchange Online has no sign-in pin outside GDAP, so the check happens after the
+    session is established or reused - when the connected session is not this tenant the run stops
+    before the first grant instead of writing permissions into whatever tenant a leftover session
+    belongs to. Pass it on every run.
+
+    It also decides how the accepted-domain check is treated. With -TenantId that check is a
+    second opinion and a disagreement is reported as a WARNING - the accepted-domain list is only
+    as good as the plan's first mapped address. Without -TenantId nothing else has verified the
+    tenant, so a connected organisation that does not accept mail for the plan's destination
+    domain stops the run before the first grant.
+
 .PARAMETER DelegatedOrganization
     Customer tenant for Exchange Online, e.g. newco.onmicrosoft.com. Required when running as a
     partner against a customer tenant.
@@ -114,6 +127,7 @@
 
 .NOTES
     Author       : AutomationHub
+    Version      : 1.2.0
     Requires     : PowerShell 7.4, ExchangeOnlineManagement
     EXO roles    : Exchange Administrator, or a role group holding the Mail Recipients role.
                    Add-MailboxPermission, Add-RecipientPermission, Set-Mailbox
@@ -161,6 +175,11 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$IncludeCollisions,
+
+    [Parameter(Mandatory = $false)]
+    [AllowNull()]
+    [AllowEmptyString()]
+    [string]$TenantId,
 
     [Parameter(Mandatory = $false)]
     [Alias('Tenant')]
@@ -873,17 +892,30 @@ try {
 
     Write-MigrationLog -Message "$($wanted.Count) permission(s) to evaluate." -Level INFO
 
-    $connection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
+    $connection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization -TenantId $TenantId
+
+    # The gate. Connect-MigrationExchange reuses whatever session is already live, which in a
+    # chained cutover shell can be the source tenant's session left open by an earlier script;
+    # -TenantId is what turns that into a stop. Passing it unconditionally is deliberate: with no
+    # -TenantId the assert writes the WARNING banner naming the tenant this run is about to write
+    # into, which is the only signal an operator gets that nothing verified it.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -ExchangeConnection $connection `
+        -Purpose 'Mailbox permissions'
+
     $connectedOrganization = if ($connection -and $connection.PSObject.Properties['Organization']) {
         [string]$connection.Organization
     } else { '' }
 
-    # Connect-MigrationExchange reuses whatever session is already live, which in a chained
-    # cutover shell can be the source tenant's session left open by an earlier script. Confirming
-    # the connected organisation actually accepts a destination domain is a cheap check against
-    # writing into the wrong tenant; it degrades to a warning rather than a hard stop when the
-    # read itself is unavailable, so a permissions gap on Get-AcceptedDomain does not block a run
-    # the operator can see is fine.
+    # Corroboration: does the connected organisation actually accept mail for the domain the plan
+    # maps into? How a disagreement is treated depends on whether the run was pinned.
+    #   -TenantId given  - the assert above is the gate, so this is only a second opinion and a
+    #                      disagreement is a WARNING. The accepted-domain list is only as good as
+    #                      the plan's first mapped address, and a legitimate run against a tenant
+    #                      that has not yet added the vanity domain must not be blocked by it.
+    #   -TenantId absent - nothing has verified the tenant, so this is the only check standing
+    #                      between a stale session and a wrong-tenant write. It stays a hard stop,
+    #                      exactly as it was before -TenantId existed: an unpinned run must not
+    #                      come out weaker than it used to be.
     $targetDomain = ''
     foreach ($value in $addressMap.Values) {
         $at = ([string]$value).LastIndexOf('@')
@@ -899,9 +931,16 @@ try {
                 "it is the destination tenant: $($_.Exception.Message)") -Level WARNING
         }
         if ($acceptedDomains.Count -gt 0 -and -not ($acceptedDomains | Where-Object { $_ -ieq $targetDomain })) {
-            throw ("Connected to '$connectedOrganization', which does not accept mail for '$targetDomain' - is " +
-                'this the destination tenant? Pass -DelegatedOrganization for the customer tenant, or sign in ' +
-                'directly to it.')
+            $domainMismatch = "Connected to '$connectedOrganization', which does not accept mail for " +
+                "'$targetDomain' - is this the destination tenant? Pass -DelegatedOrganization for a customer " +
+                'tenant, or sign in directly to it.'
+            if ($TenantId) {
+                Write-MigrationLog -Message ("$domainMismatch -TenantId matched the connected session, so this " +
+                    'is reported rather than enforced.') -Level WARNING
+            }
+            else {
+                throw $domainMismatch
+            }
         }
         Write-MigrationLog -Message "Connected to Exchange Online organisation '$connectedOrganization'." -Level INFO
     }

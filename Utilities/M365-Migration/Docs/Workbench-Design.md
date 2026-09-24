@@ -1,0 +1,815 @@
+# M365 Migration Workbench — design
+
+Status: approved 2026-09-18. This document is binding for the implementation on branch
+`feature/m365-migration-workbench`; change the document before changing the behaviour it
+describes.
+
+## 1. What this is
+
+A front door on the existing 17-script toolkit. The operator points it at a migration folder;
+it reads what is already there, keeps the migration's settings in one JSON file beside the
+outputs, presents the scripts both as guided phases with detected state and as a flat toolbox,
+builds the exact command line for a step, runs it with a live log, and records what ran.
+
+Three ways in, one engine:
+
+| Mode | How | Where |
+|---|---|---|
+| Console workbench | `Start-MigrationWorkbench.ps1 [-Workspace <dir>]` | macOS, Linux, Windows (default off Windows, `-Console` forces it on Windows) |
+| WinForms workbench | same script, no `-Console`, on Windows | Windows with pwsh 7.4+ (`Start-MigrationWorkbench.cmd` double-click launcher) |
+| Non-interactive | `Start-MigrationWorkbench.ps1 -Workspace <dir> -Step <id> [-Wave ...] [-DryRun] [-Set @{...}]` | anywhere; exits with the step's exit code |
+
+Every one of the 17 scripts keeps every option it has today. The workbench never bypasses a
+script; it only builds the command an operator could have typed.
+
+### Non-goals
+
+- No web UI, no third-party TUI module, no compiled host. Nothing that works around a
+  Microsoft product limit.
+- No plan editor. The identity plan is edited in Excel/CSV as today; the workbench shows it,
+  pins it and reconciles it.
+- No batching of several steps into one child process (v2 candidate — see backlog).
+- No secrets in the settings file, ever.
+
+## 2. Decisions and why
+
+| Decision | Why |
+|---|---|
+| Engine functions live in `M365Migration/Public` (one per file), not a second module | The toolkit *is* the build; one manifest, one test that pins exports. The scripts never call the workbench functions; the dependency direction is workbench → toolkit only. |
+| WinForms on Windows + console everywhere, both thin over the engine | WinForms/WPF do not exist off Windows; a browser cannot return a folder path and a local HTTP listener is custom infrastructure. The console mode is the product; the window is a skin. Both render from the same catalog objects, and a test asserts they list the same steps. |
+| One child `pwsh` process per step | Scripts call `exit` at top level, `Import-Module -Force`, and hold process-global Graph/EXO/Teams sessions. In-session execution is how a cached SOURCE session reaches a DESTINATION writer. Graph re-auth is silent after the first sign-in (on-disk cache); EXO and Teams cost one browser/WAM click per step. |
+| A generated driver `.ps1` per run, executed with `-File` | `pwsh -File` flattens arrays and hashtables (`-AliasDomainMap @{...}`) to strings; a splat in a driver file does not. The driver is also a reproducible artefact of exactly what ran. |
+| Parameters are read from the scripts (`Get-Command`) plus a hand-written overlay | Hand-copying 17 param blocks rots silently. The overlay holds only what the AST cannot know (phase, side, bindings, resolvers, artefacts, exit-code meaning) and a test refuses any overlay key that is not a real parameter. |
+| Tenant IDs are GUIDs in settings | The Exchange tenant assertion only works on GUIDs. A domain typed in the settings form is resolved to its GUID through the public OIDC discovery document, no sign-in needed. |
+| The workspace is the selected folder and it is `-OutputPath` | Files land exactly where the README says today; anyone can drop to the CLI mid-migration. |
+| Newest file is chosen by the timestamp in its name, never by mtime | Sync tools (OneDrive, Egnyte) rewrite mtimes. |
+
+## 3. Workspace model
+
+```
+<workspace>/                                   -OutputPath for every step
+  M365Migration.settings.json                  created by the workbench; client data; git-ignored
+  Workbench/
+    Runs.jsonl                                 one line per run (see 7.4)
+    Runs/<yyyyMMdd-HHmmss>_<StepId>/           driver.ps1, stdout.txt, stderr.txt
+  Source/        Source_<Tab>_<ts>.csv ...     -Prefix Source       (inventory)
+  Destination/   Destination_<Tab>_<ts>.csv    -Prefix Destination  (inventory)
+  Post/          Post_<Tab>_<ts>.csv           -Prefix Post         (post-migration inventory)
+  <Label>/       <Label>_IdentityPlan_<ts>.csv, <Label>_<Id>-Results_<ts>.csv, logs, reports
+```
+
+One migration per workspace. The workbench's "new workspace" flow creates
+`<default root>/<Label>/` (default root: `%LOCALAPPDATA%\Migration-Automations` on Windows,
+`~/Migration-Automations` elsewhere — `Get-MigrationDefaultOutputRoot`, now exported). An
+existing root that already holds `Source/`, `Destination/` and a label folder is a valid
+workspace as-is.
+
+Input files the operator supplies (SKU map, exclusion rules, wave map) may live anywhere; a
+path inside the workspace is stored relative to it, any other path is stored absolute.
+
+## 4. Settings file
+
+`M365Migration.settings.json`, UTF-8 without BOM, key order preserved on round-trip. The
+committed template is `Templates/M365Migration.settings.example.json`; the real filename is in
+`.gitignore`. Only the example ever enters the repository.
+
+```json
+{
+  "SchemaVersion": 1,
+  "Label": "Contoso",
+  "Scenario": "TenantToTenant",
+  "Source":      { "TenantId": "<guid>", "DisplayName": "", "OnMicrosoftDomain": "contoso.onmicrosoft.com", "DelegatedOrganization": "" },
+  "Destination": { "TenantId": "<guid>", "DisplayName": "", "OnMicrosoftDomain": "newco.onmicrosoft.com",   "DelegatedOrganization": "" },
+  "Domains":     { "Target": "contoso.com", "Release": "", "Smtp": "", "Interim": "" },
+  "Plan":        { "UpnFormat": "First.Last", "SmtpFormat": "", "MailNicknameFormat": "", "DefaultWave": "1",
+                   "DefaultUsageLocation": "US", "SkuMapPath": "", "ExclusionRulesPath": "", "WaveMapPath": "",
+                   "PreserveAliases": false, "AliasDomainMap": {}, "IncludeDisabled": false, "IncludeGuests": false,
+                   "IncludeSynced": false },
+  "Defaults":    { "Verbosity": "Medium", "IncludeCollisions": false, "UseInterim": false, "Tool": "AvePoint",
+                   "PasswordLength": 16, "WordCount": 3 },
+  "Pinned":      { "PlanPath": "" },
+  "VivaLearning": { "ClientId": "", "CertificateThumbprint": "", "LearningProviderId": "" }
+}
+```
+
+Rules:
+
+- `Scenario` ∈ `TenantToTenant` | `InPlaceRedesign`. In-place: Source and Destination hold the
+  same GUID; the phase view hides mapping export, domain release and Fly; identity cutover runs
+  with `-MatchOn Source`.
+- `Domains.Target` is the vanity domain the identities land on in the destination, and feeds
+  `-TargetDomain` (planner, Viva import). `Domains.Release` is the vanity domain being released
+  from the **source** tenant, and feeds `-Domain` (domain release). They are the same string
+  only when the vanity domain moves with the users, which is the common case but not the rule:
+  a migration onto a new brand releases one domain and lands on another. `Domains.Release`
+  blank therefore means "same as Target", and the **effective release domain** — the one the
+  domain-release step is given and the one `TypedConfirmation` makes the operator type — is
+  `Domains.Release` if non-empty, else `Domains.Target`. That fallback is a named rule in the
+  argument resolver, because a blank bound value is otherwise simply skipped.
+  `Domains.Smtp` blank = same as Target; otherwise it feeds the planner's new `-SmtpDomain`.
+  `Domains.Interim` blank = not needed; the settings form reads `Destination_Domains_*.csv`
+  and says whether Target is already verified in the destination (KnownDocGaps #6).
+- `Pinned.PlanPath` blank = newest `<Label>_IdentityPlan_*.csv`. Pinning is what makes a
+  re-plan safe: `-ExistingPlanPath` defaults to the pinned plan.
+- No key may match the module's secret-name pattern
+  (`password|passphrase|secret|credential|token|apikey|api-key|certificate|thumbprint|key$`)
+  except the documented `CertificateThumbprint`, which is a locator, not a secret. A test
+  enforces this on the example file and on every write.
+- The Viva client secret is prompted at run time as a SecureString and passed to the child
+  through an environment variable scoped to that process; it never touches the driver or disk.
+- Loading never throws. `Resolve-MigrationSettings -Path` returns
+  `{ IsValid; Errors; Settings }`; a missing file is a valid "no settings yet" state; unknown
+  keys are an error naming the valid keys; wrong `SchemaVersion` is an error.
+- `Save-MigrationSettings` writes atomically (temp file + move) and keeps a single
+  `.bak` of the previous version.
+
+## 5. Step catalog
+
+`Get-MigrationStep` returns one object per *step instance*. A script can back several
+instances (inventory × Source/Destination/Post; readiness × Pre/Provisioned/Post; domain
+release × report/remediate). The "All tools" view lists the 17 scripts with every parameter
+free; the phase view lists the instances with their fixed values applied.
+
+### 5.1 What comes from the script
+
+`Get-Command <script path>` supplies, per parameter: name, .NET type, mandatory flag,
+parameter set membership, `ValidateSet` values, `ValidateRange` bounds, `ValidatePattern`,
+aliases, and the default value from the AST (`ParamBlockAst` default expressions). `Get-Help`
+supplies the parameter description shown as help text. Cached per session.
+
+### 5.2 What comes from the overlay — `M365Migration/StepCatalog.psd1`
+
+Keyed by script basename. Every key below is optional except `Phase`, `Side`, `Title`.
+
+```powershell
+'New-MigrationUsers' = @{
+    Title     = 'Provision users'
+    Phase     = 'Prepare'                 # Discover | Plan | Prepare | Cutover
+    Order     = 6                         # runbook step number, drives the phase view order
+    Side      = 'Destination'             # Source | Destination | Offline
+    Scenario  = @('TenantToTenant', 'InPlaceRedesign')
+    Connects  = @('Graph')                # Graph | Exchange | Teams
+    Impact    = 'Write'                   # Read | Write | Destructive
+    ResultId  = 'New-Users'               # the -Name token in <Label>_<ResultId>-Results_<ts>.csv
+    Bind      = @{                        # settings key -> parameter name
+        'Destination.TenantId'       = 'TenantId'
+        'Label'                      = 'Prefix'
+        'Plan.DefaultUsageLocation'  = 'DefaultUsageLocation'
+        'Defaults.IncludeCollisions' = 'IncludeCollisions'
+        'Defaults.UseInterim'        = 'UseInterim'
+        'Defaults.PasswordLength'    = 'PasswordLength'
+        'Defaults.Verbosity'         = 'Verbosity'
+    }
+    Resolve   = @{ PlanPath = 'Plan' }    # parameter -> resolver name (see 5.3)
+    Requires  = @('Plan', 'Readiness-Pre')
+    Produces  = @('Results')              # artefact kinds the scanner looks for: Results | Report:<name> | Inventory | Plan | Mapping | Log
+    ExitCodes = @{ 0 = 'Completed'; 1 = 'Failed'; 2 = 'Some rows failed' }
+    Confirm   = $true                     # pass -Confirm:$false (ConfirmImpact High)
+    Instances = @()                       # see readiness/inventory entries for the shape
+    Notes     = 'Generated passwords are written only to the results file.'
+}
+'Test-MigrationReadiness' = @{
+    ...
+    Instances = @(
+        @{ Id = 'Readiness-Pre';         Title = 'Readiness — pre-provisioning'; Order = 5;  Fixed = @{ Stage = 'Pre' } }
+        @{ Id = 'Readiness-Provisioned'; Title = 'Readiness — provisioned';      Order = 9;  Fixed = @{ Stage = 'Provisioned' }; Resolve = @{ SourceMailboxesCsv = 'Inventory:Source:UserMailboxes' } }
+        @{ Id = 'Readiness-Post';        Title = 'Readiness — post-cutover';     Order = 17; Fixed = @{ Stage = 'Post' } }
+    )
+}
+```
+
+Two details the example does not show. A script that names its results by mode carries
+`ResultIds` as well as `ResultId` — `Compare-MigrationUserData` writes `Compare-UserData` in
+CSV mode and `Compare-UserData-Plan` in plan mode — and the drift guard compares that list
+with the `-Name` literals the script really passes to `Export-MigrationResult`. An instance
+may override any key of its script's entry, `Bind` included; `Bind` merges on the target
+parameter rather than the settings key, so the inventory's destination-side instances replace
+the entry's `Source.TenantId` → `-TenantId` binding instead of leaving both standing.
+`Requires` names either a step instance (which must be `Done`) or an artefact kind from the
+`Produces` vocabulary (which must exist), so a plan supplied by hand satisfies `'Plan'`
+without the planner having run in this workspace.
+
+The drift-guard test (`Tests/StepCatalog.Tests.ps1`) asserts, for every script: an overlay
+entry exists; every `Bind` target, `Resolve` key and `Fixed` key names a real parameter;
+every `Bind` source is a key in the settings schema; every `ValidateSet` value used in
+`Fixed` is valid; every parameter set of the script is representable (its mandatory set can
+be satisfied from Bind ∪ Resolve ∪ Fixed ∪ operator input); and no parameter is silently
+unaccounted for — each is bound, resolved, fixed, operator-entered, or listed in `Ignore`.
+
+### 5.3 Resolvers
+
+Named, pure functions over the workspace scan: `Plan` (pinned or newest plan),
+`Inventory:<Prefix>:<Tab>` (newest `<Prefix>_<Tab>_*.csv`), `Export:<Id>` (another step's
+export, e.g. the Teams `Get-` export for `Remove-`), `Settings:<key>` (a path
+stored in settings), `ExistingPlan` (the pinned plan, else the newest plan in the workspace —
+for the planner re-run; carrying the last plan forward is the safer default, and pinning is
+what freezes it). A resolver returns
+`{ Value; Source; Candidates }` so the UI can show where a value came from and offer the
+alternatives; `Value` is always `Candidates[0]`, and every path is absolute — a settings path
+stored relative is resolved against the workspace.
+
+`Export:<Id>` takes either a step id or one of a step's result tokens, and prefers that
+step's report over its results file where it publishes both: `Get-MigrationTeamsPhoneAssignments`
+writes `Source_Get-TeamsPhoneAssignments-Results_<ts>.csv` (what the export did) and
+`Source_TeamsPhoneAssignments_<ts>.csv` (`Report:TeamsPhoneAssignments` — the number, its type
+and the routing policy). Only the second round-trips into `-CsvPath`, so it is the value and the
+results file stays on the candidate list. The report's name is the token without its leading
+verb, and the preference only applies where the producing step's `Produces` declares it.
+`Settings:<key>` answers with nothing for a blank string or an empty map, so "not configured"
+never reaches a command line, and with a boolean's own value, `$false` included.
+
+### 5.4 Non-catalog knowledge that lives here, not in the scripts
+
+- `[bool]` parameters (`-ForceChangePassword`, `-AutoMapping`) render as checkboxes and are
+  emitted as `-Name $false` / `-Name $true`.
+- `Remove-MigrationDomainReferences` without `-AcknowledgeSourceTenant` is a report-only
+  run; the remediate instance fixes the switch on and is `Impact = 'Destructive'`.
+- `-Debug` and `-Verbose` are never passed (Graph request bodies would reach the console).
+
+## 6. Folder scanner and detected state
+
+`Get-MigrationWorkspace -Path` returns:
+
+```
+Path           the workspace folder, resolved
+SettingsPath   <workspace>/M365Migration.settings.json
+SettingsResult the whole Resolve-MigrationSettings result { Path; Exists; IsValid; Errors; Settings }
+Settings       the settings document, or $null when it is missing or invalid
+Label          from settings, else inferred (below), else ''
+Scenario       from settings, else 'TenantToTenant' - it selects which step instances are scanned
+Folders        [ordered] Source, Destination, Post, Label -> full path or $null
+Artefacts      every parsed file: { Path; Folder; Prefix; Name; Suffix; Timestamp; Extension }
+Plan           { Path; Pinned; Timestamp; RowCount; Waves = [ordered] @{ '1' = 90; '2' = 52 };
+                 Statuses = [ordered] @{ Planned = 134; Collision = 3; ... }; DivergentRows } or $null
+Steps          one entry per step instance:
+               { Id; State; StateSource; StateRun; StateDryRun; LastRun; LastDryRun; Files;
+                 Summary = @{ Succeeded; Failed; Skipped; Planned }; ExitCode; TenantVerified }
+Ledger         the run-ledger entries (7.4), in the order they were appended
+NextStepId     the step to do next, or $null
+Warnings       header-only CSVs, an unreadable plan, a plan newer than the pinned one, a damaged
+               ledger line, an ambiguous label, an unsatisfiable Requires, ...
+```
+
+`Plan.Timestamp`, like every other "when", is the moment in the filename.
+
+Filenames are parsed by `ConvertFrom-MigrationOutputPath` (new, the single owner of the
+`<Prefix>_<Name>[-<Suffix>]_<yyyyMMdd-HHmmss>.<ext>` contract; `Get-MigrationOutputPath`
+is its inverse and every writer in the module uses it). `.bak` files are ignored, and so is
+any other name the contract does not describe — notes and exports live beside the artefacts
+and are not the scanner's business, so they are skipped without a warning.
+
+Which step a file belongs to: a `Results`/`DryRun` file whose name is one of the instance's
+result tokens, in the folder that instance writes to (its fixed `-Prefix`, else the label);
+an inventory by `Prefix` equal to the instance's fixed `-Prefix` and the name `Users`; the
+plan by the name `IdentityPlan` in the label folder; a report by a name the instance's
+`Produces` lists as `Report:<name>`, taken whole (`DomainBlockers-Recheck` is one name).
+A script that names its results by mode carries both tokens as `ResultIds`, and the scanner
+matches on all of them: a CSV-mode comparison run from the command line still belongs to the
+comparison step that only ever writes the plan-mode token itself.
+
+Where two instances of one script could claim the same file (the three readiness stages, the
+domain-release report and remediation) the catalogue's attribution rule decides: the file
+belongs to the instance whose ledger entry recorded it, matched on the entry's `Files` list
+or on its `Started`..`Ended` window, and otherwise to the lowest-ordered instance. `Files`
+entries are matched on the leaf name, so a ledger written with relative or absolute paths
+reads the same, and a file *no* naming rule claims but a ledger entry names — a log, a report
+a future script adds — belongs to that entry's step. `Started` is floored to the whole second
+before the window comparison, because filename stamps carry nothing finer.
+
+Without a settings file the label is inferred: exactly one prefix folder that is not
+`Source`/`Destination`/`Post` and holds at least one parseable artefact is the label folder;
+zero or several leaves `Label` empty and warns, because a guessed label would attribute files
+to the wrong step.
+
+State per step instance:
+
+| State | Rule |
+|---|---|
+| `NotRun` | no artefact and no ledger entry |
+| `DryRun` | newest artefact is a `-DryRun_` results file |
+| `Done` | newest live results has no `Failed` rows and exit code 0 — or a live artefact (results, inventory, plan) exists and the newest ledger entry does not say the run ended some other way |
+| `PartlyFailed` | newest live results has `Failed` rows (exit 2) |
+| `WorkRemains` | ledger exit code 3 (domain references remain) |
+| `Failed` | ledger exit code 1 |
+| `Stale` | done, but the plan it consumed is older than the pinned plan |
+
+Where two rules could both apply, they are settled in this order: `Failed`, `WorkRemains`,
+`DryRun`, `PartlyFailed`, `Done` — a ledger that says the run failed outranks the file it
+managed to write before it did, and a rehearsal newer than the last live run outranks it.
+
+What counts as "live" is narrow, and deliberately so: a `-Results_` file, or the inventory or
+plan a non-results step writes. A log or a report never makes a step `Done` — a domain-release
+report says what the step found, not that it finished, and a log written in the same second as
+a rehearsal would otherwise read as a live run. A step with only logs or reports on disk and
+no ledger entry stays `NotRun`.
+
+Whether a run was a rehearsal is the ledger's to say: when the newest entry for the step
+records `DryRun`, that wins over what the filenames imply; a line that did not record it
+leaves the question to the files. It wins only while it is the *newer* account, though —
+its `Started` at or after the newest live artefact's timestamp. A live run made from the
+command line after a rehearsal leaves a newer artefact and no ledger line of its own, and a
+board that still read `DryRun` there would count the rehearsal's rows and offer the step again.
+
+A recorded run that left nothing behind and carries an exit code the catalogue does not
+define — an abort, a child that died — is `Failed`. It is certainly not `Done`. Nor is a step
+whose newest ledger entry ended that way but which has an *older* live results file on disk:
+`Done` needs an exit code of 0, and only a run with no ledger entry at all may be judged by
+its file.
+
+`Stale` is judged afterwards, only for a step that reads the plan (`Requires` names `Plan`,
+or `Resolve` maps a parameter to the `Plan` resolver), against the plan's own filename
+timestamp, and dated by the step's newest artefact — or, when the run left no file behind, by
+its ledger entry's `Started`.
+
+"Next step" is the lowest-ordered instance whose `Requires` are all `Done` and whose own
+state is not `Done`. A `Requires` entry that names an artefact kind rather than a step
+instance (see 5.2) is satisfied when that artefact exists in the workspace, whether or not
+the step that would have produced it has run here. A `Requires` entry that is neither — not a
+step in the scanned scenario, not a kind in the `Produces` vocabulary — can never be met, so
+it blocks its step and is reported in `Warnings` naming both.
+
+`StateSource`, `StateRun` and `StateDryRun` name the run the state is *about*: the artefact the
+summary was counted from (`Artefact`), the newest ledger entry when the run left no file behind
+(`Ledger`), or `None`. `LastRun` is the newest artefact of any kind, log and report included,
+and is deliberately not the same thing — a front end that dated its summary from `LastRun`
+would print an 11:00 result's counts beside a 12:00 log's timestamp, and would show no date at
+all for a child that died before writing anything. Both front ends render `StateRun`, so the
+stamp and the counts on one line always describe one run.
+
+Reading a results CSV for the summary reads only the `Status` column; the `GeneratedPassword`
+column is never read, rendered or persisted by the workbench.
+
+## 7. Running a step
+
+### 7.1 Resolve
+
+`Resolve-MigrationStepArguments -Step -Workspace [-Override <hashtable>] [-DryRun]
+[-Wave <string[]>]` returns `{ Arguments; ParameterSet; MissingMandatory; Warnings }`, where
+`Arguments` is an ordered list — the script's own declaration order — of
+`{ Name; Value; Source; Warning; Candidates }`.
+
+`Source` is the rung of the precedence ladder that decided the value, highest first:
+`Fixed` (the instance is only that step because of it), `Operator` (`-Override`; a key that is
+not a parameter of the script is dropped and reported in `Warnings`), `Settings` (the `Bind`
+map — a blank setting is not a value and is left out, a boolean always is one),
+`Resolved` (the `Resolve` map, keeping the resolver's `Candidates`), and `Default` — the
+script's own default, **recorded so a form can show it and deliberately not passed**, because
+a default is the script's business and re-stating it would freeze today's value into a driver
+file that outlives the script. A driver emits every argument whose `Source` is not `Default`.
+
+The parameters the workbench owns are always set explicitly: `-OutputPath <workspace>`,
+`-Prefix <instance prefix or Label>` (offline steps take the label too), `-Verbosity
+<settings>`, `-DryRun` when requested, `-Wave` when one is requested and the chosen set can
+hold it, and `-Confirm:$false` for **every script that has a `-Confirm` parameter** — every
+script declaring `SupportsShouldProcess`, not only the High-impact ones. The child runs
+`-NonInteractive` and cannot answer a prompt, so whether it would have prompted must not rest
+on a `ConfirmImpact` sitting below whatever `$ConfirmPreference` that process happens to have.
+The catalogue's `Confirm` flag still means "this script is High impact", which is what the UI
+warns on; it no longer decides whether `-Confirm` is passed.
+
+`-Prefix` and `-Verbosity` are owned the same way but usually arrive earlier, since nearly
+every entry binds `Label` → `-Prefix` and `Defaults.Verbosity` → `-Verbosity`: they normally
+come back as `Settings`, or `Fixed` where an instance pins its own prefix. `Common` on either
+means nothing else had answered. `-LogPath` is never passed: every script derives it from
+`-OutputPath`. `-TenantId` is passed to any script that takes it, from the side's settings
+block where the catalogue does not bind it; `-DelegatedOrganization` only when the settings
+hold one for that side.
+
+`ParameterSet` is the first set the script declares whose mandatory parameters are all
+present, and `MissingMandatory` lists what that set still needs; where no set is satisfiable,
+the closest one is chosen and its gap listed. A value the operator or the instance supplied
+narrows the sets under consideration to the ones that hold it first — which is what makes
+`-TestUser` select the `TestUser` set even though the plan would also have resolved — and
+arguments outside the chosen set are then dropped, because a command line that mixes two sets
+cannot bind at all.
+
+### 7.2 Gates — `Test-MigrationStepGate`
+
+`Test-MigrationStepGate -Step -Arguments <the 7.1 result> -Workspace [-Live]` returns the
+gates as data — `{ Kind; Severity; Satisfied; Message; RequiredInput }` — and both front ends
+render them the same way. Every gate that applies comes back, satisfied ones included: the
+list is a checklist, and a gate the operator has already met is how they know the rehearsal
+counted. The waves and the parameter set are read off the resolved arguments, so the gates
+judge the run that would actually happen.
+
+| Gate | Applies to | Behaviour |
+|---|---|---|
+| `DryRunFirst` | `Impact = Write` and `Destructive`, live runs only | Soft: satisfied by a dry-run ledger entry for that step whose waves match the ones requested (as sets: order and repeats do not count, and two blanks match), whose `Started` is after the plan's timestamp, that was not `Aborted` and whose `ExitCode` is 0 or 2 — an aborted or exit-1 rehearsal proved nothing, while exit 2 is a rehearsal doing its job. Where the ledger records no rehearsal of that step, a `-DryRun_` results file newer than the plan counts instead — a run made from the command line is still a run. With no plan in the workspace, any rehearsal counts. Override allowed, recorded in the ledger. |
+| `TypedConfirmation` | `Impact = Destructive`, and any `Side = Source` step whose `Impact` is not `Read` | Hard: the operator must type `RequiredInput` — the effective release domain (`Domains.Release`, else `Domains.Target`) for a source-side step, otherwise the word `REMOVE`, and `REMOVE` as the fallback where no domain is configured. A keypress/button is not accepted, so the gate is never returned satisfied. Asked for on a rehearsal too: a rehearsal still signs in to the source tenant. A domain is matched without case, because DNS has none and an operator who typed `NewCo.com` typed the domain; anything else — `REMOVE` — is matched with case, because shouting it is the point. A gate that names no `RequiredInput` at all is refused rather than auto-accepted: "nothing to type" must never become "anything is accepted". |
+| `Prerequisite` | steps with `Requires` | Soft: lists what is not in hand. A requirement naming an artefact kind is met by the artefact existing, whoever produced it. |
+| `TenantMismatch` | any connecting step | Hard, post-run: the "Connected to ... tenant <guid>" lines in the child's log are compared with the expected side's GUID; a mismatch is flagged regardless of exit code. Not produced by `Test-MigrationStepGate` — it cannot be known until the child has run, so `Invoke-MigrationStep` (7.3) appends it. The console and the window shout it in red; the unattended path writes it to stderr **and exits 1 whatever the step returned** (§10), because a scheduler has nothing but the exit code. Where the child printed no tenant line at all, the wording says so — that is a sign-in failure, not a wrong GUID — and all three front ends take the sentence from `Format-MigrationTenantVerdict`. |
+| `WaveRequired` | plan consumers | Soft: a blank wave means the whole plan; confirmed explicitly for writers — live runs of a `Write` or `Destructive` step whose chosen parameter set takes `-Wave`. Satisfied once a wave is named. |
+
+### 7.3 Driver and child process
+
+`New-MigrationStepDriver` writes `Workbench/Runs/<ts>_<Id>/driver.ps1`:
+
+```powershell
+#Requires -Version 7.4
+# Generated by Start-MigrationWorkbench <version> on <date> for <workspace>.
+# Re-run by hand: pwsh -NoProfile -File "<this file>"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$parameters = @{
+    PlanPath = '...'
+    Wave     = @('1')
+    TenantId = '...'
+    Prefix   = 'Contoso'
+    OutputPath = '...'
+    DryRun   = $true
+    Confirm  = $false
+}
+
+$ErrorActionPreference = 'Stop'
+try {
+    & '<toolkit path>/New-MigrationUsers.ps1' @parameters
+}
+catch {
+    Write-Error $_
+    exit 1
+}
+exit ([int]$LASTEXITCODE)
+```
+
+The call is guarded because a splat that never binds — an unknown parameter, a value the
+script's `ValidateSet` rejects, a missing mandatory one — leaves `$LASTEXITCODE` unset, and an
+unset `$LASTEXITCODE` exits 0. A driver that exited 0 for a step that never ran would have the
+workbench record `Completed` and the folder scanner show the step as done. A script that exits
+with a code of its own still propagates it, so 2 and 3 keep their meaning.
+
+A secret never appears in the file, and a `SecureString` cannot cross a process boundary, so
+the driver builds it in the child instead:
+`New-MigrationStepDriver -SecretEnvironmentVariable 'ClientSecret=M365MIGRATION_CLIENT_SECRET'`
+emits `$parameters.ClientSecret = ConvertTo-SecureString $env:M365MIGRATION_CLIENT_SECRET
+-AsPlainText -Force` inside the `try`, against the variable `Invoke-MigrationStep -Environment`
+sets on that process alone. The mapping is refused unless the script declares the parameter and
+declares it as a `SecureString`. The command preview shows `-ClientSecret
+$env:M365MIGRATION_CLIENT_SECRET`, never a value.
+
+`Invoke-MigrationStep` runs `<same pwsh as the parent> -NoProfile -NonInteractive
+-ExecutionPolicy Bypass -File driver.ps1` with stdout/stderr redirected to the run folder,
+polls every 250 ms (`[Threading.Thread]::Sleep`, not `Start-Sleep`), reads new complete lines
+from a byte offset and hands them to an injected writer scriptblock (console: `Write-Host`;
+WinForms: the log pane + `DoEvents` pump). Cancel kills the process tree and records
+`Aborted`. The exit code is read from the process object. Files produced are the files in the
+step's prefix folder whose **filename** timestamp is at or after the second the run started —
+names, never mtimes, since a sync client rewrites those — plus any `.log` in that folder
+touched since the run began, because a script opens its log once and appends to it throughout.
+
+Exit-code meaning comes from the overlay; the shared vocabulary is 0 completed, 1 failed,
+2 some rows failed (amber), 3 work remains (amber, domain release), other = see the log.
+
+### 7.4 Ledger
+
+`Workbench/Runs.jsonl`, one JSON object per line, appended after every run:
+`{ Started, Ended, StepId, Script, Side, TenantId, DryRun, Wave, ExitCode, Meaning, Aborted,
+TenantVerified, GateOverrides, Driver, Files, Summary }`. Never contains parameter values
+that match the secret pattern. The scanner reads it for state; the "Results & logs" view lists
+it newest first.
+
+## 8. Console workbench
+
+Pure PowerShell, no third-party modules. Every prompt goes through one seam
+(`Read-MigrationPrompt`, whose implementation `Set-MigrationPromptHandler` replaces; the
+default is `Read-Host`/`PromptForChoice`/`Read-Host -AsSecureString`) so the Pester suite
+drives the whole flow with scripted answers on macOS. `Read-MigrationPrompt.ps1` is the one
+file in the toolkit allowed to prompt, and a test asserts that of every other file.
+
+Screens: workspace pick (folders under the default root + recent list kept in
+`~/.config/M365Migration/recent.json` on macOS/Linux, `%APPDATA%\M365Migration\recent.json`
+on Windows) → first-run settings form (field by field, Enter accepts the suggestion, domain →
+GUID resolved inline) → phase view (default) / all tools / settings / results & logs → step
+form (each parameter with value and provenance; wave pick-list from the plan; file
+parameters offer the resolver's candidates) → gates → command preview → live output → exit
+meaning, Succeeded/Failed/Skipped counts, file paths.
+
+`Show-MigrationWorkbench -Path [-Version]` is the loop; `Format-MigrationWorkbenchView` renders
+each screen as `string[]` so the board can be asserted without a console. Two rules the screens
+above do not spell out. A rehearsal clears only the **hard** gates: the soft ones exist to stop
+a live run going ahead of its evidence, and demanding them of a dry run would leave an operator
+with nothing safe to do. And the settings form asks for every schema key **except**
+`SchemaVersion` — the file format's own version is not a choice an operator has — re-asking only
+the keys a failed validation names.
+
+## 9. WinForms workbench
+
+Lives only in the `#region GUI` of `Start-MigrationWorkbench.ps1`, built inside
+`Start-MigrationWorkbenchGui`, WinForms loaded there and only after the platform check.
+Layout (TableLayoutPanel + Dock/Anchor, `SetHighDpiMode PerMonitorV2`, `AutoScaleMode = Dpi`):
+
+- Top: workspace path + Browse, Label, SOURCE / DESTINATION tenant banner (colour-coded).
+- Left: tabs "Phases" (TreeView: phase → instances with state glyph and last-run text) and
+  "All tools" (ListView of the 17 scripts).
+- Right: the step form generated from the catalog (TextBox / CheckBox / ComboBox for
+  ValidateSet / CheckedListBox for `string[]` ValidateSet and for waves / file and folder
+  pickers for path parameters), provenance shown beside each value, then the read-only
+  command preview and the buttons **Dry run**, **Run**, **Copy command**, **Open folder**.
+- Bottom: log pane (read-only, Consolas, capped), status strip.
+- Dialogs: Settings (same fields as the console form), typed-confirmation dialog, results
+  summary.
+
+The window holds no logic: every button calls an engine function and renders the result. The
+form draws no row for a parameter the workbench owns (`Get-MigrationWorkbenchOwnedParameter`),
+refuses every run action against a workspace `Test-MigrationWorkspaceRunnable` rejects, judges a
+typed confirmation with `Test-MigrationTypedConfirmation` and reports the tenant with
+`Format-MigrationTenantVerdict` — the same four functions the console and the unattended path
+call, because a rule with two implementations is a rule that eventually has two meanings.
+A test dot-sources the script with `-NoGui` on macOS and asserts the GUI's step list equals
+`Get-MigrationStep`.
+
+The four renderers both front ends draw with — `Format-MigrationWorkbenchView`,
+`Format-MigrationStepGlyph`, `Format-MigrationStepLastRun` and `Get-MigrationScriptSynopsisText`
+— are **exported**, not private. They stopped being the console's own business the moment a
+second front end had to draw the same glyph, the same last-run line and the same results list,
+and the alternative to exporting them is a window that re-renders them by hand and eventually
+describes one workspace differently from the board.
+
+## 10. Entry script and launcher
+
+`Start-MigrationWorkbench.ps1` parameters: `-Workspace`, `-Console`, `-Step`, `-Wave`,
+`-DryRun`, `-Set` (hashtable of parameter overrides for non-interactive runs), `-Verbosity`,
+`-LogPath`, `-NoGui` (load-only guard). Its own log goes to `<workspace>/Workbench/` when a
+workspace is known, else to `<root>/Workbench/` — a subfolder of the default output root, never
+the root itself, which is where an operator's migration folders live. `-LogPath` names the file
+and its folder becomes the run's output folder, so a redirected log leaves nothing behind under
+the default root either.
+
+Every refusal the arguments alone decide — no `-Workspace` with `-Step`, a workspace folder that
+is not there, a `-Step` the catalogue does not hold — is made **before** `Initialize-MigrationRun`
+is called. That function creates its `-OutputPath` whether or not a line is ever written there,
+so a refusal made after it leaves a folder behind as the price of telling an operator they made
+a typo. These refusals go to the error stream and the host; there is no log to write them to, and
+that is the point. Each is printed **once**, as a plain line on stderr, and once more to the run
+log where one exists — `Write-Error`'s position block around a one-sentence refusal is three
+quarters scaffolding in the one mode whose whole output a scheduler may be capturing.
+
+`-Step` exits with the step's exit code, **except a tenant mismatch, which exits 1** whatever
+the step returned: a run against the wrong tenant is the strongest post-run finding there is,
+and an unattended caller has only the code. An aborted run still exits 130 — "I stopped this"
+is the fact the caller needs first, and a killed child may simply never have reached the
+sign-in that would have printed a tenant line. A child that reported no exit code at all
+exits 1 rather than 0.
+
+`Start-MigrationWorkbench.cmd`: finds pwsh 7 (`%ProgramFiles%\PowerShell\7\pwsh.exe`, then
+PATH), refuses Windows PowerShell 5.1 with the install link, launches
+`-NoProfile -ExecutionPolicy Bypass -File`, keeps the window open on a non-zero exit. Never
+elevates (WAM breaks under RunAs).
+
+## 11. Toolkit hardening (Part A, done before the workbench)
+
+From the five-lens code review of 2026-09-18. Every existing option is preserved.
+
+Blockers:
+1. `Connect-MigrationExchange`: after a fresh connection, if a GUID was requested and the
+   connected `TenantId` differs, disconnect and throw. `Resolve-MigrationTenantId` (new)
+   turns a domain into its GUID via `https://login.microsoftonline.com/<domain>/v2.0/.well-known/openid-configuration`,
+   so all connectors compare GUIDs. This also fixes `New-MigrationRecipients`' guard, which
+   aborted on the README's own domain-form example.
+2. `Assert-MigrationTenant` (new) replaces the four per-script checks;
+   `Set-MigrationMailboxPermissions` gains `-TenantId`; `Set-MigrationIdentity` passes the
+   Graph GUID to the Exchange connector. Writers that run without `-TenantId` print a
+   prominent warning naming the connected tenant.
+3. `Reset-MigrationCutoverPasswords` and `New-MigrationUsers` export results in `finally`,
+   fall back to a temp path, and exit 1 with an ERROR naming the count if both writes fail.
+   A failed create whose account may exist carries its password in the Failed row.
+4. `Save-MigrationPlan` refuses an empty row set; `Invoke-MigrationAction` throws when no
+   run context exists (it executed the action today).
+5. `Get-MigrationTargetDomain` (dead, interactive) is deleted;
+   `Import-MigrationVivaLearningHistory`'s two `Read-Host` prompts become parameters that
+   throw with guidance.
+6. `Set-MigrationIdentity` never removes the vanity alias before the primary add has
+   succeeded; a partial change lists completed steps in `Detail`.
+7. `Remove-MigrationDomainReferences` exits 3 when references remain, 2 for row failures.
+
+Majors: `Resolve-MigrationTeamsUser` rethrows anything but not-found;
+`Set-MigrationTeamsPhoneAssignments` keeps "Assigned <number>" in a Failed policy grant;
+`Remove-MigrationTeamsPhoneAssignments -All` and `Set-MigrationLicenses -RemoveUnplanned`
+gain acknowledgement switches (the latter becomes `ConfirmImpact = 'High'`); a formula-prefix
+sanitiser (`'` before `= + - @ \t \r`) in `Export-MigrationReport`, `Export-MigrationResult`
+and both `Export-Excel` call sites; the planner treats a header-only optional CSV as empty
+with a warning; the planner gains `-SmtpDomain`; `Get-MigrationOutputPath` /
+`ConvertFrom-MigrationOutputPath` own the filename contract; `Export-MigrationReport
+-SuppressInDryRun -Timestamp` replaces the four per-script CSV writers;
+`Get-MigrationPlanSchema` (new) and `Get-MigrationDefaultOutputRoot` are exported; every
+script's `.NOTES` gets `Version:`; results tokens follow one rule — the script name with
+`Migration` removed (`Set-Licenses`, `Test-Readiness`, `Export-MappingFile`), and a
+secondary output of the same script uses `-Suffix` (`TeamsPhoneNumbers-Unassigned`)
+— so the four outliers are renamed and the README notes it; README fixes (LogPath claim, wildcard and relative-path
+examples, "connect read-only" claim, log filename leader); `Templates/WaveMap.sample.csv`
+and the `MatchType` column in `ExclusionRules.sample.csv`; tests for the Main regions of
+`Set-MigrationLicenses`, `Test-MigrationReadiness`, `Remove-MigrationDomainReferences`;
+hermetic stubs in the two SDK-dependent test files.
+
+Documented deviations from the authoring standard (not changed): log root under the
+per-migration folder rather than ProgramData; no TLS assertion (pwsh 7 uses OS defaults);
+`[bool]` for default-on booleans; `-Verbosity` default `Medium`.
+
+Later backlog (recorded in `EnhancementBacklog.md`, not in this pass): hand-added plan
+columns dropped on write-back; OneDrive read errors hidden; credentials CSV naming/ACL;
+scope trims; seat pre-check overstated; `-RecomputeLicenses`; Main-region extractions;
+line-length reflow; result-row builder consolidation; phase batching in one child.
+
+## 12. Testing
+
+Pester 6 on macOS, no network, no display. Runs with the existing command
+(`Invoke-Pester -Path Utilities/M365-Migration/Tests`).
+
+- Engine: settings round-trip and refusals; scanner against `Tests/Fixtures/Workbench/`
+  (synthetic filenames with and without prefix, `.bak`, header-only CSV, a dry-run newer than
+  a live run); catalog drift guard over all 17 scripts; resolvers; argument resolution and
+  provenance; gates; driver generation (parses clean, no secret values, arrays and hashtables
+  survive); runner against `Tests/Fixtures/Workbench/Echo-Parameters.ps1` (dumps
+  `$PSBoundParameters` as JSON and exits with a requested code) for exit codes 0/1/2/3 and
+  cancellation; ledger append and read-back; tenant-verification parsing.
+- Console: the full flow driven through the prompt seam.
+- Entry script: dot-sourced with `-NoGui`; step-list parity between GUI and engine.
+- Hardening: one test per item in §11, plus the coverage gaps named by the review.
+- Coverage target 80% on the engine functions (Enterprise tier).
+
+## 13. Documentation
+
+`README.md` leads with the workbench quick start (both platforms) and keeps the script
+reference; the root README's Utilities table gains the workbench row in the same commit.
+`KnownDocGaps.md` marks each gap this work resolves. `EnhancementBacklog.md` gains the
+"later" list. The Hudu article is updated only on the owner's go.
+
+## 14. Versioning
+
+Module `1.1.1 → 1.2.0`. `Start-MigrationWorkbench.ps1` carries `$script:Version = '1.0.0'`
+(one constant, used in the banner, the driver header and the ledger).
+
+## 15. First Windows run
+
+The WinForms region (§9) is written on macOS, where it cannot be executed: WinForms does not
+exist there, so the region is verified structurally — the script dot-sources with `-NoGui`, the
+pure helpers behind every decision the window makes are under test, and an AST test proves
+`Add-Type` is reached only inside the builder and only after the platform check. The first run
+on Windows is therefore the acceptance test, and this is what to click.
+
+Run it on a Windows box with PowerShell 7.4+ and a throwaway workspace — a copy of a real
+migration folder, or a new one with a plan that names a test user and nothing else. Nothing
+below needs a tenant except where it says so.
+
+1. **It opens.** Double-click `Start-MigrationWorkbench.cmd`, or run
+   `pwsh -File Start-MigrationWorkbench.ps1`. The window appears with no workspace, the status
+   strip asking for one, and the banner grey.
+2. **The STA relaunch.** Close it and start it again from an explicitly multi-threaded host:
+   `pwsh -MTA -File .\Start-MigrationWorkbench.ps1`. It should relaunch itself once and the
+   window should open exactly as before. Close the window; the original console must return the
+   child's exit code (`$LASTEXITCODE` = 0), not start a second window.
+3. **Browse.** File ▸ Open workspace, pick the folder. The tree fills with the runbook, the
+   glyphs match what `-Console` shows for the same folder, one step carries `<- next` in bold,
+   and the pane lists any scanner warnings.
+4. **Settings.** Settings ▸ the dialog. Every schema key has a row; `SchemaVersion` does not.
+   Type a domain into `Source.TenantId` and press **Resolve** — it becomes a GUID (this one
+   needs the internet, nothing else does). Clear `Label`, press Save: the dialog stays open and
+   the message beside `Label` turns red. Put it back, Save: the dialog closes, the pane says
+   where the file went, and `M365Migration.settings.json.bak` is beside it.
+5. **A workspace that cannot run yet.** Blank `Label` in `M365Migration.settings.json` by hand
+   and reopen the folder. The tree still draws, the status strip and the pane name `Label`, and
+   **Dry run**, **Run** and **Copy command** each refuse with a box naming that key and pointing
+   at Settings — no gate list, no driver, no run folder. Fix `Label` through the dialog: the
+   save rescans and the strip goes back to `Ready` with no further click.
+6. **A step form.** Select **New-Users**. The banner turns blue and names the destination
+   tenant. Each row shows a value and its provenance (`Settings`, `Resolved`, `Fixed`,
+   `Operator`); a `Fixed` row is greyed out. Hover a row — the script's own `.PARAMETER` text is
+   the tooltip. `-PlanPath` has a `...` button that opens a file dialog. There is no `Wave` row:
+   the Waves checked list owns that parameter and the form draws no second control for it.
+7. **The Viva step form.** Select **VivaLearning-Import**. The `ClientSecret` row is a greyed
+   line of text reading `Set $env:M365MIGRATION_CLIENT_SECRET before Run — the window never
+   takes a secret.` — no text box, no password box, nothing to click and nothing to paste into.
+   Tab through the form and confirm the focus skips it.
+8. **Waves.** `(all waves)` is unticked for New-Users (a writer) and the plan's waves are listed
+   under it. Tick wave 1.
+9. **Copy command.** Press it: the preview box fills with the two lines, the clipboard holds the
+   `pwsh ... -File "...driver.ps1"` line, and the status strip says so. Paste it into Notepad and
+   check it names the driver, not a script.
+10. **Dry run.** Press it. The gate list appears in the pane, the preview shows the driver that
+    is about to run, output streams into the pane while the window stays responsive (drag it
+    around mid-run), Cancel is the only enabled button, and the summary dialog names the exit
+    code, the counts, the files and the tenant line. The tree redraws with the rehearsal's glyph.
+11. **Cancel.** Start a dry run of a long step (an inventory) and press **Cancel**. The pane says
+    it is cancelling, the run ends, the summary says `Aborted by the operator`, and
+    `Workbench/Runs.jsonl` records `"Aborted": true`.
+12. **The soft gate.** Select a writer that has not been rehearsed and press **Run**. A Yes/No
+    box names the `DryRunFirst` gate. Answer No — nothing runs. Answer Yes on a second attempt
+    and the ledger line for that run carries the override in `GateOverrides`.
+13. **The typed confirmation.** Select **DomainReferences-Remediate** and press **Dry run**. The
+    modal dialog appears; **Continue** stays disabled until the box holds the release domain
+    exactly (case-insensitively — try `NEWCO.COM`). Cancel it and nothing runs.
+14. **Tenant mismatch.** Point `Destination.TenantId` at a GUID that is not the tenant the run
+    will reach and run a connecting step. A red `TENANT MISMATCH` box must appear *before* the
+    summary, whatever the exit code was.
+15. **Open folder.** After a run, it opens that run's folder — `driver.ps1`, `stdout.txt`,
+    `stderr.txt`. Before any run, it opens the workspace.
+16. **Results & logs.** The menu item writes the console's own results view into the pane,
+    newest first, with each run's folder under it.
+17. **The pane cap.** Run an inventory with `Verbosity` High. Past 2000 lines the pane trims its
+    oldest half and says so; the complete output is still in `stdout.txt`.
+18. **DPI.** Set the display to 150% and reopen the window (`PerMonitorV2` applies at start).
+    Nothing is clipped, the tree text stays readable, and the form scrolls rather than truncating.
+19. **Closing mid-run.** Start a run and try to close the window: it refuses and points at
+    Cancel.
+20. **The workbench log.** `<workspace>/Workbench/` holds this session's own `.log` beside
+    `Runs.jsonl`.
+
+Anything that fails here is a finding against §9, not a change of design: the engine is already
+under test on macOS, so a fault found on this list belongs in the window.
+
+## 16. Change log
+
+| Date | Version | Change |
+|---|---|---|
+| 2026-09-18 | — | Document approved. Part A (§11) hardening of the 17 scripts and the module, shipped as module **1.2.0**. |
+| 2026-09-19 | module 1.2.0, workbench **1.0.0** | Part B built: the settings file, the step catalog, the folder scanner, argument resolution, the gates, the driver and runner, the ledger, the console board, the entry script, the `.cmd` launcher and the WinForms window. §15 "First Windows run" added, because the window is written where it cannot be executed. |
+| 2026-09-19 | module 1.2.0, workbench 1.0.0 | Post-review fix wave. The four rules the window's fix rounds established are now the engine's and all three front ends read them: `Get-MigrationWorkbenchOwnedParameter` (§7.1 — an `-Override` naming one is dropped with a warning), `Test-MigrationWorkspaceRunnable` (§8/§9/§10 — nothing runs against settings that will not load, re-checked after every rescan), `Test-MigrationTypedConfirmation` (§7.2) and `Format-MigrationTenantVerdict` (§7.2) are public, as is `ConvertFrom-MigrationMapText`. `Invoke-MigrationStep` takes the ledger's `DryRun`/`Wave` from the driver and refuses a caller that disagrees. A tenant mismatch exits 1 from the unattended path (§7.2/§10). §5.3 `ExistingPlan` wording and the §6 `Done` rule corrected to the code. |
+
+The module stays at **1.2.0** across both parts: §14 names one bump for the whole feature, and
+Part B adds exported functions to a manifest that had not shipped since the bump.
+`Start-MigrationWorkbench.ps1` carries its own `$script:Version = '1.0.0'`, used in the banner,
+the driver header and the ledger.
+
+### Rulings that changed this document
+
+Each of these came out of building or reviewing the thing described, and each amended the
+section named rather than being implemented against it.
+
+- **§4 — `Domains.Release` is a new settings key.** The spec had one vanity domain doing two
+  jobs. `Domains.Target` is what the identities land on in the destination; the domain being
+  *released* from the source tenant is a different string whenever a migration lands on a brand
+  the destination already owns. `Domains.Release` blank therefore means "same as Target", the
+  fallback is a named rule in the argument resolver (a blank bound value is otherwise skipped),
+  and the effective release domain is what both the domain-release step's `-Domain` and the
+  source-side typed confirmation use.
+- **§7.1 — `-Confirm:$false` is passed to every script that declares
+  `SupportsShouldProcess`**, not only the High-impact ones. The child runs `-NonInteractive`
+  and cannot answer a prompt, so whether it would have prompted must not rest on a
+  `ConfirmImpact` sitting below whatever `$ConfirmPreference` that process happens to have. The
+  catalogue's `Confirm` flag now means only "this script is High impact", which is what the UI
+  warns on.
+- **§7.2 — `DryRunFirst` judges the rehearsal, not just its existence.** A rehearsal counts
+  only if it was not `Aborted` and exited 0 or 2: an aborted or exit-1 rehearsal proved
+  nothing, while "some rows failed" is a rehearsal doing its job.
+- **§7.2 — `WaveRequired` is restricted to live runs of a `Write` or `Destructive` step whose
+  chosen parameter set takes `-Wave`.** The gate exists so that "the whole plan" is a decision
+  rather than an omission, and only a step that changes something needs that decision.
+- **§7.2 — the typed confirmation is matched by kind.** A domain is matched without case,
+  because DNS has none and an operator who typed `NewCo.com` typed the domain; anything else —
+  `REMOVE` — is matched with case, because shouting it is the point. A gate that names no
+  `RequiredInput` at all is refused rather than auto-accepted: "nothing to type" must never
+  become "anything is accepted".
+- **§5.2 / catalog — `Readiness-Provisioned` is `Impact = 'Write'`.** It is the readiness stage
+  that writes `MailboxProvisioned` / `OneDriveProvisioned` back into the plan, so it earns the
+  rehearsal gate the other two stages do not.
+- **§5.2 / catalog — the source-side exports fix `Prefix = 'Source'`.** `TeamsPhone-Export` and
+  `VivaLearning-Export` pin their prefix the way the README runbook already does, so their
+  output lands in `Source/` and can never collide with the label folder's.
+- **§5.2 — `ResultIds`, instance `Bind` merging and the `Requires` vocabulary.** A script that
+  names its results by mode carries every token; an instance's `Bind` merges on the *target
+  parameter* rather than the settings key, so a destination-side instance replaces the entry's
+  source binding instead of leaving both standing; and `Requires` names either a step instance
+  or an artefact kind, so a plan supplied by hand satisfies `'Plan'`.
+- **§6 — only a live results file makes a step `Done`.** A log or a report says what a step
+  found, not that it finished, and the ledger entry's own `DryRun` field outranks whatever the
+  filenames imply. `StateSource`, `StateRun` and `StateDryRun` were added so that a front end
+  renders one run's stamp beside that same run's counts.
+- **§7.3 — the driver wraps the call in `try`/`catch`.** A splat that never binds leaves
+  `$LASTEXITCODE` unset, and an unset `$LASTEXITCODE` exits 0 — which would have the workbench
+  record `Completed` for a step that never ran. The guard exits 1 instead; a script that exits
+  with a code of its own still propagates it.
+- **§7.1 — the workbench owns nine parameters, and the engine holds the list.**
+  `-DryRun`, `-Wave`, `-OutputPath`, `-TenantId`, `-LogPath`, `-Confirm`, `-WhatIf`, `-Verbose`
+  and `-Debug` are each decided by something the operator answered somewhere else — the mode,
+  the wave prompt, the workspace, the settings, the driver. An `-Override` naming one is dropped
+  with a warning that says which control sets it, rather than silently outranking it: that is
+  how a ledger comes to record the wave that was ticked while the driver runs the wave that was
+  typed. The window's own list is gone; all three front ends read
+  `Get-MigrationWorkbenchOwnedParameter`.
+- **§7.3/§7.4 — the ledger's `DryRun` and `Wave` come from the driver.** `New-MigrationStepDriver`
+  puts them on the driver object from the arguments it emits, and `Invoke-MigrationStep` writes
+  those to the ledger and refuses, before the child starts, a caller whose own `-DryRun`/`-Wave`
+  disagree. The ledger now describes the run that happened rather than the run a front end
+  thought it was asking for.
+- **§7.2/§10 — a tenant mismatch is fatal to an unattended run.** The spec's "exits with the
+  step's exit code" gains one exception: `TenantVerified = $false` exits 1 whatever the step
+  returned. A scheduler has nothing but the code, and a step that exited 0 against the wrong
+  tenant would otherwise read as a reason to run the next one.
+- **§8/§9/§10 — "while settings are invalid nothing can run" is one engine function.**
+  `Test-MigrationWorkspaceRunnable` replaces the window's own copy and is called by the console
+  board after every rescan, by the console step form before it resolves anything, and by the
+  unattended path in place of its bare `IsValid` check. Settings can stop validating *while* a
+  session is open, so asking once at the start was never enough.
+- **§5.3 — `ExistingPlan` is the pinned plan, else the newest.** The code was right and the
+  document was not: carrying the last plan forward is the safer default for a re-plan, and
+  pinning is what freezes it.
+- **§6 — `Done` needs an exit code of 0.** An older live results file no longer masks a newest
+  ledger entry that aborted or carries a code the catalogue does not define; and the ledger's
+  own `DryRun` outranks the filenames only while its `Started` is at or after the newest live
+  artefact's timestamp, so a live run made from the command line after a rehearsal is read as
+  the later run it is.
+- **§9 — the four renderers are exported, not private.** `Format-MigrationWorkbenchView`,
+  `Format-MigrationStepGlyph`, `Format-MigrationStepLastRun` and
+  `Get-MigrationScriptSynopsisText` stopped being the console's own business the moment a second
+  front end had to draw the same glyph and the same last-run line. The alternative is a window
+  that re-renders them by hand and eventually describes one workspace differently from the
+  board.

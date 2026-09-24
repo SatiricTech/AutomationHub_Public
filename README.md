@@ -62,6 +62,7 @@ By downloading, copying, or executing any code found within this repository, you
 | [`LastPass/`](Vendors/LastPass/) | `Install-LastPass.ps1` | Deploy LastPass with browser extension detection |
 | | `Remove-LastPassBrowserExtension.ps1` | Remove LastPass extensions from Chrome/Edge |
 | [`NinjaOne/`](Vendors/NinjaOne/) | `Uninstall-NinjaRmmAgent.ps1` | Complete Ninja agent removal (services, registry, drivers) |
+| [`NinjaOne/BrowserExtensionInventory/`](Vendors/NinjaOne/BrowserExtensionInventory/) | `Set-NinjaBrowserExtensionInventory.ps1` | Inventory Chrome/Edge/Brave/Firefox extensions for every user profile into three device custom fields (searchable list, HTML table, flag count) |
 | [`Proofpoint/`](Vendors/Proofpoint/) | `Uninstall-ProofpointOutlookPlugin.ps1` | Detect-first silent removal of the Proofpoint Outlook encryption plug-in (closes Outlook only if installed) |
 | [`ScreenConnect/`](Vendors/ScreenConnect/) | `Uninstall-ScreenConnectAll.ps1` | Remove all ScreenConnect/ConnectWise Control instances |
 | | `Uninstall-ScreenConnectSelective.ps1` | Remove ScreenConnect except protected fingerprints |
@@ -110,6 +111,8 @@ Mirrors the top-level structure for cross-platform parity. Add Mac scripts in th
 | | `Remove-SysInternals.bat` | Unmount Sysinternals network drive |
 | | `Send-UserNotification.ps1` | Display a notification message to the user |
 | [`M365-Migration/`](Utilities/M365-Migration/) | `M365Migration/` | Shared module every migration script imports (connections, logging, plan I/O, naming engine, collision resolver) |
+| | `Start-MigrationWorkbench.ps1` | Front door for the toolkit: console menu on any OS (WinForms on Windows), settings file per migration folder, detected state per phase, live-log runs; `-Step <instance id>` runs one catalogued step non-interactively |
+| | `Start-MigrationWorkbench.cmd` | Windows double-click launcher for the workbench (finds PowerShell 7, never elevates) |
 | | `Get-MigrationInventory.ps1` | Read-only tenant pull into nine CSVs + one workbook: Users, UserMailboxes, SharedMailboxes, MailboxPermissions, Groups, Contacts, Domains, Licenses, Summary |
 | | `Get-MigrationTeamsPhoneAssignments.ps1` | Export every user's Teams phone number, type and voice policies to a CSV (optionally the unassigned number inventory too) |
 | | `Get-MigrationVivaLearningHistory.ps1` | Export every user's Viva Learning learner history (assignments + self-initiated courses) with course metadata to CSV + JSON |
@@ -123,7 +126,7 @@ Mirrors the top-level structure for cross-platform parity. Add Mac scripts in th
 | | `Remove-MigrationDomainReferences.ps1` | Release a vanity domain in the source tenant: report every reference and blocker, then move objects off the domain |
 | | `Set-MigrationIdentity.ps1` | Apply the plan's target UPN, primary SMTP, aliases, X500, mail nickname and GAL visibility (also the in-place UPN redesign tool) |
 | | `Set-MigrationMailboxPermissions.ps1` | Re-apply FullAccess, SendAs, SendOnBehalf, calendar permissions and forwarding to the migrated mailboxes |
-| | `Reset-MigrationCutoverPasswords.ps1` | Cutover password reset to unique passphrases (plan, CSV, group or single user), change-at-next-sign-in, credential log |
+| | `Reset-MigrationCutoverPasswords.ps1` | Cutover password reset to unique passphrases (plan, CSV, group or single user), change-at-next-sign-in, credentials to the results CSV and never to the log |
 | | `Set-MigrationTeamsPhoneAssignments.ps1` | Bulk-assign Teams phone numbers in the destination tenant from a CSV (auto-detects number type, grants voice routing policy) |
 | | `Remove-MigrationTeamsPhoneAssignments.ps1` | Bulk-unassign Teams phone numbers in the source tenant, logging each removal as a reassignment-ready CSV |
 | | `Import-MigrationVivaLearningHistory.ps1` | Replay exported Viva Learning learner history into the destination tenant under a custom provider (idempotent re-runs) |

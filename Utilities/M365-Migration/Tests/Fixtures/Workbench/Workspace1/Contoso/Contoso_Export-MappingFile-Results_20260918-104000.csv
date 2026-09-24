@@ -1,0 +1,4 @@
+"Identity","Action","Status","Detail","Wave"
+"ada.lovelace@contoso.com","Map-User","Succeeded","Mapped to ada.lovelace@newco.com","1"
+"grace.hopper@contoso.com","Map-User","Succeeded","Mapped to grace.hopper@newco.com","1"
+"alan.turing@contoso.com","Map-User","Skipped","PlanStatus Collision is not mapped","2"

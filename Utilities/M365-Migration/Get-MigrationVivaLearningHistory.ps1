@@ -21,11 +21,16 @@
       <Prefix>_VivaLearningHistory_<timestamp>.json     - raw Graph objects (fidelity backup)
       <Prefix>_Get-VivaLearningHistory-Results_<ts>.csv - one row per user read
 
+    Every cell in the CSV is sanitised before writing - a CourseTitle or other value starting
+    with =, +, - or @ (a formula-triggering character in Excel/Calc/Sheets) gains a leading
+    apostrophe. Import-MigrationVivaLearningHistory reads the CSV back as-is, apostrophe
+    included, since it never round-trips the file through a spreadsheet.
+
     API quirks this script works around (documented behaviour as of Aug 2026):
       - Listing course activities supports DELEGATED sign-in only; app-only
         (client credential) tokens are rejected. The delegated scopes are
-        LearningAssignedCourse.Read and LearningSelfInitiatedCourse.Read. The
-        .All variants that Microsoft's list page mentions exist only as
+        LearningAssignedCourse.Read and LearningSelfInitiatedCourse.Read. Their
+        All-suffixed variants that Microsoft's list page mentions exist only as
         application permissions (the permissions reference carries their
         identifiers), so requesting them at a delegated sign-in fails at Entra
         before the consent prompt - this script never asks for them.
@@ -113,6 +118,7 @@
 
 .NOTES
     Author       : AutomationHub
+    Version      : 1.2.0
     Requires     : PowerShell 7.4, the M365Migration module beside this script,
                    Microsoft.Graph.Authentication (installed on demand)
     Graph scopes : Delegated - LearningAssignedCourse.Read,
@@ -612,16 +618,17 @@ function Read-LearningHistory {
 
 $exitCode = 0
 
-$run = Initialize-MigrationRun -ScriptName 'Get-MigrationVivaLearningHistory' -OutputPath $OutputPath `
+$null = Initialize-MigrationRun -ScriptName 'Get-MigrationVivaLearningHistory' -OutputPath $OutputPath `
     -Prefix $Prefix -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
 
 $results = [System.Collections.Generic.List[object]]::new()
 
 try {
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $leader = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $historyCsv = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}VivaLearningHistory_$timestamp.csv"
-    $historyJson = Join-Path -Path $run.OutputDirectory -ChildPath "${leader}VivaLearningHistory_$timestamp.json"
+    # One shared stamp for the CSV (written through Export-MigrationReport) and the JSON
+    # fidelity backup (written here directly), so the pair reads as one export.
+    $runTimestamp = Get-Date
+    $historyCsv = Get-MigrationOutputPath -Name 'VivaLearningHistory' -Timestamp $runTimestamp
+    $historyJson = Get-MigrationOutputPath -Name 'VivaLearningHistory' -Extension 'json' -Timestamp $runTimestamp
 
     if ($DryRun) {
         # This script only reads, so the DryRun stops before the sign-in: there is
@@ -640,6 +647,10 @@ try {
     }
     else {
         $context = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+        # The guard runs on a read too: a history export taken from the wrong tenant is not just
+        # wasted, it becomes the input Import-MigrationVivaLearningHistory writes back from.
+        $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $context `
+            -Purpose 'Viva Learning export'
         $grantedLearningScopes = @(@($context.Scopes) | Where-Object { $_ -like 'Learning*' })
         Write-MigrationLog -Message "Granted learning scopes: $($grantedLearningScopes -join ', ')" -Level INFO
 
@@ -729,8 +740,10 @@ try {
             Write-MigrationLog -Message 'No learner history found - nothing to export.' -Level WARNING
         }
         else {
-            Invoke-MigrationAction -Description "Write $($history.Rows.Count) activity row(s) to $historyCsv" -Action {
-                $history.Rows | Export-Csv -LiteralPath $historyCsv -NoTypeInformation -Encoding utf8
+            $null = Export-MigrationReport -Rows $history.Rows -Name 'VivaLearningHistory' -Timestamp $runTimestamp `
+                -SuppressInDryRun
+
+            Invoke-MigrationAction -Description "Write the raw JSON backup to $historyJson" -Action {
                 # -InputObject keeps the JSON an array even when exactly one user has history.
                 ConvertTo-Json -InputObject @($history.RawByUser) -Depth 10 | Set-Content -LiteralPath $historyJson -Encoding utf8
             }

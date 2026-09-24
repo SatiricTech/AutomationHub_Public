@@ -37,7 +37,8 @@ BeforeAll {
         'Get-InventoryGroupType'
         'Test-InventoryTrustee'
         'ConvertTo-InventoryFolderTrustee'
-        'Test-InventoryTenantMatch'
+        'Get-InventoryTabColumn'
+        'Get-InventoryTabSummaryPath'
     )
 
     $tokens = $null
@@ -613,18 +614,179 @@ Describe 'ConvertTo-InventoryFolderTrustee' {
     }
 }
 
-Describe 'Test-InventoryTenantMatch' {
+Describe 'The tenant guard is wired into the Main region' {
 
-    It 'Matches identical tenant GUIDs case-insensitively' {
-        Test-InventoryTenantMatch -GraphTenantId 'AAAA-1111' -ExchangeTenantId 'aaaa-1111' | Should -BeTrue
+    <#
+        A structural test, not a behavioural one. Everything else in this file exercises functions
+        lifted out of the script, and Get-MigrationInventory.ps1 has no end-to-end harness to run its
+        Main region against - so this asserts on the shape of the source instead. It would catch
+        the guard being removed or renamed, and nothing subtler: it proves the wiring exists, not
+        that it behaves correctly at runtime.
+    #>
+
+    BeforeAll {
+        $script:mainScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..' 'Get-MigrationInventory.ps1')).Path
+        $script:mainAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:mainScriptPath, [ref]$null, [ref]$null)
+        $script:mainText = Get-Content -LiteralPath $script:mainScriptPath -Raw
+
+        $script:commandText = @($script:mainAst.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            ForEach-Object { $_.Extent.Text })
     }
 
-    It 'Detects a mismatch' {
-        Test-InventoryTenantMatch -GraphTenantId 'aaaa-1111' -ExchangeTenantId 'bbbb-2222' | Should -BeFalse
+    It 'Calls Assert-MigrationTenant once with an expected tenant and a purpose' {
+        $calls = @($script:commandText | Where-Object { $_ -like 'Assert-MigrationTenant*' })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-ExpectedTenantId \$expectedTenant'
+        $calls[0] | Should -Match "-Purpose 'Tenant inventory'"
     }
 
-    It 'Treats a blank side as unverifiable, not a mismatch' {
-        Test-InventoryTenantMatch -GraphTenantId '' -ExchangeTenantId 'bbbb-2222' | Should -BeTrue
-        Test-InventoryTenantMatch -GraphTenantId 'aaaa-1111' -ExchangeTenantId '' | Should -BeTrue
+    It 'Pins the Exchange connector to the same expected tenant' {
+        $calls = @($script:commandText | Where-Object { $_ -like 'Connect-MigrationExchange*' })
+        $calls.Count | Should -Be 1
+        foreach ($call in $calls) { $call | Should -Match '-TenantId \$expectedTenant' }
+    }
+
+    It 'Falls back to the Graph tenant so the cross-check runs on an unpinned run too' {
+        $script:mainText |
+            Should -Match '\$expectedTenant = if \(\$TenantId\) \{ \$TenantId \} else \{ \$graphTenantId \}'
+    }
+
+    It 'Still says out loud that an unpinned run was not verified' {
+        $script:mainText | Should -Match 'No -TenantId was given; this run acts on tenant \$expectedTenant'
+    }
+
+    It 'Names the workbook through Get-MigrationOutputPath rather than assembling it inline' {
+        # Structural for the same reason as the rest of this block. The point is that the
+        # filename contract has one owner: 'Migration-Inventory' is the whole Name (the
+        # parser keeps a hyphenated name whole unless what follows the hyphen is a mode
+        # suffix), and the prefix and directory come from the run context.
+        $calls = @($script:commandText |
+                Where-Object { $_ -like 'Get-MigrationOutputPath*' -and $_ -like "*Migration-Inventory*" })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match "-Name 'Migration-Inventory'"
+        $calls[0] | Should -Match "-Extension 'xlsx'"
+        $calls[0] | Should -Match '-Timestamp \$runTimestamp'
+        $script:mainText | Should -Not -Match 'Migration-Inventory_\$timestamp'
+    }
+}
+
+Describe 'The tab writer' {
+
+    <#
+        Structural, like the tenant-guard block above: the script is tenant-bound so there is no
+        offline harness to run the nine-tab write for real. This proves the local CSV writer
+        (Export-InventoryTab) is gone, that every tab is written through Export-MigrationReport
+        sharing one run timestamp, that the resulting name parses back with
+        ConvertFrom-MigrationOutputPath, and that an empty tab's header still matches a populated
+        tab's - the whole reason Get-InventoryTabColumn was kept (feeding -Columns) rather than
+        retired with Export-InventoryTab.
+    #>
+
+    # Built here, at Describe scope rather than inside BeforeAll, because -ForEach needs it during
+    # Pester's discovery pass; a BeforeAll only runs later, during Run.
+    $inventoryTabNames = @(
+        'Users', 'UserMailboxes', 'SharedMailboxes', 'MailboxPermissions',
+        'Groups', 'Contacts', 'Domains', 'Licenses', 'Summary'
+    )
+
+    It 'No longer defines the retired Export-InventoryTab writer' {
+        $names = @($ast.FindAll($predicate, $true) | ForEach-Object { $_.Name })
+        $names | Should -Not -Contain 'Export-InventoryTab'
+    }
+
+    It 'Writes every tab through Export-MigrationReport, with its columns, suppressed in a dry run' {
+        $calls = @($ast.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+                    $args[0].GetCommandName() -eq 'Export-MigrationReport' }, $true) |
+            ForEach-Object { $_.Extent.Text })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-Name \$tab\b'
+        $calls[0] | Should -Match '-Columns \$columns\b'
+        $calls[0] | Should -Match '-Timestamp \$runTimestamp'
+        $calls[0] | Should -Match '-SuppressInDryRun'
+    }
+
+    It 'Computes one shared $runTimestamp for the whole run' {
+        $mainText = Get-Content -LiteralPath $inventoryScript -Raw
+        @([regex]::Matches($mainText, '\$runTimestamp\s*=\s*Get-Date\b')).Count | Should -Be 1
+    }
+
+    It 'Names <_>''s tab file so it parses back with ConvertFrom-MigrationOutputPath' -ForEach $inventoryTabNames {
+        $path = Get-MigrationOutputPath -Name $_ -Directory $TestDrive -Prefix 'Contoso'
+        $parsed = ConvertFrom-MigrationOutputPath -Path $path
+        $parsed.Name | Should -BeExactly $_
+        $parsed.Suffix | Should -BeExactly ''
+        $parsed.Prefix | Should -BeExactly 'Contoso'
+    }
+
+    It 'Writes the <_> tab''s empty header the same as its populated header' -ForEach $inventoryTabNames {
+        $null = Initialize-MigrationRun -ScriptName 'Get-MigrationInventory' -OutputPath $TestDrive -Verbosity Low
+
+        $columns = @(Get-InventoryTabColumn -Name $_)
+        $columns.Count | Should -BeGreaterThan 0 -Because "$_ needs a known column list to test"
+
+        $sample = [ordered]@{}
+        foreach ($column in $columns) { $sample[$column] = 'sample' }
+        $populatedPath = Export-MigrationReport -Rows @([pscustomobject]$sample) -Name $_
+        $populatedHeader = Get-Content -LiteralPath $populatedPath -TotalCount 1
+
+        $emptyPath = Export-MigrationReport -Rows @() -Name $_ -Columns $columns -Suffix 'Empty'
+        $emptyHeader = Get-Content -LiteralPath $emptyPath -TotalCount 1
+
+        $emptyHeader | Should -BeExactly $populatedHeader
+    }
+
+    It 'Calls the summary-path helper with the tab name, the run context and the shared timestamp' {
+        # Structural, like the tenant-guard block above: proves Main wires the three pieces
+        # Get-InventoryTabSummaryPath needs into the call, rather than exercising the dry-run
+        # behaviour end to end - the script is tenant-bound, so there is no harness for that here.
+        $calls = @($ast.FindAll(
+                { $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+                    $args[0].GetCommandName() -eq 'Get-InventoryTabSummaryPath' }, $true) |
+            ForEach-Object { $_.Extent.Text })
+        $calls.Count | Should -Be 1
+        $calls[0] | Should -Match '-Tab \$tab\b'
+        $calls[0] | Should -Match '-WrittenPath \$writtenPath\b'
+        $calls[0] | Should -Match '-Run \$run\b'
+        $calls[0] | Should -Match '-Timestamp \$runTimestamp\b'
+    }
+
+    It 'Names the dry-run summary path via Get-MigrationOutputPath, scoped to $Run.DryRun' {
+        # Structural: proves the helper's own dry-run branch is the one calling
+        # Get-MigrationOutputPath with -Name/-Timestamp, not some other code path. The behavioural
+        # half of this (does it return the right string) is the Describe below, which unit-tests
+        # the lifted function directly against a fake $Run.
+        $helperDef = @($ast.FindAll($predicate, $true) | Where-Object { $_.Name -eq 'Get-InventoryTabSummaryPath' })
+        $helperDef.Count | Should -Be 1
+        $bodyText = $helperDef[0].Body.Extent.Text
+        $bodyText | Should -Match (
+            '(?s)if\s*\(\s*\$Run\.DryRun\s*\)\s*\{\s*return Get-MigrationOutputPath -Name \$Tab -Timestamp \$Timestamp')
+    }
+}
+
+Describe 'Get-InventoryTabSummaryPath' {
+
+    <#
+        A behavioural -DryRun harness for the whole script is out of reach offline (the script is
+        tenant-bound), but the helper this logic was extracted into is pure, so it gets a real
+        unit test against a fake $Run - Get-MigrationInventory.Tests.ps1's usual technique of
+        lifting a FunctionDefinitionAst node, applied to this one.
+    #>
+
+    It 'Names the file the run would have written under -DryRun, even though nothing was written' {
+        $fakeRun = [pscustomobject]@{ DryRun = $true }
+        $stamp = Get-Date
+        $path = Get-InventoryTabSummaryPath -Tab 'Contacts' -WrittenPath '' -Run $fakeRun -Timestamp $stamp
+        $expected = Get-MigrationOutputPath -Name 'Contacts' -Timestamp $stamp
+        $path | Should -BeExactly $expected
+    }
+
+    It 'Returns the path Export-MigrationReport actually wrote for a live run' {
+        $fakeRun = [pscustomobject]@{ DryRun = $false }
+        $path = Get-InventoryTabSummaryPath -Tab 'Contacts' -WrittenPath 'C:\already\written.csv' `
+            -Run $fakeRun -Timestamp (Get-Date)
+        $path | Should -BeExactly 'C:\already\written.csv'
     }
 }

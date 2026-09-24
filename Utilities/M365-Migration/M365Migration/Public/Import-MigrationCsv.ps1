@@ -45,6 +45,13 @@ function Import-MigrationCsv {
         it explicitly. Use RecipientType, or the canonical ObjectType, to name a recipient
         class.
 
+        Every cell is passed through ConvertFrom-MigrationSafeCell on the way out, which
+        removes the leading apostrophe ConvertTo-MigrationSafeCell adds to a formula-looking
+        value when the toolkit writes a CSV. Without that, a phone number or an alias this
+        toolkit exported and then read back would carry an apostrophe into the destination
+        tenant. An apostrophe followed by anything other than a formula leader is data and
+        is kept - "'Brien" reads back as "'Brien".
+
     .PARAMETER Path
         The CSV file to read. Read as UTF-8.
 
@@ -163,11 +170,17 @@ function Import-MigrationCsv {
         }
     }
 
+    # This is the toolkit's single read seam for its own CSVs, so it is where the exporter's
+    # formula-defusing apostrophe comes back off (ConvertFrom-MigrationSafeCell). The files
+    # these scripts hand each other are chain inputs, not just reports - the inventory Users
+    # tab becomes the identity plan, which becomes what New-MigrationUsers writes to the
+    # destination tenant - so a leading apostrophe left on would be provisioned as data.
     $rows = [System.Collections.Generic.List[object]]::new()
     foreach ($record in $raw) {
         $row = [ordered]@{}
         foreach ($header in $headers) {
-            $row[[string]$headerToCanonical[$header]] = $record.PSObject.Properties[$header].Value
+            $row[[string]$headerToCanonical[$header]] =
+                ConvertFrom-MigrationSafeCell -Value $record.PSObject.Properties[$header].Value
         }
         $rows.Add([pscustomobject]$row)
     }

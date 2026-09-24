@@ -61,6 +61,36 @@ Describe 'Export-MigrationReport' {
         }
     }
 
+    Context '-SuppressInDryRun and -Timestamp' {
+
+        It 'writes nothing under -SuppressInDryRun in a dry run and returns an empty string' {
+            InModuleScope M365Migration {
+                $script:MigrationRun = @{
+                    OutputDirectory = $TestDrive; Prefix = 'T'; DryRun = $true
+                    LogPath         = (Join-Path $TestDrive 'x.log'); Verbosity = 'Low'
+                    ScriptName      = 'x'; StartedAt = Get-Date
+                }
+                $path = Export-MigrationReport -Rows @([pscustomobject]@{ A = 1 }) -Name 'Thing' -SuppressInDryRun
+                $path | Should -Be ''
+                Get-ChildItem $TestDrive -Filter '*Thing*' | Should -BeNullOrEmpty
+                $script:MigrationRun = $null
+            }
+        }
+
+        It 'uses the supplied -Timestamp in the filename' {
+            InModuleScope M365Migration {
+                $script:MigrationRun = @{
+                    OutputDirectory = $TestDrive; Prefix = 'T'; DryRun = $false
+                    LogPath         = (Join-Path $TestDrive 'x.log'); Verbosity = 'Low'
+                    ScriptName      = 'x'; StartedAt = Get-Date
+                }
+                $path = Export-MigrationReport -Rows @() -Name 'Thing' -Timestamp ([datetime]'2026-01-02T03:04:05')
+                Split-Path $path -Leaf | Should -Be 'T_Thing_20260102-030405.csv'
+                $script:MigrationRun = $null
+            }
+        }
+    }
+
     Context 'Content' {
 
         It 'Writes every row and column as given, with no Status summary block' {
@@ -78,6 +108,28 @@ Describe 'Export-MigrationReport' {
             $written = @(Import-Csv -LiteralPath $path)
             $written | Should -HaveCount 1
             $written[0].Info | Should -BeExactly 'No Blockers records found.'
+        }
+
+        It 'Writes a header-only CSV for an empty report when -Columns is given, not an Info row' {
+            $null = Initialize-MigrationRun -ScriptName 'Remove-DomainReferences' -OutputPath $script:workspace
+            $path = Export-MigrationReport -Rows @() -Name 'HeaderOnly' -Columns @('A', 'B')
+            (Get-Content -LiteralPath $path -TotalCount 1) | Should -BeExactly '"A","B"'
+            @(Import-Csv -LiteralPath $path) | Should -HaveCount 0
+        }
+
+        It 'Escapes a literal quote in a column name the way Export-Csv would' {
+            $null = Initialize-MigrationRun -ScriptName 'Remove-DomainReferences' -OutputPath $script:workspace
+            $path = Export-MigrationReport -Rows @() -Name 'QuotedHeader' -Columns @('Say "Hi"', 'B')
+            (Get-Content -LiteralPath $path -TotalCount 1) | Should -BeExactly '"Say ""Hi""","B"'
+            @(Import-Csv -LiteralPath $path) | Should -HaveCount 0
+        }
+
+        It 'Ignores -Columns when -Rows has at least one row' {
+            $null = Initialize-MigrationRun -ScriptName 'Remove-DomainReferences' -OutputPath $script:workspace
+            $path = Export-MigrationReport -Rows $script:sampleRows -Name 'ColumnsIgnored' -Columns @('X', 'Y')
+            $written = @(Import-Csv -LiteralPath $path)
+            $written | Should -HaveCount 2
+            @($written[0].PSObject.Properties.Name) | Should -Be @('Recipient', 'Reference', 'Domain')
         }
 
         It 'Returns the full path' {

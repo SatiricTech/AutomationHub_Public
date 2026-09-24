@@ -81,11 +81,30 @@ BeforeAll {
 
     function Get-MigrationPhoneNumberInventory {
         param([hashtable]$Filter, [int]$PageSize)
+        # Carries every property the -ListUnassigned report reads (AssignmentCategory, Capability,
+        # IsoCountryCode, ActivationState), matching the real Get-CsPhoneNumberAssignment shape, so
+        # the -ListUnassigned tests below exercise the same fields a live tenant would return.
         return @(
-            [pscustomobject]@{ TelephoneNumber = '+15551110000'; AssignedPstnTargetId = 'obj-aa'; NumberType = 'CallingPlan'; LocationId = 'loc-aa' }
-            [pscustomobject]@{ TelephoneNumber = '+15551110000;ext=524'; AssignedPstnTargetId = 'obj-mary'; NumberType = 'CallingPlan'; LocationId = 'loc-good' }
-            [pscustomobject]@{ TelephoneNumber = '+15553330000'; AssignedPstnTargetId = 'obj-owner'; NumberType = 'CallingPlan'; LocationId = '' }
-            [pscustomobject]@{ TelephoneNumber = '+15552220000'; AssignedPstnTargetId = ''; NumberType = 'DirectRouting'; LocationId = '' }
+            [pscustomobject]@{
+                TelephoneNumber = '+15551110000'; AssignedPstnTargetId = 'obj-aa'; NumberType = 'CallingPlan'
+                LocationId = 'loc-aa'; AssignmentCategory = 'Primary'; Capability = @('UserAssignment')
+                IsoCountryCode = 'US'; ActivationState = 'Activated'
+            }
+            [pscustomobject]@{
+                TelephoneNumber = '+15551110000;ext=524'; AssignedPstnTargetId = 'obj-mary'; NumberType = 'CallingPlan'
+                LocationId = 'loc-good'; AssignmentCategory = 'Primary'; Capability = @('UserAssignment')
+                IsoCountryCode = 'US'; ActivationState = 'Activated'
+            }
+            [pscustomobject]@{
+                TelephoneNumber = '+15553330000'; AssignedPstnTargetId = 'obj-owner'; NumberType = 'CallingPlan'
+                LocationId = ''; AssignmentCategory = 'Primary'; Capability = @('UserAssignment')
+                IsoCountryCode = 'US'; ActivationState = 'Activated'
+            }
+            [pscustomobject]@{
+                TelephoneNumber = '+15552220000'; AssignedPstnTargetId = ''; NumberType = 'DirectRouting'
+                LocationId = ''; AssignmentCategory = ''; Capability = @('UserAssignment')
+                IsoCountryCode = 'US'; ActivationState = 'Activated'
+            }
         )
     }
 
@@ -108,13 +127,16 @@ BeforeAll {
         if ($global:currentDryRun) {
             throw 'Grant-CsOnlineVoiceRoutingPolicy was reached, which -DryRun must have prevented.'
         }
+        # The number is already on the account by the time this runs, which is exactly the
+        # partial success the Failed row has to keep hold of.
+        if ($global:grantPolicyFails) { throw 'Simulated policy grant failure.' }
         $global:grantPolicyCalls.Add([pscustomobject]@{ Identity = $Identity; PolicyName = $PolicyName })
     }
 
     # Runs the script into a throwaway workspace and hands back everything a test may need.
     # 'exit' inside a script run with '&' ends that script only and sets $LASTEXITCODE.
     function Invoke-ScriptUnderTest {
-        param([hashtable]$Arguments)
+        param([hashtable]$Arguments, [switch]$FailPolicyGrant)
 
         $workspace = Join-Path ([System.IO.Path]::GetTempPath()) "SetTeamsPhone-$([guid]::NewGuid())"
         $null = New-Item -Path $workspace -ItemType Directory -Force
@@ -123,6 +145,7 @@ BeforeAll {
         $global:setPhoneCalls = [System.Collections.Generic.List[object]]::new()
         $global:grantPolicyCalls = [System.Collections.Generic.List[object]]::new()
         $global:currentDryRun = $Arguments.ContainsKey('DryRun') -and [bool]$Arguments['DryRun']
+        $global:grantPolicyFails = [bool]$FailPolicyGrant
 
         & $script:scriptPath @Arguments -OutputPath $workspace -Verbosity Low
         $exitCode = $LASTEXITCODE
@@ -131,7 +154,9 @@ BeforeAll {
         $log = @(Get-ChildItem -LiteralPath $workspace -Filter '*.log')
         return [pscustomobject]@{
             ExitCode         = $exitCode
+            Workspace        = $workspace
             ResultFile       = if ($csv.Count -eq 1) { $csv[0].Name } else { $null }
+            ResultPath       = if ($csv.Count -eq 1) { $csv[0].FullName } else { $null }
             Rows             = if ($csv.Count -eq 1) { @(Import-Csv -LiteralPath $csv[0].FullName) } else { @() }
             Log              = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
             SetPhoneCalls    = @($global:setPhoneCalls)
@@ -146,7 +171,8 @@ AfterAll {
             Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    Remove-Variable -Name setPhoneCalls, grantPolicyCalls, currentDryRun -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name setPhoneCalls, grantPolicyCalls, currentDryRun, grantPolicyFails `
+        -Scope Global -ErrorAction SilentlyContinue
 }
 
 Describe 'DryRun over a CSV of assignments' {
@@ -236,6 +262,41 @@ Describe 'A live run assigns and grants the policy' {
     }
 }
 
+Describe 'A voice routing policy grant that fails after the number was assigned' {
+
+    <#
+        The row is Failed - the run did not do what was asked - but the number is on the account
+        and re-running the assignment would hit the 'already assigned to another target' guard.
+        So the Detail has to say what succeeded before it says what did not.
+    #>
+
+    BeforeAll {
+        $script:partial = Invoke-ScriptUnderTest -FailPolicyGrant -Arguments @{
+            User               = 'solo.user@newco.onmicrosoft.com'
+            PhoneNumber        = '+15559996666'
+            VoiceRoutingPolicy = 'US-East'
+            Confirm            = $false
+        }
+    }
+
+    It 'Keeps the completed assignment in the Detail of the Failed row' {
+        $row = $script:partial.Rows[0]
+        $row.Status | Should -BeExactly 'Failed'
+        $row.Detail | Should -BeLike 'Assigned +15559996666 (DirectRouting).*'
+        $row.Detail | Should -BeLike '*Voice routing policy grant failed: Simulated policy grant failure.*'
+    }
+
+    It 'Really did assign the number before the grant failed' {
+        $script:partial.SetPhoneCalls.Count | Should -Be 1
+        $script:partial.SetPhoneCalls[0].PhoneNumber | Should -Be '+15559996666'
+        $script:partial.GrantPolicyCalls.Count | Should -Be 0
+    }
+
+    It 'Exits 2 for the failed row' {
+        $script:partial.ExitCode | Should -Be 2
+    }
+}
+
 Describe 'A single unresolvable -LocationId fails the row instead of being silently dropped' {
 
     BeforeAll {
@@ -245,5 +306,131 @@ Describe 'A single unresolvable -LocationId fails the row instead of being silen
     It 'Fails the row and never resolves to a Planned assignment' {
         $script:badLocationUser.Rows[0].Status | Should -BeExactly 'Failed'
         $script:badLocationUser.Rows[0].Detail | Should -Match "LocationId 'loc-bad' does not exist"
+    }
+}
+
+Describe '-ListUnassigned' {
+
+    <#
+        The stub Get-MigrationPhoneNumberInventory (BeforeAll, above) ignores -Filter and always
+        returns its four fixture numbers, so a real run here reports all four as unassigned - the
+        point of these tests is the writer retirement (Export-MigrationReport replacing the local
+        CSV write), not the tenant-side filtering.
+    #>
+
+    BeforeAll {
+        $script:listRun = Invoke-ScriptUnderTest -Arguments @{ ListUnassigned = $true }
+        $script:unassignedFile = @(Get-ChildItem -LiteralPath $script:listRun.Workspace `
+                -Filter 'TeamsPhoneNumbers-Unassigned_*.csv')
+        $script:unassignedRows = if ($script:unassignedFile.Count -eq 1) {
+            @(Import-Csv -LiteralPath $script:unassignedFile[0].FullName)
+        } else { @() }
+    }
+
+    It 'Exits 0, writes the results file with the normal token, and never assigns anything' {
+        $script:listRun.ExitCode | Should -Be 0
+        $script:listRun.ResultFile | Should -Not -BeNullOrEmpty
+        $script:listRun.Rows.Count | Should -Be 4
+        $script:listRun.SetPhoneCalls.Count | Should -Be 0
+        $script:listRun.GrantPolicyCalls.Count | Should -Be 0
+    }
+
+    It 'Writes the unassigned-numbers report, the same file name Get-MigrationTeamsPhoneAssignments writes' {
+        $script:unassignedFile.Count | Should -Be 1
+        $script:unassignedRows.Count | Should -Be 4
+        $script:unassignedRows.PhoneNumber | Should -Contain '+15552220000'
+    }
+
+    It 'Names both files so they parse back with ConvertFrom-MigrationOutputPath' {
+        $results = ConvertFrom-MigrationOutputPath -Path $script:listRun.ResultPath
+        $results.Name | Should -BeExactly 'Set-TeamsPhoneAssignments'
+        $results.Suffix | Should -BeExactly 'Results'
+
+        $report = ConvertFrom-MigrationOutputPath -Path $script:unassignedFile[0].FullName
+        $report.Name | Should -BeExactly 'TeamsPhoneNumbers-Unassigned'
+        $report.Suffix | Should -BeExactly ''
+    }
+
+    It 'Writes neither file under -DryRun' {
+        $dryRun = Invoke-ScriptUnderTest -Arguments @{ ListUnassigned = $true; DryRun = $true }
+        $dryRun.ExitCode | Should -Be 0
+        $dryReportFiles = @(Get-ChildItem -LiteralPath $dryRun.Workspace -Filter 'TeamsPhoneNumbers-Unassigned_*.csv')
+        $dryReportFiles.Count | Should -Be 0
+
+        $dryResults = ConvertFrom-MigrationOutputPath -Path $dryRun.ResultPath
+        $dryResults.Name | Should -BeExactly 'Set-TeamsPhoneAssignments'
+        $dryResults.Suffix | Should -BeExactly 'DryRun'
+    }
+}
+
+Describe '-ListUnassigned with nothing free in the inventory' {
+
+    <#
+        Zero unassigned numbers must write no report file at all - not the module's Info-row
+        placeholder, which would be a confusing "found nothing" file rather than no file.
+    #>
+
+    BeforeAll {
+        # Shadows the Describe-level stub (top of file). The script trusts this function's
+        # -Filter @{ PstnAssignmentStatus = 'Unassigned' } result as-is with no local
+        # re-filtering, so returning nothing here is what "no free numbers" means to it.
+        function Get-MigrationPhoneNumberInventory {
+            [CmdletBinding()]
+            param([hashtable]$Filter, [int]$PageSize)
+            return @()
+        }
+
+        $script:noneFreeRun = Invoke-ScriptUnderTest -Arguments @{ ListUnassigned = $true }
+    }
+
+    It 'Exits 0 and writes no unassigned-numbers report' {
+        $script:noneFreeRun.ExitCode | Should -Be 0
+        $reportFiles = @(Get-ChildItem -LiteralPath $script:noneFreeRun.Workspace `
+                -Filter 'TeamsPhoneNumbers-Unassigned_*.csv')
+        $reportFiles.Count | Should -Be 0
+    }
+
+    It 'Still writes the results file' {
+        $script:noneFreeRun.ResultFile | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'The tenant guard runs once over the Teams session' {
+
+    <#
+        Assert-MigrationTenant is shadowed rather than mocked so the call can be recorded without
+        the module's real resolver touching the network. A GUID -TenantId is used because that is
+        what the assert compares against; the script's job is only to hand it over unchanged.
+    #>
+
+    BeforeAll {
+        $script:guardTenantId = '00000000-0000-0000-0000-0000000000f1'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'Asserts the -TenantId it was given against the Teams tenant exactly once' {
+        $null = Invoke-ScriptUnderTest -Arguments @{
+            CsvPath  = $script:fixtureCsv
+            DryRun   = $true
+            TenantId = $script:guardTenantId
+        }
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Teams phone assignment'
+        $global:AssertCalls[0].TeamsTenant.TenantId | Should -BeExactly 'newco-tenant-guid'
     }
 }

@@ -12,8 +12,9 @@ function Export-MigrationResult {
         script-specific columns follow in the order they first appear. Status is one of
         Planned, Succeeded, Skipped or Failed - 'Planned' being what a dry run produces.
 
-        The filename encodes the mode, because mixing a rehearsal up with the real thing
-        is the expensive mistake this toolkit exists to avoid:
+        The filename comes from Get-MigrationOutputPath and encodes the mode as its Suffix,
+        because mixing a rehearsal up with the real thing is the expensive mistake this
+        toolkit exists to avoid:
           <Prefix>_<Name>-Results_<timestamp>.csv   a real run
           <Prefix>_<Name>-DryRun_<timestamp>.csv    a dry run
         The prefix and its leading underscore are omitted when the run has no prefix.
@@ -65,7 +66,6 @@ function Export-MigrationResult {
     }
 
     $directory = if ($script:MigrationRun) { $script:MigrationRun.OutputDirectory } else { Get-MigrationDefaultOutputRoot }
-    $prefix = if ($script:MigrationRun) { $script:MigrationRun.Prefix } else { '' }
 
     if (-not (Test-Path -LiteralPath $directory)) {
         try {
@@ -77,13 +77,16 @@ function Export-MigrationResult {
     }
 
     $mode = if ($isDryRun) { 'DryRun' } else { 'Results' }
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $leader = if ($prefix) { "${prefix}_" } else { '' }
-    $fileName = "${leader}${Name}-${mode}_$timestamp.csv"
-    $filePath = Join-Path -Path $directory -ChildPath $fileName
+    $filePath = Get-MigrationOutputPath -Name $Name -Suffix $mode
 
     # The four standard columns lead; everything a script added follows in first-seen order.
     $standardColumns = @('Identity', 'Action', 'Status', 'Detail')
+
+    # Credentials this toolkit minted are exempt from the formula-prefix sanitiser. The
+    # generators draw from a pool containing '-', '=', '+' and '@', so a prefixed copy would
+    # be a password the account does not have - and the value never came from a tenant, so it
+    # cannot carry an injection in the first place. See ConvertTo-MigrationSafeRow.
+    $credentialColumns = @('GeneratedPassword')
     $extraColumns = [System.Collections.Generic.List[string]]::new()
     foreach ($row in @($Rows)) {
         foreach ($property in $row.PSObject.Properties.Name) {
@@ -99,7 +102,15 @@ function Export-MigrationResult {
         foreach ($column in $columns) {
             $value = ''
             if ($row.PSObject.Properties[$column]) { $value = $row.PSObject.Properties[$column].Value }
-            $ordered[$column] = $value
+            # Sanitised here, once, so every writer downstream - Export-Csv today, anything
+            # else tomorrow - only ever sees a value a spreadsheet cannot read as a formula.
+            # The credential columns are the documented exception above.
+            $ordered[$column] = if ($credentialColumns -contains $column) {
+                $value
+            }
+            else {
+                ConvertTo-MigrationSafeCell -Value $value
+            }
         }
         $shaped.Add([pscustomobject]$ordered)
     }

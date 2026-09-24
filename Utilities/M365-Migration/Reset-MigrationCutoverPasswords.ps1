@@ -109,6 +109,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
                   Microsoft.Graph.Authentication (installed on demand by Connect-MigrationGraph).
                   All Graph reads and writes go through raw REST calls via
@@ -335,9 +336,14 @@ $exitCode = 0
 $run = Initialize-MigrationRun -ScriptName 'Reset-MigrationCutoverPasswords' -OutputPath $OutputPath `
     -Prefix $Prefix -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
 
-try {
-    $isDryRun = [bool]$run.DryRun
+$isDryRun = [bool]$run.DryRun
+$resultsExported = $false
 
+# Declared out here, not in the try: the finally block writes these rows, and a passphrase that
+# only exists in this list and on the account it was set on must survive whatever ended the run.
+$results = [System.Collections.Generic.List[object]]::new()
+
+try {
     # Fail on bad input paths before a sign-in prompt is put in front of the operator.
     switch ($PSCmdlet.ParameterSetName) {
         'Csv' { if (-not (Test-Path -LiteralPath $CsvPath)) { throw "CSV not found: $CsvPath" } }
@@ -349,6 +355,11 @@ try {
     # Microsoft.Graph.Users / .Groups submodule - and the version-matching failure they can
     # trigger against an already-loaded Microsoft.Graph.Authentication - ever enters the picture.
     $context = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+    # The guard, called unconditionally: with no -TenantId it writes the WARNING banner naming the
+    # tenant whose passwords are about to change, which is the only notice an operator gets that
+    # nothing verified it.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $context `
+        -Purpose 'Cutover password reset'
     # Connect-MigrationGraph logs a reused cached session at INFO, which the default verbosity
     # hides; a credential reset must show the tenant it is about to act on at every verbosity.
     Write-MigrationLog -Message "Target tenant: $($context.TenantId) as $($context.Account)" -Level SUCCESS
@@ -454,7 +465,6 @@ try {
 
     Write-MigrationLog -Message "Users to process: $($targets.Count)" -Level INFO
 
-    $results = [System.Collections.Generic.List[object]]::new()
     $index = 0
 
     foreach ($target in $targets) {
@@ -471,6 +481,10 @@ try {
         $detail = ''
         $generated = ''
         $passwordProfile = $null
+
+        # Read by the per-row catch, which is reachable long before the PATCH, so under
+        # Set-StrictMode it has to exist from the top of every iteration.
+        $patchAttempted = $false
 
         try {
             # A lookup that broke (throttling, 403, expired token) is a Failed row with the
@@ -502,6 +516,11 @@ try {
                     # Invoke-MigrationGraphRequest throws on a failed call (after its own retry
                     # budget) so a failed reset lands in catch and is recorded as Failed - never
                     # reported as a success with a credential that was never actually set.
+                    #
+                    # Set before the call, not after: once the PATCH is on the wire Graph may
+                    # have applied it whatever comes back, and from here on the passphrase is
+                    # the only thing that can open the account.
+                    $patchAttempted = $true
                     $null = Invoke-MigrationAction -Description "Reset the password for $identity" -Action {
                         $null = Invoke-MigrationGraphRequest -Method PATCH -Uri "/v1.0/users/$($user.Id)" `
                             -Body @{ passwordProfile = $passwordProfile }
@@ -519,7 +538,11 @@ try {
         }
         catch {
             $status = 'Failed'
-            $generated = ''   # the reset did not take - do not surface a credential
+            # Only a reset that was never sent is credential-free. Once the PATCH went out, a
+            # response that never arrived (timeout, dropped socket) can still have been applied,
+            # and the passphrase below is the only copy of what the account now answers to -
+            # clearing it would lock the user out with nothing to look the credential up by.
+            if (-not $patchAttempted) { $generated = '' }
             $message = $_.Exception.Message
             if ($message -match 'Authorization_RequestDenied|Insufficient privileges') {
                 $detail = 'Access denied - the signed-in account lacks rights to reset this user ' +
@@ -528,6 +551,10 @@ try {
             }
             else {
                 $detail = $message
+            }
+            if ($patchAttempted) {
+                $detail += ' The reset may have applied; verify sign-in with this passphrase ' +
+                    'before resetting again.'
             }
         }
 
@@ -553,11 +580,6 @@ try {
     }
 
     Write-Progress -Activity 'Resetting cutover passwords' -Completed
-
-    $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Reset-CutoverPasswords'
-    if (-not $isDryRun -and @($results | Where-Object { $_.Status -eq 'Succeeded' }).Count -gt 0) {
-        Write-MigrationLog -Message 'Generated passwords were written to the results file, not to this log. Store it securely and delete it once the credentials have been distributed.' -Level WARNING
-    }
 }
 catch {
     Write-MigrationLog -Message "Fatal: $($_.Exception.Message)" -Level ERROR
@@ -566,6 +588,66 @@ catch {
 }
 finally {
     #region Cleanup ------------------------------------------------------------
+    # The export lives here rather than at the end of the try: a passphrase that has already
+    # been set on an account exists nowhere but this list, so a dropped session between rows
+    # must not take the credentials of the rows that did succeed with it.
+    if (-not $resultsExported) {
+        $resultRows = $results.ToArray()
+        try {
+            $null = Export-MigrationResult -Rows $resultRows -Name 'Reset-CutoverPasswords'
+            $resultsExported = $true
+        }
+        catch {
+            $exportError = $_.Exception.Message
+
+            # Built inside the try: an unusable temp path would otherwise throw out of the
+            # finally itself, taking the loss message with it.
+            $fallbackPath = ''
+            try {
+                # The run folder is unusable (read-only, full, or gone), so the rows go to the
+                # temp folder instead. Get-MigrationOutputPath keeps the filename contract -
+                # including leaving the leader off entirely when the run has no prefix. The
+                # suffix has to track the run's mode: the workbench reads a step's state from
+                # it, and a DryRun file landing as '-Results' would mark the step done.
+                $fallbackSuffix = if ($isDryRun) { 'DryRun' } else { 'Results' }
+                $fallbackPath = Get-MigrationOutputPath -Directory ([System.IO.Path]::GetTempPath()) `
+                    -Prefix $run.Prefix -Name 'Reset-CutoverPasswords' -Suffix $fallbackSuffix
+
+                # Sanitised the same way Export-MigrationResult does it: the rescue copy is
+                # opened in Excel like any other results file, so it needs the same protection
+                # against a cell that starts with '=' being run as a formula - and the same
+                # exemption for the minted credential, which must stay byte-identical to the
+                # password the account actually has.
+                $resultRows |
+                    ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ -ExcludeProperty 'GeneratedPassword' } |
+                    Export-Csv -LiteralPath $fallbackPath -NoTypeInformation -Encoding utf8 -ErrorAction Stop
+                $resultsExported = $true
+                Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory); a copy was " +
+                    "saved to $fallbackPath. Move it into the run folder. Original error: $exportError") -Level ERROR
+            }
+            catch {
+                # Nowhere left to put them. Naming the count - never the credentials - is the
+                # only thing that still helps: it tells the operator how big the re-run is.
+                $lostCount = @($resultRows | Where-Object { $_.GeneratedPassword }).Count
+                $attempted = if ($fallbackPath) { "'$fallbackPath'" } else { 'the temp folder' }
+                Write-MigrationLog -Message ("Results could not be written to $($run.OutputDirectory) or to " +
+                    "$attempted`: $($_.Exception.Message) Original error: $exportError") -Level ERROR
+                if ($lostCount -gt 0) {
+                    Write-MigrationLog -Message ("$lostCount generated credential(s) could not be persisted " +
+                        'anywhere; they are lost. Reset the affected accounts again.') -Level ERROR
+                }
+                $exitCode = 1
+            }
+        }
+    }
+
+    # Any row carrying a passphrase, not just the Succeeded ones: a Failed row whose PATCH may
+    # have applied carries one too, and that file is just as much a password list.
+    $anyCredential = @($results | Where-Object { $_.GeneratedPassword }).Count -gt 0
+    if ($resultsExported -and -not $isDryRun -and $anyCredential) {
+        Write-MigrationLog -Message 'Generated passwords were written to the results file, not to this log. Store it securely and delete it once the credentials have been distributed.' -Level WARNING
+    }
+
     # The Graph session is deliberately left connected: Connect-MigrationGraph reuses a live
     # context, so disconnecting here would force a fresh sign-in for the next script in the run.
     $null = Complete-MigrationRun -ExitCode $exitCode

@@ -19,6 +19,9 @@
     Justification = 'Remove-CsPhoneNumberAssignment here is a stand-in named after the real cmdlet so the script under test resolves it. It changes nothing, so ShouldProcess would be meaningless.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
     Justification = 'Connect-MigrationTeams mirrors the module function it shadows; Teams is a product name.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+    Justification = 'The stubs run inside the script under test, whose scope chain does not reach
+    this file''s script scope. The calls they record go in a global list, removed again in AfterAll.')]
 param()
 
 BeforeAll {
@@ -106,6 +109,8 @@ BeforeAll {
 
     function Connect-MigrationTeams {
         param([string]$TenantId, [switch]$Reconnect)
+        # Counted so a test can prove a refusal happened before any sign-in was attempted.
+        $global:connectTeamsCalls.Add($TenantId)
         return [pscustomobject]@{ TenantId = 'contoso.onmicrosoft.com'; DisplayName = 'Contoso' }
     }
 
@@ -152,16 +157,19 @@ BeforeAll {
         $null = New-Item -Path $workspace -ItemType Directory -Force
         $script:workspaces.Add($workspace)
 
+        $global:connectTeamsCalls = [System.Collections.Generic.List[string]]::new()
+
         & $script:scriptPath @Arguments -OutputPath $workspace -Verbosity Low
         $exitCode = $LASTEXITCODE
 
         $csv = @(Get-ChildItem -LiteralPath $workspace -Filter 'Remove-TeamsPhoneAssignments-*.csv')
         $log = @(Get-ChildItem -LiteralPath $workspace -Filter '*.log')
         return [pscustomobject]@{
-            ExitCode   = $exitCode
-            ResultFile = if ($csv.Count -eq 1) { $csv[0].Name } else { $null }
-            Rows       = if ($csv.Count -eq 1) { @(Import-Csv -LiteralPath $csv[0].FullName) } else { @() }
-            Log        = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
+            ExitCode     = $exitCode
+            ResultFile   = if ($csv.Count -eq 1) { $csv[0].Name } else { $null }
+            Rows         = if ($csv.Count -eq 1) { @(Import-Csv -LiteralPath $csv[0].FullName) } else { @() }
+            Log          = if ($log.Count -ge 1) { Get-Content -LiteralPath $log[0].FullName -Raw } else { '' }
+            ConnectCalls = @($global:connectTeamsCalls).Count
         }
     }
 }
@@ -172,6 +180,7 @@ AfterAll {
             Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    Remove-Variable -Name connectTeamsCalls -Scope Global -ErrorAction SilentlyContinue
 }
 
 Describe 'Remove-MigrationTeamsPhoneAssignments parameter contract' {
@@ -185,6 +194,45 @@ Describe 'Remove-MigrationTeamsPhoneAssignments parameter contract' {
         $parameter = (Get-Command $script:scriptPath).Parameters['TenantId']
         $parameter.ParameterSets['User'].IsMandatory | Should -BeFalse
         $parameter.ParameterSets['Csv'].IsMandatory | Should -BeFalse
+    }
+
+    It 'Offers -AcknowledgeSourceTenant on the -All set only' {
+        $parameter = (Get-Command $script:scriptPath).Parameters['AcknowledgeSourceTenant']
+        @($parameter.ParameterSets.Keys) | Should -Be @('All')
+    }
+}
+
+Describe '-All without the acknowledgement' {
+
+    <#
+        Releasing every number in a tenant is only ever right in the tenant being decommissioned,
+        and the damage is done the moment the loop starts. The refusal therefore has to land
+        before the sign-in, not in the middle of the run.
+    #>
+
+    BeforeAll {
+        $script:refusedTenantId = '00000000-0000-0000-0000-0000000000f3'
+        $script:refused = Invoke-ScriptUnderTest -Arguments @{
+            All      = $true
+            TenantId = $script:refusedTenantId
+            DryRun   = $true
+        }
+    }
+
+    It 'Exits 1 with the tenant named in the fatal line' {
+        $script:refused.ExitCode | Should -Be 1
+        $script:refused.Log | Should -BeLike ("*Fatal: -All releases every phone number in tenant " +
+            "$script:refusedTenantId. Re-run with -AcknowledgeSourceTenant to confirm this is the " +
+            'tenant being decommissioned.*')
+    }
+
+    It 'Never signs in to Teams' {
+        $script:refused.ConnectCalls | Should -Be 0
+        $script:refused.Log | Should -Not -BeLike '*TARGET TENANT*'
+    }
+
+    It 'Writes no results file' {
+        $script:refused.ResultFile | Should -BeNullOrEmpty
     }
 }
 
@@ -296,9 +344,25 @@ Describe 'A live run with the prompt suppressed' {
 Describe 'The -All set' {
 
     BeforeAll {
-        $script:all = Invoke-ScriptUnderTest -Arguments @{ All = $true; TenantId = 'contoso.onmicrosoft.com'; DryRun = $true }
+        # -All requires a pin and the documented one is a domain, which the real
+        # Assert-MigrationTenant would resolve over the network. The guard has its own block at
+        # the end of this file; here it is shadowed so these tests stay offline.
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+
+        $script:all = Invoke-ScriptUnderTest -Arguments @{
+            All = $true; TenantId = 'contoso.onmicrosoft.com'; AcknowledgeSourceTenant = $true; DryRun = $true
+        }
         $script:allRows = @{}
         foreach ($row in $script:all.Rows) { $script:allRows[$row.Identity] = $row }
+    }
+
+    It 'Proceeds once -AcknowledgeSourceTenant is given' {
+        $script:all.ConnectCalls | Should -Be 1
+        $script:all.ResultFile | Should -Match 'Remove-TeamsPhoneAssignments-DryRun_'
+        $script:all.Rows.Count | Should -BeGreaterThan 0
     }
 
     It 'Includes resource accounts and labels them in the AccountType column' {
@@ -321,7 +385,9 @@ Describe 'The -All set' {
                 return Get-StubTeamsUser
             }
 
-            $script:fallback = Invoke-ScriptUnderTest -Arguments @{ All = $true; TenantId = 'contoso.onmicrosoft.com'; DryRun = $true }
+            $script:fallback = Invoke-ScriptUnderTest -Arguments @{
+                All = $true; TenantId = 'contoso.onmicrosoft.com'; AcknowledgeSourceTenant = $true; DryRun = $true
+            }
         }
 
         It 'Logs the cause with the fallback warning' {
@@ -334,5 +400,45 @@ Describe 'The -All set' {
             $identities | Should -Not -Contain 'no.number@contoso.com'
             $script:fallback.Rows.Count | Should -Be $script:all.Rows.Count
         }
+    }
+}
+
+Describe 'The tenant guard runs once over the Teams session' {
+
+    <#
+        Assert-MigrationTenant is shadowed rather than mocked so the call can be recorded without
+        the module's real resolver touching the network. Releasing numbers from the wrong tenant
+        is unrecoverable, so what matters is that the pin reaches the guard, not just the connector.
+    #>
+
+    BeforeAll {
+        $script:guardTenantId = '00000000-0000-0000-0000-0000000000f2'
+
+        function Assert-MigrationTenant {
+            param($ExpectedTenantId, $GraphContext, $ExchangeConnection, $TeamsTenant, $Purpose)
+            $global:AssertCalls += , $PSBoundParameters
+            [pscustomobject]@{ Matches = $true; ExpectedTenantId = $ExpectedTenantId; Connected = @{}; Reason = '' }
+        }
+    }
+
+    BeforeEach {
+        $global:AssertCalls = @()
+    }
+
+    AfterAll {
+        Remove-Variable -Name AssertCalls -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'Asserts the -TenantId it was given against the Teams tenant exactly once' {
+        $null = Invoke-ScriptUnderTest -Arguments @{
+            CsvPath  = $script:fixtureCsv
+            DryRun   = $true
+            TenantId = $script:guardTenantId
+        }
+
+        $global:AssertCalls.Count | Should -Be 1
+        $global:AssertCalls[0].ExpectedTenantId | Should -BeExactly $script:guardTenantId
+        $global:AssertCalls[0].Purpose | Should -BeExactly 'Teams phone removal'
+        $global:AssertCalls[0].TeamsTenant.TenantId | Should -BeExactly 'contoso.onmicrosoft.com'
     }
 }

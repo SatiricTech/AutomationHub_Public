@@ -75,7 +75,7 @@
 .EXAMPLE
     .\Test-MigrationReadiness.ps1 -PlanPath .\IdentityPlan.csv -Prefix Fabrikam
 
-    Runs the Pre stage over the whole plan and writes Fabrikam_Test-MigrationReadiness-Results_<ts>.csv.
+    Runs the Pre stage over the whole plan and writes Fabrikam_Test-Readiness-Results_<ts>.csv.
 
 .EXAMPLE
     .\Test-MigrationReadiness.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -Stage Provisioned -SourceMailboxesCsv .\Mailboxes.csv
@@ -96,6 +96,7 @@
 
 .NOTES
     Author: AutomationHub
+    Version: 1.2.0
     Written with assistance from Claude (Anthropic).
 
     Required Microsoft Graph scopes:
@@ -961,19 +962,35 @@ try {
     }
 
     $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
-    $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization
-
-    # Connect-MigrationExchange reuses a live EXO session whenever -DelegatedOrganization is
-    # omitted, which is exactly how every documented -TenantId-only run is invoked. Without this
-    # check a leftover session to the source tenant runs every Exchange-backed check against the
-    # wrong tenant while Graph correctly targets the destination.
     $graphTenantId = [string](Get-MigrationProperty -InputObject $graphContext -Name 'TenantId' -Default '')
-    $exoTenantId = [string](Get-MigrationProperty -InputObject $exoConnection -Name 'TenantID' -Default '')
-    if ($graphTenantId -and $exoTenantId -and $graphTenantId -ne $exoTenantId) {
-        throw ("Microsoft Graph is connected to tenant $graphTenantId but Exchange Online is connected to " +
-            "tenant $exoTenantId. Re-run with -DelegatedOrganization for the same destination tenant, or run " +
-            "Disconnect-ExchangeOnline first so a fresh session is established.")
+
+    # What both sides are held to. -TenantId when the operator named one; otherwise Graph's own
+    # tenant, so the Graph-vs-Exchange cross-check happens on every run and not only on pinned
+    # ones. Connect-MigrationExchange reuses a live EXO session whenever -DelegatedOrganization
+    # is omitted, which is exactly how every documented -TenantId-only run is invoked, so a
+    # leftover session to the source tenant would otherwise run every Exchange-backed check
+    # against the wrong tenant while Graph correctly targets the destination.
+    $expectedTenant = if ($TenantId) { $TenantId } else { $graphTenantId }
+
+    $exoConnection = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
+        -TenantId $expectedTenant
+
+    # Falling back to Graph's tenant means the assert normally has something to compare, so it
+    # never reaches its own "no tenant was specified" branch. That branch's warning still has to
+    # be said out loud, because an unpinned run is exactly the one an operator should notice.
+    # If Graph reported no tenant either there is nothing to name, and the assert's own
+    # unverifiable-connection warning covers it - saying it twice, once with a hole in the
+    # sentence, would only be noise.
+    if (-not $TenantId -and $expectedTenant) {
+        Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
+            'Pass -TenantId to guard against a cached session.') -Level WARNING
     }
+
+    # The comparison itself lives in Assert-MigrationTenant, so every connecting script shares
+    # one implementation of "are these sessions the tenant I was told to expect".
+    $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenant -GraphContext $graphContext `
+        -ExchangeConnection $exoConnection -Purpose 'Readiness checks'
+
     Write-MigrationLog -Message ("Checking destination tenant $graphTenantId (Graph as " +
         "$(Get-MigrationProperty -InputObject $graphContext -Name 'Account' -Default '?'), EXO as " +
         "$(Get-MigrationProperty -InputObject $exoConnection -Name 'UserPrincipalName' -Default '?')).") -Level INFO
@@ -1202,7 +1219,7 @@ catch {
 Write-CheckTable -Result $results.ToArray()
 
 if ($results.Count -gt 0) {
-    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Test-MigrationReadiness' }
+    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Test-Readiness' }
     catch {
         Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
         $exitCode = 1

@@ -45,7 +45,12 @@
 
 .PARAMETER RemoveUnplanned
     Also remove directly assigned SKUs the plan does not ask for. Group-inherited SKUs are never
-    removed - they are reported instead.
+    removed - they are reported instead. Requires -AcknowledgeLicenseRemoval.
+
+.PARAMETER AcknowledgeLicenseRemoval
+    Confirms that -RemoveUnplanned may strip licences. Without it -RemoveUnplanned refuses to run
+    before anything is read or connected to, because taking the Exchange licence off a user starts
+    the 30-day clock after which Microsoft 365 deletes the mailbox.
 
 .PARAMETER DefaultUsageLocation
     Two-letter ISO country code used when a plan row has no UsageLocation and the destination user
@@ -86,15 +91,16 @@
     .\Set-MigrationLicenses.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -DryRun -Prefix Fabrikam
 
     Reads wave 1, resolves every licence change, prints the seat table and writes
-    Fabrikam_Set-MigrationLicenses-DryRun_<timestamp>.csv without touching the tenant.
+    Fabrikam_Set-Licenses-DryRun_<timestamp>.csv without touching the tenant.
 
 .EXAMPLE
-    .\Set-MigrationLicenses.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -DefaultUsageLocation US
+    .\Set-MigrationLicenses.ps1 -PlanPath .\IdentityPlan.csv -Wave 1 -DefaultUsageLocation US -Confirm:$false
 
     Assigns wave 1's licences, defaulting anyone with no usage location in the plan to the US.
 
 .EXAMPLE
-    .\Set-MigrationLicenses.ps1 -PlanPath .\IdentityPlan.csv -SkuMapPath .\SkuMap.csv -RemoveUnplanned
+    .\Set-MigrationLicenses.ps1 -PlanPath .\IdentityPlan.csv -SkuMapPath .\SkuMap.csv `
+        -RemoveUnplanned -AcknowledgeLicenseRemoval -Confirm:$false
 
     Recomputes the target SKUs from SourceLicenses through a corrected SKU map and strips any
     directly assigned licence the map does not produce.
@@ -107,6 +113,7 @@
 
 .NOTES
     Author: AutomationHub
+    Version: 1.2.0
     Written with assistance from Claude (Anthropic).
 
     Required Microsoft Graph scopes:
@@ -125,9 +132,13 @@
     Exit codes: 0 success, 1 fatal (connection, plan or seat pre-check; under -DryRun the seat
     pre-check sets this code but the results file is still written), 2 completed with row
     failures.
+
+    The script declares ConfirmImpact 'High' because a licence change is billable and, when it
+    removes a licence, destructive. Pass -Confirm:$false on any unattended run so an inherited
+    $ConfirmPreference cannot stop the run at a prompt nobody is there to answer.
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
@@ -140,6 +151,8 @@ param(
     [string]$SkuMapPath,
 
     [switch]$RemoveUnplanned,
+
+    [switch]$AcknowledgeLicenseRemoval,
 
     [ValidatePattern('^([A-Za-z]{2})?$')]
     [string]$DefaultUsageLocation,
@@ -797,6 +810,14 @@ $null = Initialize-MigrationRun -ScriptName 'Set-MigrationLicenses' -OutputPath 
     -LogPath $LogPath -DryRun:$DryRun -Verbosity $Verbosity -BoundParameters $PSBoundParameters
 
 try {
+    # First thing in the run, ahead of the plan read and the sign-in: a removal sweep aimed at
+    # the wrong plan or the wrong tenant is not undone by stopping it part-way, and a mailbox
+    # whose licence went is deleted 30 days later whether or not anyone noticed.
+    if ($RemoveUnplanned -and -not $AcknowledgeLicenseRemoval) {
+        throw '-RemoveUnplanned strips every direct licence not in the plan; mailboxes on removed SKUs ' +
+        'are deleted after 30 days. Re-run with -AcknowledgeLicenseRemoval.'
+    }
+
     # Only User rows can hold a licence; anything else is filtered out at the source rather than
     # padding the results file with hundreds of irrelevant Skipped rows.
     $planRows = @(Import-MigrationPlan -Path $PlanPath -Wave $Wave -ObjectType 'User')
@@ -823,7 +844,12 @@ try {
         Write-MigrationLog -Message 'No eligible plan rows; skipping the tenant connection entirely.' -Level WARNING
     }
     else {
-        $null = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+        $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
+        # The guard, called unconditionally: with no -TenantId it writes the WARNING banner naming
+        # the tenant whose seats are about to be consumed, which is the only notice an operator
+        # gets that nothing verified it.
+        $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -GraphContext $graphContext `
+            -Purpose 'License assignment'
         $catalog = @(Get-MigrationSkuCatalog)
 
         # Every identifier the row offers goes into the lookup: the live UPN is the interim one until
@@ -897,7 +923,7 @@ catch {
 #region Cleanup
 
 if ($results.Count -gt 0) {
-    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Set-MigrationLicenses' }
+    try { $null = Export-MigrationResult -Rows $results.ToArray() -Name 'Set-Licenses' }
     catch {
         Write-MigrationLog -Message "Could not write the results file: $($_.Exception.Message)" -Level ERROR
         $exitCode = 1

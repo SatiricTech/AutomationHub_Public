@@ -40,9 +40,193 @@ parameter reference, auth matrix and plan schema.</p>
   the OneDrive-provisioning read.</p>
 </div>
 
+<h2>Workbench — the front door</h2>
+
+<p><code>Start-MigrationWorkbench.ps1</code> runs the whole runbook below without anyone
+typing a command line. Point it at a migration folder and it reads what is already there,
+keeps that migration's settings in one JSON file beside the outputs, shows the runbook with a
+detected state per step, builds the exact command a step needs, runs it in a child PowerShell
+with a live log, and records what ran. It never bypasses a script — every option every script
+has is still reachable, because all it does is build the command an operator could have typed
+and then type it.</p>
+
+<table>
+  <thead>
+    <tr><th>Mode</th><th>How to start it</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Console workbench</td>
+        <td><code>pwsh ./Start-MigrationWorkbench.ps1 [-Workspace &lt;dir&gt;]</code> — macOS, Linux and Windows</td></tr>
+    <tr><td>WinForms workbench</td>
+        <td>Double-click <code>Start-MigrationWorkbench.cmd</code> on Windows. It finds PowerShell 7, refuses Windows PowerShell 5.1 with the install link, and never elevates. <code>-Console</code> forces the console board instead</td></tr>
+    <tr><td>Non-interactive</td>
+        <td><code>./Start-MigrationWorkbench.ps1 -Workspace &lt;dir&gt; -Step &lt;id&gt; [-Wave &lt;label&gt;] [-DryRun] [-Set @{ ... }]</code> — runs one step, asks nothing, exits with the step's exit code</td></tr>
+  </tbody>
+</table>
+
+<p>Omit <code>-Workspace</code> in console mode and it offers the recent list, the folders
+under the default output root, and a typed path. <code>-Workspace</code> is required with
+<code>-Step</code>.</p>
+
+<pre><code>./Start-MigrationWorkbench.ps1 -Workspace ~/Migration-Automations/Contoso -Step New-Users -DryRun
+./Start-MigrationWorkbench.ps1 -Workspace ~/Migration-Automations/Contoso `
+    -Step DomainReferences-Remediate -Set @{ Acknowledge = 'newco.com' }</code></pre>
+
+<h3>The workspace</h3>
+
+<p>One migration per workspace folder, and that folder is <code>-OutputPath</code> for every
+step — so files land exactly where the runbook below says they land and you can drop to the
+command line at any point.</p>
+
+<pre><code>&lt;workspace&gt;/                                  every step's -OutputPath
+  M365Migration.settings.json                 this migration's settings
+  Workbench/
+    Runs.jsonl                                one JSON line per run - the run ledger
+    Runs/&lt;yyyyMMdd-HHmmss&gt;_&lt;StepId&gt;/          driver.ps1, stdout.txt, stderr.txt
+    Start-MigrationWorkbench_&lt;ts&gt;.log         the workbench's own log
+  Source/        Source_&lt;Tab&gt;_&lt;ts&gt;.csv        -Prefix Source
+  Destination/   Destination_&lt;Tab&gt;_&lt;ts&gt;.csv   -Prefix Destination
+  Post/          Post_&lt;Tab&gt;_&lt;ts&gt;.csv          -Prefix Post
+  &lt;Label&gt;/       the plan, the results files, the logs and the reports</code></pre>
+
+<h3>The settings file</h3>
+
+<p><code>M365Migration.settings.json</code> holds everything that is specific to this
+migration: the label and scenario, both tenants, the domains, the planner's naming formats and
+input paths, the run defaults, the pinned plan and the Viva Learning app registration. The
+README lists every key with a line on what it is, and
+<code>Templates/M365Migration.settings.example.json</code> is the committed template. Three
+rules are worth knowing before the first run:</p>
+
+<ul>
+  <li>Tenant IDs are stored as <strong>GUIDs</strong>. The Exchange tenant assertion only works
+  on a GUID, so a domain typed into the settings form is resolved to its GUID through the
+  public, unauthenticated OIDC discovery document — no sign-in, one HTTPS call.</li>
+  <li><code>Domains.Target</code> is the vanity domain the identities land on in the
+  destination. <code>Domains.Release</code> is the vanity domain being released from the
+  <strong>source</strong> tenant; blank means "same as Target", which is the common case but
+  not the rule — a migration onto a new brand releases one domain and lands on another.</li>
+  <li><code>Pinned.PlanPath</code> is what makes a re-plan safe: pin a plan and
+  <code>-ExistingPlanPath</code> defaults to it, so a newer file on disk does not silently
+  become the plan every step reads. Blank means "newest identity plan".</li>
+</ul>
+
+<div class="callout callout-warning">
+  <div class="callout-title">The settings file never holds a secret</div>
+  <p>No key may match the module's secret-name pattern beyond the documented locators, which
+  point at a secret rather than holding one, and a test enforces that on every
+  write. The one step that needs a client secret — the Viva Learning app-only import — reads
+  it from an environment variable and passes it to that single child process and nowhere else:
+  never to the generated driver file, the settings file or the log. <strong>Set a certificate
+  thumbprint in the settings instead and no secret is needed at all.</strong></p>
+</div>
+
+<p>The variable is <code>M365MIGRATION_CLIENT_SECRET</code>; set it before starting the
+workbench. The WinForms window has no password box by design, for exactly this reason.</p>
+
+<h3>What it detects</h3>
+
+<p>The workbench never asks where things are; it reads the folder. It loads the settings,
+works out the label folder, parses every filename that follows the toolkit's output contract,
+picks the identity plan with its waves and status counts, reads the run ledger, and derives one
+state per step — plus the step to do next. Newest always means the timestamp <em>in the
+filename</em>, never the file's modified date, because sync clients rewrite those. Anything it
+cannot make sense of becomes a warning rather than an error.</p>
+
+<table>
+  <thead>
+    <tr><th>Glyph</th><th>State</th><th>What it means</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>[ ]</code></td><td>NotRun</td><td>No artefact and no ledger entry</td></tr>
+    <tr><td><code>[~]</code></td><td>DryRun</td><td>The newest run of this step was a rehearsal</td></tr>
+    <tr><td><code>[x]</code></td><td>Done</td><td>Newest live results have no <code>Failed</code> rows and exit code 0, or the inventory/plan/mapping file exists</td></tr>
+    <tr><td><code>[!]</code></td><td>PartlyFailed / Failed</td><td>Rows failed (exit 2), or the run failed outright (exit 1)</td></tr>
+    <tr><td><code>[?]</code></td><td>WorkRemains</td><td>Exit 3 — domain references remain</td></tr>
+    <tr><td><code>[s]</code></td><td>Stale</td><td>Done, but the plan it consumed is older than the pinned plan</td></tr>
+  </tbody>
+</table>
+
+<h3>Gates</h3>
+
+<p>Every gate that applies is shown, satisfied ones included, because the list is a checklist —
+a gate already met is how you know the rehearsal counted.</p>
+
+<table>
+  <thead>
+    <tr><th>Gate</th><th>Behaviour</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>DryRunFirst</code></td>
+        <td>Soft, on live runs of a writing or destructive step. Satisfied by a rehearsal of the same step for the same waves, started after the plan was written, not cancelled, that exited 0 or 2</td></tr>
+    <tr><td><code>TypedConfirmation</code></td>
+        <td>Hard, on every destructive step and on every non-read step against the source tenant. Type the release domain (case-insensitively) or the word <code>REMOVE</code> (case-sensitively). Asked for on a rehearsal too — a rehearsal still signs in to the source tenant</td></tr>
+    <tr><td><code>Prerequisite</code></td>
+        <td>Soft. Lists what is not in hand. A requirement naming an artefact rather than a step is met by the artefact existing, whoever produced it</td></tr>
+    <tr><td><code>WaveRequired</code></td>
+        <td>Soft, on live runs of a writing or destructive step that takes <code>-Wave</code>. A blank wave means the whole plan; the gate makes that a decision rather than an omission</td></tr>
+    <tr><td><code>TenantMismatch</code></td>
+        <td>Hard and post-run: the tenant lines in the child's log are compared with the GUID the step should have reached, and a mismatch is flagged whatever the exit code was</td></tr>
+  </tbody>
+</table>
+
+<p>In a non-interactive run a hard gate is answered by
+<code>-Set @{ Acknowledge = '&lt;what it asks for&gt;' }</code> and nothing else — there is no
+console to type into, and a gate that cannot be typed at must not become a gate that is
+skipped. Soft gates are evaluated on live runs only: they warn, the run proceeds, and each is
+recorded in the ledger as an override.</p>
+
+<h3>Exit codes and the ledger</h3>
+
+<table>
+  <thead>
+    <tr><th>Code</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>0</code></td><td>The session closed normally, or the step succeeded</td></tr>
+    <tr><td><code>1</code></td><td>An unexpected error, a child that reported no exit code at all, or a run whose tenant did not verify</td></tr>
+    <tr><td><code>2</code></td><td>A refusal — no workspace, settings that will not load, an unknown step id, a parameter set short of a mandatory value, or a hard gate that was not acknowledged — or the step's own exit code 2</td></tr>
+    <tr><td><code>130</code></td><td>The run was aborted</td></tr>
+  </tbody>
+</table>
+
+<p>Any other code is the step's own, passed through unchanged, so a <code>3</code> from the
+domain-release script reaches the caller as <code>3</code>. The one exception is a tenant
+mismatch: a non-interactive run whose tenant did not verify exits <code>1</code> whatever the
+step returned, because a scheduler has only the exit code and a step that exited <code>0</code>
+against the wrong tenant must not read as a reason to run the next one. Every run appends one JSON object
+to <code>Workbench/Runs.jsonl</code> — when it started and ended, the step, the side, the
+tenant, whether it was a rehearsal, the waves, the exit code and its meaning, whether it was
+aborted, whether the tenant was verified, any gate overrides, the driver it ran and the files
+and counts it produced. That file is the workbench's memory: it is what the board reads for
+state, what the rehearsal gate reads, and what the results view lists.</p>
+
+<h3>Step ids</h3>
+
+<p><code>-Step</code> takes a step <strong>instance</strong> id, not a script name — several
+instances share one script, because the inventory runs three times, readiness three times and
+domain release twice.</p>
+
+<table>
+  <thead>
+    <tr><th>Phase</th><th>Step ids</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Discover</td><td><code>Inventory-Source</code>, <code>Inventory-Destination</code></td></tr>
+    <tr><td>Plan</td><td><code>New-IdentityPlan</code>, <code>Export-MappingFile</code></td></tr>
+    <tr><td>Prepare</td><td><code>Readiness-Pre</code>, <code>New-Users</code>, <code>Set-Licenses</code>, <code>New-Recipients</code>, <code>Readiness-Provisioned</code></td></tr>
+    <tr><td>Cutover</td><td><code>DomainReferences-Report</code>, <code>DomainReferences-Remediate</code>, <code>Set-Identity</code>, <code>Set-Identity-InPlace</code>, <code>Set-MailboxPermissions</code>, <code>Reset-CutoverPasswords</code>, <code>TeamsPhone-Export</code>, <code>TeamsPhone-Remove</code>, <code>TeamsPhone-ListUnassigned</code>, <code>TeamsPhone-Assign</code>, <code>VivaLearning-Export</code>, <code>VivaLearning-Import</code>, <code>Readiness-Post</code>, <code>Inventory-Post</code>, <code>Compare-Plan</code></td></tr>
+  </tbody>
+</table>
+
+<p><code>Set-Identity</code> and <code>Set-Identity-InPlace</code> are the same script under
+the two scenarios, and the phase view only ever shows the one the workspace's scenario
+selects.</p>
+
 <h2>The runbook</h2>
 
-<p>Every script writes into <code>~/Migration-Automations/&lt;Prefix&gt;/</code>
+<p>The steps below are what the workbench runs, and what to run by hand without it.
+Every script writes into <code>~/Migration-Automations/&lt;Prefix&gt;/</code>
 (<code>%LOCALAPPDATA%\Migration-Automations\&lt;Prefix&gt;\</code> on Windows) and stamps
 each file with the run's timestamp as <code>yyyyMMdd-HHmmss</code>. Wherever a command below
 shows <code>&lt;ts&gt;</code>, substitute that stamp — <code>Source_Users_&lt;ts&gt;.csv</code>
@@ -325,6 +509,9 @@ stays as an alias unless <code>-RemoveOldPrimaryAlias</code>; add
     <tr><th>Date</th><th>By</th><th>Change</th></tr>
   </thead>
   <tbody>
+    <tr><td>2026-09-19</td>
+        <td>Sentinel Cyber</td>
+        <td>Added the Workbench section: <code>Start-MigrationWorkbench.ps1</code> now runs the whole runbook from a settings file per migration folder, with detected state per step, gates, a run ledger and a non-interactive mode.</td></tr>
     <tr><td>2026-09-09</td>
         <td>Sentinel Cyber</td>
         <td>Runbook: explained the <code>&lt;ts&gt;</code> timestamp placeholder, where each run's files land, and what every <code>New-MigrationIdentityPlan</code> parameter is.</td></tr>

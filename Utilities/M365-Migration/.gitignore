@@ -1,0 +1,6 @@
+# Real per-migration settings hold tenant IDs and paths; only the example template is committed.
+M365Migration.settings.json
+
+# The workbench fixtures are synthetic workspaces (contoso.com / newco.com, zero GUIDs) and the
+# scanner looks the settings file up by its real name, so those copies have to be committed.
+!Tests/Fixtures/Workbench/**/M365Migration.settings.json

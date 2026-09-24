@@ -145,10 +145,13 @@
 
 .NOTES
     Author       : AutomationHub
+    Version      : 1.2.0
     Requires     : PowerShell 7.4, the M365Migration module beside this script
     Graph scopes : none - this script is entirely offline
     EXO roles    : none
     GDAP         : not applicable (no tenant connection is made)
+    Exit codes   : 0 success (CSV mode always exits 0), 1 fatal error, 2 -PlanPath mode found one
+                   or more Missing or Mismatch rows (see the results file).
     Written with assistance from Claude (Anthropic).
 #>
 

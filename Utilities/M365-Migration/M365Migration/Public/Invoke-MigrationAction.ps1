@@ -8,6 +8,10 @@ function Invoke-MigrationAction {
         DryRun promise credible: there is exactly one place where a write can happen,
         and it is guarded by one flag read from the run context.
 
+        Throws if called before Initialize-MigrationRun has set that context, rather than
+        guessing DryRun is off - a script that reaches this without a run context has a bug,
+        and running the mutation for real would be the wrong way to find out.
+
         In DryRun the action is not invoked and nothing is emitted, after logging
         '[DRYRUN] Would: <Description>'. Otherwise the description is logged, the action
         runs, and any failure is logged and re-thrown so the caller's per-row catch can
@@ -54,8 +58,11 @@ function Invoke-MigrationAction {
         [switch]$PassThru
     )
 
-    $isDryRun = $false
-    if ($script:MigrationRun) { $isDryRun = [bool]$script:MigrationRun.DryRun }
+    if (-not $script:MigrationRun) {
+        throw 'Invoke-MigrationAction was called outside a run. Call Initialize-MigrationRun first ' +
+            'so the DryRun state is known.'
+    }
+    $isDryRun = [bool]$script:MigrationRun.DryRun
 
     if ($isDryRun) {
         Write-MigrationLog -Message "[DRYRUN] Would: $Description" -Level WARNING

@@ -124,6 +124,7 @@
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Written with assistance from Claude (Anthropic).
 
     Graph scopes (delegated):
@@ -735,67 +736,12 @@ function Write-InventoryProgress {
     Write-Progress -Activity "Inventory: $Tab" -Status "$Current of $Total $Status" -PercentComplete $percent
 }
 
-function Export-InventoryTab {
-    <#
-        Writes one tab to CSV and, when enabled, to a worksheet in the shared workbook. Not
-        Export-MigrationReport: all nine files and the workbook share one timestamp so the set
-        reads as one inventory, and a report writer has nowhere to put the worksheet.
-
-        An empty tab is written as a header-only CSV carrying the tab's real columns (-Column),
-        so New-MigrationIdentityPlan's required-column check still passes when the file is handed
-        to it; the worksheet gets a single informational row instead because Export-Excel cannot
-        write a sheet from an empty pipeline. A WARNING names the empty tab. When no column list
-        is known the CSV falls back to the same informational row. The write goes through
-        Invoke-MigrationAction, which is what makes -DryRun log the planned file list and write
-        nothing.
-    #>
-    [CmdletBinding()]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
-        Justification = 'ExcelPath and IncludeExcel are consumed inside the Invoke-MigrationAction scriptblock, which the analyzer does not follow. The scriptblock is what makes the write DryRun-aware.')]
-    param(
-        [AllowNull()][AllowEmptyCollection()][object[]]$Row,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CsvPath,
-        [AllowNull()][AllowEmptyString()][string]$ExcelPath,
-        [AllowNull()][AllowEmptyCollection()][string[]]$Column,
-        [switch]$IncludeExcel
-    )
-
-    $data = @($Row)
-    $count = $data.Count
-    $headerOnly = $null
-    if ($count -eq 0) {
-        $placeholder = @([pscustomobject]@{ Info = "No $Name records found." })
-        $columns = @($Column | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if ($columns.Count -gt 0) {
-            $headerOnly = ($columns | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }) -join ','
-        }
-        else {
-            $data = $placeholder
-        }
-        Write-MigrationLog -Level WARNING -Message ("The $Name tab is empty. Do not pass " +
-            "$CsvPath to New-MigrationIdentityPlan - Import-MigrationCsv rejects a CSV with no data rows.")
-    }
-
-    Invoke-MigrationAction -Description "Write the $Name tab ($count row(s)) to $CsvPath" -Action {
-        if ($null -ne $headerOnly) {
-            Set-Content -LiteralPath $CsvPath -Value $headerOnly -Encoding UTF8
-        }
-        else {
-            $data | Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding UTF8
-        }
-        if ($IncludeExcel -and -not [string]::IsNullOrWhiteSpace($ExcelPath)) {
-            $sheet = if ($count -eq 0) { $placeholder } else { $data }
-            $sheet | Export-Excel -Path $ExcelPath -WorksheetName $Name -AutoSize -FreezeTopRow -BoldTopRow -AutoFilter
-        }
-    }
-}
-
 function Get-InventoryTabColumn {
     <#
         The column names of one tab, taken from the same row-shaping code that fills it, so an
-        empty tab's header never drifts from a populated one. Groups, Domains and Licenses are
-        shaped inline in the main block and are listed here by name.
+        empty tab's header (passed to Export-MigrationReport's -Columns) never drifts from a
+        populated one. Groups, Domains, Licenses and Summary are shaped inline in the main block
+        rather than by a dedicated ConvertTo-* function, so they are listed here by name instead.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
@@ -833,12 +779,38 @@ function Get-InventoryTabColumn {
             return @('DomainName', 'IsDefault', 'IsInitial', 'IsVerified', 'AuthenticationType', 'SupportedServices')
         }
         'Licenses' {
-            return @('SkuPartNumber', 'FriendlyName', 'SkuId', 'Enabled', 'Consumed', 'Available', 'ServicePlansDisabledCommon')
+            return @(
+                'SkuPartNumber', 'FriendlyName', 'SkuId', 'Enabled', 'Consumed', 'Available',
+                'ServicePlansDisabledCommon'
+            )
         }
         'Summary' { return @('Item', 'Value') }
     }
 
     return @()
+}
+
+function Get-InventoryTabSummaryPath {
+    <#
+        The path named in the "Inventory summary" log block for one tab: the path
+        Export-MigrationReport actually wrote for a live run, or the path it would have written
+        under -DryRun. Export-MigrationReport returns '' when -SuppressInDryRun suppresses the
+        write, so without this the summary would show nothing for a run whose whole point is to
+        preview the files - the help promises "logs the files it would have written".
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Tab,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$WrittenPath,
+        [Parameter(Mandatory)]$Run,
+        [Parameter(Mandatory)][datetime]$Timestamp
+    )
+
+    if ($Run.DryRun) {
+        return Get-MigrationOutputPath -Name $Tab -Timestamp $Timestamp
+    }
+    return $WrittenPath
 }
 
 function ConvertTo-InventoryFolderTrustee {
@@ -875,24 +847,6 @@ function ConvertTo-InventoryFolderTrustee {
     if ($display) { return $display }
 
     return ([string]$User).Trim()
-}
-
-function Test-InventoryTenantMatch {
-    <#
-        True when the Graph and Exchange Online sessions belong to the same tenant. Both sides
-        expose the tenant as a GUID (Get-MgContext.TenantId and Get-ConnectionInformation.TenantID)
-        so the comparison is exact; a blank on either side cannot be verified and is treated as a
-        match, with the caller expected to log it.
-    #>
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param(
-        [AllowNull()][AllowEmptyString()][string]$GraphTenantId,
-        [AllowNull()][AllowEmptyString()][string]$ExchangeTenantId
-    )
-
-    if ([string]::IsNullOrWhiteSpace($GraphTenantId) -or [string]::IsNullOrWhiteSpace($ExchangeTenantId)) { return $true }
-    return ($GraphTenantId.Trim() -ieq $ExchangeTenantId.Trim())
 }
 
 function Get-InventoryGraphUser {
@@ -1267,13 +1221,16 @@ try {
         Write-MigrationLog -Message "Domain filter: $(Join-MigrationList -Values $domains)" -Level INFO
     }
 
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $filePrefix = if ($run.Prefix) { "$($run.Prefix)_" } else { '' }
-    $excelPath = Join-Path -Path $run.OutputDirectory -ChildPath "${filePrefix}Migration-Inventory_$timestamp.xlsx"
-    $csvPaths = [ordered]@{}
-    foreach ($tab in $inventoryTabs) {
-        $csvPaths[$tab] = Join-Path -Path $run.OutputDirectory -ChildPath "${filePrefix}${tab}_$timestamp.csv"
-    }
+    # One shared stamp for every tab's CSV (written through Export-MigrationReport) and the
+    # workbook, so the whole set reads as one inventory.
+    $runTimestamp = Get-Date
+    $timestamp = $runTimestamp.ToString('yyyyMMdd-HHmmss')
+
+    # Named through Get-MigrationOutputPath, the single owner of the filename contract.
+    # 'Migration-Inventory' is the whole Name rather than a name plus a suffix: the parser
+    # splits on the last hyphen only when what follows it is a mode suffix ('Results' or
+    # 'DryRun'), so a hyphenated name like this one comes back whole.
+    $excelPath = Get-MigrationOutputPath -Name 'Migration-Inventory' -Extension 'xlsx' -Timestamp $runTimestamp
 
     # ImportExcel is a convenience, not a dependency: an inventory that produced only CSVs is
     # still a complete inventory, so a failed install warns rather than aborting the run.
@@ -1289,17 +1246,36 @@ try {
     $graphContext = Connect-MigrationGraph -Scopes $requiredGraphScopes -TenantId $TenantId
     $graphTenantId = [string](Get-InventoryValue $graphContext 'TenantId' '')
 
-    # Connect-MigrationExchange now accepts -TenantId and drops/reconnects a cached session
-    # that targets a different tenant, the same guard -DelegatedOrganization already gave it -
-    # so passing Graph's resolved tenant GUID here closes the gap for the primary, non-GDAP
-    # path. Running Source then Destination in one console would otherwise pair the new
-    # tenant's Graph tabs with the old tenant's Exchange tabs, silently.
-    $exchangeInformation = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization -TenantId $graphTenantId
+    # What both sides are held to. -TenantId when the operator named one; otherwise Graph's own
+    # tenant, which keeps Exchange Online pinned to whatever Graph signed in to even on a run
+    # that was given no pin at all. Running Source then Destination in one console would
+    # otherwise pair the new tenant's Graph tabs with the old tenant's Exchange tabs, silently.
+    $expectedTenant = if ($TenantId) { $TenantId } else { $graphTenantId }
+
+    # Connect-MigrationExchange drops and reconnects a cached session that targets a different
+    # tenant, the same guard -DelegatedOrganization already gave it, closing the gap for the
+    # primary, non-GDAP path.
+    $exchangeInformation = Connect-MigrationExchange -DelegatedOrganization $DelegatedOrganization `
+        -TenantId $expectedTenant
     $exchangeTenantId = [string](Get-InventoryValue $exchangeInformation 'TenantID' '')
-    if (-not (Test-InventoryTenantMatch -GraphTenantId $graphTenantId -ExchangeTenantId $exchangeTenantId)) {
-        throw ("Graph (tenant $graphTenantId) and Exchange Online (tenant $exchangeTenantId) are signed in to " +
-            'different tenants. Run Disconnect-ExchangeOnline, sign in to the right tenant and re-run.')
+
+    # Falling back to Graph's tenant means the assert normally has something to compare, so it
+    # never reaches its own "no tenant was specified" branch. That branch's warning still has to
+    # be said out loud, because an unpinned run is exactly the one an operator should notice.
+    # If Graph reported no tenant either there is nothing to name, and the assert's own
+    # unverifiable-connection warning covers it - saying it twice, once with a hole in the
+    # sentence, would only be noise.
+    if (-not $TenantId -and $expectedTenant) {
+        Write-MigrationLog -Message ("No -TenantId was given; this run acts on tenant $expectedTenant. " +
+            'Pass -TenantId to guard against a cached session.') -Level WARNING
     }
+
+    # The guard runs on a read too: an inventory taken from the wrong tenant is not just wasted,
+    # it becomes the input every later phase trusts. One implementation, shared with every other
+    # connecting script.
+    $null = Assert-MigrationTenant -ExpectedTenantId $expectedTenant -GraphContext $graphContext `
+        -ExchangeConnection $exchangeInformation -Purpose 'Tenant inventory'
+
     if (-not $graphTenantId -or -not $exchangeTenantId) {
         Write-MigrationLog -Level WARNING -Message ('Could not confirm that Graph and Exchange Online target the same ' +
             "tenant (Graph '$graphTenantId', Exchange '$exchangeTenantId'). Check the TenantId row of the Summary tab.")
@@ -1829,11 +1805,34 @@ try {
         Summary            = @($summaryRows)
     }
 
+    $csvPaths = [ordered]@{}
     foreach ($tab in $inventoryTabs) {
+        $rows = @($tabData[$tab])
+        # -Columns is what lets an empty tab keep the same header a populated one has: without it,
+        # an empty optional tab would be a single Info row, and New-MigrationIdentityPlan's
+        # required-column check (via Import-OptionalPlanCsv) would see that as a missing column
+        # rather than as nothing of that kind to plan.
         $columns = @(Get-InventoryTabColumn -Name $tab -IncludeAuthMethodColumn:$IncludeAuthMethods `
                 -IncludeOneDriveColumn:$IncludeOneDrive)
-        Export-InventoryTab -Row $tabData[$tab] -Name $tab -CsvPath $csvPaths[$tab] -Column $columns `
-            -ExcelPath $excelPath -IncludeExcel:$useExcel
+        $writtenPath = Export-MigrationReport -Rows $rows -Name $tab -Columns $columns `
+            -Timestamp $runTimestamp -SuppressInDryRun
+        $csvPaths[$tab] = Get-InventoryTabSummaryPath -Tab $tab -WrittenPath $writtenPath -Run $run `
+            -Timestamp $runTimestamp
+
+        if ($useExcel) {
+            # Export-Excel cannot write a sheet from an empty pipeline, so an empty tab gets the
+            # same single informational row the CSV gets from Export-MigrationReport. The write
+            # goes through Invoke-MigrationAction, which is what makes -DryRun log the planned
+            # file and write nothing.
+            $placeholder = @([pscustomobject]@{ Info = "No $tab records found." })
+            $sheetRows = if ($rows.Count -eq 0) { $placeholder } else { $rows }
+            $sheetRows = @($sheetRows | ForEach-Object { ConvertTo-MigrationSafeRow -Row $_ })
+            $description = "Write the $tab worksheet ($($rows.Count) row(s)) to $excelPath"
+            Invoke-MigrationAction -Description $description -Action {
+                $sheetRows | Export-Excel -Path $excelPath -WorksheetName $tab -AutoSize `
+                    -FreezeTopRow -BoldTopRow -AutoFilter
+            }
+        }
     }
 
     Write-MigrationLog -Message '--- Inventory summary ---' -Level SUCCESS

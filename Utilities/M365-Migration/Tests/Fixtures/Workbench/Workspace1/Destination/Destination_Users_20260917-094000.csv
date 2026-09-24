@@ -1,0 +1,2 @@
+"ObjectId","UserPrincipalName","DisplayName","FirstName","LastName","Mail","JobTitle","Department","UsageLocation","AccountEnabled","UserType","IsSynced","ManagerUpn","Licenses","ProxyAddresses"
+"00000000-0000-0000-0000-00000000000a","alan.turing@newco.com","Alan Turing","Alan","Turing","alan.turing@newco.com","Architect","Engineering","US","True","Member","False","","ENTERPRISEPACK","SMTP:alan.turing@newco.com"

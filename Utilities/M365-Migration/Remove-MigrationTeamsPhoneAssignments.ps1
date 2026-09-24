@@ -58,6 +58,11 @@
     (auto attendant / call queue numbers) included. Requires -TenantId so a whole-tenant
     release is always pinned to a named tenant rather than whichever cached session is live.
 
+.PARAMETER AcknowledgeSourceTenant
+    Confirms that the tenant named in -TenantId is the one being decommissioned. -All refuses to
+    run without it: releasing every number in the wrong tenant takes the phone system down for a
+    client who is not migrating, and nothing in the run can put the numbers back automatically.
+
 .PARAMETER OutputPath
     Root directory for the log and results CSV. Defaults to the toolkit's standard root:
     %LOCALAPPDATA%\Migration-Automations on Windows, ~/Migration-Automations elsewhere.
@@ -96,12 +101,15 @@
     Releases every number named in the export produced by Get-MigrationTeamsPhoneAssignments.ps1.
 
 .EXAMPLE
-    .\Remove-MigrationTeamsPhoneAssignments.ps1 -All -TenantId contoso.onmicrosoft.com -Prefix Contoso -Verbosity High
+    .\Remove-MigrationTeamsPhoneAssignments.ps1 -All -TenantId contoso.onmicrosoft.com `
+        -AcknowledgeSourceTenant -Prefix Contoso -Verbosity High
 
-    Releases every assigned number in the named tenant, with full console tracing.
+    Releases every assigned number in the named tenant, with full console tracing. Without
+    -AcknowledgeSourceTenant the run stops before signing in.
 
 .NOTES
     Author      : AutomationHub
+    Version     : 1.2.0
     Requires    : PowerShell 7.4, the M365Migration module shipped beside this script, and
                   the MicrosoftTeams module version 5.7.0 or later (installed on demand when
                   absent). Older module versions report a failed removal by returning a
@@ -132,6 +140,11 @@ param(
 
     [Parameter(Mandatory, ParameterSetName = 'All')]
     [switch]$All,
+
+    # -All is the only set that can empty a tenant, so the acknowledgement lives with it rather
+    # than being a switch the single-user and CSV runs could carry around meaninglessly.
+    [Parameter(ParameterSetName = 'All')]
+    [switch]$AcknowledgeSourceTenant,
 
     [string]$OutputPath,
 
@@ -171,7 +184,21 @@ try {
         throw "CSV not found: $CsvPath"
     }
 
+    # Checked before the connection, because by the time a wrong-tenant -All run has signed in
+    # the next thing it does is start releasing numbers. -TenantId is mandatory on this set, so
+    # the message can always name the tenant the operator pinned.
+    if ($PSCmdlet.ParameterSetName -eq 'All' -and -not $AcknowledgeSourceTenant) {
+        throw "-All releases every phone number in tenant $TenantId. Re-run with -AcknowledgeSourceTenant " +
+        'to confirm this is the tenant being decommissioned.'
+    }
+
     $tenant = Connect-MigrationTeams -TenantId $TenantId
+
+    # The guard, called unconditionally: -TenantId is only mandatory for -All, so on the User and
+    # Csv paths this is also what writes the WARNING banner naming the tenant the numbers are
+    # about to come off when no pin was given.
+    $null = Assert-MigrationTenant -ExpectedTenantId $TenantId -TeamsTenant $tenant `
+        -Purpose 'Teams phone removal'
 
     # Name the tenant at WARNING so it shows at the default verbosity even when a cached
     # session was reused (Connect-MigrationTeams logs that reuse at INFO only). This is the
