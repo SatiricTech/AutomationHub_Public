@@ -175,6 +175,16 @@ Describe 'Test-InstallerSignature' {
     }
 }
 
+Describe 'Get-AgentInstaller' {
+    It 'Sends a user agent the NinjaOne load balancer accepts' {
+        Mock Invoke-WebRequest { }
+        Get-AgentInstaller -Url $script:GoodUrl -OutFile 'x.msi'
+        Should -Invoke Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
+            $UserAgent -and $UserAgent -notmatch 'WindowsPowerShell'
+        }
+    }
+}
+
 Describe 'Start-MsiInstall' {
     BeforeEach {
         Mock Start-Process { [pscustomobject]@{ ExitCode = 3010 } }
