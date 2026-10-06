@@ -110,6 +110,7 @@ $SuccessExitCodes = @(0, 3010, 1641)
 $AllowedHostPattern = '^([a-z0-9-]+\.)*(ninjarmm|ninjaone)\.com$'
 # Code-signing certificate CNs NinjaOne has used. Add a name here if NinjaOne rotates its publisher.
 $AllowedSigners = @('NinjaOne, LLC', 'NinjaOne LLC', 'NinjaRMM LLC', 'NinjaRMM, LLC')
+$DownloadUserAgent = 'Install-NinjaOneAgent/1.0'
 $ServiceWaitSeconds = 60
 $ServicePollSeconds = 5
 
@@ -221,7 +222,9 @@ function Get-AgentInstaller {
 
     # The 5.1 progress bar throttles large downloads.
     $ProgressPreference = 'SilentlyContinue'
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 600
+    # NinjaOne's load balancer returns 403 to any user agent containing "WindowsPowerShell"
+    # (the 5.1 default), so send an explicit one.
+    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 600 -UserAgent $DownloadUserAgent
 }
 
 function Test-ElevatedSession {
