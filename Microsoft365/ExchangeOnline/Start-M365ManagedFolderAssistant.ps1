@@ -70,8 +70,8 @@
     Lists the mailboxes that would be processed. Queues nothing.
 
 .PARAMETER LogPath
-    Path to the log file. Defaults to $env:ProgramData\<MSPName>\Logs on Windows and to the
-    temp directory on macOS/Linux.
+    Path to the log file. Defaults to $env:ProgramData\<MSPName>\Logs on Windows and to
+    ~/.local/state/<MSPName>/Logs on macOS/Linux.
 
 .EXAMPLE
     ./Start-M365ManagedFolderAssistant.ps1 -DryRun -Verbosity High
@@ -137,13 +137,15 @@ $scriptStartTime       = Get-Date
 $timestamp             = Get-Date -Format 'yyyyMMdd-HHmmss'
 $scriptName            = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 
-# $env:ProgramData does not exist on macOS/Linux, so fall back to the temp directory there.
+# $env:ProgramData does not exist on macOS/Linux. Use a folder in the user's own profile there,
+# not the temp directory: /tmp is shared on Linux, and another local user could pre-create the
+# folder or a symlink to read the report (UPNs, tenant name) or redirect the writes.
 if (-not $LogPath) {
     $logRoot = if ($IsWindows -and $env:ProgramData) {
         Join-Path $env:ProgramData $MSPName 'Logs'
     }
     else {
-        Join-Path ([System.IO.Path]::GetTempPath()) $MSPName 'Logs'
+        Join-Path $HOME '.local' 'state' $MSPName 'Logs'
     }
     $LogPath = Join-Path $logRoot "$scriptName-$timestamp.log"
 }

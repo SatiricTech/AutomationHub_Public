@@ -108,7 +108,7 @@ selector switch such as `-HoldCleanup`, not on its own.
 ## Logs, reports, and exit codes
 
 Logs go to `%ProgramData%\{mspname}\Logs` on Windows. Set `$MSPName` at the top of each
-script. On macOS and Linux, logs go to the temp directory. The CSV report is written next
+script. On macOS and Linux, logs go to `~/.local/state/{mspname}/Logs`. The CSV report is written next
 to the log unless you pass `-OutputPath`.
 
 | Exit code | Meaning |
