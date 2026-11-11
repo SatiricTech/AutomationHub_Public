@@ -43,6 +43,8 @@ By downloading, copying, or executing any code found within this repository, you
 |--------|---------|-------------|
 | [`EntraID/`](Microsoft365/EntraID/) | `Start-EntraIDSyncCycle.bat` | Trigger a delta Entra ID (Azure AD) sync |
 | [`EntraID/PerUserMfaAudit/`](Microsoft365/EntraID/PerUserMfaAudit/) | `Get-EntraPerUserMfaAudit.ps1` | Read-only audit of legacy per-user MFA state (Enabled/Enforced) tenant-wide, per group, or per user — CSV report + CI exit codes |
+| [`ExchangeOnline/`](Microsoft365/ExchangeOnline/) | `Enable-M365ArchiveAutoExpand.ps1` | Enable auto-expanding archiving org-wide or per mailbox, optionally enabling the main archive first — irreversible, confirmation gate, DryRun, CSV report |
+| | `Start-M365ManagedFolderAssistant.ps1` | Run the Managed Folder Assistant on every mailbox (or named ones) so retention/archive policies apply now — retry on throttling, CSV report |
 | [`OfficeApps/`](Microsoft365/OfficeApps/) | `Install-Microsoft365Apps.ps1` | Deploy M365 Business Standard apps via ODT |
 | | `Get-LatestOdtInstaller.ps1` | Download the latest Office Deployment Tool |
 | | `Microsoft365-BusinessStandard.xml` | ODT configuration for Business Standard (non-shared) |
