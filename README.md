@@ -63,6 +63,7 @@ By downloading, copying, or executing any code found within this repository, you
 | | `Invoke-HuntressAuditPolicyRemediation.ps1` | RMM detect & remediate for Huntress SIEM audit policy baseline |
 | [`LastPass/`](Vendors/LastPass/) | `Install-LastPass.ps1` | Deploy LastPass with browser extension detection |
 | | `Remove-LastPassBrowserExtension.ps1` | Remove LastPass extensions from Chrome/Edge |
+| [`N-able/`](Vendors/N-able/) | `Remove-NableAgent.ps1` | Discover and remove all N-able / SolarWinds MSP software (N-central agent, PME, Take Control, N-sight, Cove, Passportal): vendor uninstallers with timeouts, then forced service/file/registry cleanup and verification; DryRun, never touches protected security vendors, reports Managed AV for manual removal |
 | [`NinjaOne/`](Vendors/NinjaOne/) | `Uninstall-NinjaRmmAgent.ps1` | Complete Ninja agent removal (services, registry, drivers) |
 | | `Install-NinjaOneAgent.ps1` | Download and silently install the NinjaOne agent MSI from an editable installer URL (skips if already installed) |
 | [`NinjaOne/BrowserExtensionInventory/`](Vendors/NinjaOne/BrowserExtensionInventory/) | `Set-NinjaBrowserExtensionInventory.ps1` | Inventory Chrome/Edge/Brave/Firefox extensions for every user profile into three device custom fields (searchable list, HTML table, flag count) |
